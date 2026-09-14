@@ -1,6 +1,7 @@
 //! Separate certificate work capacity, leaving at least one shared database slot
 //! for route/lifecycle work. A detached blocking task retains both its operation
-//! and crypto permits until it actually finishes.
+//! and crypto permits until it actually finishes. Holding a permit across a
+//! backend session is the backend's own concern; see `postgres::certificate_connection`.
 use crate::store::{StoreError, StoreResult};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -69,7 +70,7 @@ impl CertificateWorkLimits {
 }
 // The watch-specific slot shares the exact operation/client/drain lifetime.
 // A canceled read cannot release it while SQL is still queued on the session.
-struct CertificateWorkPermits {
+pub(crate) struct CertificateWorkPermits {
     _operation: OwnedSemaphorePermit,
     _watch: Option<OwnedSemaphorePermit>,
     _watch_admission: Option<OwnedSemaphorePermit>,
@@ -79,6 +80,11 @@ pub(crate) struct CertificateWork {
     crypto: Arc<Semaphore>,
 }
 impl CertificateWork {
+    /// Backend session wrappers hold these permits for the whole checkout,
+    /// including any drain that outlives a cancelled read.
+    pub(crate) fn permits(&self) -> Arc<CertificateWorkPermits> {
+        self.operation.clone()
+    }
     pub async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> StoreResult<T> + Send + 'static,
@@ -95,76 +101,6 @@ impl CertificateWork {
         })
         .await
         .map_err(|_| StoreError::internal("certificate crypto worker failed"))?
-    }
-}
-
-/// A checkout may have sent SQL even when its query future is dropped. Never
-/// return that session to Fast recycling until its queued rollback and a final
-/// protocol round trip have drained. At most one drain task exists per operation
-/// slot. Timeout or task/runtime cancellation discards the session instead.
-pub(crate) struct CertificateConnection {
-    client: Option<deadpool_postgres::Client>,
-    operation: Arc<CertificateWorkPermits>,
-}
-impl std::ops::Deref for CertificateConnection {
-    type Target = deadpool_postgres::Client;
-    fn deref(&self) -> &Self::Target {
-        self.client.as_ref().unwrap()
-    }
-}
-impl std::ops::DerefMut for CertificateConnection {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.client.as_mut().unwrap()
-    }
-}
-struct PendingDrain {
-    client: Option<deadpool_postgres::Client>,
-    _operation: Arc<CertificateWorkPermits>,
-}
-impl Drop for PendingDrain {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            // Remove from pool before ClientWrapper aborts its connection task.
-            drop(deadpool_postgres::Client::take(client));
-        }
-    }
-}
-impl PendingDrain {
-    async fn run(mut self) {
-        let drained = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.client.as_ref().unwrap().simple_query(""),
-        )
-        .await;
-        if matches!(drained, Ok(Ok(_))) {
-            drop(self.client.take()); // Only this successful path recycles.
-        }
-    }
-}
-impl Drop for CertificateConnection {
-    fn drop(&mut self) {
-        let drain = PendingDrain {
-            client: self.client.take(),
-            _operation: self.operation.clone(),
-        };
-        // Holding the operation permit bounds queued/running drain tasks as
-        // well as SQL. Dropping this task also discards its client safely.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(drain.run());
-        } else {
-            drop(drain); // Safe discard even outside an entered runtime.
-        }
-    }
-}
-impl CertificateWork {
-    pub async fn client(
-        &self,
-        store: &crate::postgres::PostgresStore,
-    ) -> StoreResult<CertificateConnection> {
-        Ok(CertificateConnection {
-            client: Some(store.client().await?),
-            operation: self.operation.clone(),
-        })
     }
 }
 

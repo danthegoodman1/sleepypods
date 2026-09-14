@@ -21,6 +21,31 @@ Deleted or clears refs/keys. Reservation constraints do not establish Kubernetes
 absence on their own. Migration backfill rejects conflicting existing owners
 and rolls back rather than selecting one arbitrarily.
 
+## Clock ownership
+
+The store owns every timestamp it compares. Callers pass durations, never
+instants: a reconciliation lease is requested as a TTL, and the store starts it
+from the same clock that later decides whether the lease has lapsed. Backlog age
+and work eligibility are computed the same way. One clock supplies both operands
+of every comparison, so a caller whose clock runs fast cannot lengthen its own
+lease and a slow one cannot shorten it.
+
+Exclusivity does not rest on any clock. Two clock-free mechanisms carry it: the
+fencing tokens revalidated on every write (`reconcile_owner`, `reconcile_attempt`
+and `instance_generation`), and the unresolved-effect barrier, which blocks
+claims, candidate scans and requeues while a Kubernetes call is in flight. The
+lease clock only decides when idle work may be reclaimed from an owner presumed
+dead, so clock skew costs a duplicated reconcile pass or a delayed recovery, not
+a duplicated effect.
+
+A store backend without a server clock may designate its own reference; the
+contract requires a single monotonic reference per comparison, not this
+implementation's `clock_timestamp()`. Lease TTLs must be at least one
+millisecond and no longer than `MAX_RECONCILIATION_LEASE_TTL` (24 hours).
+
+Because the store owns the clock, tests elapse a deadline by retiring the stored
+timestamp rather than by claiming a later "now".
+
 Reconciliation stores three separate timestamps:
 
 - `state_entered_at_unix_millis` changes only with the materialization state. It

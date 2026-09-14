@@ -243,14 +243,10 @@ impl ControlPlaneStore for CapabilityProbe {
             format!("{request:?}"),
         )
     }
-    fn load_materialization_operational_metrics<'a>(
-        &'a self,
-        request: LoadMaterializationOperationalMetricsRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
-        self.fail(
-            "load_materialization_operational_metrics",
-            format!("{request:?}"),
-        )
+    fn load_materialization_operational_metrics(
+        &self,
+    ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
+        self.fail("load_materialization_operational_metrics", "()".to_owned())
     }
     fn claim_materialization_reconciliation<'a>(
         &'a self,
@@ -596,21 +592,20 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     check!(
         2,
         list_materialization_reconciliation_candidates,
-        ListMaterializationReconciliationCandidatesRequest::new(now, 23).for_target(target.clone())
+        ListMaterializationReconciliationCandidatesRequest::new(23).for_target(target.clone())
     );
-    check!(
-        2,
-        load_materialization_operational_metrics,
-        LoadMaterializationOperationalMetricsRequest::new(now)
-    );
+    assert!(store
+        .load_materialization_operational_metrics()
+        .await
+        .is_err());
+    probe.check("load_materialization_operational_metrics", "()".into(), 2);
     check!(
         1,
         claim_materialization_reconciliation,
         ClaimMaterializationReconciliationRequest::new(
             materialization.clone(),
             "claim-owner",
-            now,
-            now + Duration::from_secs(41)
+            Duration::from_secs(41)
         )
     );
     check!(
@@ -655,7 +650,7 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             "renew-owner",
             67,
             generation,
-            now + Duration::from_secs(71),
+            Duration::from_secs(71),
             MaterializationState::Pending
         )
     );

@@ -588,8 +588,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
                     ClaimMaterializationReconciliationRequest::new(
                         pending.id.clone(),
                         "expired-failure",
-                        SystemTime::now(),
-                        SystemTime::now() + Duration::from_secs(30),
+                        Duration::from_secs(30),
                     ),
                 )
                 .await?
@@ -1020,9 +1019,8 @@ async fn delete_supersedes_pending_case(
                     ClaimMaterializationReconciliationRequest::new(
                         pending.id.clone(),
                         "replacement",
-                        SystemTime::now(),
-                        SystemTime::now() + Duration::from_secs(30),
-                    ),
+            Duration::from_secs(30),
+        ),
                 )
                 .await?
                 .is_some()
@@ -1124,8 +1122,7 @@ async fn deletion_and_failure_use_one_lock_order(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending.id.clone(),
             "lock-order-owner",
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .unwrap();
@@ -1218,7 +1215,7 @@ async fn deletion_and_failure_use_one_lock_order(
                 "lock-order-owner",
                 1,
                 pending.instance_generation,
-                SystemTime::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
                 MaterializationState::Pending,
             ),
         )
@@ -1326,8 +1323,7 @@ async fn failure_deadline_lock_boundary(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending.id.clone(),
             "deadline-lock-owner",
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .unwrap();

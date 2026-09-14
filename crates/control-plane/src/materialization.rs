@@ -2,7 +2,7 @@ pub use sleepypods_api::materialization::{
     BackendEndpoint, InvalidMaterializationTarget, MaterializationTarget,
 };
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use crate::ids::{BackendGeneration, Generation, InstanceId, MaterializationId};
 use crate::instance::InstanceRecord;
@@ -104,13 +104,7 @@ pub struct MaterializationReconciliationLease {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListMaterializationReconciliationCandidatesRequest {
     pub target: Option<MaterializationTarget>,
-    pub now: SystemTime,
     pub limit: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadMaterializationOperationalMetricsRequest {
-    pub now: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,12 +128,18 @@ pub struct MaterializationHeldKeysOperationalMetrics {
     pub exclusivity_keys_held: u64,
 }
 
+/// The longest lease a store must accept, matching the store's other timeout
+/// bounds. Anything longer outlives the process that would renew it.
+pub const MAX_RECONCILIATION_LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Reconciliation leases are requested as a lifetime, never as an instant. The
+/// store starts every lease from its own clock so one process's offset cannot
+/// lengthen or shorten the window other processes wait before reclaiming work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimMaterializationReconciliationRequest {
     pub materialization_id: MaterializationId,
     pub owner: String,
-    pub now: SystemTime,
-    pub lease_expires_at: SystemTime,
+    pub lease_ttl: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,7 +148,7 @@ pub struct RenewMaterializationReconciliationLeaseRequest {
     pub instance_generation: Generation,
     pub materialization_id: MaterializationId,
     pub owner: String,
-    pub lease_expires_at: SystemTime,
+    pub lease_ttl: Duration,
     pub attempt: u64,
 }
 
@@ -364,18 +364,11 @@ impl ListMaterializationReconciliationCandidatesRequest {
         self.target = Some(target);
         self
     }
-    pub fn new(now: SystemTime, limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             target: None,
-            now,
             limit,
         }
-    }
-}
-
-impl LoadMaterializationOperationalMetricsRequest {
-    pub fn new(now: SystemTime) -> Self {
-        Self { now }
     }
 }
 
@@ -420,14 +413,12 @@ impl ClaimMaterializationReconciliationRequest {
     pub fn new(
         materialization_id: MaterializationId,
         owner: impl Into<String>,
-        now: SystemTime,
-        lease_expires_at: SystemTime,
+        lease_ttl: Duration,
     ) -> Self {
         Self {
             materialization_id,
             owner: owner.into(),
-            now,
-            lease_expires_at,
+            lease_ttl,
         }
     }
 }
@@ -438,7 +429,7 @@ impl RenewMaterializationReconciliationLeaseRequest {
         owner: impl Into<String>,
         attempt: u64,
         instance_generation: Generation,
-        lease_expires_at: SystemTime,
+        lease_ttl: Duration,
         expected_state: MaterializationState,
     ) -> Self {
         Self {
@@ -447,7 +438,7 @@ impl RenewMaterializationReconciliationLeaseRequest {
             attempt,
             materialization_id,
             owner: owner.into(),
-            lease_expires_at,
+            lease_ttl,
         }
     }
 }
@@ -571,18 +562,6 @@ impl MaterializationState {
 
     pub const fn metric_label(self) -> sleepypods_observability::metrics::MetricLabel {
         sleepypods_observability::metrics::MetricLabel::state(self.as_str())
-    }
-}
-
-pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> Result<i64, String> {
-    match value.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis())
-            .map_err(|_| "system time does not fit in unix millis".to_owned()),
-        Err(error) => {
-            let millis = i64::try_from(error.duration().as_millis())
-                .map_err(|_| "system time does not fit in unix millis".to_owned())?;
-            Ok(-millis)
-        }
     }
 }
 
