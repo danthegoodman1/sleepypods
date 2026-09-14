@@ -724,8 +724,8 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
     .map_err(|_| "initial cache warmup exceeded total 1s fixture budget")??;
     assert_instance_response(&old, "fresh pre-cutover cache entry", "old")?;
 
-    // Bound mutation setup too, keeping the original 10s cache entry younger
-    // than the notification deadline. No request runs between these commits.
+    // Bound mutation setup too, keeping the cache entry younger than the
+    // notification deadline. No request runs between these commits.
     tokio::time::timeout(Duration::from_secs(1), async {
         let deleted = operator
             .delete_route_binding(DeleteRouteBindingRequest {
@@ -779,7 +779,11 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })
     .await
-    .map_err(|_| "route notification did not converge within 3s (before 10s TTL)")??;
+    .map_err(|_| {
+        "route notification did not converge within 3s, well inside the positive cache TTL"
+    })??;
+    // Convergence has to beat the positive cache TTL by a wide margin, so that
+    // what this proves is notification delivery rather than an entry aging out.
     if cached_at.elapsed() >= Duration::from_secs(5) {
         return Err("route freshness proof exceeded its pre-TTL fixture budget".into());
     }

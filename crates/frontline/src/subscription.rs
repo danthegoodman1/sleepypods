@@ -4,7 +4,7 @@ use sleepypods_api::{BackendGeneration, CachePolicy, Generation, RouteEntry, Rou
 
 use crate::{
     cache::{stale_route_entry, CacheInsertResult, StaleRouteEntry},
-    RouteCache,
+    PositiveCacheEntry, RouteCache,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -294,6 +294,34 @@ impl SubscriptionState {
                 )
             })
             .collect()
+    }
+
+    /// Install the ready backend a wake produced on the answer the wake was
+    /// issued for. The answer is addressed by the identity it was cached for,
+    /// because a wake can outlive the stream that issued its subscription, and
+    /// it keeps whatever remains of the lifetime it already had.
+    pub fn apply_ready_wake(
+        &mut self,
+        cached: &PositiveCacheEntry,
+        ready: RouteEntry,
+        now: Instant,
+    ) -> ApplyUpdateOutcome {
+        let identity = cached.request_identity.clone();
+        let Some(current) = self.cache.positive(&identity) else {
+            return ApplyUpdateOutcome::MissingSubscription;
+        };
+        if let Some(stale) = stale_route_entry(&current.entry, &ready) {
+            return stale_update_outcome(stale);
+        }
+        let remaining = cached.expires_at().saturating_duration_since(now);
+        self.cache.refresh_positive(
+            &identity,
+            cached.matched_identity.clone(),
+            ready,
+            CachePolicy::new(remaining),
+            now,
+        );
+        ApplyUpdateOutcome::Replaced(CacheInsertResult::default())
     }
 
     fn apply_update(

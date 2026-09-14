@@ -708,7 +708,7 @@ async fn stream_close_event_invalidates_hot_positive_before_ttl_and_lazily_rebui
     let FrontlineRouteResolution::Resolved(entry) = result else {
         panic!("expected rebuilt positive route");
     };
-    assert_eq!(entry.subscription_id, subscription_id("sub-new"));
+    assert_eq!(entry.subscription_id, Some(subscription_id("sub-new")));
     assert_eq!(entry.entry.route_binding_id.as_str(), "route-new");
     assert!(resolver
         .state()

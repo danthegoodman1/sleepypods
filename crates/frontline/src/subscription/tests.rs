@@ -117,7 +117,7 @@ fn route_miss_inserts_negative_cache_without_subscription_id() {
         now,
     );
 
-    assert_eq!(state.cache().positives().len(), 0);
+    assert_eq!(state.cache().positives().count(), 0);
     assert_eq!(state.cache().negatives().len(), 1);
     assert_eq!(
         state.cache().lookup(&request, now).status(),
@@ -212,7 +212,7 @@ fn duplicate_resolved_response_for_same_identity_keeps_one_active_subscription()
         .cache()
         .positive_by_subscription(&subscription_id("sub-first"))
         .is_none());
-    assert_eq!(state.cache().positives().len(), 1);
+    assert_eq!(state.cache().positives().count(), 1);
     assert_eq!(
         state
             .cache()
