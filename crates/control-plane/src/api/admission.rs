@@ -21,6 +21,12 @@ pub struct ApiLimits {
     pub subscription_lifetime: Duration,
     pub lookup_timeout: Duration,
     pub response_timeout: Duration,
+    /// Positive route cache lifetime handed to proxies. Subscription
+    /// invalidations are the primary freshness mechanism; this is the bound on
+    /// how long a dropped event can go unnoticed. It outlives
+    /// `subscription_lifetime`, because a proxy carries cached answers across an
+    /// orderly stream rotation and registers them on the replacement stream.
+    pub positive_route_cache_ttl: Duration,
 }
 impl Default for ApiLimits {
     fn default() -> Self {
@@ -35,6 +41,7 @@ impl Default for ApiLimits {
             subscription_lifetime: Duration::from_secs(60),
             lookup_timeout: Duration::from_secs(3),
             response_timeout: Duration::from_secs(1),
+            positive_route_cache_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -153,8 +160,7 @@ where
             || request
                 .uri()
                 .path()
-                .ends_with("/ProxyControlPlane/Subscribe")
-            || request.uri().path() == "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe";
+                .ends_with("/ProxyControlPlane/Subscribe");
         let connection = connection_progress(request.extensions()).cloned();
         let delivery_timeout = self.delivery_timeout;
         let future = self.inner.call(request);

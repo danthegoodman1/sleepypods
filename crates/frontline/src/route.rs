@@ -64,6 +64,10 @@ where
 }
 
 const MAX_ROUTE_FLIGHTS: usize = 64;
+// Re-registration is background repair of answers that are already serving, so
+// it may never consume the budget a first-time miss needs to reach the control
+// plane. Half the flights stay reserved for demand.
+const MAX_REREGISTRATION_FLIGHTS: usize = MAX_ROUTE_FLIGHTS / 2;
 const MAX_ROUTE_WAITERS: usize = 256;
 const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
 #[derive(Debug)]
@@ -482,6 +486,9 @@ struct RouteObservation {
 #[derive(Default)]
 struct RouteObservations {
     stream_epoch: u64,
+    /// Observations begun before this epoch crossed a session that dropped
+    /// events. An orderly rotation advances `stream_epoch` without raising it.
+    lossy_from: u64,
     sequence: u64,
     next_id: u64,
     active: HashMap<u64, u64>,
@@ -499,10 +506,25 @@ impl RouteObservations {
         }
     }
 
-    fn reset(&mut self) {
+    /// The stream ended in order. Replies still in flight belong to a stream
+    /// this coordinator no longer tracks, and the IDs it issued are dead, but
+    /// the session delivered everything it had.
+    fn rotate(&mut self) {
         self.stream_epoch += 1;
         self.active.clear();
         self.subscriptions.clear();
+    }
+
+    /// The session dropped events, so anything it still owes is unreliable.
+    fn reset(&mut self) {
+        self.rotate();
+        self.lossy_from = self.stream_epoch;
+    }
+
+    /// Whether an observation begun at `epoch` has since crossed a session that
+    /// dropped events.
+    fn crossed_lossy(&self, epoch: u64) -> bool {
+        epoch < self.lossy_from
     }
 
     // False means the bounded history cannot safely correlate another event.
@@ -540,6 +562,14 @@ impl RouteObservations {
 }
 
 enum PendingRoute<R, W> {
+    /// Re-registering a retained answer after its stream closed. No caller is
+    /// waiting, so a closed response channel must not be read as "abandoned".
+    Reregister {
+        identity: RouteIdentity,
+        request_id: crate::RouteRequestId,
+        observation: RouteObservation,
+        result: Result<SubscribeControlPlaneOutput, FrontlineRouteCoordinatorError<R, W>>,
+    },
     Subscribe {
         identity: RouteIdentity,
         request_id: crate::RouteRequestId,
@@ -576,6 +606,8 @@ async fn route_actor<RouteClient, Wake>(
     let mut tracker = WakeTracker::new();
     let mut observations = RouteObservations::default();
     let mut next_request = 0u64;
+    let mut reregister: std::collections::VecDeque<RouteIdentity> =
+        std::collections::VecDeque::new();
     loop {
         drain_events(
             &mut client,
@@ -583,17 +615,22 @@ async fn route_actor<RouteClient, Wake>(
             &mut observations,
             &mut unsubscribes,
             &observability,
+            &mut reregister,
         )
         .await;
-        let evicted = state
-            .write()
-            .await
-            .cache_mut()
-            .expire_limited(
-                Instant::now(),
-                MAX_ROUTE_FLIGHTS.saturating_sub(unsubscribes.len()),
-            )
-            .subscriptions_to_unsubscribe;
+        // The read fast path shares this lock, so only take it for writing when
+        // something is actually due.
+        let now = Instant::now();
+        let evicted = if state.read().await.cache().has_expired(now) {
+            state
+                .write()
+                .await
+                .cache_mut()
+                .expire_limited(now, MAX_ROUTE_FLIGHTS.saturating_sub(unsubscribes.len()))
+                .subscriptions_to_unsubscribe
+        } else {
+            Vec::new()
+        };
         defer_unsubscribes(
             evicted,
             &mut client,
@@ -602,6 +639,33 @@ async fn route_actor<RouteClient, Wake>(
             &mut unsubscribes,
         )
         .await;
+
+        // Retained answers keep serving while this runs, so re-registration is
+        // background work: it yields the flight budget to live requests.
+        while tasks.len() < MAX_REREGISTRATION_FLIGHTS {
+            let Some(identity) = reregister.pop_front() else {
+                break;
+            };
+            if !state
+                .read()
+                .await
+                .cache()
+                .needs_reregistration(&identity, Instant::now())
+            {
+                continue;
+            }
+            next_request += 1;
+            let request_id =
+                crate::RouteRequestId::new(format!("req:{next_request}")).expect("request ID");
+            let future = client.subscribe_route(request_id.clone(), identity.clone());
+            let observation = observations.begin();
+            spawn_subscribe(&mut tasks, future, move |result| PendingRoute::Reregister {
+                identity,
+                request_id,
+                observation,
+                result,
+            });
+        }
 
         tokio::select! {
             biased;
@@ -615,8 +679,37 @@ async fn route_actor<RouteClient, Wake>(
                 // a reply. Consume that event before installing the observation.
                 drain_events(
                     &mut client, &state, &mut observations, &mut unsubscribes, &observability,
+                    &mut reregister,
                 ).await;
                 match completed {
+                    PendingRoute::Reregister { identity, request_id, observation, result } => {
+                        let subscription_id = result.as_ref().ok().and_then(resolved_subscription_id).cloned();
+                        let same_stream = observation.stream_epoch == observations.stream_epoch;
+                        let crossed_lossy = observations.crossed_lossy(observation.stream_epoch);
+                        let valid = observations.finish(observation, subscription_id.as_ref());
+                        let validation = result.as_ref().ok().map(|message| {
+                            crate::resolver::validate_subscribe_response::<RouteClient::Error>(&request_id, &identity, message)
+                        });
+                        // A reply that crossed another rotation belongs to a
+                        // stream this cache no longer tracks. Reclaim it the
+                        // same way a crossed Subscribe reply is reclaimed.
+                        if !valid || validation.as_ref().is_some_and(Result::is_err) {
+                            reclaim_crossed_reply(
+                                subscription_id, same_stream, crossed_lossy, &mut client, &state,
+                                &mut observations, &mut unsubscribes,
+                            ).await;
+                            continue;
+                        }
+                        let Ok(message) = result else { continue };
+                        let mut removed = Vec::new();
+                        append_unsubscribes(
+                            state.write().await.apply_resolved_response(identity, message, Instant::now()),
+                            &mut removed,
+                        );
+                        defer_unsubscribes(
+                            removed, &mut client, &state, &mut observations, &mut unsubscribes,
+                        ).await;
+                    }
                     PendingRoute::Subscribe { identity, request_id, observation, response, result } => {
                         observability.record_metric(MetricObservation::new(
                             RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
@@ -626,26 +719,16 @@ async fn route_actor<RouteClient, Wake>(
                         ));
                         let subscription_id = result.as_ref().ok().and_then(resolved_subscription_id).cloned();
                         let same_stream = observation.stream_epoch == observations.stream_epoch;
+                        let crossed_lossy = observations.crossed_lossy(observation.stream_epoch);
                         let valid = observations.finish(observation, subscription_id.as_ref());
                         let validation = result.as_ref().ok().map(|message| {
                             crate::resolver::validate_subscribe_response(&request_id, &identity, message)
                         });
                         if !valid || response.is_closed() || validation.as_ref().is_some_and(Result::is_err) {
-                            // A completion crossing a reset has ambiguous session
-                            // ownership: ensure() may have reconnected while this
-                            // operation was in flight. Reclaim it with a reset,
-                            // never an unsubscribe that could target a reused ID
-                            // on a new session while leaving cached authority live.
-                            if same_stream {
-                                defer_unsubscribes(
-                                    subscription_id.into_iter().collect(), &mut client, &state,
-                                    &mut observations, &mut unsubscribes,
-                                ).await;
-                            } else if subscription_id.is_some() {
-                                reset_route_session(
-                                    &mut client, &state, &mut observations, &mut unsubscribes,
-                                ).await;
-                            }
+                            reclaim_crossed_reply(
+                                subscription_id, same_stream, crossed_lossy, &mut client, &state,
+                                &mut observations, &mut unsubscribes,
+                            ).await;
                             let error = match validation {
                                 Some(Err(error)) => FrontlineRouteCoordinatorError::Resolve(error),
                                 _ => FrontlineRouteCoordinatorError::InvalidatedDuringResolution,
@@ -735,11 +818,7 @@ async fn route_actor<RouteClient, Wake>(
                         let request_id = crate::RouteRequestId::new(format!("req:{next_request}")).expect("request ID");
                         let future = client.subscribe_route(request_id.clone(), identity.clone());
                         let observation = observations.begin();
-                        tasks.spawn(async move {
-                            let result = match tokio::time::timeout(SUBSCRIBE_DEADLINE, future).await {
-                                Ok(result) => result.map_err(|error| FrontlineRouteCoordinatorError::Resolve(FrontlineRouteResolverError::Subscribe(error))),
-                                Err(_) => Err(FrontlineRouteCoordinatorError::SubscribeDeadline),
-                            };
+                        spawn_subscribe(&mut tasks, future, move |result| {
                             PendingRoute::Subscribe {identity, request_id, observation, response, result}
                         });
                     }
@@ -760,6 +839,69 @@ fn resolved_subscription_id(
     }
 }
 
+/// Both the demand path and re-registration issue the same call under the same
+/// deadline; only the completion they produce differs.
+fn spawn_subscribe<RouteClientError, WakeClientError, Finish>(
+    tasks: &mut tokio::task::JoinSet<PendingRoute<RouteClientError, WakeClientError>>,
+    future: crate::RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, RouteClientError>,
+    finish: Finish,
+) where
+    RouteClientError: Send + 'static,
+    WakeClientError: Send + 'static,
+    Finish: FnOnce(
+            Result<
+                SubscribeControlPlaneOutput,
+                FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>,
+            >,
+        ) -> PendingRoute<RouteClientError, WakeClientError>
+        + Send
+        + 'static,
+{
+    tasks.spawn(async move {
+        let result = match tokio::time::timeout(SUBSCRIBE_DEADLINE, future).await {
+            Ok(result) => result.map_err(|error| {
+                FrontlineRouteCoordinatorError::Resolve(FrontlineRouteResolverError::Subscribe(
+                    error,
+                ))
+            }),
+            Err(_) => Err(FrontlineRouteCoordinatorError::SubscribeDeadline),
+        };
+        finish(result)
+    });
+}
+
+/// Reclaim a reply this coordinator refuses to install. On the stream that
+/// issued it, drop the subscription. Past an orderly rotation, discard it: its
+/// ID died with its stream, so unsubscribing could target a reused ID on the
+/// replacement stream, and the ended session left nothing undelivered. Past a
+/// session that dropped events, ownership is ambiguous, because `ensure` may
+/// have reconnected while the reply was in flight, so reset and give up cached
+/// authority with it.
+async fn reclaim_crossed_reply<Client: RouteSubscriptionClient>(
+    subscription_id: Option<crate::SubscriptionId>,
+    same_stream: bool,
+    crossed_lossy: bool,
+    client: &mut Client,
+    state: &tokio::sync::RwLock<SubscriptionState>,
+    observations: &mut RouteObservations,
+    unsubscribes: &mut tokio::task::JoinSet<bool>,
+) where
+    Client::Error: 'static,
+{
+    if same_stream {
+        defer_unsubscribes(
+            subscription_id.into_iter().collect(),
+            client,
+            state,
+            observations,
+            unsubscribes,
+        )
+        .await;
+    } else if crossed_lossy && subscription_id.is_some() {
+        reset_route_session(client, state, observations, unsubscribes).await;
+    }
+}
+
 async fn reset_route_session<Client: RouteSubscriptionClient>(
     client: &mut Client,
     state: &tokio::sync::RwLock<SubscriptionState>,
@@ -768,6 +910,10 @@ async fn reset_route_session<Client: RouteSubscriptionClient>(
 ) where
     Client::Error: 'static,
 {
+    // Reached only where events were demonstrably lost: an overflowed
+    // correlation budget, a failed transport, or cleanup that could not be
+    // delivered. A dropped invalidation may name anything, so cached authority
+    // goes with the session. An orderly close loses nothing and rotates instead.
     observations.reset();
     state.write().await.cache_mut().clear();
     *unsubscribes = tokio::task::JoinSet::new();
@@ -814,6 +960,7 @@ async fn drain_events<Client: RouteSubscriptionClient>(
     observations: &mut RouteObservations,
     unsubscribes: &mut tokio::task::JoinSet<bool>,
     observability: &ObservabilityRecorder,
+    rotated: &mut std::collections::VecDeque<RouteIdentity>,
 ) where
     Client::Error: 'static,
 {
@@ -827,6 +974,10 @@ async fn drain_events<Client: RouteSubscriptionClient>(
                 for event in events {
                     record_subscription_event(observability, &event);
                     match event {
+                        crate::RouteSubscriptionEvent::StreamEnded => {
+                            observations.rotate();
+                            rotated.extend(state.cache_mut().rotate_session());
+                        }
                         crate::RouteSubscriptionEvent::StreamClosed => {
                             observations.reset();
                             state.cache_mut().clear();
@@ -888,7 +1039,8 @@ fn record_subscription_event(
         crate::RouteSubscriptionEvent::Update(message) => {
             crate::resolver::record_subscribe_message(observability, message)
         }
-        crate::RouteSubscriptionEvent::StreamClosed => {
+        crate::RouteSubscriptionEvent::StreamEnded
+        | crate::RouteSubscriptionEvent::StreamClosed => {
             crate::resolver::record_subscribe_stream_closed(observability)
         }
     }

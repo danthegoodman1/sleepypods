@@ -2281,3 +2281,258 @@ async fn shared_wake_completion_checks_only_its_affected_subscription() {
         }
     }
 }
+
+// A stream rotates roughly once a minute. Dropping the cache at that moment
+// makes every request in flight depend on a control-plane round trip, so a
+// control plane that is slow or saturated turns a rotation into errors rather
+// than a slow path: `Saturated` past MAX_ROUTE_WAITERS, `SubscribeDeadline`
+// otherwise. Retained answers must keep serving straight through it.
+#[tokio::test]
+async fn stream_rotation_keeps_serving_cached_routes_without_saturating() {
+    let client = BlockingRouteClient::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let identities: Vec<RouteIdentity> = (0..8)
+        .map(|index| http_request(&format!("host{index}.example.com"), "/"))
+        .collect();
+    let replies: Vec<_> = identities
+        .iter()
+        .map(|_| client.push_subscribe_response_channel())
+        .collect();
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            64,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+
+    // Warm the cache: one resolved, registered answer per identity.
+    let warm: Vec<_> = identities
+        .iter()
+        .cloned()
+        .map(|identity| {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.route(identity, now()).await })
+        })
+        .collect();
+    client.wait_for_call_count(identities.len()).await;
+    for (index, reply) in replies.into_iter().enumerate() {
+        reply
+            .send(Ok(resolved_response(
+                generated_request_id(index as u64 + 1),
+                subscription_id(&format!("sub:{}", index + 1)),
+                identities[index].clone(),
+                route_entry(InstanceState::Running, 7, Some(1)),
+            )))
+            .unwrap();
+    }
+    for task in warm {
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            FrontlineRouteOutcome::Ready(_)
+        ));
+    }
+    let warmed_calls = client.calls().len();
+
+    // The stream closes. Re-registration is deliberately left unanswered, so
+    // anything that reaches the control plane here would block or fail.
+    let _reregistration: Vec<_> = identities
+        .iter()
+        .map(|_| client.push_subscribe_response_channel())
+        .collect();
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::StreamEnded);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Far more concurrent requests than MAX_ROUTE_WAITERS, all for cached routes.
+    let load: Vec<_> = (0..super::MAX_ROUTE_WAITERS * 2)
+        .map(|index| {
+            let shared = shared.clone();
+            let identity = identities[index % identities.len()].clone();
+            tokio::spawn(async move { shared.route(identity, now()).await })
+        })
+        .collect();
+    for task in load {
+        match task.await.unwrap() {
+            Ok(FrontlineRouteOutcome::Ready(_)) => {}
+            other => panic!("rotation must not disturb a cached route, got {other:?}"),
+        }
+    }
+
+    // Re-registration was attempted for the retained identities and is still
+    // outstanding; none of the load above added control-plane work.
+    let calls = client.calls().len();
+    assert!(
+        calls > warmed_calls,
+        "retained answers are registered again on the new stream"
+    );
+    assert!(
+        calls <= warmed_calls + identities.len(),
+        "re-registration is one attempt per retained identity, not per request"
+    );
+}
+
+// Repairing retained answers must never crowd out a route the cache has never
+// seen: that request has nothing to fall back on.
+#[tokio::test]
+async fn reregistration_leaves_flight_budget_for_a_first_time_miss() {
+    let client = BlockingRouteClient::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cached: Vec<RouteIdentity> = (0..super::MAX_ROUTE_FLIGHTS)
+        .map(|index| http_request(&format!("cached{index}.example.com"), "/"))
+        .collect();
+    let replies: Vec<_> = cached
+        .iter()
+        .map(|_| client.push_subscribe_response_channel())
+        .collect();
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            256,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+
+    let warm: Vec<_> = cached
+        .iter()
+        .cloned()
+        .map(|identity| {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.route(identity, now()).await })
+        })
+        .collect();
+    client.wait_for_call_count(cached.len()).await;
+    for (index, reply) in replies.into_iter().enumerate() {
+        reply
+            .send(Ok(resolved_response(
+                generated_request_id(index as u64 + 1),
+                subscription_id(&format!("sub:{}", index + 1)),
+                cached[index].clone(),
+                route_entry(InstanceState::Running, 7, Some(1)),
+            )))
+            .unwrap();
+    }
+    for task in warm {
+        task.await.unwrap().unwrap();
+    }
+
+    // Every retained identity wants re-registering, and none of them answer.
+    let _stalled: Vec<_> = cached
+        .iter()
+        .map(|_| client.push_subscribe_response_channel())
+        .collect();
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::StreamEnded);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let fresh = http_request("never-seen.example.com", "/");
+    let pending = {
+        let shared = shared.clone();
+        let identity = fresh.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    // The stalled re-registrations hold at most half the budget, so this
+    // first-time miss still gets a flight and reaches the control plane rather
+    // than being rejected as saturated.
+    client
+        .wait_for_call_count(cached.len() + super::MAX_REREGISTRATION_FLIGHTS + 1)
+        .await;
+    assert!(
+        client.calls().iter().any(|call| matches!(
+            call,
+            RouteClientCall::Subscribe { identity, .. } if *identity == fresh
+        )),
+        "a first-time miss must still reach the control plane during re-registration"
+    );
+    pending.abort();
+}
+
+// A stream rotates in order about once a minute, so a reply that crosses one is
+// routine rather than a sign of trouble. Its subscription ID died with its
+// stream and must not be unsubscribed on the replacement, but the ended session
+// delivered everything it had, so no other cached answer owes anything to it.
+#[tokio::test]
+async fn reply_crossing_an_orderly_rotation_is_discarded_without_costing_authority() {
+    let client = BlockingRouteClient::default();
+    let old_reply = client.push_subscribe_response_channel();
+    let new_reply = client.push_subscribe_response_channel();
+    let retry_reply = client.push_subscribe_response_channel();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let shared = FrontlineRouteCoordinator::new(
+        FrontlineRouteResolver::new(
+            4,
+            BlockingEventClient {
+                client: client.clone(),
+                events: events.clone(),
+            },
+        ),
+        WakeTracker::new(),
+        FakeWakeClient::default(),
+    )
+    .into_shared();
+    let old_identity = http_request("old.example.com", "/");
+    let new_identity = http_request("new.example.com", "/");
+    let old = {
+        let shared = shared.clone();
+        let identity = old_identity.clone();
+        tokio::spawn(async move { shared.route(identity, now()).await })
+    };
+    client.wait_for_call_count(1).await;
+    events
+        .lock()
+        .unwrap()
+        .push(crate::RouteSubscriptionEvent::StreamEnded);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    new_reply
+        .send(Ok(resolved_response(
+            generated_request_id(2),
+            subscription_id("reused"),
+            new_identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(2)),
+        )))
+        .unwrap();
+    assert!(matches!(
+        shared.route(new_identity.clone(), now()).await.unwrap(),
+        FrontlineRouteOutcome::Ready(_)
+    ));
+
+    // The old stream's reply lands late, carrying an ID the new stream reissued.
+    old_reply
+        .send(Ok(resolved_response(
+            generated_request_id(1),
+            subscription_id("reused"),
+            old_identity.clone(),
+            route_entry(InstanceState::Running, 7, Some(1)),
+        )))
+        .unwrap();
+    client.wait_for_call_count(3).await;
+    retry_reply
+        .send(Ok(miss_response(generated_request_id(3), old_identity)))
+        .unwrap();
+    assert!(matches!(
+        old.await.unwrap().unwrap(),
+        FrontlineRouteOutcome::Miss(_)
+    ));
+    assert!(
+        shared.local_route(&new_identity, now()).await.is_some(),
+        "an orderly rotation loses no events, so a stale reply costs no authority"
+    );
+    assert!(!client
+        .calls()
+        .iter()
+        .any(|call| matches!(call, RouteClientCall::Unsubscribe { .. })));
+}

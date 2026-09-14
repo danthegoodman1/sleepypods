@@ -184,14 +184,8 @@ pub(super) async fn enqueue(store: &PostgresStore, id: MaterializationId) -> Sto
 pub(super) async fn maintain(store: &PostgresStore, limit: u32) -> StoreResult<u64> {
     let limit = limit.clamp(1, 1024);
     let idempotency = store.expire_idempotency_records(limit).await?;
-    let http01 = super::http01_ops::expire_http01_challenges(
-        store,
-        crate::http01::ExpireHttp01ChallengesRequest {
-            now: std::time::SystemTime::now(),
-            limit: Some(limit as usize),
-        },
-    )
-    .await?;
+    let http01 =
+        super::http01_ops::collect_expired_http01_challenges(store, limit as usize).await?;
     let client = store.client().await?;
     let outbox = client.execute("DELETE FROM route_change_outbox WHERE revision IN (SELECT revision FROM route_change_outbox WHERE revision < COALESCE((SELECT min(revision) FROM route_change_outbox WHERE created_at_unix_millis >= (extract(epoch from clock_timestamp()) * 1000)::bigint - 600000), 9223372036854775807) ORDER BY revision LIMIT $1)", &[&i64::from(limit)]).await.map_err(map_postgres_error)?;
     Ok(idempotency + http01 as u64 + outbox)

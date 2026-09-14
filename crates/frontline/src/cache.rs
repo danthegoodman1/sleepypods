@@ -13,6 +13,10 @@ pub struct PositiveCacheEntry {
     pub request_identity: RouteIdentity,
     pub entry: RouteEntry,
     expires_at: Instant,
+    /// False once the stream that issued `subscription_id` has closed. The
+    /// answer stays usable until its TTL, but it can no longer be invalidated
+    /// and its ID must never be sent to the control plane again.
+    registered: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +79,7 @@ pub struct RouteCache {
     negative_sequence: HashMap<RouteIdentity, u64>,
     negative_expiry: BTreeMap<(Instant, u64), RouteIdentity>,
     sequence: u64,
+    local_sequence: u64,
 }
 
 impl PositiveCacheEntry {
@@ -91,6 +96,7 @@ impl PositiveCacheEntry {
             matched_identity,
             entry,
             expires_at: now + cache_policy.ttl(),
+            registered: true,
         }
     }
 
@@ -100,6 +106,11 @@ impl PositiveCacheEntry {
 
     pub fn is_expired(&self, now: Instant) -> bool {
         now >= self.expires_at
+    }
+
+    /// Whether this answer is still backed by a live control-plane subscription.
+    pub fn is_registered(&self) -> bool {
+        self.registered
     }
 }
 
@@ -146,6 +157,7 @@ impl RouteCache {
             negative_sequence: HashMap::new(),
             negative_expiry: BTreeMap::new(),
             sequence: 0,
+            local_sequence: 0,
         }
     }
     pub fn capacity(&self) -> usize {
@@ -213,10 +225,18 @@ impl RouteCache {
                 result
                     .subscriptions_to_unsubscribe
                     .push(positive.subscription_id);
+                // A rotated answer gets one attempt to register again, so
+                // rejecting it here leaves an answer no invalidation can reach.
+                // Drop it and let the next request resolve from scratch.
+                if !existing.registered {
+                    self.remove_positive(&existing.subscription_id);
+                }
                 return result;
             }
-            self.remove_positive(&existing.subscription_id);
-            if existing.subscription_id != positive.subscription_id {
+            let removed = self.remove_positive(&existing.subscription_id);
+            if existing.subscription_id != positive.subscription_id
+                && removed.is_some_and(|removed| removed.registered)
+            {
                 result
                     .subscriptions_to_unsubscribe
                     .push(existing.subscription_id.clone());
@@ -225,6 +245,20 @@ impl RouteCache {
         self.remove_positive(&positive.subscription_id);
         self.remove_negative(&request);
         positive.request_identity = request.clone();
+        self.index_positive(request, positive);
+        while self.positives.len() > self.capacity {
+            let id = self.positive_order.first_key_value().unwrap().1.clone();
+            if self
+                .remove_positive(&id)
+                .is_some_and(|removed| removed.registered)
+            {
+                result.subscriptions_to_unsubscribe.push(id);
+            }
+        }
+        result
+    }
+
+    fn index_positive(&mut self, request: RouteIdentity, positive: PositiveCacheEntry) {
         let id = positive.subscription_id.clone();
         self.sequence += 1;
         let seq = self.sequence;
@@ -235,12 +269,35 @@ impl RouteCache {
         self.positive_sequence.insert(id.clone(), seq);
         self.positive_expiry.insert((positive.expires_at, seq), id);
         self.positives.push(Arc::new(positive));
-        while self.positives.len() > self.capacity {
-            let id = self.positive_order.first_key_value().unwrap().1.clone();
-            self.remove_positive(&id);
-            result.subscriptions_to_unsubscribe.push(id);
+    }
+
+    /// The stream backing every current subscription has closed. Cached answers
+    /// stay valid until their own TTL, but their IDs are dead: the next stream
+    /// restarts its numbering, so a retained ID would alias a stranger's live
+    /// subscription in `by_subscription`, in an invalidation, or in an
+    /// unsubscribe. Re-key each retained answer to an ID the control plane can
+    /// never issue, and return what has to be registered again.
+    pub fn rotate_session(&mut self) -> Vec<RouteIdentity> {
+        let retained = std::mem::take(&mut self.positives);
+        self.by_subscription.clear();
+        self.by_request.clear();
+        self.positive_order.clear();
+        self.positive_sequence.clear();
+        self.positive_expiry.clear();
+        let mut identities = Vec::with_capacity(retained.len());
+        for entry in retained {
+            let mut entry = Arc::try_unwrap(entry).unwrap_or_else(|shared| (*shared).clone());
+            self.local_sequence += 1;
+            let Ok(local) = SubscriptionId::new(format!("local:{}", self.local_sequence)) else {
+                continue;
+            };
+            entry.subscription_id = local;
+            entry.registered = false;
+            let request = entry.request_identity.clone();
+            identities.push(request.clone());
+            self.index_positive(request, entry);
         }
-        result
+        identities
     }
     pub fn insert_negative(
         &mut self,
@@ -250,8 +307,12 @@ impl RouteCache {
     ) -> CacheInsertResult {
         let mut result = self.expire_limited(now, 64);
         if let Some(id) = self.by_request.get(&request).cloned() {
-            self.remove_positive(&id);
-            result.subscriptions_to_unsubscribe.push(id);
+            if self
+                .remove_positive(&id)
+                .is_some_and(|removed| removed.registered)
+            {
+                result.subscriptions_to_unsubscribe.push(id);
+            }
         }
         self.remove_negative(&request);
         self.sequence += 1;
@@ -268,6 +329,26 @@ impl RouteCache {
         }
         result
     }
+    /// Whether a rotated answer for this identity is still worth registering
+    /// again: re-registration is pointless once it has been replaced, expired,
+    /// or already re-registered by a live request.
+    pub fn needs_reregistration(&self, identity: &RouteIdentity, now: Instant) -> bool {
+        self.by_request
+            .get(identity)
+            .and_then(|id| self.positive_by_subscription(id))
+            .is_some_and(|entry| !entry.registered && !entry.is_expired(now))
+    }
+    /// True when `expire_limited` would evict something. Lets a caller skip
+    /// taking the write lock on an idle maintenance pass.
+    pub fn has_expired(&self, now: Instant) -> bool {
+        self.positive_expiry
+            .first_key_value()
+            .is_some_and(|((expires, _), _)| *expires <= now)
+            || self
+                .negative_expiry
+                .first_key_value()
+                .is_some_and(|((expires, _), _)| *expires <= now)
+    }
     pub fn expire(&mut self, now: Instant) -> CacheInsertResult {
         self.expire_limited(now, usize::MAX)
     }
@@ -281,8 +362,12 @@ impl RouteCache {
             }
             remaining -= 1;
             let id = id.clone();
-            self.remove_positive(&id);
-            result.subscriptions_to_unsubscribe.push(id);
+            if self
+                .remove_positive(&id)
+                .is_some_and(|removed| removed.registered)
+            {
+                result.subscriptions_to_unsubscribe.push(id);
+            }
         }
         while let Some(((expires, _), request)) = self.negative_expiry.first_key_value() {
             if *expires > now || remaining == 0 {
@@ -331,14 +416,6 @@ impl RouteCache {
         self.by_subscription
             .get(id)
             .and_then(|index| self.positives.get(*index))
-    }
-    pub fn positive_by_matched_identity(
-        &self,
-        identity: &RouteIdentity,
-    ) -> Option<&Arc<PositiveCacheEntry>> {
-        self.positives
-            .iter()
-            .find(|entry| &entry.matched_identity == identity)
     }
     pub fn positives(&self) -> &[Arc<PositiveCacheEntry>] {
         &self.positives

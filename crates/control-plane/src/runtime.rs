@@ -252,6 +252,20 @@ impl RuntimeConfig {
                 *setting = std::time::Duration::from_millis(value);
             }
         }
+        // The positive route cache TTL bounds how long a dropped invalidation
+        // can go unnoticed, so it is allowed past the 60s request-timeout cap
+        // the shared duration loop applies to request-scoped settings.
+        if let Some(value) = postgres_positive_integer(
+            &values,
+            "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
+        )? {
+            if value > 600_000 {
+                return Err(RuntimeConfigError::InvalidPostgresSetting {
+                    name: "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
+                });
+            }
+            api_limits.positive_route_cache_ttl = std::time::Duration::from_millis(value);
+        }
         Ok(Self {
             security,
             api_limits,
@@ -631,7 +645,11 @@ pub async fn dispatch_route_changes(
     events: RouteSubscriptionBroker,
     mut shutdown: watch::Receiver<bool>,
 ) -> RuntimeResult<()> {
-    let mut cursor = 0;
+    // Subscribers attach after this process starts and resolve against current
+    // state, so retained history predating it carries no information they lack.
+    // Replaying it also bursts the broadcast channel at the moment the control
+    // plane is coldest, and a subscriber that lags is dropped and made to reset.
+    let mut cursor: Option<u64> = None;
     let mut failures = 0;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -640,7 +658,17 @@ pub async fn dispatch_route_changes(
             biased;
             _ = shutdown.changed() => { events.shutdown(); return Ok(()); },
             _ = interval.tick() => {
-                let batch = match store.load_route_changes(cursor, 1024).await {
+                let Some(start) = cursor else {
+                    match store.load_route_change_revision().await {
+                        Ok(revision) => { failures = 0; cursor = Some(revision); },
+                        Err(error) => {
+                            failures += 1;
+                            if failures >= 5 { return Err(Box::new(error)); }
+                        }
+                    }
+                    continue;
+                };
+                let batch = match store.load_route_changes(start, 1024).await {
                     Ok(batch) => { failures = 0; batch },
                     Err(error) => {
                         events.reset(); failures += 1;
@@ -650,7 +678,7 @@ pub async fn dispatch_route_changes(
                 };
                 if batch.reset { events.reset(); }
                 for event in batch.events { events.publish_durable(&event)?; }
-                cursor = batch.cursor;
+                cursor = Some(batch.cursor);
             }
         }
     }

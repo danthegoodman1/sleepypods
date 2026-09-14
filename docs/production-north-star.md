@@ -238,9 +238,13 @@ target is 100ms after an event reaches that queue under supported load.
 Commit-to-cache delivery also includes the control plane's 250ms polling interval,
 database/runtime scheduling and any backlog, as described in the
 [delivery bounds](operator-guide.md#runtime-failure-and-delivery-bounds).
-A bounded queue overflow
-closes the subscription stream and clears all cached authority. Reconnection
-never erases this barrier. Responses crossing a consumed invalidation are
+Reaching the subscription lifetime ends a stream in order. Cached answers keep
+serving under identifiers the control plane can never reissue, bounded by the TTL
+they already carried, while the frontline registers them on the replacement
+stream; half the identity flights stay reserved for first-time misses. A bounded
+queue overflow closes the subscription stream and clears all cached authority,
+because a lost invalidation can name any cached route. Reconnection never erases
+this barrier. Responses crossing a consumed invalidation are
 re-resolved, preventing an invalidation-before-install race.
 
 Cold requests share up to 64 identity flights with at most 256 waiting callers.
