@@ -22,7 +22,6 @@ use crate::{
 };
 
 pub const PROXY_SERVICE_NAME: &str = "sleepypods.controlplane.v1.ProxyControlPlane";
-const POSITIVE_ROUTE_CACHE_TTL: Duration = Duration::from_secs(10);
 const SUBSCRIBE_RESPONSE_BUFFER: usize = 16;
 
 type ProxySubscribeResponseStream = Pin<
@@ -282,7 +281,7 @@ where
                         let response = tokio::select! {
                             _ = cancellation.cancelled() => return,
                             _ = &mut expiry => return,
-                            result = tokio::time::timeout(limits.lookup_timeout, handle_subscribe_request(store.as_ref(), target.clone(), request, &mut subscriptions, &mut next_subscription_number)) => {
+                            result = tokio::time::timeout(limits.lookup_timeout, handle_subscribe_request(store.as_ref(), target.clone(), request, &mut subscriptions, &mut next_subscription_number, limits.positive_route_cache_ttl)) => {
                                 match result { Ok(response) => response, Err(_) => Err(Status::deadline_exceeded("route lookup timed out")) }
                             }
                         };
@@ -426,6 +425,7 @@ async fn handle_subscribe_request(
     request: pb::ProxySubscribeRequest,
     subscriptions: &mut HashMap<String, ActiveRouteSubscription>,
     next_subscription_number: &mut u64,
+    positive_cache_ttl: Duration,
 ) -> Result<Option<pb::ProxySubscribeResponse>, Status> {
     match request
         .input
@@ -437,6 +437,7 @@ async fn handle_subscribe_request(
             request,
             subscriptions,
             next_subscription_number,
+            positive_cache_ttl,
         )
         .await
         .map(Some),
@@ -456,6 +457,7 @@ async fn subscribe_route(
     request: pb::ProxySubscribeRouteRequest,
     subscriptions: &mut HashMap<String, ActiveRouteSubscription>,
     next_subscription_number: &mut u64,
+    positive_cache_ttl: Duration,
 ) -> Result<pb::ProxySubscribeResponse, Status> {
     let request_id = non_empty_field(request.request_id, "request_id")?;
     let identity = request
@@ -500,7 +502,7 @@ async fn subscribe_route(
                         matched_identity: Some(route_identity_to_proto(matched_identity)),
                         route: Some(route_entry_to_proto(entry)),
                         cache_policy: Some(cache_policy_to_proto(domain_route::CachePolicy::new(
-                            POSITIVE_ROUTE_CACHE_TTL,
+                            positive_cache_ttl,
                         ))),
                     },
                 )),

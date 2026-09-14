@@ -220,6 +220,39 @@ fn sni_wildcard_answer_does_not_authorize_an_unseen_exact_host() {
 }
 
 #[test]
+fn has_expired_agrees_with_what_expire_limited_would_evict() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    assert!(!cache.has_expired(now), "an empty cache has nothing due");
+
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub-a", key, 1, 1, now), now);
+    cache.insert_negative(
+        request("miss.example.com", "/b"),
+        CachePolicy::new(Duration::from_secs(1)),
+        now,
+    );
+    assert!(!cache.has_expired(now), "fresh entries are not due");
+
+    // Positive and negative budgets expire independently, so each side has to
+    // be able to report on its own.
+    let expired = now + Duration::from_secs(1);
+    assert!(cache.has_expired(expired));
+    assert_eq!(
+        cache
+            .expire_limited(expired, usize::MAX)
+            .subscriptions_to_unsubscribe
+            .len(),
+        1
+    );
+    assert!(
+        !cache.has_expired(expired),
+        "nothing remains due once expiry has run"
+    );
+    assert_eq!(cache.len(), 0);
+}
+
+#[test]
 fn expiration_work_is_incremental_without_serving_expired_entries() {
     let now = Instant::now();
     let mut cache = RouteCache::new(512);
@@ -246,4 +279,117 @@ fn expiration_work_is_incremental_without_serving_expired_entries() {
             .status(),
         CacheLookupStatus::Expired
     );
+}
+
+#[test]
+fn rotation_retains_answers_under_dead_ids_that_are_never_unsubscribed() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
+
+    let identities = cache.rotate_session();
+    assert_eq!(identities, vec![key.clone()]);
+
+    // The answer still serves, and still answers the identity it was cached for.
+    let entry = match cache.lookup(&key, now) {
+        CacheLookup::Hit(CacheLookupHit::Positive(entry)) => entry,
+        other => panic!("a rotated answer keeps serving, got {other:?}"),
+    };
+    assert!(!entry.is_registered());
+    assert_ne!(
+        entry.subscription_id,
+        sub("sub:1"),
+        "a retained answer is re-keyed away from the ID the next stream will reissue"
+    );
+    assert!(cache.needs_reregistration(&key, now));
+
+    // The next stream reissues sub:1 for a different route. It must neither
+    // collide with nor invalidate the retained answer.
+    let other = request("other.example.com", "/b");
+    cache.insert_resolved(
+        other.clone(),
+        positive("sub:1", other.clone(), 1, 30, now),
+        now,
+    );
+    assert!(matches!(
+        cache.lookup(&key, now),
+        CacheLookup::Hit(CacheLookupHit::Positive(_))
+    ));
+    assert!(cache.invalidate_subscription(&sub("sub:1")));
+    assert!(
+        matches!(
+            cache.lookup(&key, now),
+            CacheLookup::Hit(CacheLookupHit::Positive(_))
+        ),
+        "invalidating the reissued ID must not remove the retained answer"
+    );
+
+    // Expiring a rotated answer never sends its dead ID to the control plane.
+    let expired = now + Duration::from_secs(31);
+    assert!(cache.has_expired(expired));
+    assert!(
+        cache
+            .expire_limited(expired, usize::MAX)
+            .subscriptions_to_unsubscribe
+            .is_empty(),
+        "a dead subscription ID is never unsubscribed on the new stream"
+    );
+}
+
+#[test]
+fn a_rotated_answer_stays_bounded_by_the_ttl_it_was_given() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
+    cache.rotate_session();
+
+    // Rotation preserves the original deadline rather than extending it: losing
+    // invalidation must shorten the trust window, never lengthen it.
+    assert!(matches!(
+        cache.lookup(&key, now + Duration::from_secs(29)),
+        CacheLookup::Hit(CacheLookupHit::Positive(_))
+    ));
+    assert_eq!(
+        cache.lookup(&key, now + Duration::from_secs(30)).status(),
+        CacheLookupStatus::Expired
+    );
+    assert!(!cache.needs_reregistration(&key, now + Duration::from_secs(30)));
+}
+
+#[test]
+fn a_rotated_answer_rejected_as_stale_is_dropped_rather_than_left_unreachable() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 7, 30, now), now);
+    cache.rotate_session();
+
+    // Re-registration resolves afresh and comes back behind what is cached. The
+    // new subscription is refused, which spends the retained answer's one chance
+    // to register again.
+    let result =
+        cache.insert_resolved(key.clone(), positive("sub:9", key.clone(), 6, 30, now), now);
+    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("sub:9")]);
+    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
+    assert!(!cache.needs_reregistration(&key, now));
+}
+
+#[test]
+fn a_registered_answer_rejected_as_stale_keeps_serving() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 7, 30, now), now);
+
+    let result =
+        cache.insert_resolved(key.clone(), positive("sub:9", key.clone(), 6, 30, now), now);
+    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("sub:9")]);
+    let entry = match cache.lookup(&key, now) {
+        CacheLookup::Hit(CacheLookupHit::Positive(entry)) => entry,
+        other => panic!("a registered answer survives a stale rival, got {other:?}"),
+    };
+    assert!(entry.is_registered());
+    assert_eq!(entry.subscription_id, sub("sub:1"));
 }

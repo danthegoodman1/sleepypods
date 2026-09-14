@@ -96,7 +96,8 @@ async fn ordered_notifications(
         "rollback removes both state and intent"
     );
 
-    // Every process independently replays history; neither consumes another's events.
+    // Each dispatcher anchors on the revision current when it starts, so neither
+    // replays the history already committed above.
     let left = RouteSubscriptionBroker::new();
     let right = RouteSubscriptionBroker::new();
     let mut left_events = left.subscribe();
@@ -112,11 +113,20 @@ async fn ordered_notifications(
         right,
         receiver,
     ));
-    for _ in 0..committed.cursor {
-        let a = tokio::time::timeout(Duration::from_secs(3), left_events.recv()).await??;
-        let b = tokio::time::timeout(Duration::from_secs(3), right_events.recv()).await??;
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+
+    // Both must anchor before the change below, or the assertion that they
+    // deliver it would also pass on a dispatcher that simply replayed history.
+    for events in [&mut left_events, &mut right_events] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), events.recv())
+                .await
+                .is_err(),
+            "a starting dispatcher publishes no already-committed history"
+        );
     }
+
+    // Independence: one dispatcher reading the outbox never consumes or hides
+    // an event from another, so a change after both start reaches both.
     first.execute("UPDATE instances SET state = 'running', generation = generation + 1 WHERE instance_id = 'order-a'", &[]).await?;
     for events in [&mut left_events, &mut right_events] {
         let event = tokio::time::timeout(Duration::from_secs(3), events.recv()).await??;
@@ -1422,5 +1432,88 @@ async fn failure_deadline_lock_boundary(
     assert!(status.uncertain_effect.is_none());
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+#[tokio::test]
+async fn http01_liveness_is_decided_by_the_database_clock() -> TestResult {
+    let Ok(base) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let schema = unique_schema_name();
+    let (admin, connection) = tokio_postgres::connect(&base, NoTls).await?;
+    let admin_task = tokio::spawn(connection);
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
+    let pg = PostgresStore::connect(&config).await?;
+    let result = http01_database_clock(&pg, &config).await;
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    admin_task.abort();
+    result
+}
+
+// Expiry is written relative to `clock_timestamp()` rather than to this
+// process's clock, so the assertions hold whatever the caller's offset is. A
+// resolver comparing against its own clock only agrees by coincidence.
+async fn http01_database_clock(pg: &PostgresStore, config: &PostgresStoreConfig) -> TestResult {
+    let raw = raw_client(config).await?;
+    let key = Http01ChallengeKey::new("clock.example.com", "token-clock").expect("valid key");
+    pg.put_http01_challenge(
+        PutHttp01ChallengeRequest::with_ttl(
+            key.clone(),
+            "key-auth-clock",
+            Duration::from_secs(3600),
+            SystemTime::now(),
+        )
+        .expect("valid challenge"),
+    )
+    .await?;
+
+    let shift = |offset_millis: i64| {
+        let raw = &raw;
+        async move {
+            raw.execute(
+                "UPDATE http01_challenges SET expires_at_unix_millis =
+                 (extract(epoch from clock_timestamp()) * 1000)::bigint + $1",
+                &[&offset_millis],
+            )
+            .await
+        }
+    };
+
+    shift(3_600_000).await?;
+    assert!(
+        pg.resolve_http01_challenge(key.clone()).await?.is_some(),
+        "a challenge live on the database clock resolves"
+    );
+
+    shift(-1).await?;
+    assert!(
+        pg.resolve_http01_challenge(key.clone()).await?.is_none(),
+        "a challenge expired on the database clock stops resolving"
+    );
+
+    // Background collection has no instant of its own and must use the same clock.
+    shift(3_600_000).await?;
+    pg.maintain_runtime_records(1024).await?;
+    assert!(
+        pg.resolve_http01_challenge(key.clone()).await?.is_some(),
+        "collection leaves a challenge that is live on the database clock"
+    );
+
+    shift(-1).await?;
+    pg.maintain_runtime_records(1024).await?;
+    assert_eq!(
+        raw.query_one("SELECT count(*) FROM http01_challenges", &[])
+            .await?
+            .get::<_, i64>(0),
+        0,
+        "collection removes a challenge expired on the database clock"
+    );
+
     Ok(())
 }

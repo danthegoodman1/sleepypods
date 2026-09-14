@@ -51,6 +51,12 @@ pub trait RouteSubscriptionClient {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteSubscriptionEvent {
     Update(Box<SubscribeControlPlaneOutput>),
+    /// The server ended the response stream in order, after delivering
+    /// everything it had queued. Subscriptions are gone, but no invalidation
+    /// was dropped, so cached answers stay usable until their own TTL.
+    StreamEnded,
+    /// The session failed or dropped events. A lost invalidation can name any
+    /// cached identity, so cached authority goes with it.
     StreamClosed,
 }
 
@@ -282,7 +288,7 @@ where
                     let outcome = self.state.apply_control_plane_message(*message, now);
                     self.unsubscribe_outcome(&outcome).await?;
                 }
-                RouteSubscriptionEvent::StreamClosed => {
+                RouteSubscriptionEvent::StreamEnded | RouteSubscriptionEvent::StreamClosed => {
                     record_subscribe_stream_closed(&self.observability);
                     self.state
                         .invalidate_active_subscriptions(InvalidationReason::StreamClosed, now);

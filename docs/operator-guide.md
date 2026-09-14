@@ -275,6 +275,17 @@ Sidecars use their configured TCP setup timeout and the same two-second TLS
 handshake timeout. Canceling an async caller does not stop an operating-system
 DNS lookup already running on a blocking worker.
 
+`SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS` sets the positive route
+cache lifetime the control plane hands to proxies, sixty seconds by default and
+at most ten minutes. Subscription invalidations, not this TTL, keep proxy caches
+fresh; the TTL bounds how long a dropped invalidation can go unnoticed. A proxy
+keeps its cached answers across an orderly stream rotation and registers them
+again on the replacement stream, so the TTL outlives
+`SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS`; a session that dropped
+events discards its cache instead. Lowering the TTL increases control-plane
+load: an expiring entry costs one unsubscribe and one subscribe per route per
+proxy.
+
 The control plane applies `SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS` (five
 seconds by default) to the complete server-side TLS handshake as well as initial
 request setup. An incomplete handshake closes at that deadline even if the peer
@@ -619,8 +630,12 @@ a dispatcher read failure resets subscriptions. Five consecutive dispatcher or
 maintenance failures stop the runtime. Under healthy storage, an unbacklogged
 change is dispatched within one polling interval plus database/scheduling time;
 a backlog requires additional batches. This is not a hard wall-clock guarantee
-during storage failure. Positive cache TTL is ten seconds and negative TTL is one
-second, providing a bounded fallback even when transport notification fails.
+during storage failure. Positive cache TTL is sixty seconds by default and
+negative TTL is one second, providing a bounded fallback even when transport
+notification fails. Reaching `SUBSCRIPTION_LIFETIME_MS` ends a stream in order,
+and the proxy keeps serving its cached answers while it registers them on the
+replacement stream. A session that dropped events discards its cache, because a
+lost invalidation can name any cached route.
 
 Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 
@@ -634,6 +649,7 @@ Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 | `UNARY_DELIVERY_TIMEOUT_MS` | 5000 from response headers to complete delivery |
 | `SUBSCRIPTION_LIFETIME_MS` | 60000, then reconnect/refresh |
 | `LOOKUP_TIMEOUT_MS` / `RESPONSE_TIMEOUT_MS` | 3000 / 1000 |
+| `POSITIVE_ROUTE_CACHE_TTL_MS` | 60000, at most 600000; bounds a missed invalidation |
 
 Admission occurs before connection tasks or protobuf decoding. Each connection
 allows 32 H2 streams; protobuf requests/responses are capped at 256KiB/1MiB.

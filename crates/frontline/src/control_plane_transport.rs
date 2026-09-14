@@ -104,10 +104,15 @@ type PendingRouteResponses = Arc<
 #[derive(Debug)]
 enum GrpcRouteSubscriptionEvent {
     Message(SubscribeControlPlaneOutput),
+    /// The server ended the stream after delivering its queue, which is the
+    /// ordinary outcome of the subscription lifetime cap.
+    ResponseStreamEnded,
     ResponseStreamClosed,
     Status(tonic::Status),
     Protocol(ProxyProtocolAdapterError),
-    UnexpectedRouteResponse { request_id: RouteRequestId },
+    UnexpectedRouteResponse {
+        request_id: RouteRequestId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -169,7 +174,8 @@ impl<T> GrpcProxyControlPlaneClient<T> {
             if let Some(event) = event {
                 return match event {
                     GrpcRouteSubscriptionEvent::Message(message) => Ok(message),
-                    GrpcRouteSubscriptionEvent::ResponseStreamClosed => {
+                    GrpcRouteSubscriptionEvent::ResponseStreamEnded
+                    | GrpcRouteSubscriptionEvent::ResponseStreamClosed => {
                         Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed)
                     }
                     GrpcRouteSubscriptionEvent::Status(status) => {
@@ -442,7 +448,12 @@ where
                 GrpcRouteSubscriptionEvent::Message(message) => {
                     RouteSubscriptionEvent::Update(Box::new(message))
                 }
-                // A protocol error must still clear authority before callers retry.
+                GrpcRouteSubscriptionEvent::ResponseStreamEnded => {
+                    RouteSubscriptionEvent::StreamEnded
+                }
+                // Overflow discards queued events behind this barrier, and a
+                // status or protocol failure leaves the session indeterminate.
+                // Both must clear authority before callers retry.
                 _ => RouteSubscriptionEvent::StreamClosed,
             })
             .collect();
@@ -617,7 +628,7 @@ async fn read_subscription_responses(
                     Err(error) => GrpcRouteSubscriptionEvent::Protocol(error),
                 }
             }
-            Ok(None) => GrpcRouteSubscriptionEvent::ResponseStreamClosed,
+            Ok(None) => GrpcRouteSubscriptionEvent::ResponseStreamEnded,
             Err(status) => GrpcRouteSubscriptionEvent::Status(status),
         };
         closed.store(true, Ordering::Release);

@@ -517,7 +517,7 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
     );
     assert_eq!(
         resolved.cache_policy,
-        Some(ProxyCachePolicy { ttl_millis: 10_000 })
+        Some(ProxyCachePolicy { ttl_millis: 60_000 })
     );
 }
 
