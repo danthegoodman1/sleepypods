@@ -155,7 +155,7 @@ fn fifo_eviction_and_expiry_indices_remain_bounded_during_churn() {
         8
     );
     assert!(cache.is_empty());
-    assert!(cache.by_request.is_empty());
+    assert!(cache.by_subscription.is_empty());
     assert!(cache.positive_expiry.is_empty());
 }
 #[test]
@@ -296,11 +296,9 @@ fn rotation_retains_answers_under_dead_ids_that_are_never_unsubscribed() {
         CacheLookup::Hit(CacheLookupHit::Positive(entry)) => entry,
         other => panic!("a rotated answer keeps serving, got {other:?}"),
     };
-    assert!(!entry.is_registered());
-    assert_ne!(
-        entry.subscription_id,
-        sub("sub:1"),
-        "a retained answer is re-keyed away from the ID the next stream will reissue"
+    assert_eq!(
+        entry.subscription_id, None,
+        "a retained answer holds no ID the next stream could reissue"
     );
     assert!(cache.needs_reregistration(&key, now));
 
@@ -391,5 +389,48 @@ fn a_registered_answer_rejected_as_stale_keeps_serving() {
         other => panic!("a registered answer survives a stale rival, got {other:?}"),
     };
     assert!(entry.is_registered());
-    assert_eq!(entry.subscription_id, sub("sub:1"));
+    assert_eq!(entry.subscription_id, Some(sub("sub:1")));
+}
+
+#[test]
+fn a_rotated_answer_is_absent_from_every_control_plane_facing_view() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
+    assert_eq!(cache.active_subscription_ids(), vec![sub("sub:1")]);
+
+    cache.rotate_session();
+    assert!(
+        cache.active_subscription_ids().is_empty(),
+        "a rotated answer has no subscription to report"
+    );
+    assert!(cache.positive_by_subscription(&sub("sub:1")).is_none());
+    assert!(!cache.invalidate_subscription(&sub("sub:1")));
+    assert!(
+        matches!(
+            cache.lookup(&key, now),
+            CacheLookup::Hit(CacheLookupHit::Positive(_))
+        ),
+        "an ID the next stream reissues reaches nothing the previous one cached"
+    );
+}
+
+#[test]
+fn invalidating_by_identity_releases_only_an_id_the_control_plane_issued() {
+    let now = Instant::now();
+    let mut cache = RouteCache::new(8);
+    let key = request("app.example.com", "/a");
+    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
+    assert_eq!(cache.invalidate_request(&key), Some(sub("sub:1")));
+    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
+
+    cache.insert_resolved(key.clone(), positive("sub:2", key.clone(), 1, 30, now), now);
+    cache.rotate_session();
+    assert_eq!(
+        cache.invalidate_request(&key),
+        None,
+        "a rotated answer has no ID to release"
+    );
+    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
 }

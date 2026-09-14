@@ -12,7 +12,7 @@ use proxy_core::observability::{
     recorder::{MetricObservation, ObservabilityRecorder},
     Operation, Outcome,
 };
-use sleepypods_api::{CachePolicy, InstanceState, RouteEntry, RouteIdentity};
+use sleepypods_api::{InstanceState, RouteEntry, RouteIdentity};
 
 #[cfg(test)]
 use crate::FrontlineRouteResolution;
@@ -127,7 +127,6 @@ pub enum FrontlineRouteOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontlineRouteCoordinatorError<RouteClientError, WakeClientError> {
     Resolve(FrontlineRouteResolverError<RouteClientError>),
-    CacheUpdate(FrontlineRouteResolverError<RouteClientError>),
     Wake(WakeClientError),
     WakeDeadline(WakeInstanceRequest),
     RouteActorClosed,
@@ -760,7 +759,7 @@ async fn route_actor<RouteClient, Wake>(
                     }
                     PendingRoute::Wake { entry, request, observation, response, result } => {
                         tracker.complete(&request.instance_id, request.expected_generation);
-                        if !observations.finish(observation, Some(&entry.subscription_id)) {
+                        if !observations.finish(observation, entry.subscription_id.as_ref()) {
                             let _ = response.send(Err(FrontlineRouteCoordinatorError::InvalidatedDuringResolution));
                             continue;
                         }
@@ -773,10 +772,8 @@ async fn route_actor<RouteClient, Wake>(
                                 ));
                                 if let WakeResponseDisposition::Ready(backend) = &disposition {
                                     let now = Instant::now();
-                                    state.write().await.apply_control_plane_message(SubscribeControlPlaneOutput::RouteUpdated {
-                                        subscription_id: entry.subscription_id.clone(), matched_identity: entry.matched_identity.clone(),
-                                        entry: ready_route_entry(&entry.entry, backend.clone()), cache_policy: CachePolicy::new(entry.expires_at().saturating_duration_since(now)),
-                                    }, now);
+                                    let ready = ready_route_entry(&entry.entry, backend.clone());
+                                    state.write().await.apply_ready_wake(&entry, ready, now);
                                 }
                                 Ok(wake_outcome(disposition))
                             }
@@ -796,10 +793,7 @@ async fn route_actor<RouteClient, Wake>(
                 let cached = if refresh {
                     let removed = {
                         let mut state = state.write().await;
-                        if let crate::CacheLookup::Hit(crate::CacheLookupHit::Positive(entry)) = state.cache().lookup(&identity, now) {
-                            state.cache_mut().invalidate_subscription(&entry.subscription_id);
-                            vec![entry.subscription_id.clone()]
-                        } else { Vec::new() }
+                        state.cache_mut().invalidate_request(&identity).into_iter().collect()
                     };
                     defer_unsubscribes(
                         removed, &mut client, &state, &mut observations, &mut unsubscribes,
@@ -1312,32 +1306,14 @@ where
         backend: ReadyBackend,
         now: Instant,
     ) -> Result<(), FrontlineRouteCoordinatorError<RouteClient::Error, Wake::Error>> {
-        let remaining_ttl = cache_entry.expires_at().saturating_duration_since(now);
-        let update = SubscribeControlPlaneOutput::RouteUpdated {
-            subscription_id: cache_entry.subscription_id.clone(),
-            matched_identity: cache_entry.matched_identity.clone(),
-            entry: ready_route_entry(&cache_entry.entry, backend),
-            cache_policy: CachePolicy::new(remaining_ttl),
-        };
-
-        let outcome = self
+        let ready = ready_route_entry(&cache_entry.entry, backend);
+        match self
             .resolver
-            .apply_control_plane_message(update, now)
-            .await
-            .map_err(FrontlineRouteCoordinatorError::CacheUpdate)?;
-
-        match outcome {
-            crate::ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced(_)) => {
-                Ok(())
-            }
-            crate::ApplyControlPlaneMessageOutcome::Updated(outcome) => {
-                Err(FrontlineRouteCoordinatorError::RejectedCacheUpdate(outcome))
-            }
-            crate::ApplyControlPlaneMessageOutcome::Resolved(_)
-            | crate::ApplyControlPlaneMessageOutcome::Miss(_)
-            | crate::ApplyControlPlaneMessageOutcome::Invalidated { .. } => {
-                unreachable!("RouteUpdated control-plane messages must produce an update outcome")
-            }
+            .state_mut()
+            .apply_ready_wake(&cache_entry, ready, now)
+        {
+            ApplyUpdateOutcome::Replaced(_) => Ok(()),
+            outcome => Err(FrontlineRouteCoordinatorError::RejectedCacheUpdate(outcome)),
         }
     }
 }
@@ -1393,7 +1369,6 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resolve(error) => write!(f, "route resolution failed: {error}"),
-            Self::CacheUpdate(error) => write!(f, "route cache update failed: {error}"),
             Self::Wake(error) => write!(f, "wake request failed: {error}"),
             Self::WakeDeadline(request) => write!(
                 f,

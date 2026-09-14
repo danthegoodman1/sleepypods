@@ -367,12 +367,16 @@ pub(crate) fn record_cache_lookup(observability: &ObservabilityRecorder, lookup:
     });
     observability.record_lazy(|| {
         let fields = match lookup {
-            CacheLookup::Hit(CacheLookupHit::Positive(entry)) => vec![
-                LogField::subscription_id(entry.subscription_id.as_str()),
-                LogField::route_id(entry.entry.route_binding_id.as_str()),
-                LogField::instance_id(entry.entry.instance_id.as_str()),
-                LogField::generation(entry.entry.instance_generation.get()),
-            ],
+            CacheLookup::Hit(CacheLookupHit::Positive(entry)) => {
+                let mut fields = Vec::with_capacity(4);
+                if let Some(id) = &entry.subscription_id {
+                    fields.push(LogField::subscription_id(id.as_str()));
+                }
+                fields.push(LogField::route_id(entry.entry.route_binding_id.as_str()));
+                fields.push(LogField::instance_id(entry.entry.instance_id.as_str()));
+                fields.push(LogField::generation(entry.entry.instance_generation.get()));
+                fields
+            }
             _ => Vec::new(),
         };
         ObservabilityEvent::Log(LifecycleLogEvent::new(EVENT_ROUTE_CACHE_LOOKUP, fields))
