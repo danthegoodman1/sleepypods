@@ -305,13 +305,11 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
             let id = replacement_id.clone();
             Box::pin(async move {
                 db.record_materialization(request).await?;
-                let now = SystemTime::now();
                 db.claim_materialization_reconciliation(
                     ClaimMaterializationReconciliationRequest::new(
                         id,
                         "replacement-owner",
-                        now,
-                        now + Duration::from_secs(60),
+                        Duration::from_secs(60),
                     ),
                 )
                 .await?;
@@ -604,13 +602,11 @@ async fn exact_fence_retries(
             BackendGeneration::new(1),
         ))
         .await?;
-    let now = SystemTime::now();
     let claimed = pg
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending.id.clone(),
             "fenced-owner",
-            now,
-            now + Duration::from_secs(60),
+            Duration::from_secs(60),
         ))
         .await?
         .unwrap();

@@ -10,8 +10,7 @@ use std::{
 };
 
 use control_plane::materialization::{
-    LoadActiveMaterializationRequest, LoadMaterializationOperationalMetricsRequest,
-    LoadMaterializationRequest, LoadReadyMaterializationRequest,
+    LoadActiveMaterializationRequest, LoadMaterializationRequest, LoadReadyMaterializationRequest,
 };
 use control_plane::{
     render_manifests, BackendEndpoint, BackendGeneration, BeginSleepRequest,
@@ -388,6 +387,7 @@ async fn run_conformance(
     exercise_exclusivity_keys(store, config).await?;
     exercise_no_object_apply_failure_release(store).await?;
     exercise_materialization_reconciliation_leases(store, config, class.reference.clone()).await?;
+    exercise_lease_clock_ownership(store, config, class.reference.clone()).await?;
 
     let delete_target = store
         .create_instance(create_instance_request(
@@ -1067,6 +1067,140 @@ async fn exercise_instance_lifecycle(
     Ok(())
 }
 
+/// The store owns the lease clock. Callers request a lifetime, and the store
+/// starts it from the same clock every process compares expiry against, so a
+/// caller's offset can neither lengthen nor shorten the window before its work
+/// becomes reclaimable.
+async fn exercise_lease_clock_ownership(
+    store: &PostgresStore,
+    config: &PostgresStoreConfig,
+    workload_class: WorkloadClassVersionRef,
+) -> Result<(), StoreError> {
+    let raw = raw_client(config).await?;
+    let target = MaterializationTarget::new("cluster-lease-clock", "apps").expect("valid target");
+    let created = store
+        .create_instance(create_instance_request(
+            "idem-lease-clock",
+            "instance-lease-clock",
+            workload_class,
+            vec![],
+        ))
+        .await?;
+    let waking = store
+        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+            created.instance.id.clone(),
+            created.instance.generation,
+            InstanceState::Waking,
+            StateTransitionReason::WakeRequested,
+        ))
+        .await?;
+    let pending = store
+        .record_materialization(RecordMaterializationRequest::new(
+            waking.id.clone(),
+            waking.generation,
+            target.clone(),
+            MaterializationState::Pending,
+            BackendGeneration::new(1),
+        ))
+        .await?;
+
+    // Remaining lifetime measured entirely inside the database: both operands
+    // come from the clock that wrote the expiry.
+    let remaining_millis = |id: control_plane::MaterializationId| {
+        let raw = &raw;
+        async move {
+            let row = raw
+                .query_one(
+                    "SELECT reconcile_lease_expires_at_unix_millis
+                        - (extract(epoch from clock_timestamp()) * 1000)::bigint AS remaining
+                     FROM materializations WHERE materialization_id = $1",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| StoreError::internal(error.to_string()))?;
+            Ok::<i64, StoreError>(row.get::<_, i64>("remaining"))
+        }
+    };
+
+    let claimed = store
+        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
+            pending.id.clone(),
+            "lease-clock-owner",
+            Duration::from_secs(600),
+        ))
+        .await?
+        .expect("pending work is claimable");
+    let attempt = claimed
+        .reconciliation_lease
+        .as_ref()
+        .expect("claim returns lease metadata")
+        .attempt;
+    let remaining = remaining_millis(pending.id.clone()).await?;
+    assert!(
+        (594_000..=600_000).contains(&remaining),
+        "claim starts its TTL at the database clock, leaving ~600s; got {remaining}ms"
+    );
+
+    // Renewal restarts the lifetime from the database clock rather than
+    // extending whatever instant a caller might have computed.
+    let renewed = store
+        .renew_materialization_reconciliation_lease(
+            RenewMaterializationReconciliationLeaseRequest::new(
+                pending.id.clone(),
+                "lease-clock-owner",
+                attempt,
+                pending.instance_generation,
+                Duration::from_secs(30),
+                MaterializationState::Pending,
+            ),
+        )
+        .await?;
+    assert!(renewed, "the live owner renews its own lease");
+    let remaining = remaining_millis(pending.id.clone()).await?;
+    assert!(
+        (24_000..=30_000).contains(&remaining),
+        "renewal restarts the TTL from the database clock, leaving ~30s; got {remaining}ms"
+    );
+
+    for (ttl, label) in [
+        (Duration::ZERO, "zero"),
+        (Duration::from_micros(500), "sub-millisecond"),
+        (
+            control_plane::materialization::MAX_RECONCILIATION_LEASE_TTL + Duration::from_secs(1),
+            "beyond the 24 hour bound",
+        ),
+    ] {
+        let error = store
+            .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
+                pending.id.clone(),
+                "lease-clock-owner",
+                ttl,
+            ))
+            .await
+            .expect_err("a lease TTL must be usable");
+        assert!(
+            matches!(error, StoreError::InvalidArgument { .. }),
+            "a {label} lease TTL is an invalid argument, got {error}"
+        );
+    }
+
+    // Backlog age subtracts a database-written timestamp, so it too must come
+    // from the database clock instead of the caller's.
+    let metrics = store.load_materialization_operational_metrics().await?;
+    let backlog = metrics
+        .backlog_states
+        .iter()
+        .find(|backlog| backlog.state == MaterializationState::Pending)
+        .expect("pending backlog is reported");
+    let age = backlog.oldest_age.expect("pending backlog reports an age");
+    assert!(
+        age < Duration::from_secs(600),
+        "backlog age is measured against the database clock; got {age:?}"
+    );
+
+    Ok(())
+}
+
 async fn create_lifecycle_instance(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
@@ -1295,11 +1429,7 @@ async fn exercise_exclusivity_keys(
     assert_eq!(owner_materialization.exclusivity_keys, expected_owner_keys);
     let owner_record = store.record_materialization(owner_materialization).await?;
     assert_eq!(owner_record.exclusivity_keys, expected_owner_keys);
-    let operational_metrics = store
-        .load_materialization_operational_metrics(
-            LoadMaterializationOperationalMetricsRequest::new(SystemTime::now()),
-        )
-        .await?;
+    let operational_metrics = store.load_materialization_operational_metrics().await?;
     let pending_metrics = operational_metrics
         .backlog_states
         .iter()
@@ -1458,11 +1588,7 @@ async fn exercise_exclusivity_keys(
         completed.materialization.exclusivity_keys,
         expected_owner_keys
     );
-    let ready_operational_metrics = store
-        .load_materialization_operational_metrics(
-            LoadMaterializationOperationalMetricsRequest::new(SystemTime::now()),
-        )
-        .await?;
+    let ready_operational_metrics = store.load_materialization_operational_metrics().await?;
     assert!(
         ready_operational_metrics
             .backlog_states
@@ -1754,10 +1880,9 @@ async fn exercise_materialization_reconciliation_leases(
     assert_eq!(loaded_pending.state, MaterializationState::Pending);
     assert_eq!(loaded_pending.rendered_objects.len(), 1);
 
-    let now = SystemTime::now();
     let candidates = store
         .list_materialization_reconciliation_candidates(
-            ListMaterializationReconciliationCandidatesRequest::new(now, 10),
+            ListMaterializationReconciliationCandidatesRequest::new(10),
         )
         .await?;
     assert!(candidates
@@ -1768,8 +1893,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-a",
-            now,
-            now + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .expect("first lease claim succeeds");
@@ -1794,8 +1918,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-b",
-            now + Duration::from_secs(1),
-            now + Duration::from_secs(31),
+            Duration::from_secs(30),
         ))
         .await?;
     assert!(owner_b_claim.is_none());
@@ -1804,8 +1927,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-a",
-            now + Duration::from_secs(1),
-            now + Duration::from_secs(31),
+            Duration::from_secs(30),
         ))
         .await?;
     assert!(same_owner_claim.is_none());
@@ -1817,7 +1939,7 @@ async fn exercise_materialization_reconciliation_leases(
                 "owner-b",
                 1,
                 pending_record.instance_generation,
-                now + Duration::from_secs(40),
+                Duration::from_secs(30),
                 MaterializationState::Pending,
             ),
         )
@@ -1829,8 +1951,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             pending_record.id.clone(),
             "owner-b",
-            now + Duration::from_secs(31),
-            now + Duration::from_secs(61),
+            Duration::from_secs(30),
         ))
         .await?
         .expect("expired lease can be claimed by another owner");
@@ -1913,8 +2034,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             expired_pending.id.clone(),
             "expired-owner",
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .expect("expired lease fixture claim succeeds relative to request clock");
@@ -1926,7 +2046,7 @@ async fn exercise_materialization_reconciliation_leases(
                 "expired-owner",
                 1,
                 expired_pending.instance_generation,
-                now + Duration::from_secs(90),
+                Duration::from_secs(30),
                 MaterializationState::Pending,
             ),
         )
@@ -1998,8 +2118,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             stale_race.id.clone(),
             "race-owner",
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
         ))
         .await?
         .expect("race fixture lease claim succeeds");
@@ -2086,24 +2205,15 @@ async fn exercise_materialization_reconciliation_leases(
         .materialization
         .expect("materialization marked deleting");
     let deleting_id = deleting.id.clone();
-    // Candidate scans and direct claims must both respect the immutable drain deadline.
+    // Candidate scans and direct claims must both respect the immutable drain
+    // deadline. The store reads its own clock, so elapsing the grace period
+    // means retiring the stored deadline rather than claiming a later "now".
     let before_grace_candidates = store
         .list_materialization_reconciliation_candidates(
-            ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), 100),
+            ListMaterializationReconciliationCandidatesRequest::new(100),
         )
         .await?;
     assert!(!before_grace_candidates
-        .iter()
-        .any(|candidate| candidate.id == deleting_id));
-    let after_grace_candidates = store
-        .list_materialization_reconciliation_candidates(
-            ListMaterializationReconciliationCandidatesRequest::new(
-                SystemTime::now() + drain_grace_timeout + Duration::from_secs(1),
-                100,
-            ),
-        )
-        .await?;
-    assert!(after_grace_candidates
         .iter()
         .any(|candidate| candidate.id == deleting_id));
     assert!(
@@ -2111,21 +2221,26 @@ async fn exercise_materialization_reconciliation_leases(
             .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
                 deleting_id.clone(),
                 "delete-owner-a",
-                SystemTime::now(),
-                SystemTime::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
             ))
             .await?
             .is_none(),
         "manual claim must not bypass drain grace"
     );
     raw.execute("UPDATE materializations SET drain_not_before_unix_millis = 0, next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&deleting_id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
-    let after_grace = SystemTime::now() + drain_grace_timeout + Duration::from_secs(1);
+    let after_grace_candidates = store
+        .list_materialization_reconciliation_candidates(
+            ListMaterializationReconciliationCandidatesRequest::new(100),
+        )
+        .await?;
+    assert!(after_grace_candidates
+        .iter()
+        .any(|candidate| candidate.id == deleting_id));
     store
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-a",
-            after_grace,
-            after_grace + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .expect("delete lease claim succeeds after grace");
@@ -2210,8 +2325,7 @@ async fn exercise_materialization_reconciliation_leases(
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             expired_deleting.id.clone(),
             "expired-delete-owner",
-            SystemTime::now(),
-            SystemTime::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
         ))
         .await?
         .expect("expired delete lease fixture claim succeeds relative to request clock");
@@ -3588,13 +3702,11 @@ async fn phase5_reservation_concurrency(
     ));
     // Renewal and release preserve state age; retry queue placement is separate.
     let age_before: i64 = raw.query_one("SELECT state_entered_at_unix_millis FROM materializations WHERE materialization_id = $1", &[&held.id.as_str()]).await?.get(0);
-    let now = SystemTime::now();
     store
         .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
             held.id.clone(),
             "age-owner",
-            now,
-            now + Duration::from_secs(60),
+            Duration::from_secs(60),
         ))
         .await?
         .unwrap();
@@ -3605,7 +3717,7 @@ async fn phase5_reservation_concurrency(
                 "age-owner",
                 1,
                 held.instance_generation,
-                now + Duration::from_secs(120),
+                Duration::from_secs(30),
                 MaterializationState::Pending,
             ),
         )
@@ -4059,8 +4171,7 @@ async fn postgres_migration_backfill_and_collision_rejection() -> TestResult {
                     ClaimMaterializationReconciliationRequest::new(
                         control_plane::MaterializationId::new("legacy-mat")?,
                         "early",
-                        SystemTime::now(),
-                        SystemTime::now() + Duration::from_secs(30)
+                        Duration::from_secs(30),
                     )
                 )
                 .await?
@@ -4601,7 +4712,9 @@ async fn postgres_effect_barriers_and_same_owner_attempt_fencing() -> TestResult
         request.rendered_objects = vec![RenderedObjectRef { api_version: "v1".into(), kind: "Service".into(), namespace: "apps".into(), name: "effect-service".into() }];
         request.exclusivity_keys = vec![RenderedExclusivityKey::new("singleton", "effects")];
         let pending = store.record_materialization(request).await?;
-        let claim = |owner: &str| ClaimMaterializationReconciliationRequest::new(pending.id.clone(), owner, SystemTime::now(), SystemTime::now() + Duration::from_secs(30));
+        let claim = |owner: &str| ClaimMaterializationReconciliationRequest::new(pending.id.clone(), owner,
+            Duration::from_secs(30),
+        );
         let first = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
         let first_attempt = first.reconciliation_lease.as_ref().unwrap().attempt;
         raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
@@ -4612,8 +4725,7 @@ async fn postgres_effect_barriers_and_same_owner_attempt_fencing() -> TestResult
 pending.id.clone(),
 "same-owner",
 first_attempt,
-pending.instance_generation,
-SystemTime::now() + Duration::from_secs(30), MaterializationState::Pending)).await?);
+pending.instance_generation, Duration::from_secs(30), MaterializationState::Pending)).await?);
         assert!(!store.release_materialization_reconciliation_lease(ReleaseMaterializationReconciliationLeaseRequest::new(
 pending.id.clone(),
 "same-owner",
@@ -4643,7 +4755,7 @@ pending.instance_generation,
         assert!(matches!(store.complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(pending.id.clone(), "same-owner", second_attempt, complete_for_reconciled_pending(&pending, "http://ready:80"))).await, Err(StoreError::LeaseConflict { .. })));
         raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
         assert!(store.claim_materialization_reconciliation(claim("new-owner")).await?.is_none(), "unresolved create blocks transfer even if Kubernetes name is absent");
-        assert!(store.list_materialization_reconciliation_candidates(ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), 32)).await?.is_empty());
+        assert!(store.list_materialization_reconciliation_candidates(ListMaterializationReconciliationCandidatesRequest::new(32)).await?.is_empty());
         // The old API response finally arrives: only exact acknowledgement removes
         // uncertainty. A fresh driver may then inspect/delete the late created UID.
         assert!(store.acknowledge_materialization_effect(ack(2)).await?);
@@ -4709,7 +4821,7 @@ pending.instance_generation,
         assert!(recreated_pending.instance_generation > pending.instance_generation);
         let reused_claim = store.claim_materialization_reconciliation(claim("same-owner")).await?.unwrap();
         assert_eq!(reused_claim.reconciliation_lease.as_ref().unwrap().attempt, first_attempt, "attempt counter may restart after row deletion");
-        assert!(!store.renew_materialization_reconciliation_lease(RenewMaterializationReconciliationLeaseRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.instance_generation, SystemTime::now()+Duration::from_secs(30), MaterializationState::Pending)).await?);
+        assert!(!store.renew_materialization_reconciliation_lease(RenewMaterializationReconciliationLeaseRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.instance_generation, Duration::from_secs(30), MaterializationState::Pending)).await?);
         assert!(!store.release_materialization_reconciliation_lease(ReleaseMaterializationReconciliationLeaseRequest::new(pending.id.clone(), "same-owner", first_attempt, pending.instance_generation)).await?);
         let new_effect = MaterializationEffectRequest { instance_generation: recreated_pending.instance_generation, attempt: first_attempt, ..effect(1) };
         assert!(store.begin_materialization_effect(new_effect).await?);

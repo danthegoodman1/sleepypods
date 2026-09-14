@@ -141,7 +141,7 @@ where
                     let scan_started = Instant::now();
                     if let Err(error) = self.store.finalize_instance_deletions(self.config.batch_size).await { self.record_reconciler_run(Outcome::Error, scan_started.elapsed()); break Err(error); }
                     let candidates = self.store.list_materialization_reconciliation_candidates(
-                        ListMaterializationReconciliationCandidatesRequest::new(SystemTime::now(), self.config.batch_size).for_target(self.target.clone())
+                        ListMaterializationReconciliationCandidatesRequest::new(self.config.batch_size).for_target(self.target.clone())
                     ).await;
                     let candidates = match candidates {
                         Ok(candidates) => { scan_failures = 0; candidates },
@@ -195,15 +195,11 @@ where
             .store
             .finalize_instance_deletions(self.config.batch_size)
             .await;
-        let now = SystemTime::now();
         let candidates = match self
             .store
             .list_materialization_reconciliation_candidates(
-                ListMaterializationReconciliationCandidatesRequest::new(
-                    now,
-                    self.config.batch_size,
-                )
-                .for_target(self.target.clone()),
+                ListMaterializationReconciliationCandidatesRequest::new(self.config.batch_size)
+                    .for_target(self.target.clone()),
             )
             .await
         {
@@ -257,14 +253,12 @@ where
             return;
         }
         let candidate_state = candidate.state;
-        let lease_expires_at = SystemTime::now() + self.config.lease_ttl;
         let claimed = match self
             .store
             .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
                 candidate.id.clone(),
                 self.config.owner.clone(),
-                SystemTime::now(),
-                lease_expires_at,
+                self.config.lease_ttl,
             ))
             .await
         {
@@ -618,7 +612,7 @@ where
                         .expect("claimed lease")
                         .attempt,
                     materialization.instance_generation,
-                    SystemTime::now() + self.config.lease_ttl,
+                    self.config.lease_ttl,
                     materialization.state,
                 ),
             )
@@ -1659,6 +1653,35 @@ mod tests {
         }
     }
 
+    /// A lease is requested as a lifetime. The reconciler must hand the store
+    /// its configured TTL untouched: deriving an absolute expiry here would make
+    /// the real lease length depend on this process's clock offset, so a
+    /// skewed-fast reconciler would silently hold work past its configured TTL.
+    #[tokio::test]
+    async fn reconciler_requests_its_configured_lease_ttl_without_consulting_its_clock() {
+        let instance = waking_instance("instance-reconcile");
+        let pending = pending_materialization("lease-ttl", &instance);
+        let store = Arc::new(FakeReconcileStore::new(pending, instance));
+        let client = FakeKubernetesClient::default();
+        let mut driver = reconciler(store.clone(), KubernetesMaterializer::new(client.clone()));
+        driver.config.lease_ttl = Duration::from_secs(47);
+        let candidate = store.materialization.lock().unwrap().clone();
+
+        driver
+            .claim_and_reconcile_with_cancel(candidate, &crate::runtime_work::Cancellation::new())
+            .await;
+
+        let requested = store.requested_lease_ttls.lock().unwrap().clone();
+        assert!(
+            !requested.is_empty(),
+            "the pass must claim, and therefore request a lease"
+        );
+        assert!(
+            requested.iter().all(|ttl| *ttl == Duration::from_secs(47)),
+            "every lease request carries the configured TTL verbatim: {requested:?}"
+        );
+    }
+
     #[tokio::test]
     async fn pending_supersession_acks_known_unsent_begin_before_exact_release() {
         let instance = waking_instance("instance-reconcile");
@@ -2323,6 +2346,7 @@ mod tests {
         complete_calls: Mutex<usize>,
         guarded_delete_calls: Mutex<usize>,
         release_calls: Mutex<usize>,
+        requested_lease_ttls: Mutex<Vec<Duration>>,
     }
 
     impl FakeReconcileStore {
@@ -2346,6 +2370,7 @@ mod tests {
                 complete_calls: Mutex::new(0),
                 guarded_delete_calls: Mutex::new(0),
                 release_calls: Mutex::new(0),
+                requested_lease_ttls: Mutex::new(Vec::new()),
             }
         }
 
@@ -2539,9 +2564,14 @@ mod tests {
                 {
                     return Ok(None);
                 }
+                self.requested_lease_ttls
+                    .lock()
+                    .unwrap()
+                    .push(request.lease_ttl);
+                // A store starts the lease from its own clock.
                 materialization.reconciliation_lease = Some(MaterializationReconciliationLease {
                     owner: request.owner,
-                    expires_at: request.lease_expires_at,
+                    expires_at: SystemTime::now() + request.lease_ttl,
                     attempt: 1,
                 });
                 Ok(Some(materialization.clone()))
@@ -2554,6 +2584,10 @@ mod tests {
         ) -> StoreFuture<'a, StoreResult<bool>> {
             Box::pin(async move {
                 *self.renew_calls.lock().unwrap() += 1;
+                self.requested_lease_ttls
+                    .lock()
+                    .unwrap()
+                    .push(request.lease_ttl);
                 if let Some(progress) = &self.begin_renew_progress {
                     let mut committed = progress.committed.subscribe();
                     if self.effect.lock().unwrap().is_some() && !*committed.borrow_and_update() {

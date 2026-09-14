@@ -909,10 +909,12 @@ impl ControlPlaneStore for TestStore {
             else {
                 return Ok(None);
             };
+            // A store compares stored expiry against its own clock.
+            let now = SystemTime::now();
             if record
                 .reconciliation_lease
                 .as_ref()
-                .is_some_and(|lease| lease.expires_at > request.now)
+                .is_some_and(|lease| lease.expires_at > now)
             {
                 return Ok(None);
             }
@@ -926,7 +928,7 @@ impl ControlPlaneStore for TestStore {
                 .map_or(1, |lease| lease.attempt + 1);
             record.reconciliation_lease = Some(MaterializationReconciliationLease {
                 owner: request.owner,
-                expires_at: request.lease_expires_at,
+                expires_at: now + request.lease_ttl,
                 attempt,
             });
             Ok(Some(record.clone()))
@@ -952,7 +954,7 @@ impl ControlPlaneStore for TestStore {
             else {
                 return Ok(false);
             };
-            lease.expires_at = request.lease_expires_at;
+            lease.expires_at = SystemTime::now() + request.lease_ttl;
             Ok(true)
         })
     }

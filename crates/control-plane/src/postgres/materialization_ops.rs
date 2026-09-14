@@ -6,13 +6,12 @@ use crate::{
     ids::Generation,
     instance::{validate_instance_state_transition, InstanceState, StateTransitionReason},
     materialization::{
-        unix_millis_from_system_time, BeginSleepRequest, BeginSleepResult,
-        ClaimMaterializationReconciliationRequest, CompleteWakeReconciliationRequest,
-        CompleteWakeRequest, CompleteWakeResult, DeleteMaterializationReconciliationRequest,
-        FinalizeSleepReconciliationRequest, FinalizeSleepRequest, FinalizeSleepResult,
-        ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
-        ForceReleaseExclusivityKeyResult, ListMaterializationReconciliationCandidatesRequest,
-        LoadActiveMaterializationRequest, LoadMaterializationOperationalMetricsRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+        DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
+        FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
+        ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
+        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
         LoadMaterializationRequest, LoadReadyMaterializationRequest,
         MaterializationBacklogOperationalMetrics, MaterializationHeldKeysOperationalMetrics,
         MaterializationOperationalMetrics, MaterializationRecord, MaterializationState,
@@ -264,11 +263,12 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
     request: ListMaterializationReconciliationCandidatesRequest,
 ) -> StoreResult<Vec<MaterializationRecord>> {
     let client = store.client().await?;
-    let now = unix_millis_from_system_time(request.now).map_err(StoreError::invalid_argument)?;
     let limit = i64::try_from(request.limit)
         .map_err(|_| StoreError::invalid_argument("reconciliation candidate limit is too large"))?;
     let cluster = request.target.as_ref().map(|t| t.cluster_id());
     let namespace = request.target.as_ref().map(|t| t.namespace());
+    // Eligibility compares stored deadlines against the database clock that
+    // wrote them. A caller clock never decides whose work is reclaimable.
     let rows = client
         .query(
             "
@@ -279,18 +279,18 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
             FROM materializations
             WHERE state IN ('pending', 'deleting')
                 AND (failure_kind IS NULL OR failure_kind = 'transient' OR failure_requires_cleanup)
-                AND ($3::text IS NULL OR (cluster_id = $3 AND namespace = $4))
+                AND ($2::text IS NULL OR (cluster_id = $2 AND namespace = $3))
                 AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)
-                AND next_attempt_at_unix_millis <= $1
-                AND drain_not_before_unix_millis <= $1
+                AND next_attempt_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                AND drain_not_before_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
                 AND (
                     reconcile_owner IS NULL
-                    OR reconcile_lease_expires_at_unix_millis <= $1
+                    OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
                 )
             ORDER BY (state = 'deleting') DESC, next_attempt_at_unix_millis, materialization_id
-            LIMIT $2
+            LIMIT $1
             ",
-            &[&now, &limit, &cluster, &namespace],
+            &[&limit, &cluster, &namespace],
         )
         .await
         .map_err(map_postgres_error)?;
@@ -300,16 +300,17 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
 
 pub(crate) async fn load_materialization_operational_metrics(
     store: &PostgresStore,
-    request: LoadMaterializationOperationalMetricsRequest,
 ) -> StoreResult<MaterializationOperationalMetrics> {
     let client = store.client().await?;
-    let now = unix_millis_from_system_time(request.now).map_err(StoreError::invalid_argument)?;
+    // Backlog age subtracts a database-written timestamp, so the database
+    // clock supplies the other operand.
     let backlog_rows = client
         .query(
             "
             SELECT state,
                 COUNT(*)::bigint AS backlog_count,
-                MIN(state_entered_at_unix_millis) AS oldest_updated_at_unix_millis
+                GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    - MIN(state_entered_at_unix_millis)) AS oldest_age_millis
             FROM materializations
             WHERE state IN ('pending', 'deleting')
             GROUP BY state
@@ -340,8 +341,7 @@ pub(crate) async fn load_materialization_operational_metrics(
     for row in backlog_rows {
         let state: String = row.get("state");
         let backlog_count: i64 = row.get("backlog_count");
-        let oldest_updated_at_unix_millis: i64 = row.get("oldest_updated_at_unix_millis");
-        let age = now.saturating_sub(oldest_updated_at_unix_millis).max(0);
+        let age: i64 = row.get("oldest_age_millis");
         backlog_states.push(MaterializationBacklogOperationalMetrics::new(
             materialization_state_from_db(&state)?,
             u64::try_from(backlog_count)
@@ -377,57 +377,39 @@ pub(crate) async fn claim_materialization_reconciliation(
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     validate_lease_owner(&request.owner)?;
-    let now = unix_millis_from_system_time(request.now).map_err(StoreError::invalid_argument)?;
-    let lease_expires_at = unix_millis_from_system_time(request.lease_expires_at)
-        .map_err(StoreError::invalid_argument)?;
-    if lease_expires_at <= now {
-        return Err(StoreError::invalid_argument(
-            "materialization reconciliation lease expiry must be after now",
-        ));
-    }
+    let lease_ttl_millis = lease_ttl_millis(request.lease_ttl)?;
 
     let materialization_id = request.materialization_id.as_str();
     let owner = request.owner.as_str();
     // Lock first, then take a fresh READ COMMITTED snapshot for the barrier.
     // A NOT EXISTS in the locking UPDATE alone can retain a pre-wait snapshot.
     transaction.query_opt("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&materialization_id]).await.map_err(map_postgres_error)?;
-    let database_now: i64 = transaction
-        .query_one(
-            "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint",
-            &[],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .get(0);
-    let now = now.min(database_now);
-    if lease_expires_at <= database_now {
-        return Err(StoreError::invalid_argument(
-            "lease expiry must be after the database clock",
-        ));
-    }
+    // Both the eligibility comparisons and the new expiry read the database
+    // clock after the lock wait, so a lease always lasts its requested TTL
+    // measured by the same clock every other process compares against.
     let row = transaction
         .query_opt(
             "
             UPDATE materializations
             SET reconcile_owner = $2,
-                reconcile_lease_expires_at_unix_millis = $3,
+                reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $3,
                 reconcile_attempt = reconcile_attempt + 1,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materialization_id = $1
                 AND state IN ('pending', 'deleting') AND (failure_kind IS NULL OR failure_kind = 'transient' OR failure_requires_cleanup)
                 AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)
-                AND next_attempt_at_unix_millis <= $4
-                AND drain_not_before_unix_millis <= $4
+                AND next_attempt_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                AND drain_not_before_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
                 AND (
                     reconcile_owner IS NULL
-                    OR reconcile_lease_expires_at_unix_millis <= $4
+                    OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
                 )
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
                 namespace, state, backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
-            &[&materialization_id, &owner, &lease_expires_at, &now],
+            &[&materialization_id, &owner, &lease_ttl_millis],
         )
         .await
         .map_err(map_postgres_error)?;
@@ -442,18 +424,18 @@ pub(crate) async fn renew_materialization_reconciliation_lease(
 ) -> StoreResult<bool> {
     let client = store.client().await?;
     validate_lease_owner(&request.owner)?;
-    let lease_expires_at = unix_millis_from_system_time(request.lease_expires_at)
-        .map_err(StoreError::invalid_argument)?;
+    let lease_ttl_millis = lease_ttl_millis(request.lease_ttl)?;
     let materialization_id = request.materialization_id.as_str();
     let owner = request.owner.as_str();
     let attempt = lease_attempt(request.attempt)?;
     let generation = generation_to_i64(request.instance_generation)?;
     let expected_state = materialization_state_to_db(request.expected_state);
+    // Renewal restarts the TTL from the database clock, exactly like a claim.
     let updated = client
         .execute(
             "
             UPDATE materializations
-            SET reconcile_lease_expires_at_unix_millis = $3,
+            SET reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $3,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materialization_id = $1
                 AND reconcile_owner = $2
@@ -462,7 +444,7 @@ pub(crate) async fn renew_materialization_reconciliation_lease(
                 AND reconcile_lease_expires_at_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint
                 AND state IN ('pending', 'deleting') AND state = $6
             ",
-            &[&materialization_id, &owner, &lease_expires_at, &attempt, &generation, &expected_state],
+            &[&materialization_id, &owner, &lease_ttl_millis, &attempt, &generation, &expected_state],
         )
         .await
         .map_err(map_postgres_error)?;
@@ -1035,6 +1017,24 @@ async fn ensure_reconciliation_lease(
         });
     }
     Ok(())
+}
+
+/// A lease lifetime the database can add to its own clock. The upper bound
+/// matches every other store timeout and keeps the sum inside a bigint.
+fn lease_ttl_millis(ttl: Duration) -> StoreResult<i64> {
+    if ttl > crate::materialization::MAX_RECONCILIATION_LEASE_TTL {
+        return Err(StoreError::invalid_argument(
+            "materialization reconciliation lease TTL exceeds 24 hours",
+        ));
+    }
+    // The bound above keeps this value, and the database's sum, inside a bigint.
+    let millis = ttl.as_millis() as i64;
+    if millis == 0 {
+        return Err(StoreError::invalid_argument(
+            "materialization reconciliation lease TTL must be at least one millisecond",
+        ));
+    }
+    Ok(millis)
 }
 
 fn validate_lease_owner(owner: &str) -> StoreResult<()> {

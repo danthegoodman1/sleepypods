@@ -30,10 +30,7 @@ use crate::{
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
-    materialization::{
-        InvalidMaterializationTarget, LoadMaterializationOperationalMetricsRequest,
-        MaterializationState, MaterializationTarget,
-    },
+    materialization::{InvalidMaterializationTarget, MaterializationState, MaterializationTarget},
     materializer::{
         KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
     },
@@ -718,12 +715,7 @@ async fn record_materialization_operational_metrics(
         ));
     }
 
-    let Ok(metrics) = store
-        .load_materialization_operational_metrics(
-            LoadMaterializationOperationalMetricsRequest::new(std::time::SystemTime::now()),
-        )
-        .await
-    else {
+    let Ok(metrics) = store.load_materialization_operational_metrics().await else {
         return;
     };
 
@@ -940,10 +932,10 @@ mod tests {
         manifest::KubernetesObject,
         materialization::{
             BackendEndpoint, CompleteWakeRequest, CompleteWakeResult,
-            LoadMaterializationOperationalMetricsRequest, LoadReadyMaterializationRequest,
-            MaterializationBacklogOperationalMetrics, MaterializationHeldKeysOperationalMetrics,
-            MaterializationOperationalMetrics, MaterializationRecord, MaterializationState,
-            RecordMaterializationRequest, RenderedObjectRef,
+            LoadReadyMaterializationRequest, MaterializationBacklogOperationalMetrics,
+            MaterializationHeldKeysOperationalMetrics, MaterializationOperationalMetrics,
+            MaterializationRecord, MaterializationState, RecordMaterializationRequest,
+            RenderedObjectRef,
         },
         materializer::{KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer},
         route::{
@@ -1602,10 +1594,9 @@ mod tests {
             expire_http01_challenges
         );
 
-        fn load_materialization_operational_metrics<'a>(
-            &'a self,
-            _request: LoadMaterializationOperationalMetricsRequest,
-        ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
+        fn load_materialization_operational_metrics(
+            &self,
+        ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
             Box::pin(async {
                 Ok(MaterializationOperationalMetrics::new(
                     vec![

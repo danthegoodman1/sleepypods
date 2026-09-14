@@ -17,9 +17,9 @@ use crate::{
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
         ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationOperationalMetricsRequest, LoadMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
-        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest,
+        MaterializationOperationalMetrics, MaterializationRecord, RecordMaterializationRequest,
+        ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
@@ -215,10 +215,9 @@ pub trait ControlPlaneStore: Send + Sync {
         request: ListMaterializationReconciliationCandidatesRequest,
     ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>>;
 
-    fn load_materialization_operational_metrics<'a>(
-        &'a self,
-        request: LoadMaterializationOperationalMetricsRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>>;
+    fn load_materialization_operational_metrics(
+        &self,
+    ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>>;
 
     fn claim_materialization_reconciliation<'a>(
         &'a self,
@@ -684,12 +683,11 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn load_materialization_operational_metrics<'a>(
-        &'a self,
-        request: LoadMaterializationOperationalMetricsRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationOperationalMetrics>> {
+    fn load_materialization_operational_metrics(
+        &self,
+    ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
-            store.load_materialization_operational_metrics(request.clone())
+            store.load_materialization_operational_metrics()
         })
     }
 

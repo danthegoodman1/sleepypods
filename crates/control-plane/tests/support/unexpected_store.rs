@@ -287,10 +287,9 @@ macro_rules! unexpected_store_methods {
         unexpected_store_methods!($($rest),*);
     };
     (load_materialization_operational_metrics $(, $rest:ident)* $(,)?) => {
-    fn load_materialization_operational_metrics<'a>(
-        &'a self,
-        _request: control_plane::materialization::LoadMaterializationOperationalMetricsRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::materialization::MaterializationOperationalMetrics>> {
+    fn load_materialization_operational_metrics(
+        &self,
+    ) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::materialization::MaterializationOperationalMetrics>> {
         panic!("unexpected test store capability: load_materialization_operational_metrics")
     }
         unexpected_store_methods!($($rest),*);
