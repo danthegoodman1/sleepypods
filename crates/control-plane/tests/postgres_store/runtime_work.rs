@@ -776,6 +776,12 @@ async fn postgres_runtime_delete_supersedes_pending_attempt() -> TestResult {
     result
 }
 
+/// The reconciliation lease the two hanging supersession cases run on. A hung
+/// attempt learns that a Delete superseded it at its next heartbeat, a third of
+/// this window, and its successor renews the lease across a database round trip,
+/// so the window holds both with room for a loaded database.
+const SUPERSESSION_LEASE_TTL: Duration = Duration::from_secs(2);
+
 async fn delete_supersedes_pending_case(
     store: Arc<RetryingControlPlaneStore>,
     raw: &tokio_postgres::Client,
@@ -835,10 +841,12 @@ async fn delete_supersedes_pending_case(
         MaterializationReconcilerConfig {
             owner: format!("owner-{behavior}"),
             interval: Duration::from_millis(10),
-            // Short read-preemption heartbeat; definite apply errors finish before
-            // the first heartbeat so failure publication must independently be fenced.
+            // The hanging cases run on a short lease, so a superseded attempt
+            // learns of the Delete at its next heartbeat. Definite apply errors
+            // finish before the first heartbeat of the long lease, which leaves
+            // failure publication to be fenced on its own.
             lease_ttl: if matches!(behavior, "hang" | "apply-hang") {
-                Duration::from_millis(120)
+                SUPERSESSION_LEASE_TTL
             } else {
                 Duration::from_secs(30)
             },
@@ -852,7 +860,9 @@ async fn delete_supersedes_pending_case(
     let driver_started = tokio::time::Instant::now();
     jobs.spawn(driver.run_until_shutdown(receiver));
     let result: TestResult = async {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // Reaching the callback means the driver claimed the work and drove it
+        // to the gate, which is several database round trips.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while client.waiting.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -867,13 +877,15 @@ async fn delete_supersedes_pending_case(
         if waking.state != InstanceState::Waking {
             return Err(format!("expected Waking, got {waking:?}").into());
         }
-        // This is an observation budget, not a lifecycle policy. Definite errors
-        // must hand off before the first 10s heartbeat and the old 30s lease, but
-        // real database/cleanup I/O is not required to finish within one second.
-        let completion_budget = if definite_apply {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(1)
+        // These are observation budgets, not lifecycle policy. Waiting out a
+        // lease, cleaning up objects and sweeping a finalized instance all run
+        // at the database's pace, and each case asserts the timing it actually
+        // constrains where that timing happens.
+        let completion_budget = match behavior {
+            // The uncertain case observes that nothing finalizes, so a short
+            // window keeps a negative observation cheap.
+            "apply-hang" => Duration::from_secs(1),
+            _ => Duration::from_secs(30),
         };
         let delete_started = tokio::time::Instant::now();
         let completion_deadline = delete_started + completion_budget;
@@ -1024,18 +1036,22 @@ async fn delete_supersedes_pending_case(
             {
                 return Err("released uncertain dispatched attempt".into());
             }
+            // The replacement below has to meet an expired lease, so that a
+            // refused claim proves the uncertain effect fences it rather than a
+            // live lease doing the work.
+            await_expired_lease(raw, pending.id.as_str(), SUPERSESSION_LEASE_TTL * 5).await?;
             if store
                 .claim_materialization_reconciliation(
                     ClaimMaterializationReconciliationRequest::new(
                         pending.id.clone(),
                         "replacement",
-            Duration::from_secs(30),
-        ),
+                        Duration::from_secs(30),
+                    ),
                 )
                 .await?
                 .is_some()
             {
-                return Err("claimed uncertain attempt after its short lease expired".into());
+                return Err("claimed uncertain attempt after its lease expired".into());
             }
             if store.finalize_instance_deletions(10).await? != 0 {
                 return Err("finalized instance with uncertain effect".into());
@@ -1089,6 +1105,34 @@ async fn delete_supersedes_pending_case(
 
 async fn supersession_snapshot(raw: &tokio_postgres::Client, id: &str) -> TestResult<String> {
     Ok(raw.query_opt("SELECT json_build_object('state', m.state, 'instance_state', i.state, 'instance_generation', i.generation, 'materialization_generation', m.instance_generation, 'now', (extract(epoch from clock_timestamp()) * 1000)::bigint, 'operation_deadline', m.operation_deadline_unix_millis, 'owner', m.reconcile_owner, 'attempt', m.reconcile_attempt, 'lease_expires', m.reconcile_lease_expires_at_unix_millis, 'failure_kind', m.failure_kind, 'failure_count', m.failure_count, 'failure_requires_cleanup', m.failure_requires_cleanup, 'effect_count', (SELECT count(*) FROM materialization_effects e WHERE e.materialization_id=m.materialization_id))::text FROM materializations m JOIN instances i USING(instance_id) WHERE materialization_id=$1", &[&id]).await?.map(|row| row.get::<_, String>(0)).unwrap_or_else(|| "absent".into()))
+}
+
+/// Wait until the row's reconciliation lease sits in the database's past.
+async fn await_expired_lease(
+    raw: &tokio_postgres::Client,
+    id: &str,
+    budget: Duration,
+) -> TestResult {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let row = raw
+            .query_opt(
+                "SELECT reconcile_lease_expires_at_unix_millis IS NULL \
+                    OR reconcile_lease_expires_at_unix_millis \
+                        <= (extract(epoch from clock_timestamp()) * 1000)::bigint \
+                 FROM materializations WHERE materialization_id = $1",
+                &[&id],
+            )
+            .await?
+            .ok_or_else(|| format!("materialization {id} vanished while its lease was held"))?;
+        if row.get::<_, bool>(0) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("lease on {id} still holds after {budget:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn deletion_and_failure_use_one_lock_order(
