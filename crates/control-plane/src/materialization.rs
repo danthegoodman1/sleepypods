@@ -1,5 +1,5 @@
 pub use sleepypods_api::materialization::{
-    BackendEndpoint, InvalidMaterializationTarget, MaterializationTarget,
+    BackendAddress, BackendEndpoint, InvalidMaterializationTarget, MaterializationTarget,
 };
 
 use std::time::{Duration, SystemTime};

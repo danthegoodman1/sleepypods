@@ -138,10 +138,10 @@ pub(crate) const RESOLVE_ROUTE_SQL: &str = "
         LIMIT 1
     )
     SELECT selected.*, instances.state, instances.generation,
-        ready.backend_uri, ready.backend_generation
+        ready.backend_uri, ready.backend_address, ready.backend_generation
     FROM selected JOIN instances USING (instance_id)
     LEFT JOIN LATERAL (
-        SELECT backend_uri, backend_generation FROM materializations
+        SELECT backend_uri, backend_address, backend_generation FROM materializations
         WHERE instance_id = selected.instance_id
             AND instance_generation = instances.generation
             AND cluster_id = $5 AND namespace = $6 AND state = 'ready'
@@ -182,6 +182,7 @@ pub(crate) async fn resolve_route(
     let route = route_binding_row_from_row(&row)?;
     let state: String = row.get("state");
     let backend_uri: Option<String> = row.get("backend_uri");
+    let backend_address: Option<String> = row.get("backend_address");
     let backend_generation: Option<i64> = row.get("backend_generation");
     Ok(RouteResolution::Resolved {
         matched_identity: route.identity,
@@ -190,10 +191,7 @@ pub(crate) async fn resolve_route(
             instance_id: route.instance_id,
             instance_state: super::mapping::instance_state_from_db(&state)?,
             instance_generation: super::mapping::generation_from_i64(row.get("generation"))?,
-            backend: backend_uri
-                .map(crate::materialization::BackendEndpoint::new)
-                .transpose()
-                .map_err(|error| StoreError::internal(error.to_string()))?,
+            backend: super::mapping::backend_endpoint_from_row(backend_uri, backend_address)?,
             backend_generation: backend_generation
                 .map(super::mapping::backend_generation_from_i64)
                 .transpose()?,
@@ -360,7 +358,7 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations

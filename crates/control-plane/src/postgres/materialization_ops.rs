@@ -58,7 +58,7 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -95,7 +95,7 @@ pub(crate) async fn load_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -273,7 +273,7 @@ pub(crate) async fn list_materialization_reconciliation_candidates(
         .query(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -405,7 +405,7 @@ pub(crate) async fn claim_materialization_reconciliation(
                     OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
                 )
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -569,6 +569,7 @@ pub(crate) async fn delete_materialization_reconciliation(
             UPDATE materializations
             SET state = 'deleted',
                 backend_uri = NULL,
+                backend_address = NULL,
                 rendered_objects = '[]'::jsonb,
                 exclusivity_keys = '[]'::jsonb,
                 reconcile_owner = NULL,
@@ -583,7 +584,7 @@ pub(crate) async fn delete_materialization_reconciliation(
                 AND reconcile_owner = $7
                 AND reconcile_lease_expires_at_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -629,7 +630,7 @@ pub(crate) async fn force_delete_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -654,6 +655,7 @@ pub(crate) async fn force_delete_materialization(
                 UPDATE materializations
                 SET state = 'deleted',
                     backend_uri = NULL,
+                    backend_address = NULL,
                     rendered_objects = '[]'::jsonb,
                     exclusivity_keys = '[]'::jsonb,
                     reconcile_owner = NULL,
@@ -704,7 +706,7 @@ pub(crate) async fn force_release_exclusivity_key(
         .query(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -1113,6 +1115,11 @@ pub(super) async fn upsert_materialization(
     let namespace = request.target.namespace();
     let state = materialization_state_to_db(request.state);
     let backend_uri = request.backend.as_ref().map(|backend| backend.uri());
+    let backend_address = request
+        .backend
+        .as_ref()
+        .and_then(|backend| backend.address())
+        .map(|address| address.to_string());
     let backend_generation = backend_generation_to_i64(request.backend_generation)?;
     let rendered_objects = rendered_objects_to_json(&request.rendered_objects);
     let exclusivity_keys = rendered_exclusivity_keys_to_json(&request.exclusivity_keys);
@@ -1132,9 +1139,10 @@ pub(super) async fn upsert_materialization(
                 backend_generation,
                 rendered_objects,
                 exclusivity_keys,
-                projection_generation
+                projection_generation,
+                backend_address
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (instance_id, cluster_id, namespace)
             DO UPDATE SET
                 materialization_id = EXCLUDED.materialization_id,
@@ -1142,6 +1150,7 @@ pub(super) async fn upsert_materialization(
                 projection_generation = EXCLUDED.projection_generation,
                 state = EXCLUDED.state,
                 backend_uri = EXCLUDED.backend_uri,
+                backend_address = EXCLUDED.backend_address,
                 backend_generation = EXCLUDED.backend_generation,
                 rendered_objects = EXCLUDED.rendered_objects,
                 exclusivity_keys = EXCLUDED.exclusivity_keys,
@@ -1150,7 +1159,7 @@ pub(super) async fn upsert_materialization(
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materializations.backend_generation <= EXCLUDED.backend_generation
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -1166,6 +1175,7 @@ pub(super) async fn upsert_materialization(
                 &rendered_objects,
                 &exclusivity_keys,
                 &projection_generation,
+                &backend_address,
             ],
         )
         .await
@@ -1196,7 +1206,7 @@ async fn load_active_materialization_from_client(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -1238,6 +1248,7 @@ async fn mark_active_materialization_state(
                 SET state = $4,
                     instance_generation = $5,
                     backend_uri = NULL,
+                    backend_address = NULL,
                     rendered_objects = COALESCE($6, rendered_objects),
                     exclusivity_keys = COALESCE($7, exclusivity_keys),
                     reconcile_owner = NULL,
@@ -1248,7 +1259,7 @@ async fn mark_active_materialization_state(
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                     exclusivity_keys, reconcile_owner,
                     reconcile_lease_expires_at_unix_millis, reconcile_attempt
                 ",
@@ -1271,6 +1282,7 @@ async fn mark_active_materialization_state(
                 UPDATE materializations
                 SET state = $4,
                     backend_uri = NULL,
+                    backend_address = NULL,
                     reconcile_owner = NULL,
                     reconcile_lease_expires_at_unix_millis = NULL,
                     updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
@@ -1279,7 +1291,7 @@ async fn mark_active_materialization_state(
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                     exclusivity_keys, reconcile_owner,
                     reconcile_lease_expires_at_unix_millis, reconcile_attempt
                 ",
@@ -1312,6 +1324,7 @@ async fn mark_active_materialization_deleting_for_sleep(
             UPDATE materializations
             SET state = $5,
                 backend_uri = NULL,
+                backend_address = NULL,
                 reconcile_owner = NULL,
                 reconcile_lease_expires_at_unix_millis = NULL,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint,
@@ -1322,7 +1335,7 @@ async fn mark_active_materialization_deleting_for_sleep(
                 AND instance_generation = $4
                 AND state <> 'deleted'
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, backend_address, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",

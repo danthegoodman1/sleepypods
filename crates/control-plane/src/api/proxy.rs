@@ -578,6 +578,7 @@ fn proxy_ready_response(
                     instance_generation: instance.generation.get(),
                     backend_uri: backend.uri().to_owned(),
                     backend_generation: materialization.backend_generation.get(),
+                    backend_address: backend.address().map(|address| address.to_string()),
                 },
             )),
         }),
@@ -729,6 +730,11 @@ fn route_host_kind_to_proto(kind: domain_route::RouteHostKind) -> pb::RouteHostK
 }
 
 fn route_entry_to_proto(entry: domain_route::RouteEntry) -> pb::ProxyRouteEntry {
+    let backend_address = entry
+        .backend
+        .as_ref()
+        .and_then(|backend| backend.address())
+        .map(|address| address.to_string());
     pb::ProxyRouteEntry {
         route_binding_id: entry.route_binding_id.as_str().to_owned(),
         instance_id: entry.instance_id.as_str().to_owned(),
@@ -738,6 +744,7 @@ fn route_entry_to_proto(entry: domain_route::RouteEntry) -> pb::ProxyRouteEntry 
         backend_generation: entry
             .backend_generation
             .map(|backend_generation| backend_generation.get()),
+        backend_address,
     }
 }
 

@@ -93,6 +93,7 @@ fn route_entry() -> RouteEntry {
 
 fn pb_route_entry() -> pb::ProxyRouteEntry {
     pb::ProxyRouteEntry {
+        backend_address: None,
         route_binding_id: "route-a".to_owned(),
         instance_id: "instance-a".to_owned(),
         instance_state: pb::InstanceState::Running as i32,
@@ -293,6 +294,7 @@ fn wake_ready_response_preserves_backend_semantics() {
     let output = proxy_wake_response_from_proto(pb::ProxyWakeInstanceResponse {
         outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
             pb::ProxyWakeReadyResult {
+                backend_address: None,
                 instance_id: "instance-a".to_owned(),
                 instance_generation: 7,
                 backend_uri: "http://10.0.0.7:8080".to_owned(),
@@ -310,6 +312,69 @@ fn wake_ready_response_preserves_backend_semantics() {
             backend: backend("http://10.0.0.7:8080"),
             backend_generation: Some(BackendGeneration::new(3)),
         }
+    );
+}
+
+#[test]
+fn wake_ready_response_carries_an_observed_backend_address() {
+    let output = proxy_wake_response_from_proto(pb::ProxyWakeInstanceResponse {
+        outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
+            pb::ProxyWakeReadyResult {
+                backend_address: Some("10.244.1.7:8080".to_owned()),
+                instance_id: "instance-a".to_owned(),
+                instance_generation: 7,
+                backend_uri: "http://10.0.0.7:8080".to_owned(),
+                backend_generation: 3,
+            },
+        )),
+    })
+    .expect("ready response");
+
+    let WakeInstanceResponse::AlreadyRunning { backend, .. } = output else {
+        panic!("expected an already-running response");
+    };
+    assert_eq!(backend.uri(), "http://10.0.0.7:8080");
+    assert_eq!(
+        backend.address(),
+        Some("10.244.1.7:8080".parse().expect("valid address"))
+    );
+}
+
+#[test]
+fn wake_ready_response_rejects_a_backend_address_that_cannot_be_dialed() {
+    let error = proxy_wake_response_from_proto(pb::ProxyWakeInstanceResponse {
+        outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
+            pb::ProxyWakeReadyResult {
+                backend_address: Some("not-an-address".to_owned()),
+                instance_id: "instance-a".to_owned(),
+                instance_generation: 7,
+                backend_uri: "http://10.0.0.7:8080".to_owned(),
+                backend_generation: 3,
+            },
+        )),
+    })
+    .expect_err("an undialable address is rejected");
+
+    assert!(
+        matches!(
+            error,
+            ProxyProtocolAdapterError::InvalidField { field, .. } if field == "backend.address"
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn route_entries_carry_an_observed_backend_address() {
+    let entry = super::route_entry_from_proto(pb::ProxyRouteEntry {
+        backend_address: Some("[fd00::7]:8080".to_owned()),
+        ..pb_route_entry()
+    })
+    .expect("route entry");
+
+    assert_eq!(
+        entry.backend.expect("backend is present").address(),
+        Some("[fd00::7]:8080".parse().expect("valid address"))
     );
 }
 
@@ -627,6 +692,7 @@ fn missing_wake_outcome_and_bad_ready_backend_return_typed_errors() {
         proxy_wake_response_from_proto(pb::ProxyWakeInstanceResponse {
             outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
                 pb::ProxyWakeReadyResult {
+                    backend_address: None,
                     instance_id: "instance-a".to_owned(),
                     instance_generation: 7,
                     backend_uri: " ".to_owned(),
@@ -655,6 +721,7 @@ fn subscription_id_is_opaque_and_not_inferred_from_route_identity() {
                     pb::RouteHostKind::Exact,
                 )),
                 route: Some(pb::ProxyRouteEntry {
+                    backend_address: None,
                     route_binding_id: "different-route-id".to_owned(),
                     instance_id: "different-instance-id".to_owned(),
                     instance_state: pb::InstanceState::Cold as i32,

@@ -3,11 +3,16 @@ mod conditional_tests;
 
 mod idle_membership;
 
-use std::{error::Error, fmt, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use k8s_openapi::api::{
     core::v1::{PersistentVolumeClaim, Service},
-    discovery::v1::EndpointSlice,
+    discovery::v1::{Endpoint, EndpointSlice},
 };
 use kube::{
     api::{
@@ -20,7 +25,7 @@ use tokio::time::{sleep, timeout, Instant};
 
 use crate::{
     manifest::KubernetesObject,
-    materialization::{BackendEndpoint, RenderedObjectRef},
+    materialization::{BackendAddress, BackendEndpoint, RenderedObjectRef},
     materializer::{
         rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
         KubernetesMaterializerClient,
@@ -261,12 +266,13 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
 
                 loop {
                     let service = services.get(&service_ref.name).await.map_err(kube_error)?;
-                    let backend = backend_endpoint_for_service(&service, &self.config)?;
                     let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
                     let slices = endpoint_slices
                         .list(&ListParams::default().labels(&selector))
                         .await
                         .map_err(kube_error)?;
+                    let address = ready_backend_address(&service, &slices.items);
+                    let backend = backend_endpoint_for_service(&service, &self.config, address)?;
 
                     if slices
                         .iter()
@@ -576,6 +582,7 @@ fn api_resource_for_ref(object: &RenderedObjectRef) -> KubernetesClientResult<Ap
 fn backend_endpoint_for_service(
     service: &Service,
     config: &KubeMaterializerClientConfig,
+    address: Option<BackendAddress>,
 ) -> KubernetesClientResult<BackendEndpoint> {
     let backend_scheme = backend_scheme_for_service(service, config)?;
 
@@ -590,10 +597,11 @@ fn backend_endpoint_for_service(
         })?;
     let port = service_port(service)?;
 
-    BackendEndpoint::new(format!(
-        "{}://{name}.{namespace}.svc.cluster.local:{port}",
-        backend_scheme
-    ))
+    let uri = format!("{backend_scheme}://{name}.{namespace}.svc.cluster.local:{port}");
+    match address {
+        Some(address) => BackendEndpoint::with_address(uri, address),
+        None => BackendEndpoint::new(uri),
+    }
     .map_err(|error| KubernetesClientError::new(error.to_string()))
 }
 
@@ -627,6 +635,10 @@ fn backend_scheme_for_service<'a>(
 }
 
 fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -> bool {
+    slice_belongs_to_service(service, slice) && first_ready_endpoint(slice).is_some()
+}
+
+fn slice_belongs_to_service(service: &Service, slice: &EndpointSlice) -> bool {
     let Some(uid) = service
         .metadata
         .uid
@@ -653,7 +665,11 @@ fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -
     {
         return false;
     }
-    slice.endpoints.iter().any(|endpoint| {
+    true
+}
+
+fn first_ready_endpoint(slice: &EndpointSlice) -> Option<&Endpoint> {
+    slice.endpoints.iter().find(|endpoint| {
         !endpoint.addresses.is_empty()
             && endpoint
                 .conditions
@@ -668,12 +684,50 @@ fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -
     })
 }
 
+/// The address a ready endpoint was observed at, for callers that can route to
+/// it without resolving the Service name. A dual-stack Service presents one
+/// slice per address family, so the lowest (address type, slice name) pair wins
+/// and repeated reads of an unchanged Service agree.
+fn ready_backend_address(service: &Service, slices: &[EndpointSlice]) -> Option<BackendAddress> {
+    let mut candidates: Vec<(&str, &str, BackendAddress)> = slices
+        .iter()
+        .filter(|slice| slice_belongs_to_service(service, slice))
+        .filter_map(|slice| {
+            let port = endpoint_slice_port(slice)?;
+            let ip = first_ready_endpoint(slice)?
+                .addresses
+                .first()?
+                .parse::<IpAddr>()
+                .ok()?;
+            let address = BackendAddress::new(SocketAddr::new(ip, port)).ok()?;
+
+            Some((
+                slice.address_type.as_str(),
+                slice.metadata.name.as_deref().unwrap_or_default(),
+                address,
+            ))
+        })
+        .collect();
+    candidates.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+
+    candidates.first().map(|(_, _, address)| *address)
+}
+
+fn endpoint_slice_port(slice: &EndpointSlice) -> Option<u16> {
+    slice
+        .ports
+        .as_ref()?
+        .iter()
+        .find_map(|port| u16::try_from(port.port?).ok().filter(|port| *port != 0))
+}
+
 fn readiness_inspection_for_service(
     service: &Service,
     slices: &[EndpointSlice],
     config: &KubeMaterializerClientConfig,
 ) -> KubernetesClientResult<ProjectionReadinessInspection> {
-    let backend = match backend_endpoint_for_service(service, config) {
+    let address = ready_backend_address(service, slices);
+    let backend = match backend_endpoint_for_service(service, config, address) {
         Ok(backend) => backend,
         Err(_) => {
             return Ok(ProjectionReadinessInspection::Unready {
@@ -806,21 +860,21 @@ mod tests {
     use k8s_openapi::{
         api::{
             core::v1::{Service, ServicePort, ServiceSpec},
-            discovery::v1::{Endpoint, EndpointConditions, EndpointSlice},
+            discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice},
         },
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use kube::{core::Status, Error as KubeError};
 
     use crate::{
-        materialization::{BackendEndpoint, RenderedObjectRef},
+        materialization::{BackendAddress, BackendEndpoint, RenderedObjectRef},
         projection::ProjectionReadinessInspection,
     };
 
     use super::{
         api_resource_for_ref, backend_endpoint_for_service, endpoint_slice_has_ready_endpoint,
         is_not_found, is_valid_uri_scheme, kube_error, readiness_inspection_for_service,
-        rendered_service_ref, KubeMaterializerClientConfig,
+        ready_backend_address, rendered_service_ref, KubeMaterializerClientConfig,
     };
 
     #[test]
@@ -885,10 +939,11 @@ mod tests {
         let service = service("api", "apps", [80, 8080]);
         let config = KubeMaterializerClientConfig::default();
 
-        let backend =
-            backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
+        let backend = backend_endpoint_for_service(&service, &config, None)
+            .expect("service backend endpoint");
 
         assert_eq!(backend.uri(), "http://api.apps.svc.cluster.local:80");
+        assert_eq!(backend.address(), None);
     }
 
     #[test]
@@ -899,8 +954,8 @@ mod tests {
             ..KubeMaterializerClientConfig::default()
         };
 
-        let backend =
-            backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
+        let backend = backend_endpoint_for_service(&service, &config, None)
+            .expect("service backend endpoint");
 
         assert_eq!(backend.uri(), "tcp://postgres.data.svc.cluster.local:5432");
     }
@@ -914,8 +969,8 @@ mod tests {
         )]));
         let config = KubeMaterializerClientConfig::default();
 
-        let backend =
-            backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
+        let backend = backend_endpoint_for_service(&service, &config, None)
+            .expect("service backend endpoint");
 
         assert_eq!(
             backend.uri(),
@@ -1136,6 +1191,184 @@ mod tests {
                 })
                 .collect(),
             ..EndpointSlice::default()
+        }
+    }
+
+    fn owned_endpoint_slice(
+        name: &str,
+        address_type: &str,
+        addresses: &[&str],
+        port: Option<i32>,
+        ready: Option<bool>,
+    ) -> EndpointSlice {
+        EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some(name.to_owned()),
+                owner_references: Some(vec![
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".to_owned(),
+                        kind: "Service".to_owned(),
+                        name: "api".to_owned(),
+                        uid: "current-service".to_owned(),
+                        controller: Some(true),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+            address_type: address_type.to_owned(),
+            endpoints: vec![Endpoint {
+                addresses: addresses.iter().map(|value| (*value).to_owned()).collect(),
+                conditions: Some(EndpointConditions {
+                    ready,
+                    ..EndpointConditions::default()
+                }),
+                ..Endpoint::default()
+            }],
+            ports: port.map(|port| {
+                vec![EndpointPort {
+                    port: Some(port),
+                    ..EndpointPort::default()
+                }]
+            }),
+            ..EndpointSlice::default()
+        }
+    }
+
+    fn backend_address(value: &str) -> BackendAddress {
+        value
+            .parse::<BackendAddress>()
+            .expect("valid backend address")
+    }
+
+    #[test]
+    fn ready_backend_address_uses_the_ready_endpoint_address_and_port() {
+        let service = service("api", "apps", [80]);
+        let slices = [owned_endpoint_slice(
+            "api-v4",
+            "IPv4",
+            &["10.244.1.7"],
+            Some(8080),
+            Some(true),
+        )];
+
+        assert_eq!(
+            ready_backend_address(&service, &slices),
+            Some(backend_address("10.244.1.7:8080"))
+        );
+    }
+
+    #[test]
+    fn ready_backend_address_brackets_ipv6_endpoints() {
+        let service = service("api", "apps", [80]);
+        let slices = [owned_endpoint_slice(
+            "api-v6",
+            "IPv6",
+            &["fd00::7"],
+            Some(8080),
+            Some(true),
+        )];
+
+        assert_eq!(
+            ready_backend_address(&service, &slices).map(|address| address.to_string()),
+            Some("[fd00::7]:8080".to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_backend_address_needs_a_port_a_ready_endpoint_and_a_numeric_address() {
+        let service = service("api", "apps", [80]);
+        for slice in [
+            owned_endpoint_slice("api-no-port", "IPv4", &["10.244.1.7"], None, Some(true)),
+            owned_endpoint_slice(
+                "api-unready",
+                "IPv4",
+                &["10.244.1.7"],
+                Some(8080),
+                Some(false),
+            ),
+            owned_endpoint_slice(
+                "api-zero-port",
+                "IPv4",
+                &["10.244.1.7"],
+                Some(0),
+                Some(true),
+            ),
+            owned_endpoint_slice(
+                "api-fqdn",
+                "FQDN",
+                &["api.apps.svc.cluster.local"],
+                Some(8080),
+                Some(true),
+            ),
+            owned_endpoint_slice("api-empty", "IPv4", &[], Some(8080), Some(true)),
+        ] {
+            assert_eq!(ready_backend_address(&service, &[slice]), None);
+        }
+    }
+
+    #[test]
+    fn ready_backend_address_ignores_slices_owned_by_another_service() {
+        let service = service("other", "apps", [80]);
+        let slices = [owned_endpoint_slice(
+            "api-v4",
+            "IPv4",
+            &["10.244.1.7"],
+            Some(8080),
+            Some(true),
+        )];
+
+        assert_eq!(ready_backend_address(&service, &slices), None);
+    }
+
+    #[test]
+    fn ready_backend_address_picks_the_same_dual_stack_slice_on_every_read() {
+        let service = service("api", "apps", [80]);
+        let v4 = owned_endpoint_slice("api-v4", "IPv4", &["10.244.1.7"], Some(8080), Some(true));
+        let v6 = owned_endpoint_slice("api-v6", "IPv6", &["fd00::7"], Some(8080), Some(true));
+
+        let forward = ready_backend_address(&service, &[v4.clone(), v6.clone()]);
+        let reversed = ready_backend_address(&service, &[v6, v4]);
+
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, Some(backend_address("10.244.1.7:8080")));
+    }
+
+    #[test]
+    fn service_backend_endpoint_carries_the_observed_pod_address() {
+        let service = service("api", "apps", [80]);
+        let config = KubeMaterializerClientConfig::default();
+
+        let backend = backend_endpoint_for_service(
+            &service,
+            &config,
+            Some(backend_address("10.244.1.7:8080")),
+        )
+        .expect("service backend endpoint");
+
+        assert_eq!(backend.uri(), "http://api.apps.svc.cluster.local:80");
+        assert_eq!(backend.address(), Some(backend_address("10.244.1.7:8080")));
+    }
+
+    #[test]
+    fn readiness_inspection_reports_the_ready_pod_address() {
+        let service = service("api", "apps", [80]);
+        let config = KubeMaterializerClientConfig::default();
+        let slices = [owned_endpoint_slice(
+            "api-v4",
+            "IPv4",
+            &["10.244.1.7"],
+            Some(8080),
+            Some(true),
+        )];
+
+        match readiness_inspection_for_service(&service, &slices, &config)
+            .expect("readiness inspection")
+        {
+            ProjectionReadinessInspection::Ready(backend) => {
+                assert_eq!(backend.address(), Some(backend_address("10.244.1.7:8080")));
+            }
+            other => panic!("expected a ready inspection, got {other:?}"),
         }
     }
 }
