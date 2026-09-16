@@ -816,6 +816,7 @@ impl FakeProxyControlPlane {
         backend_uri: &str,
     ) -> pb::ProxyRouteEntry {
         pb::ProxyRouteEntry {
+            backend_address: None,
             route_binding_id: route_binding_id.to_owned(),
             instance_id: instance_id.to_owned(),
             instance_state: pb::InstanceState::Running as i32,
@@ -827,6 +828,7 @@ impl FakeProxyControlPlane {
 
     fn cold_route_entry(&self) -> pb::ProxyRouteEntry {
         pb::ProxyRouteEntry {
+            backend_address: None,
             route_binding_id: "frontline-load-smoke-cold-route".to_owned(),
             instance_id: "frontline-load-smoke-cold-instance".to_owned(),
             instance_state: pb::InstanceState::Cold as i32,
@@ -891,6 +893,7 @@ impl ProxyControlPlane for FakeProxyControlPlane {
         Ok(Response::new(pb::ProxyWakeInstanceResponse {
             outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
                 pb::ProxyWakeReadyResult {
+                    backend_address: None,
                     instance_id: request.instance_id,
                     instance_generation: request.expected_generation,
                     backend_uri: self.backend_uri.to_string(),
@@ -992,6 +995,7 @@ impl ProxyControlPlane for GeneratedGrpcBackend {
         Ok(Response::new(pb::ProxyWakeInstanceResponse {
             outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
                 pb::ProxyWakeReadyResult {
+                    backend_address: None,
                     instance_id: request.instance_id,
                     instance_generation: request.expected_generation,
                     backend_uri: "http://generated-grpc-backend.example.test".to_owned(),

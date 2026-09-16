@@ -119,6 +119,10 @@ message ProxyWakeReadyResult {
   uint64 instance_generation = 2;
   string backend_uri = 3;
   uint64 backend_generation = 4;
+  // The address the ready backend was observed at, as IP and port with IPv6
+  // bracketed. Present when the materializer resolved one; clients that cannot
+  // route to it directly keep using backend_uri.
+  optional string backend_address = 5;
 }
 
 message ProxyWakeStillWakingResult {
@@ -211,6 +215,10 @@ message ProxyRouteEntry {
   uint64 instance_generation = 4;
   optional string backend_uri = 5;
   optional uint64 backend_generation = 6;
+  // The address the ready backend was observed at, as IP and port with IPv6
+  // bracketed. Present when the materializer resolved one; clients that cannot
+  // route to it directly keep using backend_uri.
+  optional string backend_address = 7;
 }
 
 message ProxyCachePolicy {

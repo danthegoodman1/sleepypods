@@ -24,7 +24,7 @@ pub use auth::{BearerToken, InvalidBearerToken, OptionalBearerTokenInterceptor};
 pub use certificate::*;
 pub use http01::*;
 pub use instance::InstanceState;
-pub use materialization::{BackendEndpoint, MaterializationTarget};
+pub use materialization::{BackendAddress, BackendEndpoint, MaterializationTarget};
 pub use route::*;
 pub use sleepypods_types::*;
 

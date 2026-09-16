@@ -35,7 +35,9 @@ below use request shapes.
   generation. Its persisted `projection_generation` is an immutable Kubernetes
   ownership and sidecar incarnation stamp, separate from the instance CAS
   revision. It records rendered refs, target cluster/namespace, backend URI,
-  readiness, and failure state.
+  the backend address observed at readiness, readiness, and failure state. The
+  backend address is the ready endpoint's IP and port, offered to proxies that
+  can route to it directly; proxies that cannot keep resolving the backend URI.
 - `WorkloadSleepPolicy`: idle timeout, idle-report retry backoff, drain grace
   timeout, and optional per-instance idle-timeout override bounds.
 - Volume templates: static PV/PVC templates rendered from class template fields

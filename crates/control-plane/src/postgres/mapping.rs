@@ -15,7 +15,7 @@ use crate::{
     instance::{InstanceRecord, InstanceState, InstanceValues},
     manifest::ManifestTemplate,
     materialization::{
-        BackendEndpoint, MaterializationReconciliationLease, MaterializationRecord,
+        BackendAddress, BackendEndpoint, MaterializationReconciliationLease, MaterializationRecord,
         MaterializationState, MaterializationTarget, RenderedObjectRef,
     },
     route::{
@@ -119,6 +119,30 @@ pub(crate) fn route_binding_row_from_row(row: &Row) -> StoreResult<RouteBindingR
     })
 }
 
+/// A stored backend keeps its observed address when one was recorded. Rows
+/// written before the address column, and sleeping materializations, carry only
+/// the URI.
+pub(crate) fn backend_endpoint_from_row(
+    uri: Option<String>,
+    address: Option<String>,
+) -> StoreResult<Option<BackendEndpoint>> {
+    let Some(uri) = uri else {
+        return Ok(None);
+    };
+    let backend = match address {
+        Some(address) => {
+            let address = address
+                .parse::<BackendAddress>()
+                .map_err(invalid_stored_data)?;
+            BackendEndpoint::with_address(uri, address)
+        }
+        None => BackendEndpoint::new(uri),
+    }
+    .map_err(invalid_stored_data)?;
+
+    Ok(Some(backend))
+}
+
 pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<MaterializationRecord> {
     let materialization_id: String = row.get("materialization_id");
     let instance_id: String = row.get("instance_id");
@@ -127,6 +151,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
     let namespace: String = row.get("namespace");
     let state: String = row.get("state");
     let backend_uri: Option<String> = row.get("backend_uri");
+    let backend_address: Option<String> = row.get("backend_address");
     let backend_generation: i64 = row.get("backend_generation");
     let rendered_objects: Value = row.get("rendered_objects");
     let exclusivity_keys: Value = row.get("exclusivity_keys");
@@ -142,10 +167,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
         projection_generation: generation_from_i64(row.get("projection_generation"))?,
         target: MaterializationTarget::new(cluster_id, namespace).map_err(invalid_stored_data)?,
         state: materialization_state_from_db(&state)?,
-        backend: backend_uri
-            .map(BackendEndpoint::new)
-            .transpose()
-            .map_err(invalid_stored_data)?,
+        backend: backend_endpoint_from_row(backend_uri, backend_address)?,
         backend_generation: backend_generation_from_i64(backend_generation)?,
         rendered_objects: rendered_objects_from_json(rendered_objects)?,
         exclusivity_keys: rendered_exclusivity_keys_from_json(exclusivity_keys)?,
@@ -695,10 +717,71 @@ fn invalid_stored_data(error: impl std::fmt::Display) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::route_identity_key;
+    use super::{backend_endpoint_from_row, route_identity_key};
+    use crate::materialization::BackendAddress;
     use crate::route::{
         route_match_score, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity,
     };
+
+    #[test]
+    fn stored_backend_without_a_uri_is_absent() {
+        assert_eq!(
+            backend_endpoint_from_row(None, None).expect("absent backend is valid"),
+            None
+        );
+        assert_eq!(
+            backend_endpoint_from_row(None, Some("10.244.1.7:8080".to_owned()))
+                .expect("absent backend is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn stored_backend_keeps_its_uri_when_no_address_was_recorded() {
+        let backend = backend_endpoint_from_row(Some("http://app.apps.svc:80".to_owned()), None)
+            .expect("backend is valid")
+            .expect("backend is present");
+
+        assert_eq!(backend.uri(), "http://app.apps.svc:80");
+        assert_eq!(backend.address(), None);
+    }
+
+    #[test]
+    fn stored_backend_restores_a_recorded_address() {
+        for value in ["10.244.1.7:8080", "[fd00::7]:8080"] {
+            let backend = backend_endpoint_from_row(
+                Some("http://app.apps.svc:80".to_owned()),
+                Some(value.to_owned()),
+            )
+            .expect("backend is valid")
+            .expect("backend is present");
+
+            assert_eq!(
+                backend.address(),
+                Some(value.parse::<BackendAddress>().expect("valid address"))
+            );
+        }
+    }
+
+    #[test]
+    fn stored_backend_rejects_an_address_that_cannot_be_dialed() {
+        for value in [
+            "not-an-address",
+            "10.244.1.7",
+            "0.0.0.0:8080",
+            "10.244.1.7:0",
+        ] {
+            let error = backend_endpoint_from_row(
+                Some("http://app.apps.svc:80".to_owned()),
+                Some(value.to_owned()),
+            )
+            .expect_err("stored address is invalid");
+
+            assert!(error
+                .to_string()
+                .contains("stored Postgres data is invalid"));
+        }
+    }
 
     #[test]
     fn route_identity_key_uses_normalized_domain_parts() {

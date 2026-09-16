@@ -5,9 +5,9 @@ use std::{
 };
 
 use sleepypods_api::{
-    pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
-    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
-    RouteHost, RouteHostKind, RouteIdentity,
+    pb, BackendAddress, BackendEndpoint, BackendGeneration, CachePolicy, Generation,
+    Http01ChallengeKey, Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix,
+    RouteBindingId, RouteEntry, RouteHost, RouteHostKind, RouteIdentity,
 };
 
 use crate::{
@@ -155,7 +155,7 @@ pub fn proxy_wake_response_from_proto(
             Ok(WakeInstanceResponse::AlreadyRunning {
                 instance_id: instance_id(response.instance_id)?,
                 generation: Generation::new(response.instance_generation),
-                backend: backend_endpoint(response.backend_uri)?,
+                backend: backend_endpoint(response.backend_uri, response.backend_address)?,
                 backend_generation: Some(BackendGeneration::new(response.backend_generation)),
             })
         }
@@ -227,11 +227,22 @@ fn route_binding_id(value: String) -> Result<RouteBindingId, ProxyProtocolAdapte
     })
 }
 
-fn backend_endpoint(value: String) -> Result<BackendEndpoint, ProxyProtocolAdapterError> {
-    BackendEndpoint::new(value).map_err(|error| ProxyProtocolAdapterError::InvalidField {
-        field: error.field(),
-        message: error.to_string(),
-    })
+fn backend_endpoint(
+    uri: String,
+    address: Option<String>,
+) -> Result<BackendEndpoint, ProxyProtocolAdapterError> {
+    let invalid =
+        |field, message: String| ProxyProtocolAdapterError::InvalidField { field, message };
+    match address {
+        Some(address) => {
+            let address = address
+                .parse::<BackendAddress>()
+                .map_err(|error| invalid(error.field(), error.to_string()))?;
+            BackendEndpoint::with_address(uri, address)
+        }
+        None => BackendEndpoint::new(uri),
+    }
+    .map_err(|error| invalid(error.field(), error.to_string()))
 }
 
 fn route_identity_from_required_proto(
@@ -347,12 +358,16 @@ fn route_host_from_proto(host: pb::RouteHost) -> Result<RouteHost, ProxyProtocol
 fn route_entry_from_proto(
     route: pb::ProxyRouteEntry,
 ) -> Result<RouteEntry, ProxyProtocolAdapterError> {
+    let backend_address = route.backend_address;
     Ok(RouteEntry {
         route_binding_id: route_binding_id(route.route_binding_id)?,
         instance_id: instance_id(route.instance_id)?,
         instance_state: instance_state_from_proto(route.instance_state)?,
         instance_generation: Generation::new(route.instance_generation),
-        backend: route.backend_uri.map(backend_endpoint).transpose()?,
+        backend: route
+            .backend_uri
+            .map(|uri| backend_endpoint(uri, backend_address))
+            .transpose()?,
         backend_generation: route.backend_generation.map(BackendGeneration::new),
     })
 }

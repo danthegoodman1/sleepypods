@@ -40,6 +40,7 @@ async fn wake_instance_ready_response_maps_through_generated_client() {
     service.set_wake_response(Ok(pb::ProxyWakeInstanceResponse {
         outcome: Some(pb::proxy_wake_instance_response::Outcome::Ready(
             pb::ProxyWakeReadyResult {
+                backend_address: None,
                 instance_id: "instance-a".to_owned(),
                 instance_generation: 7,
                 backend_uri: "http://10.0.0.7:8080".to_owned(),
@@ -1074,6 +1075,7 @@ fn pb_http_identity(host: &str, path: Option<&str>) -> pb::RouteIdentity {
 
 fn pb_route_entry() -> pb::ProxyRouteEntry {
     pb::ProxyRouteEntry {
+        backend_address: None,
         route_binding_id: "route-a".to_owned(),
         instance_id: "instance-a".to_owned(),
         instance_state: pb::InstanceState::Running as i32,

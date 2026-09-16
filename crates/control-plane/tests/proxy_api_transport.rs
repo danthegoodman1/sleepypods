@@ -168,6 +168,7 @@ async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend(
         "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
+    assert_eq!(ready.backend_address.as_deref(), Some("10.244.1.7:8080"));
     assert_eq!(client.applied_objects_len(), 2);
 }
 
@@ -513,6 +514,7 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
             instance_generation: 7,
             backend_uri: Some("http://svc-acme.apps.svc.cluster.local:80".to_owned()),
             backend_generation: Some(7),
+            backend_address: None,
         })
     );
     assert_eq!(
@@ -2296,8 +2298,11 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("not ready"));
             }
 
-            BackendEndpoint::new("http://svc-acme-69856ec0.apps.svc.cluster.local:80")
-                .map_err(|error| KubernetesClientError::new(error.to_string()))
+            BackendEndpoint::with_address(
+                "http://svc-acme-69856ec0.apps.svc.cluster.local:80",
+                "10.244.1.7:8080".parse().expect("fixture address is valid"),
+            )
+            .map_err(|error| KubernetesClientError::new(error.to_string()))
         })
     }
 
