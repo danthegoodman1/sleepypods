@@ -19,39 +19,56 @@ const TOKEN_PREFIX: &str = "sleepypodsInstanceValue";
 pub(super) struct PlaceholderDocument {
     text: String,
     prefix: String,
-    /// Each token paired with the value that replaces it, in the order the
-    /// template names them.
+    /// The instance-value field behind each token, in token order.
+    fields: Vec<String>,
+    /// Each token paired with the value that replaces it. Empty until an
+    /// instance supplies its values.
     substitutions: Vec<(String, String)>,
 }
 
 impl PlaceholderDocument {
-    pub(super) fn new(
-        template: &TemplateText,
-        values: &InstanceValues,
-    ) -> Result<Self, ManifestRenderError> {
+    /// The manifest with a token wherever an instance value belongs. A check
+    /// that runs before any instance exists reads the text as it stands.
+    pub(super) fn new(template: &TemplateText) -> Self {
         let prefix = unique_prefix(template);
         let mut text = String::new();
-        let mut substitutions = Vec::new();
+        let mut fields = Vec::new();
         for part in template.parts() {
             match part {
                 TemplateTextPart::Literal(literal) => text.push_str(literal),
                 TemplateTextPart::InstanceValue(field) => {
+                    text.push_str(&token(&prefix, fields.len()));
+                    fields.push(field.clone());
+                }
+            }
+        }
+        Self {
+            text,
+            prefix,
+            fields,
+            substitutions: Vec::new(),
+        }
+    }
+
+    /// Take the value behind each token from the instance.
+    pub(super) fn with_values(
+        mut self,
+        values: &InstanceValues,
+    ) -> Result<Self, ManifestRenderError> {
+        self.substitutions =
+            self.fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
                     let value = values.get(field).ok_or_else(|| {
                         ManifestRenderError::MissingInstanceValue {
                             field: field.clone(),
                         }
                     })?;
-                    let token = format!("{prefix}{}-", substitutions.len());
-                    text.push_str(&token);
-                    substitutions.push((token, value.clone()));
-                }
-            }
-        }
-        Ok(Self {
-            text,
-            prefix,
-            substitutions,
-        })
+                    Ok((token(&self.prefix, index), value.clone()))
+                })
+                .collect::<Result<Vec<_>, ManifestRenderError>>()?;
+        Ok(self)
     }
 
     /// The manifest to parse, with a token wherever an instance value belongs.
@@ -122,6 +139,12 @@ impl PlaceholderDocument {
                 .map(|remainder| (value.as_str(), remainder))
         })
     }
+}
+
+/// The token that stands in for the instance value at `index`. The trailing dash
+/// closes it, so one token is never a prefix of another.
+fn token(prefix: &str, index: usize) -> String {
+    format!("{prefix}{index}-")
 }
 
 /// A token has to be distinguishable from the manifest around it, so the prefix

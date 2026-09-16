@@ -233,10 +233,6 @@ impl RuntimeConfig {
                 &mut api_limits.write_timeout,
             ),
             (
-                "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS",
-                &mut api_limits.subscription_lifetime,
-            ),
-            (
                 "SLEEPYPODS_CONTROL_PLANE_LOOKUP_TIMEOUT_MS",
                 &mut api_limits.lookup_timeout,
             ),
@@ -251,6 +247,20 @@ impl RuntimeConfig {
                 }
                 *setting = std::time::Duration::from_millis(value);
             }
+        }
+        // A subscription stream lives across many requests and the proxy keeps
+        // its route cache when one rotates, so the stream lifetime is allowed
+        // past the 60s request-timeout cap the shared duration loop applies to
+        // request-scoped settings. A longer lifetime rotates streams less often.
+        if let Some(value) =
+            postgres_positive_integer(&values, "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS")?
+        {
+            if value > 600_000 {
+                return Err(RuntimeConfigError::InvalidPostgresSetting {
+                    name: "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS",
+                });
+            }
+            api_limits.subscription_lifetime = std::time::Duration::from_millis(value);
         }
         // The positive route cache TTL bounds how long a dropped invalidation
         // can go unnoticed, so it is allowed past the 60s request-timeout cap
@@ -1060,6 +1070,53 @@ mod tests {
                     "{name}={value}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn subscription_lifetime_reaches_past_the_request_timeout_cap() {
+        let name = "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS";
+
+        for value in ["1", "60000", "300000", "600000"] {
+            let mut env = valid_env();
+            env.push((name, value));
+            assert!(
+                RuntimeConfig::from_key_values(env).is_ok(),
+                "{name}={value}"
+            );
+        }
+
+        for value in ["0", "-1", "1.5", "600001"] {
+            let mut env = valid_env();
+            env.push((name, value));
+            assert!(
+                matches!(RuntimeConfig::from_key_values(env),
+                Err(RuntimeConfigError::InvalidPostgresSetting { name: actual }) if actual == name),
+                "{name}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scoped_timeouts_stay_within_a_minute() {
+        for name in [
+            "SLEEPYPODS_CONTROL_PLANE_UNARY_DELIVERY_TIMEOUT_MS",
+            "SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS",
+            "SLEEPYPODS_CONTROL_PLANE_WRITE_TIMEOUT_MS",
+            "SLEEPYPODS_CONTROL_PLANE_LOOKUP_TIMEOUT_MS",
+            "SLEEPYPODS_CONTROL_PLANE_RESPONSE_TIMEOUT_MS",
+        ] {
+            let mut env = valid_env();
+            env.push((name, "60000"));
+            assert!(RuntimeConfig::from_key_values(env).is_ok(), "{name}=60000");
+
+            let mut env = valid_env();
+            env.push((name, "60001"));
+            assert!(
+                matches!(RuntimeConfig::from_key_values(env),
+                Err(RuntimeConfigError::InvalidPostgresSetting { name: actual }) if actual == name),
+                "{name}=60001"
+            );
         }
     }
 

@@ -506,7 +506,14 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
                 "value": "acme",
             }],
             "volumeMounts": [],
+            "securityContext": { "allowPrivilegeEscalation": false },
         })
+    );
+    let pod_spec = &deployment["spec"]["template"]["spec"];
+    assert_eq!(pod_spec["automountServiceAccountToken"], json!(false));
+    assert_eq!(
+        pod_spec["securityContext"],
+        json!({ "seccompProfile": { "type": "RuntimeDefault" } })
     );
     assert_eq!(
         deployment["spec"]["template"]["spec"]["containers"][1]["ports"][0],
@@ -1081,6 +1088,121 @@ metadata:
         "raw_objects.manifest.metadata.annotations",
         "sleepypods.io/template-generation must be \"3\", got non-string value",
     );
+}
+
+#[test]
+fn rejects_a_templated_raw_persistent_volume_that_omits_retain() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raw-pv-"#,
+        ),
+        TemplateTextPart::instance_value("tenant"),
+        TemplateTextPart::literal(
+            r#"
+spec:
+  capacity:
+    storage: 1Gi
+  persistentVolumeReclaimPolicy: Delete
+"#,
+        ),
+    ])];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect_err("a raw PV without Retain is rejected even when templated");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volumes.reclaim_policy",
+            message: "raw managed static PVs require explicit Retain".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_a_raw_persistent_volume_whose_reclaim_policy_an_instance_chooses() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raw-pv
+spec:
+  capacity:
+    storage: 1Gi
+  persistentVolumeReclaimPolicy: "#,
+        ),
+        TemplateTextPart::instance_value("reclaim"),
+        TemplateTextPart::literal("\n"),
+    ])];
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "instance-a",
+            7,
+            values([("tenant", "acme"), ("reclaim", "Retain")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect_err("an instance may not choose the reclaim policy");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volumes.reclaim_policy",
+            message: "raw managed static PVs require explicit Retain".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn renders_a_templated_raw_persistent_volume_that_declares_retain() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: raw-pv-"#,
+        ),
+        TemplateTextPart::instance_value("tenant"),
+        TemplateTextPart::literal(
+            r#"
+spec:
+  capacity:
+    storage: 1Gi
+  persistentVolumeReclaimPolicy: Retain
+"#,
+        ),
+    ])];
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("a templated raw PV declaring Retain renders");
+
+    assert_eq!(raw_object(&rendered).metadata.name, "raw-pv-acme");
 }
 
 #[test]
