@@ -63,3 +63,27 @@ jobs:
           set -o pipefail
           cargo test --locked -p control-plane --test postgres_store -- --nocapture --color never 2>&1 | tee postgres-store.out
           python3 scripts/check-postgres-execution.py postgres-store.out
+
+  kind-e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      # Each gate builds the production images itself. cargo chef keeps the
+      # cooked dependencies in a layer the three binaries share, so the first
+      # gate pays for them once and the second reuses the layer cache.
+      - name: Stateless lifecycle gate
+        run: ./scripts/test-kind-e2e-stateless.sh
+
+      - name: Routing and HTTP-01 gate
+        run: ./scripts/test-kind-e2e-routing.sh
