@@ -103,7 +103,10 @@ type PendingRouteResponses = Arc<
 
 #[derive(Debug)]
 enum GrpcRouteSubscriptionEvent {
-    Message(SubscribeControlPlaneOutput),
+    /// Boxed so one large payload does not set the size of every queued event.
+    /// Callers hand it straight to `RouteSubscriptionEvent::Update`, which owns
+    /// a box already.
+    Message(Box<SubscribeControlPlaneOutput>),
     /// The server ended the stream after delivering its queue, which is the
     /// ordinary outcome of the subscription lifetime cap.
     ResponseStreamEnded,
@@ -173,7 +176,7 @@ impl<T> GrpcProxyControlPlaneClient<T> {
                 .pop_front();
             if let Some(event) = event {
                 return match event {
-                    GrpcRouteSubscriptionEvent::Message(message) => Ok(message),
+                    GrpcRouteSubscriptionEvent::Message(message) => Ok(*message),
                     GrpcRouteSubscriptionEvent::ResponseStreamEnded
                     | GrpcRouteSubscriptionEvent::ResponseStreamClosed => {
                         Err(GrpcProxyControlPlaneError::SubscribeResponseStreamClosed)
@@ -446,7 +449,7 @@ where
             .into_iter()
             .map(|event| match event {
                 GrpcRouteSubscriptionEvent::Message(message) => {
-                    RouteSubscriptionEvent::Update(Box::new(message))
+                    RouteSubscriptionEvent::Update(message)
                 }
                 GrpcRouteSubscriptionEvent::ResponseStreamEnded => {
                     RouteSubscriptionEvent::StreamEnded
@@ -613,7 +616,9 @@ async fn read_subscription_responses(
                                 continue;
                             }
                             GrpcRouteSubscriptionEvent::UnexpectedRouteResponse { request_id }
-                        } else if events.push(GrpcRouteSubscriptionEvent::Message(message)) {
+                        } else if events
+                            .push(GrpcRouteSubscriptionEvent::Message(Box::new(message)))
+                        {
                             continue;
                         } else {
                             closed.store(true, Ordering::Release);

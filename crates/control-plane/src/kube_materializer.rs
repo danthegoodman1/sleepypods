@@ -1231,7 +1231,6 @@ mod tests {
                     ..EndpointPort::default()
                 }]
             }),
-            ..EndpointSlice::default()
         }
     }
 
