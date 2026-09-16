@@ -8,18 +8,18 @@ use crate::{
 };
 
 use super::{
-    ApplyOrder, Container, ContainerPort, ContainerTemplate, CsiPersistentVolumeSource,
-    CsiSecretRefTemplate, CsiSecretReference, Deployment, DeploymentSpec, EnvVar,
-    HostPathPersistentVolumeSource, KubernetesObject, LabelSelector, ManifestRenderError,
-    ManifestTemplate, ObjectMeta, PersistentVolume, PersistentVolumeAccessMode,
-    PersistentVolumeClaim, PersistentVolumeClaimRef, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy, PersistentVolumeSource,
-    PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec, PodTemplateMetadata,
-    PodTemplateSpec, PodVolume, RawKubernetesManifestTemplate, RawKubernetesObject,
-    RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret, SecretKeyRef, Service,
-    ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec,
-    TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind,
-    ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    bind::PlaceholderDocument, ApplyOrder, Container, ContainerPort, ContainerTemplate,
+    CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference, Deployment,
+    DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
+    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
+    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
+    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
+    PodTemplateMetadata, PodTemplateSpec, PodVolume, RawKubernetesManifestTemplate,
+    RawKubernetesObject, RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret,
+    SecretKeyRef, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet,
+    StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
+    WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
@@ -283,12 +283,23 @@ fn render_raw_object(
     metadata_labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
 ) -> Result<RenderedManifestObject, ManifestRenderError> {
-    let rendered = render_non_empty("raw_objects.manifest", &template.manifest, instance)?;
-    let mut value: Value =
-        serde_yaml::from_str(&rendered).map_err(|error| ManifestRenderError::InvalidField {
+    let document = PlaceholderDocument::new(&template.manifest, &instance.values)?;
+    if document.text().trim().is_empty() {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest",
+            message: "rendered value must not be empty".to_owned(),
+        });
+    }
+    let mut value: Value = serde_yaml::from_str(document.text()).map_err(|error| {
+        ManifestRenderError::InvalidField {
             field: "raw_objects.manifest",
             message: format!("manifest must be valid YAML or JSON: {error}"),
-        })?;
+        }
+    })?;
+    // Binding here puts every instance value inside a scalar of the parsed
+    // document, so the checks below and the object that reaches Kubernetes both
+    // see the values the tenant actually supplied.
+    document.bind(&mut value);
     reject_raw_primary_selector(&value)?;
     let object = value
         .as_object_mut()
@@ -871,15 +882,10 @@ fn render_volume(
             }))
         }
         PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
-            let path = render_non_empty("volume.source.host_path.path", path, instance)?;
-            if !path.starts_with('/') {
-                return Err(ManifestRenderError::InvalidField {
-                    field: "volume.source.host_path.path",
-                    message: format!("hostPath path {path:?} must be absolute"),
-                });
-            }
+            let rendered = render_non_empty("volume.source.host_path.path", path, instance)?;
+            validate_host_path(path, &rendered)?;
             PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
-                path,
+                path: rendered,
                 type_: type_
                     .as_ref()
                     .map(|value| render_non_empty("volume.source.host_path.type", value, instance))
@@ -1122,6 +1128,35 @@ fn render_non_empty(
         });
     }
     Ok(value)
+}
+
+/// A hostPath names a directory on the node, so the class author fixes its root
+/// and an instance may only choose a subdirectory beneath that root.
+fn validate_host_path(template: &TemplateText, rendered: &str) -> Result<(), ManifestRenderError> {
+    if !rendered.starts_with('/') {
+        return Err(ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: format!("hostPath path {rendered:?} must be absolute"),
+        });
+    }
+    if !template.literal_prefix().starts_with('/') {
+        return Err(ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: format!(
+                "hostPath path {rendered:?} must start with a literal absolute directory, \
+                 so that an instance value chooses a subdirectory rather than the root"
+            ),
+        });
+    }
+    if rendered.split('/').any(|segment| segment == "..") {
+        return Err(ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: format!(
+                "hostPath path {rendered:?} must stay inside its directory, so no segment may be \"..\""
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_namespace(namespace: &str) -> Result<(), ManifestRenderError> {
