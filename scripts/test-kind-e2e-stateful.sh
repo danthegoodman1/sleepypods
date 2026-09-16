@@ -311,6 +311,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -319,6 +321,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: no-auth
             - name: SLEEPYPODS_STORE_PROVIDER
@@ -344,6 +348,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -401,7 +408,7 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-frontline --timeout=180s
 
 echo "==> Starting local port-forward loops"
-start_port_forward_loop sleepypods-control-plane "${operator_port}" 50051 "${control_plane_pf_log}"
+start_port_forward_loop sleepypods-control-plane "${operator_port}" 50053 "${control_plane_pf_log}"
 control_plane_pf="${port_forward_loop_pid}"
 start_port_forward_loop sleepypods-frontline "${frontline_port}" 8080 "${frontline_pf_log}"
 frontline_pf="${port_forward_loop_pid}"

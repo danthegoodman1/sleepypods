@@ -40,7 +40,11 @@ use crate::{
     KubeMaterializerClient,
 };
 
+/// Carries the proxy and sidecar services, which in-cluster workloads reach.
 pub const CONTROL_PLANE_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR";
+/// Carries the operator service alone, on a listener a workload has no reason
+/// to reach. Keeping the two apart lets a NetworkPolicy separate them.
+pub const OPERATOR_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR";
 pub const OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR";
 pub const STORE_PROVIDER_ENV: &str = "SLEEPYPODS_STORE_PROVIDER";
 pub const POSTGRES_URL_ENV: &str = "SLEEPYPODS_POSTGRES_URL";
@@ -64,6 +68,7 @@ pub type RuntimeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub listen_addr: SocketAddr,
+    pub operator_listen_addr: SocketAddr,
     pub operator_grpc_web_listen_addr: Option<SocketAddr>,
     pub metrics_listen_addr: Option<SocketAddr>,
     pub control_plane: ControlPlaneConfig,
@@ -114,6 +119,7 @@ impl RuntimeConfig {
             .collect::<HashMap<_, _>>();
 
         let listen_addr = parse_required_socket_addr(&values, CONTROL_PLANE_LISTEN_ADDR_ENV)?;
+        let operator_listen_addr = parse_required_socket_addr(&values, OPERATOR_LISTEN_ADDR_ENV)?;
         let operator_grpc_web_listen_addr =
             parse_optional_socket_addr(&values, OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV)?;
         let metrics_listen_addr = parse_optional_socket_addr(&values, METRICS_LISTEN_ADDR_ENV)?;
@@ -280,6 +286,7 @@ impl RuntimeConfig {
             security,
             api_limits,
             listen_addr,
+            operator_listen_addr,
             operator_grpc_web_listen_addr,
             metrics_listen_addr,
             control_plane: ControlPlaneConfig::new(store, auth),
@@ -288,46 +295,10 @@ impl RuntimeConfig {
     }
 }
 
-pub fn native_control_plane_router<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-) -> NativeControlPlaneRouter
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    let route_events = RouteSubscriptionBroker::new();
-    native_control_plane_router_with_route_events(
-        store,
-        materializer,
-        target,
-        AuthConfig::NoAuth,
-        route_events,
-    )
-}
-
-fn native_control_plane_router_with_route_events<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    auth_config: AuthConfig,
-    route_events: RouteSubscriptionBroker,
-) -> NativeControlPlaneRouter
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    native_control_plane_router_with_tls(
-        store,
-        materializer,
-        target,
-        auth_config,
-        route_events,
-        None,
-    )
-    .expect("plaintext server configuration")
-}
-
-pub fn native_control_plane_router_with_tls<C>(
+/// The listener in-cluster workloads reach, carrying the proxy and sidecar
+/// services. The operator service stays off it, so a compromised workload finds
+/// nothing but the two APIs its own components already speak.
+pub fn workload_router_with_tls<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
@@ -339,28 +310,7 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
-    let mut server = tonic::transport::Server::builder();
-    if let Some(tls) = tls {
-        server = server.tls_config(tls)?;
-    }
-    Ok(server
-        .timeout(std::time::Duration::from_secs(10))
-        .max_concurrent_streams(32)
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
-        .layer(route_events.admission.clone())
-        .add_service(tonic::service::interceptor::InterceptedService::new(
-            operator_grpc_service_with_store_and_route_events(
-                Arc::clone(&store),
-                materializer.clone(),
-                target.clone(),
-                route_events.clone(),
-            ),
-            auth.interceptor(
-                crate::api::OPERATOR_SERVICE_NAME,
-                crate::auth::CallerRole::Operator,
-            ),
-        ))
+    Ok(grpc_server(route_events.clone(), tls)?
         .add_service(tonic::service::interceptor::InterceptedService::new(
             proxy_grpc_service_with_store_and_route_events(
                 Arc::clone(&store),
@@ -385,6 +335,54 @@ where
                 crate::auth::CallerRole::Sidecar,
             ),
         )))
+}
+
+/// The listener an operator reaches, carrying the operator service alone.
+pub fn operator_router_with_tls<C>(
+    store: Arc<dyn ControlPlaneStore>,
+    materializer: KubernetesMaterializer<C>,
+    target: MaterializationTarget,
+    auth_config: AuthConfig,
+    route_events: RouteSubscriptionBroker,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+) -> RuntimeResult<NativeControlPlaneRouter>
+where
+    C: KubernetesMaterializerClient + Clone + 'static,
+{
+    let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
+    Ok(grpc_server(route_events.clone(), tls)?.add_service(
+        tonic::service::interceptor::InterceptedService::new(
+            operator_grpc_service_with_store_and_route_events(
+                store,
+                materializer,
+                target,
+                route_events,
+            ),
+            auth.interceptor(
+                crate::api::OPERATOR_SERVICE_NAME,
+                crate::auth::CallerRole::Operator,
+            ),
+        ),
+    ))
+}
+
+/// The transport settings both native listeners share.
+fn grpc_server(
+    route_events: RouteSubscriptionBroker,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+) -> RuntimeResult<
+    tonic::transport::server::Server<Stack<crate::api::admission::RpcAdmissionLayer, Identity>>,
+> {
+    let mut server = tonic::transport::Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    Ok(server
+        .timeout(std::time::Duration::from_secs(10))
+        .max_concurrent_streams(32)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
+        .layer(route_events.admission.clone()))
 }
 
 pub fn operator_grpc_web_router<C>(
@@ -479,6 +477,13 @@ where
         config.api_limits.write_timeout,
     )
     .await?;
+    let operator_incoming = crate::runtime_io::BoundedIncoming::bind(
+        config.operator_listen_addr,
+        sockets.clone(),
+        config.api_limits.setup_timeout,
+        config.api_limits.write_timeout,
+    )
+    .await?;
     let web_incoming = if let Some(address) = config.operator_grpc_web_listen_addr {
         Some(
             crate::runtime_io::BoundedIncoming::bind(
@@ -498,7 +503,15 @@ where
             config.security.ca_pem.clone(),
         );
     let route_events = RouteSubscriptionBroker::with_limits(config.api_limits.clone());
-    let native_router = native_control_plane_router_with_tls(
+    let workload_router = workload_router_with_tls(
+        Arc::clone(&store),
+        materializer.clone(),
+        config.target.clone(),
+        config.control_plane.auth.clone(),
+        route_events.clone(),
+        config.security.tls(config.api_limits.setup_timeout)?,
+    )?;
+    let operator_router = operator_router_with_tls(
         Arc::clone(&store),
         materializer.clone(),
         config.target.clone(),
@@ -536,8 +549,20 @@ where
     listeners.spawn({
         let native_shutdown = native_shutdown.clone();
         async move {
-            native_router
+            workload_router
                 .serve_with_incoming_shutdown(native_incoming, wait_for_shutdown(native_shutdown))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
+        }
+    });
+    listeners.spawn({
+        let operator_shutdown = native_shutdown.clone();
+        async move {
+            operator_router
+                .serve_with_incoming_shutdown(
+                    operator_incoming,
+                    wait_for_shutdown(operator_shutdown),
+                )
                 .await
                 .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
         }
@@ -1074,6 +1099,72 @@ mod tests {
     }
 
     #[test]
+    fn env_config_requires_the_operator_listen_addr() {
+        assert!(matches!(
+            RuntimeConfig::from_key_values(valid_env_without(OPERATOR_LISTEN_ADDR_ENV)),
+            Err(RuntimeConfigError::MissingEnv {
+                name: OPERATOR_LISTEN_ADDR_ENV
+            })
+        ));
+    }
+
+    /// The listener a workload reaches carries no operator service, so a caller
+    /// that finds the port still finds no operator method behind it.
+    #[tokio::test]
+    async fn the_workload_listener_serves_no_operator_method() {
+        let store: Arc<dyn ControlPlaneStore> = Arc::new(NoopStore);
+        let materializer = KubernetesMaterializer::new(NoopKubernetesClient);
+        let target = MaterializationTarget::new("cluster-a", "apps").expect("target");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let router = workload_router_with_tls(
+            store,
+            materializer,
+            target,
+            AuthConfig::NoAuth,
+            RouteSubscriptionBroker::new(),
+            None,
+        )
+        .expect("workload router");
+        let mut served = JoinSet::new();
+        served.spawn(async move {
+            router
+                .serve_with_incoming(
+                    tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener),
+                )
+                .await
+        });
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let status =
+            crate::api::pb::operator_control_plane_client::OperatorControlPlaneClient::new(
+                channel.clone(),
+            )
+            .get_instance(crate::api::pb::GetInstanceRequest {
+                instance_id: "instance-a".to_owned(),
+            })
+            .await
+            .expect_err("the workload listener carries no operator service");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        // The services a workload does need answer on the same listener.
+        let reachable =
+            crate::api::pb::sidecar_control_plane_client::SidecarControlPlaneClient::new(channel)
+                .report_idle(crate::api::pb::SidecarReportIdleRequest::default())
+                .await
+                .expect_err("the request is invalid, but the service is present");
+        assert_ne!(reachable.code(), tonic::Code::Unimplemented);
+
+        served.abort_all();
+    }
+
+    #[test]
     fn subscription_lifetime_reaches_past_the_request_timeout_cap() {
         let name = "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS";
 
@@ -1381,13 +1472,29 @@ mod tests {
     }
 
     #[test]
-    fn constructs_native_and_operator_grpc_web_routers() {
+    fn constructs_a_router_for_each_listener() {
         let store: Arc<dyn ControlPlaneStore> = Arc::new(NoopStore);
         let materializer = KubernetesMaterializer::new(NoopKubernetesClient);
         let target = MaterializationTarget::new("cluster-a", "apps").expect("target");
 
-        let _native =
-            native_control_plane_router(Arc::clone(&store), materializer.clone(), target.clone());
+        let _workload = workload_router_with_tls(
+            Arc::clone(&store),
+            materializer.clone(),
+            target.clone(),
+            AuthConfig::NoAuth,
+            RouteSubscriptionBroker::new(),
+            None,
+        )
+        .expect("workload router");
+        let _operator = operator_router_with_tls(
+            Arc::clone(&store),
+            materializer.clone(),
+            target.clone(),
+            AuthConfig::NoAuth,
+            RouteSubscriptionBroker::new(),
+            None,
+        )
+        .expect("operator router");
         let _operator_grpc_web = operator_grpc_web_router(store, materializer, target);
     }
 
@@ -1501,6 +1608,7 @@ mod tests {
     fn valid_env() -> Vec<(&'static str, &'static str)> {
         vec![
             (CONTROL_PLANE_LISTEN_ADDR_ENV, "127.0.0.1:50051"),
+            (OPERATOR_LISTEN_ADDR_ENV, "127.0.0.1:50053"),
             (STORE_PROVIDER_ENV, "postgres"),
             (
                 POSTGRES_URL_ENV,

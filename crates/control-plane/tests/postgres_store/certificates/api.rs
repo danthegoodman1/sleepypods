@@ -51,31 +51,78 @@ fn query(known: Option<u64>) -> pb::ResolveTlsCertificateRequest {
         known_view_revision: known,
     }
 }
+/// The control plane keeps the operator service on its own listener, so a test
+/// that speaks both roles connects to both.
+struct TestServer {
+    workload_url: String,
+    operator_url: String,
+    ca: String,
+}
+
 async fn server(
     store: impl ControlPlaneStore + 'static,
     auth: AuthConfig,
     tls: bool,
     tasks: &mut tokio::task::JoinSet<()>,
-) -> TestResult<(String, String)> {
+) -> TestResult<TestServer> {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let ca = cert.pem();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
     // No Kubernetes request is valid in this test; certificate/HTTP01 methods
     // must not route, wake or materialize any instance.
     let kube = kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse()?))?;
-    let router = control_plane::runtime::native_control_plane_router_with_tls(
-        Arc::new(store),
-        KubernetesMaterializer::new(KubeMaterializerClient::new(kube)),
-        MaterializationTarget::new("test", "test")?,
-        auth,
-        RouteSubscriptionBroker::new(),
+    let store = Arc::new(store);
+    let materializer = KubernetesMaterializer::new(KubeMaterializerClient::new(kube));
+    let target = MaterializationTarget::new("test", "test")?;
+    let route_events = RouteSubscriptionBroker::new();
+    let identity = || {
         tls.then(|| {
             ServerTlsConfig::new()
                 .identity(Identity::from_pem(ca.clone(), signing_key.serialize_pem()))
-        }),
-    )?;
+        })
+    };
+
+    let workload_url = serve_router(
+        control_plane::runtime::workload_router_with_tls(
+            store.clone(),
+            materializer.clone(),
+            target.clone(),
+            auth.clone(),
+            route_events.clone(),
+            identity(),
+        )?,
+        tls,
+        tasks,
+    )
+    .await?;
+    let operator_url = serve_router(
+        control_plane::runtime::operator_router_with_tls(
+            store,
+            materializer,
+            target,
+            auth,
+            route_events,
+            identity(),
+        )?,
+        tls,
+        tasks,
+    )
+    .await?;
+
+    Ok(TestServer {
+        workload_url,
+        operator_url,
+        ca,
+    })
+}
+
+async fn serve_router(
+    router: control_plane::runtime::NativeControlPlaneRouter,
+    tls: bool,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> TestResult<String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     tasks.spawn(async move {
         router
             .serve_with_incoming(
@@ -84,13 +131,10 @@ async fn server(
             .await
             .unwrap();
     });
-    Ok((
-        format!(
-            "{}://localhost:{}",
-            if tls { "https" } else { "http" },
-            addr.port()
-        ),
-        ca,
+    Ok(format!(
+        "{}://localhost:{}",
+        if tls { "https" } else { "http" },
+        addr.port()
     ))
 }
 async fn channel(endpoint: String, ca: Option<&str>) -> TestResult<Channel> {
@@ -105,10 +149,16 @@ async fn postgres_certificate_native_tls_role_boundary_and_http01() -> TestResul
     database_test(|store, raw, _config| async move {
         let mut tasks = tokio::task::JoinSet::new();
         let result = async {
-            let (url, ca) = server(store.clone(), tokens(), true, &mut tasks).await?;
+            let served = server(store.clone(), tokens(), true, &mut tasks).await?;
+            let TestServer {
+                workload_url,
+                operator_url: url,
+                ca,
+            } = served;
             let connection = channel(url.clone(), Some(&ca)).await?;
             let mut operator = OperatorControlPlaneClient::new(connection.clone());
-            let mut proxy = ProxyControlPlaneClient::new(connection.clone());
+            let mut proxy =
+                ProxyControlPlaneClient::new(channel(workload_url, Some(&ca)).await?);
             let material = material(&["app.example"]);
             let publication = pb::PublishCertificateRequest {
                 certificate_id: "native".into(),
@@ -362,8 +412,11 @@ async fn postgres_certificate_native_tls_role_boundary_and_http01() -> TestResul
                 (tokens(), false),
                 (AuthConfig::NoAuth, false),
             ] {
-                let (url, ca) = server(store.clone(), auth, tls, &mut tasks).await?;
-                let connection = channel(url, tls.then_some(ca.as_str())).await?;
+                let served = server(store.clone(), auth, tls, &mut tasks).await?;
+                let ca = served.ca;
+                let trust = tls.then_some(ca.as_str());
+                let connection = channel(served.operator_url, trust).await?;
+                let workload_connection = channel(served.workload_url, trust).await?;
                 let mut client = OperatorControlPlaneClient::new(connection.clone());
                 let mut request = authorized(publication.clone(), "operator-secret");
                 request
@@ -378,7 +431,7 @@ async fn postgres_certificate_native_tls_role_boundary_and_http01() -> TestResul
                     Code::PermissionDenied
                 );
                 assert_eq!(
-                    ProxyControlPlaneClient::new(connection)
+                    ProxyControlPlaneClient::new(workload_connection)
                         .resolve_tls_certificate(authorized(query(None), "proxy-secret"))
                         .await
                         .unwrap_err()

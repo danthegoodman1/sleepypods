@@ -418,6 +418,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -426,6 +428,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: static-bearer-token
             - name: SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE
@@ -483,6 +487,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
 YAML
 
   KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-control-plane --timeout=180s
@@ -493,7 +500,7 @@ start_port_forwards() {
 
   echo "==> Starting local port-forwards"
   KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-    svc/sleepypods-control-plane "${operator_port}:50051" >"${control_plane_pf_log}" 2>&1 &
+    svc/sleepypods-control-plane "${operator_port}:50053" >"${control_plane_pf_log}" 2>&1 &
   control_plane_pf=$!
   KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
     svc/sleepypods-frontline "${tls_termination_port}:8443" "${tls_passthrough_port}:9443" >"${frontline_pf_log}" 2>&1 &

@@ -15,6 +15,7 @@ app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/routing-app:${image_
 late_app_image="${SLEEPYPODS_KIND_E2E_LATE_APP_IMAGE:-${image_prefix}/routing-app-late:${image_tag}-$(date +%s)-$$}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
+workload_port="${SLEEPYPODS_KIND_E2E_WORKLOAD_PORT:-19752}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19780}"
 control_plane_replicas="${SLEEPYPODS_KIND_E2E_CONTROL_PLANE_REPLICAS:-1}"
 kubeconfig="$(mktemp)"
@@ -288,6 +289,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -296,6 +299,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: no-auth
             - name: SLEEPYPODS_STORE_PROVIDER
@@ -321,6 +326,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -378,7 +386,8 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/sleepypods-frontline --timeout=180s
 
 echo "==> Starting local port-forward loops"
-start_port_forward_loop sleepypods-control-plane "${operator_port}" 50051 "${control_plane_pf_log}"
+start_port_forward_loop sleepypods-control-plane "${operator_port}" 50053 "${control_plane_pf_log}"
+start_port_forward_loop sleepypods-control-plane "${workload_port}" 50051 "${control_plane_pf_log}"
 control_plane_pf="${port_forward_loop_pid}"
 start_port_forward_loop sleepypods-frontline "${frontline_port}" 8080 "${frontline_pf_log}"
 frontline_pf="${port_forward_loop_pid}"
@@ -389,6 +398,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_KIND_CLUSTER="${cluster_name}" \
   SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
   SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
+  SLEEPYPODS_E2E_WORKLOAD_ENDPOINT="http://127.0.0.1:${workload_port}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_LATE_APP_IMAGE="${late_app_image}" \

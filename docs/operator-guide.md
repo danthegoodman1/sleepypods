@@ -67,8 +67,9 @@ operator or gRPC-Web APIs.
 Control-plane authentication is caller authentication at this API boundary. It
 does not authenticate application end users and it does not replace network
 policy, gateway, or service-mesh placement for direct control-plane exposure.
-Native gRPC operator, proxy, and sidecar services and the gRPC-Web operator
-listener use the same role policy:
+The operator service answers on its own listener, so a workload that reaches the
+proxy and sidecar listener finds no operator method behind it. Every listener
+applies the same role policy:
 
 - Operator credentials call `OperatorControlPlane`.
 - Proxy credentials call `ProxyControlPlane`, including HTTP-01 lookup and
@@ -739,8 +740,10 @@ absence in another cluster cannot release its reservations.
 
 Run three production components:
 
-- Control plane: native gRPC listener for operator, proxy, and sidecar services;
-  optional gRPC-Web listener for operator unary APIs.
+- Control plane: one native gRPC listener for the proxy and sidecar services,
+  a second for the operator service, and an optional gRPC-Web listener for
+  operator unary APIs. Workloads reach the first; keep the operator listeners on
+  a network path pods have no route to.
 - Frontline: always-on HTTP listener; optional TLS termination and TLS/SNI
   passthrough listeners; connects to the control plane.
 - Sidecar: injected into materialized workloads; proxies to the local app port
@@ -757,7 +760,8 @@ Important environment variables:
 
 | Component | Variable |
 | --- | --- |
-| control plane | `SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR` |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR` carries the proxy and sidecar services |
+| control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR` carries the operator service |
 | control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR` optional |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` for local tests, or `static-bearer-token` for configured auth |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |

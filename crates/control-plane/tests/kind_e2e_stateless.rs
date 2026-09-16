@@ -168,6 +168,8 @@ async fn stateless_http_lifecycle_through_deployed_platform() -> TestResult<()> 
 struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
+    /// The listener carrying the proxy and sidecar services.
+    workload_endpoint: String,
     frontline_addr: SocketAddr,
     frontline_metrics_addr: SocketAddr,
     app_image: String,
@@ -197,6 +199,8 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods-e2e-stateless".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:19051".to_owned()),
+            workload_endpoint: env::var("SLEEPYPODS_E2E_WORKLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:19052".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19080".to_owned())
                 .parse()?,
@@ -259,6 +263,12 @@ async fn assert_invalid_control_plane_credentials_fail(config: &E2eConfig) -> Te
         .timeout(Duration::from_secs(10))
         .connect()
         .await?;
+    // The proxy and sidecar services answer on their own listener.
+    let workload_channel = Endpoint::from_shared(config.workload_endpoint.clone())?
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(10))
+        .connect()
+        .await?;
 
     let mut operator = OperatorControlPlaneClient::with_interceptor(
         channel.clone(),
@@ -273,7 +283,7 @@ async fn assert_invalid_control_plane_credentials_fail(config: &E2eConfig) -> Te
     assert_eq!(operator_error.code(), Code::Unauthenticated);
 
     let mut proxy = ProxyControlPlaneClient::with_interceptor(
-        channel.clone(),
+        workload_channel.clone(),
         token_interceptor(&config.invalid_token)?,
     );
     let proxy_error = proxy
@@ -287,7 +297,7 @@ async fn assert_invalid_control_plane_credentials_fail(config: &E2eConfig) -> Te
     assert_eq!(proxy_error.code(), Code::Unauthenticated);
 
     let mut sidecar = SidecarControlPlaneClient::with_interceptor(
-        channel,
+        workload_channel,
         token_interceptor(&config.invalid_token)?,
     );
     let sidecar_error = sidecar
@@ -383,7 +393,7 @@ async fn begin_abandoned_wake(
     if created.state != PbInstanceState::Cold as i32 || created.generation != 0 {
         return Err(format!("abandoned fixture must start Cold generation0: {created:?}").into());
     }
-    let channel = Endpoint::from_shared(config.operator_endpoint.clone())?
+    let channel = Endpoint::from_shared(config.workload_endpoint.clone())?
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(10))
         .connect()

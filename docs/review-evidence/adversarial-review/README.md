@@ -33,11 +33,10 @@ directory and no rendered segment may be `..`.
 **F3, HTTP-01 on the operator surface — closed.** Serving an ACME challenge is a
 proxy read.
 
-**F4, one listener carries three roles — open.** `runtime.rs` adds the operator,
-proxy, and sidecar services to a single `Server`, so a workload pod that must
-reach the sidecar API can also reach the operator API. Distinct per-role tokens
-(`auth.rs` rejects duplicates) mean a workload holds no operator credential, so
-this is reachability rather than access.
+**F4, one listener carried three roles — closed.** The operator service answers
+on its own listener, set by `SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR`, and
+the listener workloads reach carries the proxy and sidecar services alone. An
+operator method on the workload listener answers `Unimplemented`.
 
 **F6, pod hardening — closed.** A rendered pod drops its ServiceAccount token,
 runs under the runtime's default seccomp profile, and gains no privileges.

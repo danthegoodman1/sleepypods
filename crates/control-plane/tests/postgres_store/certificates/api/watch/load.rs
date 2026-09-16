@@ -74,10 +74,12 @@ async fn postgres_sixteen_disjoint_maximum_watches_preserve_ordinary_progress_un
         let mut servers = tokio::task::JoinSet::new();
         let mut consumers = tokio::task::JoinSet::<TestResult<()>>::new();
         let result = async {
-            let (url, ca) = server(RetryingControlPlaneStore::with_default_policy(Arc::new(limited)), tokens(), true, &mut servers).await?;
-            let connection = channel(url, Some(&ca)).await?;
-            let mut proxy = ProxyControlPlaneClient::new(connection.clone());
-            let mut operator = OperatorControlPlaneClient::new(connection);
+            let served = server(RetryingControlPlaneStore::with_default_policy(Arc::new(limited)), tokens(), true, &mut servers).await?;
+            let ca = served.ca;
+            let mut proxy =
+                ProxyControlPlaneClient::new(channel(served.workload_url, Some(&ca)).await?);
+            let mut operator =
+                OperatorControlPlaneClient::new(channel(served.operator_url, Some(&ca)).await?);
             let counts = Arc::new(std::array::from_fn::<_,16,_>(|_| AtomicUsize::new(0)));
             let mut senders = Vec::new();
             let mut observed = Vec::new();

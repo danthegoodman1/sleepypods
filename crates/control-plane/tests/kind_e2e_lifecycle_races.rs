@@ -177,6 +177,8 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
 struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
+    /// The listener carrying the proxy and sidecar services.
+    workload_endpoint: String,
     frontline_addr: SocketAddr,
     cluster_name: String,
     app_image: String,
@@ -199,6 +201,8 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods-e2e-lifecycle-races".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:19851".to_owned()),
+            workload_endpoint: env::var("SLEEPYPODS_E2E_WORKLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:19852".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19880".to_owned())
                 .parse()?,
@@ -244,7 +248,7 @@ async fn concurrent_wake_calls_converge(
 
     let mut tasks = Vec::new();
     for _ in 0..4 {
-        let endpoint = config.operator_endpoint.clone();
+        let endpoint = config.workload_endpoint.clone();
         tasks.push(tokio::spawn(async move {
             let mut proxy = connect_proxy(&endpoint).await?;
             let response = proxy
@@ -362,7 +366,7 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     )
     .await?;
 
-    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let mut sidecar = connect_sidecar(&config.workload_endpoint).await?;
     let stale = sidecar
         .report_idle(SidecarReportIdleRequest {
             // Waking instances reject idle observations before membership inspection.
@@ -546,7 +550,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
             return Err("fixture requires the original StatefulSet delete permission".into());
         }
         sleep(Duration::from_secs(2)).await;
-        let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+        let mut sidecar = connect_sidecar(&config.workload_endpoint).await?;
         let (pod_uid, pod_generation) =
             current_idle_member(kube.clone(), &config.namespace, "lifecycle-delete-draining")
                 .await?;
@@ -755,7 +759,7 @@ async fn failed_wake_retry_rejects_stale_generation(
     )
     .await?;
 
-    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
     let stale = proxy
         .wake_instance(ProxyWakeInstanceRequest {
             instance_id: "lifecycle-failed-retry".to_owned(),
@@ -818,7 +822,7 @@ async fn stale_sidecar_report_is_rejected(
         30,
     )
     .await?;
-    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let mut sidecar = connect_sidecar(&config.workload_endpoint).await?;
     let (first_pod_uid, first_pod_generation) =
         current_idle_member(kube.clone(), &config.namespace, "lifecycle-stale-sidecar").await?;
     age_ready_for_controlled_lifecycle_case(
@@ -924,7 +928,7 @@ async fn idle_report_requires_current_single_member(
         wait_for_instance_state(operator, instance_id, PbInstanceState::Running, 30).await?;
     let (pod_uid, pod_generation) =
         current_idle_member(kube.clone(), &config.namespace, instance_id).await?;
-    let mut sidecar = connect_sidecar(&config.operator_endpoint).await?;
+    let mut sidecar = connect_sidecar(&config.workload_endpoint).await?;
     let report = SidecarReportIdleRequest {
         instance_id: instance_id.to_owned(),
         expected_generation: pod_generation,
@@ -1122,7 +1126,7 @@ async fn route_reassignment_invalidates_active_subscription(
     }
     // Prewarm through durable acceptance and read-only state observation. Never
     // resolve this frontend host until both backends can already serve traffic.
-    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
     for instance_id in ["lifecycle-reassign-old", "lifecycle-reassign-new"] {
         let instance = get_instance(operator, instance_id).await?;
         let wake = proxy

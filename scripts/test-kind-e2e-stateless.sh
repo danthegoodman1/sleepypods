@@ -12,6 +12,7 @@ image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-stateless}"
 app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/stateless-app:${image_tag}}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19051}"
+workload_port="${SLEEPYPODS_KIND_E2E_WORKLOAD_PORT:-19052}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19080}"
 frontline_metrics_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_METRICS_PORT:-19090}"
 operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
@@ -251,6 +252,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
           readinessProbe:
             tcpSocket:
               port: grpc
@@ -259,6 +262,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: static-bearer-token
             - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
@@ -290,6 +295,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -357,7 +365,7 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 
 echo "==> Starting local port-forwards"
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
-  svc/sleepypods-control-plane "${operator_port}:50051" >"${control_plane_pf_log}" 2>&1 &
+  svc/sleepypods-control-plane "${operator_port}:50053" "${workload_port}:50051" >"${control_plane_pf_log}" 2>&1 &
 control_plane_pf=$!
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
   svc/sleepypods-frontline "${frontline_port}:8080" "${frontline_metrics_port}:19090" >"${frontline_pf_log}" 2>&1 &
@@ -368,6 +376,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_KIND_E2E_STATELESS=1 \
   SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
   SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
+  SLEEPYPODS_E2E_WORKLOAD_ENDPOINT="http://127.0.0.1:${workload_port}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR="127.0.0.1:${frontline_metrics_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
