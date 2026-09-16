@@ -4854,3 +4854,6 @@ mod cleanup_boundary;
 
 #[path = "postgres_store/certificates.rs"]
 mod certificates;
+
+#[path = "postgres_store/crash_boundaries.rs"]
+mod crash_boundaries;
