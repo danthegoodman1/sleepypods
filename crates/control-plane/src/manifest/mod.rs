@@ -2,6 +2,7 @@ use std::{error::Error, fmt};
 
 use crate::{instance::InstanceRecord, sleep_policy::ResolvedSleepPolicy};
 
+mod bind;
 mod objects;
 mod render;
 mod serialize;

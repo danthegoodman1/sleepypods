@@ -8,10 +8,10 @@ use super::{
     EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject, ManifestRenderError,
     ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
     PersistentVolumeSource, PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate,
-    RenderManifestOptions, RenderManifestRequest, ServicePortTemplate, ServiceTemplate,
-    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
-    WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
-    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    RawKubernetesObject, RenderManifestOptions, RenderManifestRequest, RenderedManifest,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
+    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 use crate::materializer::{rendered_object_ref, rendered_object_refs};
 use crate::{
@@ -1080,6 +1080,237 @@ metadata:
         error,
         "raw_objects.manifest.metadata.annotations",
         "sleepypods.io/template-generation must be \"3\", got non-string value",
+    );
+}
+
+#[test]
+fn raw_manifest_binds_an_instance_value_that_spells_a_placeholder_once() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  annotations:
+    example.com/first: ""#,
+        ),
+        TemplateTextPart::instance_value("first"),
+        TemplateTextPart::literal(
+            r#""
+    example.com/second: ""#,
+        ),
+        TemplateTextPart::instance_value("second"),
+        TemplateTextPart::literal(
+            r#""
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+"#,
+        ),
+    ])];
+
+    // The first value spells the placeholder the second value uses, which a
+    // second pass over the document would replace.
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "instance-a",
+            7,
+            values([
+                ("tenant", "acme"),
+                ("first", "sleepypodsInstanceValue1-"),
+                ("second", "plain"),
+            ]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("raw object renders");
+
+    let annotations = &raw_object(&rendered).value["metadata"]["annotations"];
+    assert_eq!(
+        annotations["example.com/first"],
+        "sleepypodsInstanceValue1-"
+    );
+    assert_eq!(annotations["example.com/second"], "plain");
+}
+
+#[test]
+fn raw_manifest_keeps_literal_text_that_looks_like_a_placeholder() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  annotations:
+    example.com/author: "sleepypodsInstanceValue0-"
+    example.com/tenant: ""#,
+        ),
+        TemplateTextPart::instance_value("tenant"),
+        TemplateTextPart::literal(
+            r#""
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+"#,
+        ),
+    ])];
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("raw object renders");
+
+    let annotations = &raw_object(&rendered).value["metadata"]["annotations"];
+    assert_eq!(
+        annotations["example.com/author"],
+        "sleepypodsInstanceValue0-"
+    );
+    assert_eq!(annotations["example.com/tenant"], "acme");
+}
+
+#[test]
+fn raw_manifest_binds_an_instance_value_used_as_a_key() {
+    let mut template = deployment_template();
+    template.raw_objects = vec![raw_manifest_parts([
+        TemplateTextPart::literal(
+            r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-svc
+  annotations:
+    example.com/"#,
+        ),
+        TemplateTextPart::instance_value("tenant"),
+        TemplateTextPart::literal(
+            r#": owned
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+"#,
+        ),
+    ])];
+
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+        sleep_policy: sleep_policy(),
+        namespace: "apps",
+        template_generation: Some(Generation::new(3)),
+    })
+    .expect("raw object renders");
+
+    assert_eq!(
+        raw_object(&rendered).value["metadata"]["annotations"]["example.com/acme"],
+        "owned"
+    );
+}
+
+#[test]
+fn rejects_host_path_whose_root_an_instance_value_chooses() {
+    let mut template = host_path_stateful_template();
+    template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
+        path: TemplateText::instance_value("data_dir"),
+        type_: None,
+    };
+
+    let error = render_manifests(RenderManifestRequest {
+        template: &template,
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("data_dir", "/")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("a hostPath root chosen by an instance is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: "hostPath path \"/\" must start with a literal absolute directory, so that \
+                      an instance value chooses a subdirectory rather than the root"
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn rejects_host_path_that_climbs_out_of_the_authors_directory() {
+    let error = render_manifests(RenderManifestRequest {
+        template: &data_dir_host_path_template(),
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("data_dir", "acme/../../etc")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect_err("a hostPath climbing out of its directory is rejected");
+
+    assert_eq!(
+        error,
+        ManifestRenderError::InvalidField {
+            field: "volume.source.host_path.path",
+            message: "hostPath path \"/var/local/sleepypods/acme/../../etc\" must stay inside \
+                      its directory, so no segment may be \"..\""
+                .to_owned(),
+        }
+    );
+}
+
+#[test]
+fn renders_host_path_subdirectory_whose_name_begins_with_dots() {
+    let rendered = render_manifests(RenderManifestRequest {
+        template: &data_dir_host_path_template(),
+        instance: &instance(
+            "postgres-a",
+            2,
+            values([("tenant", "acme"), ("data_dir", "..data")]),
+        ),
+        sleep_policy: sleep_policy(),
+        namespace: "data",
+        template_generation: None,
+    })
+    .expect("a subdirectory whose name begins with dots still renders");
+
+    let volume = rendered
+        .objects
+        .iter()
+        .find_map(|object| match &object.object {
+            KubernetesObject::PersistentVolume(volume) => Some(volume),
+            _ => None,
+        })
+        .expect("PersistentVolume was rendered");
+
+    assert_eq!(
+        volume.spec.source,
+        PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
+            path: "/var/local/sleepypods/..data".to_owned(),
+            type_: Some("DirectoryOrCreate".to_owned()),
+        })
     );
 }
 
@@ -2182,6 +2413,20 @@ fn host_path_stateful_template() -> ManifestTemplate {
     template
 }
 
+/// A hostPath template whose subdirectory comes from its own field, leaving the
+/// workload name free to stay a valid Kubernetes name.
+fn data_dir_host_path_template() -> ManifestTemplate {
+    let mut template = host_path_stateful_template();
+    template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
+        path: TemplateText::from_parts([
+            TemplateTextPart::literal("/var/local/sleepypods/"),
+            TemplateTextPart::instance_value("data_dir"),
+        ]),
+        type_: Some(TemplateText::literal("DirectoryOrCreate")),
+    };
+    template
+}
+
 fn sidecar_template() -> SidecarTemplate {
     SidecarTemplate {
         name: "sleepypods-sidecar".to_owned(),
@@ -2238,6 +2483,23 @@ fn raw_manifest(manifest: &str) -> RawKubernetesManifestTemplate {
     RawKubernetesManifestTemplate {
         manifest: TemplateText::literal(manifest),
     }
+}
+
+fn raw_manifest_parts(parts: impl Into<Vec<TemplateTextPart>>) -> RawKubernetesManifestTemplate {
+    RawKubernetesManifestTemplate {
+        manifest: TemplateText::from_parts(parts),
+    }
+}
+
+fn raw_object(rendered: &RenderedManifest) -> &RawKubernetesObject {
+    rendered
+        .objects
+        .iter()
+        .find_map(|object| match &object.object {
+            KubernetesObject::Raw(raw) => Some(raw),
+            _ => None,
+        })
+        .expect("raw object was rendered")
 }
 
 fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {

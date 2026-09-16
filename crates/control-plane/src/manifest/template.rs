@@ -231,6 +231,15 @@ impl TemplateText {
         &self.parts
     }
 
+    /// The text the class author fixed at the front, which renders the same for
+    /// every instance. Empty when an instance value comes first.
+    pub fn literal_prefix(&self) -> &str {
+        match self.parts.first() {
+            Some(TemplateTextPart::Literal(literal)) => literal,
+            Some(TemplateTextPart::InstanceValue(_)) | None => "",
+        }
+    }
+
     pub fn render(&self, values: &InstanceValues) -> Result<String, ManifestRenderError> {
         let mut rendered = String::new();
         for part in &self.parts {
