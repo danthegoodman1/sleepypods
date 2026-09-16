@@ -673,6 +673,44 @@ fn assert_response(response: &HttpResponse, context: &str) -> TestResult<()> {
     Ok(())
 }
 
+/// The hardening the platform applies to every pod it renders, read back from
+/// the object the API server accepted.
+fn assert_pod_hardening(pod_spec: &k8s_openapi::api::core::v1::PodSpec) -> TestResult<()> {
+    if pod_spec.automount_service_account_token != Some(false) {
+        return Err(format!(
+            "materialized pod must decline its ServiceAccount token, got {:?}",
+            pod_spec.automount_service_account_token
+        )
+        .into());
+    }
+    let seccomp = pod_spec
+        .security_context
+        .as_ref()
+        .and_then(|context| context.seccomp_profile.as_ref())
+        .ok_or("materialized pod is missing its seccomp profile")?;
+    if seccomp.type_ != "RuntimeDefault" {
+        return Err(format!(
+            "materialized pod must run the runtime's default seccomp profile, got {:?}",
+            seccomp.type_
+        )
+        .into());
+    }
+    for container in &pod_spec.containers {
+        let escalation = container
+            .security_context
+            .as_ref()
+            .and_then(|context| context.allow_privilege_escalation);
+        if escalation != Some(false) {
+            return Err(format!(
+                "container {:?} must gain no privileges, got {escalation:?}",
+                container.name
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 async fn assert_materialized_deployment_and_service(
     kube: Client,
     config: &E2eConfig,
@@ -686,6 +724,7 @@ async fn assert_materialized_deployment_and_service(
         .as_ref()
         .and_then(|spec| spec.template.spec.as_ref())
         .ok_or("materialized Deployment is missing pod spec")?;
+    assert_pod_hardening(pod_spec)?;
     let app = pod_spec
         .containers
         .iter()

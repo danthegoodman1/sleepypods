@@ -647,7 +647,7 @@ Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 | `MAX_SUBSCRIPTIONS_PER_STREAM` | 256 dependency entries |
 | `SETUP_TIMEOUT_MS` / `WRITE_TIMEOUT_MS` | 5000 / 5000 |
 | `UNARY_DELIVERY_TIMEOUT_MS` | 5000 from response headers to complete delivery |
-| `SUBSCRIPTION_LIFETIME_MS` | 60000, then reconnect/refresh |
+| `SUBSCRIPTION_LIFETIME_MS` | 60000, at most 600000; then reconnect/refresh |
 | `LOOKUP_TIMEOUT_MS` / `RESPONSE_TIMEOUT_MS` | 3000 / 1000 |
 | `POSITIVE_ROUTE_CACHE_TTL_MS` | 60000, at most 600000; bounds a missed invalidation |
 

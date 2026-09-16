@@ -37,43 +37,34 @@ impl ManifestTemplate {
             return Err(ManifestRenderError::InvalidField { field: "volumes.reclaim_policy", message: "managed static volumes require Retain; provider-volume deletion is outside the lifecycle contract".into() });
         }
         for raw in &self.raw_objects {
-            let literal = raw
-                .manifest
-                .parts
-                .iter()
-                .try_fold(String::new(), |mut text, part| match part {
-                    TemplateTextPart::Literal(value) => {
-                        text.push_str(value);
-                        Some(text)
-                    }
-                    TemplateTextPart::InstanceValue(_) => None,
-                });
-            if let Some(literal) = literal {
-                if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(&literal) {
-                    if value["kind"] == "PersistentVolume"
-                        && value
-                            .pointer("/spec/persistentVolumeReclaimPolicy")
-                            .and_then(serde_json::Value::as_str)
-                            != Some("Retain")
-                    {
-                        return Err(ManifestRenderError::InvalidField {
-                            field: "volumes.reclaim_policy",
-                            message: "raw managed static PVs require explicit Retain".into(),
-                        });
-                    }
-                    if value["kind"] == "PersistentVolumeClaim"
-                        && value
-                            .pointer("/spec/volumeName")
-                            .and_then(serde_json::Value::as_str)
-                            .is_none_or(str::is_empty)
-                    {
-                        return Err(ManifestRenderError::InvalidField {
-                            field: "volumes.static_binding",
-                            message:
-                                "raw PVCs require explicit static bindings in managed inventory"
-                                    .into(),
-                        });
-                    }
+            // Reading the manifest with a token in each instance value's place
+            // puts a templated raw volume under the same retention checks as a
+            // literal one. A token is not "Retain", so a class that lets an
+            // instance choose the reclaim policy fails here.
+            let document = super::bind::PlaceholderDocument::new(&raw.manifest);
+            if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(document.text()) {
+                if value["kind"] == "PersistentVolume"
+                    && value
+                        .pointer("/spec/persistentVolumeReclaimPolicy")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("Retain")
+                {
+                    return Err(ManifestRenderError::InvalidField {
+                        field: "volumes.reclaim_policy",
+                        message: "raw managed static PVs require explicit Retain".into(),
+                    });
+                }
+                if value["kind"] == "PersistentVolumeClaim"
+                    && value
+                        .pointer("/spec/volumeName")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(ManifestRenderError::InvalidField {
+                        field: "volumes.static_binding",
+                        message: "raw PVCs require explicit static bindings in managed inventory"
+                            .into(),
+                    });
                 }
             }
         }

@@ -283,7 +283,7 @@ fn render_raw_object(
     metadata_labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
 ) -> Result<RenderedManifestObject, ManifestRenderError> {
-    let document = PlaceholderDocument::new(&template.manifest, &instance.values)?;
+    let document = PlaceholderDocument::new(&template.manifest).with_values(&instance.values)?;
     if document.text().trim().is_empty() {
         return Err(ManifestRenderError::InvalidField {
             field: "raw_objects.manifest",

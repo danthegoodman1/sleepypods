@@ -233,6 +233,11 @@ fn pod_template_to_value(template: &PodTemplateSpec) -> Value {
         "spec": {
             "containers": template.spec.containers.iter().map(container_to_value).collect::<Vec<_>>(),
             "volumes": template.spec.volumes.iter().map(pod_volume_to_value).collect::<Vec<_>>(),
+            // A workload talks to the control plane over gRPC with the sidecar's
+            // own credential, so it needs no ServiceAccount token and no syscalls
+            // beyond the container runtime's default set.
+            "automountServiceAccountToken": false,
+            "securityContext": { "seccompProfile": { "type": "RuntimeDefault" } },
         },
     })
 }
@@ -251,6 +256,9 @@ fn container_to_value(container: &Container) -> Value {
         "ports": container.ports.iter().map(container_port_to_value).collect::<Vec<_>>(),
         "env": container.env.iter().map(env_var_to_value).collect::<Vec<_>>(),
         "volumeMounts": container.volume_mounts.iter().map(volume_mount_to_value).collect::<Vec<_>>(),
+        // A container starts with the privileges its image needs and gains none
+        // after that, so a setuid binary inside it stays at the same level.
+        "securityContext": { "allowPrivilegeEscalation": false },
     });
     if let Some(probe) = &container.readiness_probe {
         value["readinessProbe"] = json!({

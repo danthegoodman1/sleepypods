@@ -62,6 +62,28 @@ pub struct RenderedExclusivityKey {
 pub enum ValueSchemaError {
     MissingRequiredField { field: String },
     UnknownField { field: String },
+    ControlCharacter { field: String, character: char },
+    TooLong { field: String, length: usize },
+}
+
+/// An instance value fills one scalar of a manifest, so it stays printable text
+/// of a length a Kubernetes field can hold.
+pub const MAX_INSTANCE_VALUE_LENGTH: usize = 4096;
+
+fn validate_value_text(field: &str, value: &str) -> Result<(), ValueSchemaError> {
+    if let Some(character) = value.chars().find(|character| character.is_control()) {
+        return Err(ValueSchemaError::ControlCharacter {
+            field: field.to_owned(),
+            character,
+        });
+    }
+    if value.len() > MAX_INSTANCE_VALUE_LENGTH {
+        return Err(ValueSchemaError::TooLong {
+            field: field.to_owned(),
+            length: value.len(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +201,10 @@ impl WorkloadValueSchema {
                     });
                 }
             }
+        }
+
+        for (field, value) in values {
+            validate_value_text(field, value)?;
         }
 
         let mut validated = values.clone();
@@ -300,6 +326,16 @@ impl fmt::Display for ValueSchemaError {
                 write!(f, "missing required instance value {field:?}")
             }
             Self::UnknownField { field } => write!(f, "unknown instance value {field:?}"),
+            Self::ControlCharacter { field, character } => write!(
+                f,
+                "instance value {field:?} holds control character {character:?}; \
+                 an instance value stays printable text"
+            ),
+            Self::TooLong { field, length } => write!(
+                f,
+                "instance value {field:?} is {length} bytes, over the \
+                 {MAX_INSTANCE_VALUE_LENGTH} byte limit"
+            ),
         }
     }
 }

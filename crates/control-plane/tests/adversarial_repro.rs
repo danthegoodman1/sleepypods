@@ -243,12 +243,12 @@ spec:
 }
 
 // --------------------------------------------------------------------------
-// F6: the rendered (non-raw) pod spec has no hardening at all - no
-// automountServiceAccountToken:false, no securityContext, no runtimeClassName.
+// F6 (fixed): a rendered pod drops the ServiceAccount token it has no use for,
+// runs under the runtime's default seccomp profile, and gains no privileges.
 // --------------------------------------------------------------------------
 
 #[test]
-fn rendered_pod_spec_has_no_sandbox_or_service_account_hardening() {
+fn rendered_pod_spec_drops_its_service_account_token_and_sandboxes_the_workload() {
     let rendered = render_manifests(RenderManifestRequest {
         template: &base_template(),
         instance: &instance("tenant-a", 1, values([("tag", "1")])),
@@ -270,21 +270,53 @@ fn rendered_pod_spec_has_no_sandbox_or_service_account_hardening() {
     let json = KubernetesObject::Deployment(deployment.clone()).to_kubernetes_json();
     let pod_spec = &json["spec"]["template"]["spec"];
 
-    // Only containers and volumes are emitted: the workload keeps the default
-    // ServiceAccount token, no runtimeClass, and no seccomp/securityContext.
-    assert!(pod_spec["automountServiceAccountToken"].is_null());
-    assert!(pod_spec["runtimeClassName"].is_null());
-    assert!(pod_spec["securityContext"].is_null());
-    assert!(pod_spec["containers"][0]["securityContext"].is_null());
+    assert_eq!(pod_spec["automountServiceAccountToken"], false);
+    assert_eq!(
+        pod_spec["securityContext"]["seccompProfile"]["type"],
+        "RuntimeDefault"
+    );
+    for container in pod_spec["containers"]
+        .as_array()
+        .expect("containers are an array")
+    {
+        assert_eq!(
+            container["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+    }
 }
 
 // --------------------------------------------------------------------------
-// F7: the value schema validates presence only, so any string passes and can
-// carry the YAML payload used above.
+// F7 (fixed): an instance value stays printable text, so the newlines a YAML
+// payload needs keep it out of the schema.
 // --------------------------------------------------------------------------
 
 #[test]
-fn value_schema_accepts_yaml_payload_as_a_declared_field() {
+fn value_schema_rejects_a_multi_line_yaml_payload() {
+    let schema = WorkloadValueSchema::new(false).with_field(
+        "tag",
+        WorkloadValueFieldRule {
+            required: true,
+            default: None,
+        },
+    );
+
+    let error = schema
+        .validate_values(&values([(
+            "tag",
+            "1\"\n          securityContext:\n            privileged: true\n#",
+        )]))
+        .expect_err("a value carrying newlines is rejected");
+
+    assert!(
+        format!("{error}").contains("control character"),
+        "unexpected error: {error}"
+    );
+}
+
+/// An ordinary value keeps working: printable text of any shape passes.
+#[test]
+fn value_schema_accepts_printable_text() {
     let schema = WorkloadValueSchema::new(false).with_field(
         "tag",
         WorkloadValueFieldRule {
@@ -294,13 +326,10 @@ fn value_schema_accepts_yaml_payload_as_a_declared_field() {
     );
 
     let validated = schema
-        .validate_values(&values([(
-            "tag",
-            "1\"\n          securityContext:\n            privileged: true\n#",
-        )]))
-        .expect("schema validation only checks field presence");
+        .validate_values(&values([("tag", "1.2.3-rc1+build.7")]))
+        .expect("printable text is valid");
 
-    assert!(validated["tag"].contains("privileged: true"));
+    assert_eq!(validated["tag"], "1.2.3-rc1+build.7");
 }
 
 /// Binding after the parse means an instance value is always a string scalar.
