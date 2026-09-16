@@ -281,6 +281,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
             - name: grpc-web
               containerPort: 50052
           readinessProbe:
@@ -291,6 +293,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR
               value: 0.0.0.0:50052
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
@@ -324,6 +328,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
     - name: grpc-web
       port: 50052
       targetPort: 50052

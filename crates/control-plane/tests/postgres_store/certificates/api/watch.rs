@@ -59,8 +59,10 @@ async fn postgres_tls_watch_two_replicas_forced_registration_rotation_rebind_and
             .with_certificate_sealer(ring("a", &[("a", 7)]));
         let mut tasks = tokio::task::JoinSet::new();
         let result = async {
-            let (url1, ca1) = server(store.clone(), tokens(), true, &mut tasks).await?;
-            let (url2, ca2) = server(second.clone(), tokens(), true, &mut tasks).await?;
+            let first_server = server(store.clone(), tokens(), true, &mut tasks).await?;
+            let second_server = server(second.clone(), tokens(), true, &mut tasks).await?;
+            let (url1, ca1) = (first_server.workload_url, first_server.ca);
+            let (url2, ca2) = (second_server.workload_url, second_server.ca);
             let mut first = ProxyControlPlaneClient::new(channel(url1, Some(&ca1)).await?);
             let mut other = ProxyControlPlaneClient::new(channel(url2, Some(&ca2)).await?);
             store
@@ -207,7 +209,8 @@ async fn postgres_tls_watch_native_role_size_initial_timeout_and_capacity() -> T
             .with_certificate_sealer(ring("a", &[("a", 7)]));
         let mut tasks = tokio::task::JoinSet::new();
         let result = async {
-            let (url, ca) = server(limited.clone(), tokens(), true, &mut tasks).await?;
+            let served = server(limited.clone(), tokens(), true, &mut tasks).await?;
+            let (url, ca) = (served.workload_url, served.ca);
             let connection = channel(url, Some(&ca)).await?;
             let mut client = ProxyControlPlaneClient::new(connection.clone());
             for token in ["operator-secret", "sidecar-secret", "wrong-secret"] {
@@ -312,7 +315,8 @@ async fn postgres_tls_watch_native_role_size_initial_timeout_and_capacity() -> T
             ));
             drop((send, events));
             for (auth, tls) in [(AuthConfig::NoAuth, true), (tokens(), false)] {
-                let (url, ca) = server(store.clone(), auth, tls, &mut tasks).await?;
+                let served = server(store.clone(), auth, tls, &mut tasks).await?;
+                let (url, ca) = (served.workload_url, served.ca);
                 let mut insecure =
                     ProxyControlPlaneClient::new(channel(url, tls.then_some(ca.as_str())).await?);
                 let mut request = authorized(

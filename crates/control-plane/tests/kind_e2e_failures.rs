@@ -106,6 +106,8 @@ async fn failure_paths_through_deployed_platform() -> TestResult<()> {
 struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
+    /// The listener carrying the proxy and sidecar services.
+    workload_endpoint: String,
     frontline_addr: SocketAddr,
     app_image: String,
     sidecar_image: String,
@@ -124,6 +126,8 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods-e2e-failures".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:19651".to_owned()),
+            workload_endpoint: env::var("SLEEPYPODS_E2E_WORKLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:19652".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19680".to_owned())
                 .parse()?,
@@ -269,7 +273,7 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
     kube: Client,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
 
     create_class_instance_and_route(
         operator,
@@ -397,7 +401,7 @@ async fn duplicate_volume_inventory_is_rejected_before_acceptance(
     .await?;
     let created = get_instance(operator, DUPLICATE_VOLUME_INSTANCE_ID).await?;
     assert_state(&created, PbInstanceState::Cold)?;
-    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
     let error = proxy
         .wake_instance(ProxyWakeInstanceRequest {
             instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
@@ -487,7 +491,7 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
     )
     .await?;
 
-    let mut proxy = connect_proxy(&config.operator_endpoint).await?;
+    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
     let started = Instant::now();
     let accepted = proxy
         .wake_instance(ProxyWakeInstanceRequest {

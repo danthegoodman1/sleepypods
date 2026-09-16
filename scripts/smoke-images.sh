@@ -88,6 +88,7 @@ smoke_run() {
     control-plane)
       docker run --rm \
         --env SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR=127.0.0.1:50051 \
+        --env SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR=127.0.0.1:50053 \
         --env SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth \
         --env SLEEPYPODS_STORE_PROVIDER=postgres \
         --env SLEEPYPODS_POSTGRES_URL=postgres://sleepypods:sleepypods@127.0.0.1:9/sleepypods \

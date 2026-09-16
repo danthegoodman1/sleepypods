@@ -132,6 +132,8 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
 struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
+    /// The listener carrying the proxy and sidecar services.
+    workload_endpoint: String,
     frontline_addr: SocketAddr,
     cluster_name: String,
     app_image: String,
@@ -154,6 +156,8 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods-e2e-restart".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:19751".to_owned()),
+            workload_endpoint: env::var("SLEEPYPODS_E2E_WORKLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:19752".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19780".to_owned())
                 .parse()?,
@@ -202,7 +206,7 @@ async fn restart_during_wake_recovers_without_stale_backend(
     // Complete the sole wake acceptance before restart. A pending frontend
     // request could otherwise issue another Wake RPC while recovery is checked.
     let mut proxy = ProxyControlPlaneClient::new(
-        Endpoint::from_shared(config.operator_endpoint.clone())?
+        Endpoint::from_shared(config.workload_endpoint.clone())?
             .connect()
             .await?,
     );
@@ -657,7 +661,7 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
     // Prewarm both backends without resolving REASSIGN_HOST through the
     // frontend. Its first later lookup will have a fresh positive cache TTL.
     let mut proxy = ProxyControlPlaneClient::new(
-        Endpoint::from_shared(config.operator_endpoint.clone())?
+        Endpoint::from_shared(config.workload_endpoint.clone())?
             .connect()
             .await?,
     );
@@ -690,7 +694,7 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
     }
     drop(proxy);
 
-    restart_control_plane_pod(kube, &config.namespace, &config.operator_endpoint).await?;
+    restart_control_plane_pod(kube, &config.namespace, config).await?;
     let mut operator = connect_operator(&config.operator_endpoint).await?;
     // Running does not establish a frontend subscription or Service connection.
     // Complete both paths through distinct exact identities before starting the
@@ -849,9 +853,9 @@ async fn http01_challenges_survive_restart_and_cleanup(
     )
     .await?;
 
-    restart_control_plane_pod(kube.clone(), &config.namespace, &config.operator_endpoint).await?;
+    restart_control_plane_pod(kube.clone(), &config.namespace, config).await?;
     let mut operator = connect_operator(&config.operator_endpoint).await?;
-    let resolved = ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+    let resolved = ProxyControlPlaneClient::connect(config.workload_endpoint.clone())
         .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_TOKEN)),
@@ -910,7 +914,7 @@ async fn http01_challenges_survive_restart_and_cleanup(
         SystemTime::now() + Duration::from_secs(90),
     )
     .await?;
-    restart_control_plane_pod(kube, &config.namespace, &config.operator_endpoint).await?;
+    restart_control_plane_pod(kube, &config.namespace, config).await?;
     let mut operator = connect_operator(&config.operator_endpoint).await?;
     let expiring_path = challenge_path(HTTP01_EXPIRING_TOKEN);
     wait_for_http01_response(
@@ -935,7 +939,7 @@ async fn http01_challenges_survive_restart_and_cleanup(
         renewed_expiry,
     )
     .await?;
-    let renewed = ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+    let renewed = ProxyControlPlaneClient::connect(config.workload_endpoint.clone())
         .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
@@ -965,7 +969,7 @@ async fn http01_challenges_survive_restart_and_cleanup(
     {
         return Err("expired HTTP-01 key authorization was still served after restart".into());
     }
-    if ProxyControlPlaneClient::connect(config.operator_endpoint.clone())
+    if ProxyControlPlaneClient::connect(config.workload_endpoint.clone())
         .await?
         .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
             key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
@@ -1262,7 +1266,7 @@ fn instance_state(instance: &Instance) -> PbInstanceState {
 async fn restart_control_plane_pod(
     kube: Client,
     namespace: &str,
-    operator_endpoint: &str,
+    config: &E2eConfig,
 ) -> TestResult<()> {
     let pods: Api<Pod> = Api::namespaced(kube, namespace);
     let original = pods
@@ -1295,9 +1299,45 @@ async fn restart_control_plane_pod(
         Duration::from_secs(120),
     )
     .await?;
-    connect_operator(operator_endpoint).await?;
+    // Both listeners are forwarded separately, so both have to answer again
+    // before a caller picks either one back up.
+    connect_operator(&config.operator_endpoint).await?;
+    connect_workload(&config.workload_endpoint).await?;
 
     Ok(())
+}
+
+/// The proxy listener, once it answers a read that changes nothing.
+async fn connect_workload(endpoint: &str) -> TestResult<ProxyControlPlaneClient<Channel>> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let attempt = async {
+            let channel = Endpoint::from_shared(endpoint.to_owned())?
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(10))
+                .connect()
+                .await?;
+            let mut client = ProxyControlPlaneClient::new(channel);
+            client
+                .resolve_http01_challenge(ResolveHttp01ChallengeRequest {
+                    key: Some(http01_key(
+                        "connectivity-probe.invalid",
+                        "connectivity-probe",
+                    )),
+                })
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(client)
+        }
+        .await;
+        match attempt {
+            Ok(client) => return Ok(client),
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("waiting for proxy gRPC endpoint {endpoint}: {error}");
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn scale_control_plane(kube: Client, namespace: &str, replicas: i32) -> TestResult<()> {

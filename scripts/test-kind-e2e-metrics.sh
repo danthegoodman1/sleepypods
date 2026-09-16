@@ -334,6 +334,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 50051
+            - name: operator
+              containerPort: 50053
             - name: metrics
               containerPort: 19090
           readinessProbe:
@@ -344,6 +346,8 @@ spec:
           env:
             - name: SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR
               value: 0.0.0.0:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR
+              value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR
               value: 0.0.0.0:19090
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
@@ -371,6 +375,9 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
+    - name: operator
+      port: 50053
+      targetPort: 50053
     - name: metrics
       port: 19090
       targetPort: 19090
@@ -513,7 +520,7 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 
 echo "==> Starting local port-forwards"
 start_port_forward sleepypods-control-plane \
-  "${operator_port}:50051" \
+  "${operator_port}:50053" \
   "${control_plane_metrics_port}:19090"
 start_port_forward sleepypods-frontline \
   "${frontline_port}:8080" \

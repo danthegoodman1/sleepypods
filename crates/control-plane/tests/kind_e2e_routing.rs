@@ -158,6 +158,8 @@ struct RouteSpec {
 struct E2eConfig {
     namespace: String,
     operator_endpoint: String,
+    /// The listener carrying the proxy and sidecar services.
+    workload_endpoint: String,
     frontline_addr: SocketAddr,
     app_image: String,
     sidecar_image: String,
@@ -177,6 +179,8 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods-e2e-routing".to_owned()),
             operator_endpoint: env::var("SLEEPYPODS_E2E_OPERATOR_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:19251".to_owned()),
+            workload_endpoint: env::var("SLEEPYPODS_E2E_WORKLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:19252".to_owned()),
             frontline_addr: env::var("SLEEPYPODS_E2E_FRONTLINE_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:19280".to_owned())
                 .parse()?,
@@ -416,7 +420,7 @@ async fn assert_http01_flow(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    let mut proxy = ProxyControlPlaneClient::connect(config.operator_endpoint.clone()).await?;
+    let mut proxy = ProxyControlPlaneClient::connect(config.workload_endpoint.clone()).await?;
     wait_for_instance_response(
         config,
         "normal route before HTTP-01 challenge",
