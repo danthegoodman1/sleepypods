@@ -253,7 +253,7 @@ where
             let pending = Arc::new(Mutex::new(HashMap::new()));
             let closed = Arc::new(AtomicBool::new(false));
             let id = NEXT_SUBSCRIPTION_SESSION
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("subscription session ID space exhausted");
             let reader = tokio::spawn(read_subscription_responses(
                 responses,
