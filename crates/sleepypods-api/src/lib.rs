@@ -17,6 +17,9 @@ pub mod transport;
 pub mod ids {
     pub use sleepypods_types::*;
 }
+/// Clippy 1.99 reads tonic's generated server traits as marking `#[must_use]`
+/// on futures that already carry it.
+#[allow(clippy::double_must_use)]
 pub mod pb {
     tonic::include_proto!("sleepypods.controlplane.v1");
 }
