@@ -15,8 +15,8 @@ below use request shapes.
 
 - `WorkloadClassVersion`: immutable template and policy bundle. It defines a
   single-replica `Deployment` or `StatefulSet`, app container, sidecar template,
-  Service, optional PV/PVC volume templates, value schema, default values, and
-  sleep policy.
+  Service, optional PV/PVC volume templates, a value schema with per-field
+  defaults, and sleep policy.
 - `Instance`: one workload created from a pinned workload class version plus
   validated string `values`. State is `Cold`, `Waking`, `Running`, `Draining`,
   `Failed`, `Deleting`, or `Deleted`, with a generation for stale-update
@@ -54,9 +54,10 @@ The V1 operator service is unary-only:
 - `CreateWorkloadClassVersion`, `GetWorkloadClassVersion`
 - `CreateInstance`, `GetInstance`, `DeleteInstance`
 - `CreateRouteBinding`, `GetRouteBinding`, `DeleteRouteBinding`
-- `PutHttp01Challenge`, `DeleteHttp01Challenge`, `ExpireHttp01Challenges`
+- `PutHttp01Challenge`, `DeleteHttp01Challenge`
 - `PublishCertificate`, `GetCertificateMetadata`, `RemoveCertificate`,
-  `ReencryptCertificate`, `SetTlsBinding`, `GetTlsBinding` (native TLS only)
+  `ReencryptCertificate`, `ReencryptCertificates`, `SetTlsBinding`,
+  `GetTlsBinding` (native TLS only)
 - `ReconcileMaterialization`, `ForceDeleteMaterialization`,
   `ForceReleaseExclusivityKey`
 
@@ -86,6 +87,20 @@ plane injects `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN`
 into rendered sidecars from runtime config; operators do not put this token in
 WorkloadClass templates. Browser/gRPC-Web and native operator clients send
 `Authorization: Bearer <operator-token>`.
+
+The gRPC-Web listener serves the platform TLS identity whenever
+`SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE` and
+`SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` are set, so the operator token crosses
+it encrypted; browsers negotiate HTTP/2 on it.
+`SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS` lists the origins whose pages may
+call the listener, comma-separated and written as a browser sends them: a
+lowercase `https://console.example.com`, with a port only when the page uses
+one. The list is empty by default, so name each console origin before its pages
+can call. A request whose `Origin` is outside the list receives HTTP 403 before
+authentication, and CORS responses name only listed origins. A request with no
+`Origin` header comes from a client other than a browser page, and its bearer
+token decides it. Startup fails on a malformed origin, and on an origin list
+without `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR`.
 
 `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` is for local development and tests
 only. It is explicit; omitting the auth mode or configuring malformed, missing,
@@ -165,16 +180,29 @@ failure. Read current metadata/binding state and compare versions and the desire
 certificate fingerprint before attempting another conditional write.
 
 Private keys are encrypted in Postgres using deployment-provided sealing keys.
-Back up those keys separately from the database. When changing sealing keys,
-first distribute the new read key to every control-plane replica, then switch
-every writer to the new active key. Use `ReencryptCertificate` with the current
-certificate version and sealing revision for each live certificate. Verify all
-live rows use the new key before retiring the old read key. Before that final
-check, settle in-flight and ambiguous database writes from old-key writers;
-disconnecting a caller or stopping its transport alone does not prove that a
-queued commit cannot still finish. Keep old read keys available through this
-settlement and retain keys required to restore older backups. Re-encryption
-preserves certificate versions and hostname views.
+Back up those keys separately from the database. To rotate a sealing key:
+
+1. Add the new key to the key ring of every control-plane replica and keep the
+   current `active_id`.
+2. Switch `active_id` to the new key on every replica. New publications seal
+   under it.
+3. Call `ReencryptCertificates({sealing_key_id: "<old key>"})` until `remaining`
+   is zero. Each call re-seals up to sixteen active certificates under the
+   active key and returns the number the old key still seals.
+   `ReencryptCertificate` re-seals one certificate at its current version and
+   sealing revision.
+4. Settle in-flight and ambiguous database writes from old-key writers, repeat
+   the call to confirm `remaining` is zero, then remove the old key from every
+   ring.
+
+At startup the control plane compares the sealing keys of active certificates
+with its ring. When a certificate is sealed under a key the ring lacks, the
+process exits and names the missing key IDs; restore those keys, or finish
+re-encryption on a replica that holds them, then start it again. Disconnecting
+a caller or stopping its transport alone does not prove that a queued commit
+cannot still finish, so keep the old key in the ring through settlement and
+retain the keys required to restore older backups. Re-encryption preserves
+certificate versions and hostname views.
 
 ## Frontline certificate cache
 
@@ -314,7 +342,8 @@ containing the following JSON shape. Each key is 32 random bytes encoded as
 
 The file is limited to 8 KiB and the key ring to eight distinct IDs. The active
 ID must exist in that ring. All other entries remain available for decryption
-during a coordinated key rotation. Sealing keys require authenticated native
+during a coordinated key rotation, and the ring must hold every key that seals
+an active certificate or startup fails. Sealing keys require authenticated native
 TLS. Do not put them in application templates, database rows, logs or source
 control. Database backups without the corresponding sealing keys cannot restore
 certificate service.
@@ -325,21 +354,21 @@ Create a workload class version:
 
 ```text
 CreateWorkloadClassVersion({
-  idempotency_key: "wc-web-v1-20260624",
   class_id: "web",
   version: 1,
-  default_values: {"image": "registry.example/web:2026-06-24"},
-  value_schema: {fields: {"tenant": {required: true}, "image": {required: true}},
+  value_schema: {fields: {"tenant": {required: true},
+      "image": {default_value: "registry.example/web:2026-06-24"}},
     allow_extra: false},
-  template_generation: 1,
   template: {
     workload: {
       kind: WORKLOAD_KIND_DEPLOYMENT,
       name: {parts: [{literal: "web-"}, {instance_value: "tenant"}]},
       app_container: {name: "app", image: {parts: [{instance_value: "image"}]},
-        ports: [{name: "http", container_port: 8080}]}
+        ports: [{name: "http", container_port: 8080}]},
+      termination_grace_period_seconds: 30
     },
-    sidecar: {name: "sleepypods-sidecar", image: {parts: [{literal: "sidecar:prod"}]}, listen_port: 15000},
+    sidecar: {name: "sleepypods-sidecar", image: {parts: [{literal: "sidecar:prod"}]},
+      listen_port: 15000, app_protocol: APP_PROTOCOL_HTTP1},
     service: {name: {parts: [{literal: "web-"}, {instance_value: "tenant"}]},
       ports: [{name: "http", port: 80, target_port: 8080}]},
     volumes: []
@@ -349,16 +378,63 @@ CreateWorkloadClassVersion({
 })
 ```
 
-Create an instance:
+A class version is immutable. Repeating an identical create returns the stored
+version; a different request for the same `class_id` and `version` returns
+`AlreadyExists`.
+
+Each schema field is `required`, carries a `default_value`, or is optional. An
+instance that omits a field with a default receives the default when it is
+created. Templates and exclusivity keys may read only fields that are required
+or defaulted, so every instance of the class carries each value its templates
+use. Field names starting with `sleepypods.` belong to the platform.
+
+`sidecar.app_protocol` names the protocol the sidecar speaks to the app
+container in HTTP mode: `APP_PROTOCOL_HTTP1` (the default) or `APP_PROTOCOL_H2C`
+for apps that serve HTTP/2 without TLS, such as gRPC servers. The control plane
+passes it to the sidecar as `SLEEPYPODS_APP_PROTOCOL=http1` or `h2c`. A sidecar
+in TCP mode forwards bytes and takes no app protocol.
+
+`workload.termination_grace_period_seconds` sets how long Kubernetes waits
+between SIGTERM and SIGKILL when the workload's Pod stops. It defaults to 30 and
+has a maximum of 300.
+
+Create an instance, with its routes if it has any:
 
 ```text
 CreateInstance({
   idempotency_key: "instance-tenant-a-20260624",
   instance_id: "tenant-a",
   workload_class: {class_id: "web", version: 1},
-  values: {"tenant": "tenant-a", "image": "registry.example/web:2026-06-24"}
+  values: {"tenant": "tenant-a"},
+  routes: [{route_binding_id: "route-tenant-a-app",
+    identity: {http: {host: {kind: ROUTE_HOST_KIND_EXACT, host: "app.example.com"},
+      path_prefix: "/"}}}]
 })
 ```
+
+The instance and its `routes` commit in one transaction, so the instance is
+reachable as soon as the call returns.
+
+### Create-Time Validation
+
+A create call accepts only what a wake can render, so an error reaches the
+operator who sent the request and a wake meets no template error.
+
+`CreateWorkloadClassVersion` returns `InvalidArgument` when:
+
+- `class_id` is outside the Kubernetes label-value form: at most 63 characters
+  of letters, digits, `-`, `_` and `.`, starting and ending alphanumeric;
+- a template or exclusivity key reads a value the schema leaves optional or
+  undeclared;
+- the manifest fails to render for a trial instance that supplies every declared
+  value, for example a missing Service template, a duplicate volume, or a raw
+  object that fails to parse or uses a kind outside the supported list.
+
+`CreateInstance` returns `NotFound` when the class version is absent, and
+`InvalidArgument` when the instance's own values render an invalid manifest: a
+name that is not a DNS label, a StatefulSet or Service name outside the
+Kubernetes limits below, a hostPath outside its directory, or an empty
+exclusivity key.
 
 ### Kubernetes Naming Rules
 
@@ -390,6 +466,13 @@ Kubernetes apply. PersistentVolumes are cluster-scoped and are collision-checked
 with an empty namespace; namespaced objects are checked with their rendered
 namespace.
 
+Two kinds have tighter Kubernetes limits, and `CreateInstance` enforces both:
+
+- A StatefulSet's final name has at most 52 characters, because Kubernetes
+  appends a revision hash to it in a Pod label. That leaves 35 characters for
+  the rendered base name.
+- A Service's final name starts with a letter.
+
 Typed manifest templates are the preferred path for supported Kubernetes
 fields. Operators can use `ManifestTemplate.raw_objects` as an advanced escape
 hatch for unsupported fields that must be preserved exactly in applied
@@ -402,12 +485,24 @@ Raw objects are limited in V1 to `Deployment`, `StatefulSet`, `Service`, `Secret
 `PersistentVolume`, and `PersistentVolumeClaim`; standalone raw Pods are unsupported. After substitution, the
 control plane parses the manifest, validates `apiVersion`, `kind`,
 `metadata.name`, and namespace scope, injects the same SleepyPods ownership
-labels and template-generation annotations used by typed objects, and derives
+labels used by typed objects, and derives
 rendered refs before any Kubernetes apply. Conflicting SleepyPods identity
 labels are rejected. PersistentVolumes must be cluster-scoped; namespaced raw
 objects are applied in the materialization target namespace. Raw refs collide
 with typed refs, so a raw object cannot reuse the same
 apiVersion/kind/namespace/name as a typed-rendered object.
+
+A raw object's `metadata.name` ends with `-` and the instance suffix, so two
+instances of one class render distinct objects. The platform supplies the suffix
+as the instance value `sleepypods.instance_suffix`; raw manifests read it, and
+the schema leaves it undeclared:
+
+```text
+raw_objects: [{manifest: {parts: [
+  {literal: "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web-config-"},
+  {instance_value: "sleepypods.instance_suffix"},
+  {literal: "\nstringData:\n  mode: production\n"}]}}]
+```
 
 Raw Deployment/StatefulSet Pod templates retain instance cleanup labels but do
 not receive the primary `sleepypods.io/workload-name` label. That label is
@@ -471,6 +566,12 @@ Use `ROUTE_HOST_KIND_WILDCARD_SUFFIX` for wildcard suffix routing, for example
 `host: "*.apps.example.com"`. Use `PROTOCOL_ROUTE_TLS_SNI` with `identity.sni`
 for TLS/SNI passthrough routes.
 
+A route host is an ASCII DNS name or IPv4 address without a port or path, at
+most 253 characters long. Each dot-separated label has 1 to 63 letters, digits,
+hyphens or underscores and starts and ends without a hyphen. The control plane
+lowercases the host and rejects any other form with `InvalidArgument`, so every
+stored route names a host a request can carry.
+
 Add an HTTP-01 challenge token:
 
 ```text
@@ -481,9 +582,9 @@ PutHttp01Challenge({
 })
 ```
 
-After the ACME check finishes, call `DeleteHttp01Challenge`. Periodically call
-`ExpireHttp01Challenges` with the current Unix milliseconds to garbage-collect
-expired records.
+After the ACME check finishes, call `DeleteHttp01Challenge`. The frontline stops
+serving a challenge at `expires_at_unix_millis`, and control-plane maintenance
+removes expired records.
 
 Attach an existing volume:
 
@@ -492,6 +593,9 @@ Attach an existing volume:
 2. Reference those values from a `VolumeTemplate` `source.csi.volume_handle` or
    `source.host_path.path`, plus `pv_name`, `pvc_name`, `capacity`, access
    modes, reclaim policy, and optional storage class.
+   A hostPath template that reads instance values starts with a literal
+   absolute directory ending in `/`, such as `/srv/tenants/`, and the rendered
+   path has no `..` segment, so a value chooses a subdirectory of that directory.
    Static CSI volumes can also set typed secret refs on `source.csi`, including
    `controller_publish_secret_ref`, `node_stage_secret_ref`,
    `node_publish_secret_ref`, `controller_expand_secret_ref`, and
@@ -531,7 +635,8 @@ conflict until the owning materialization reaches `Deleted` or an operator uses
 an explicit force operation.
 
 `ReconcileMaterialization` is the first operator action for a stuck
-materialization. It loads the row by materialization id, returns current state,
+materialization. It takes the `instance_id`, loads that instance's
+materialization in this control plane's cluster and namespace, returns current state,
 lease metadata, recorded object refs, and live projection observations, and
 enqueues eligible `Pending`, `Deleting` or legacy `Failed` work through the same
 scheduler. `attempted` means enqueue accepted, not work completed. Set
@@ -558,7 +663,8 @@ retryable Kubernetes/API-access problem unless the bounded reason indicates a
 persistent permission or discovery issue.
 
 `ForceDeleteMaterialization` is an emergency cleanup tool for a materialization
-whose Kubernetes cleanup has already been inspected. The response includes the
+whose Kubernetes cleanup has already been inspected. It takes the `instance_id`,
+an operator name and an audit reason. The response includes the
 recorded object refs that were present before the row was cleared plus
 best-effort projection observations for those refs. Observation does not mutate
 Kubernetes objects. It also clears any unresolved effect barrier. Before using
@@ -742,8 +848,9 @@ Run three production components:
 
 - Control plane: one native gRPC listener for the proxy and sidecar services,
   a second for the operator service, and an optional gRPC-Web listener for
-  operator unary APIs. Workloads reach the first; keep the operator listeners on
-  a network path pods have no route to.
+  operator unary APIs. All three serve the platform TLS identity when one is
+  configured. Workloads reach the first; keep the operator listeners on a
+  network path pods have no route to.
 - Frontline: always-on HTTP listener; optional TLS termination and TLS/SNI
   passthrough listeners; connects to the control plane.
 - Sidecar: injected into materialized workloads; proxies to the local app port
@@ -763,6 +870,7 @@ Important environment variables:
 | control plane | `SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR` carries the proxy and sidecar services |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR` carries the operator service |
 | control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR` optional |
+| control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS` optional comma-separated browser origins for the gRPC-Web listener, empty by default |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` for local tests, or `static-bearer-token` for configured auth |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE`, `SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` for native platform TLS |
@@ -780,7 +888,7 @@ Important environment variables:
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
-| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
+| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, `SLEEPYPODS_APP_PROTOCOL` in HTTP mode, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 | sidecar | `SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 
 Kubernetes permissions must allow create, conditional merge update, inspection

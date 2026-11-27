@@ -36,7 +36,11 @@ status when a documented gap actually closes.
 - Code generation: `crates/sleepypods-api/build.rs`
 - Store contract: `crates/control-plane/src/store.rs`
 - Postgres provider: `crates/control-plane/src/postgres/`
-- Manifest rendering: `crates/control-plane/src/manifest/`
+- Manifest rendering: `crates/control-plane/src/manifest/`; instance-scoped
+  object names: `crates/control-plane/src/kubernetes_name.rs`
+- Create-time validation: `WorkloadClassVersion::validate_renderable` in
+  `workload.rs` and `CreateInstanceRequest::validate_renders` in `instance.rs`,
+  both called from `api/server.rs`
 - Kubernetes materialization: `crates/control-plane/src/kube_materializer.rs`
   and `crates/control-plane/src/materializer.rs`
 - Resource/lifecycle semantics: `crates/control-plane/src/workload.rs`,
@@ -44,7 +48,12 @@ status when a documented gap actually closes.
   `sleep_policy.rs`, and `materialization.rs`; shared route and HTTP-01 contracts
   are in `crates/sleepypods-api/src/{route,http01}.rs`.
 - Operator/proxy/sidecar services:
-  `crates/control-plane/src/api/server.rs`, `api/proxy.rs`, `api/sidecar.rs`
+  `crates/control-plane/src/api/server.rs`, `api/proxy.rs`, `api/sidecar.rs`;
+  the store-error-to-status mapping they share is `store_error_to_status` in
+  `api/mod.rs`
+- gRPC-Web origins and CORS: `crates/control-plane/src/api/grpc_web.rs`
+- Caller authentication and its decision counter:
+  `crates/control-plane/src/auth.rs`
 - Frontline route cache/resolver:
   `crates/frontline/src/cache.rs`, `matcher.rs`, `resolver.rs`, `route.rs`,
   `subscription.rs`
@@ -123,7 +132,9 @@ Targeted gates live in `scripts/`:
   lifecycle, outage and restart checks. This explicit release gate includes real
   sleep-floor and five-minute lease waits. Local ignored tests are not deployed
   execution evidence.
-- `test-kind-e2e-grpc-web.sh`: deployed browser-shaped gRPC-Web operator path.
+- `test-kind-e2e-grpc-web.sh`: deployed browser-shaped gRPC-Web operator path
+  over platform TLS, with an allowed origin, a refused origin and a refused
+  plaintext request.
 - `test-kind-e2e-libpq-sni.sh`: real PostgreSQL/libpq 17 direct SNI
   passthrough.
 - `test-kind-e2e-failures.sh`: bad route, readiness failure, PVC binding
@@ -143,6 +154,16 @@ Targeted gates live in `scripts/`:
 - Keep provider-specific semantics behind traits such as `ControlPlaneStore`
   and `KubernetesMaterializerClient`.
 - `WorkloadClassVersion` is immutable; instances pin a class version.
+- A create RPC accepts only what a wake can render. `CreateWorkloadClassVersion`
+  and `CreateInstance` dry-run the renderer, so a new template rule belongs in
+  `manifest/render.rs`, where both the create call and the wake enforce it.
+- Instance values under the `sleepypods.` prefix belong to the platform. The
+  renderer supplies them; schemas and requests cannot set them.
+- A store failure reaches a caller through `store_error_to_status`: backend
+  text goes to the `control_plane.store.error` event and the status carries a
+  fixed message.
+- Per-request facts are metrics. Control-plane stderr carries lifecycle changes,
+  errors and rejections, so a read or an accepted caller writes no line.
 - Hot proxy paths must avoid control-plane calls, database access, global locks,
   unbounded allocation, and per-request client construction.
 - Route cache subscription IDs are opaque. Do not parse them or make them part

@@ -14,6 +14,7 @@ pub use sleepypods_api::pb;
 
 use sleepypods_observability::recorder::{
     LifecycleLogEvent, LogField, ObservabilityRecorder, EVENT_CONTROL_PLANE_STORE_ERROR,
+    FIELD_ERROR_MESSAGE,
 };
 use tonic::Status;
 
@@ -104,7 +105,7 @@ fn log_store_error(kind: &'static str, message: String) {
         EVENT_CONTROL_PLANE_STORE_ERROR,
         vec![
             LogField::error_reason(kind),
-            LogField::new("error.message", message),
+            LogField::new(FIELD_ERROR_MESSAGE, message),
         ],
     ));
 }
