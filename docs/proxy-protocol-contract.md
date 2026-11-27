@@ -255,8 +255,11 @@ termination and SNI passthrough listeners.
 | `SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS` | 60000 | Response-header wait without upload-byte progress |
 | `SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS` | 60000 | Pending socket/stream delivery writes, including TCP/SNI |
 
-Admission has no wait queue: excess accepted sockets are closed before spawning
-connection work; excess HTTP requests return 503 with Retry-After: 1. Hyper also
+Admission has no wait queue. An excess accepted socket closes before any
+connection work starts: it sends FIN, then discards up to 64 KiB the client has
+already sent, such as a ClientHello, so the client and any relay in front of the
+proxy read end of stream rather than a reset. Excess HTTP requests return 503
+with Retry-After: 1. Hyper also
 limits h2 streams before service dispatch. Pooled HTTP upstream saturation returns
 503 until an active socket closes or idle eviction frees a slot. WS/TCP/SNI
 upstream sockets follow their admitted active sessions and are separate from the

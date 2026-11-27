@@ -1,5 +1,10 @@
 //! The accept loop and socket options shared by every proxy listener.
-use std::{future::Future, io, net::SocketAddr, time::Duration};
+use std::{
+    future::Future,
+    io::{self, Read},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
@@ -16,6 +21,10 @@ pub(crate) const KEEPALIVE_RETRIES: u32 = 3;
 /// Pause after an accept failure that needs capacity to return, such as an
 /// exhausted file-descriptor table.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// The input a refused socket discards before it closes: enough for a
+/// ClientHello or the largest request head the proxy reads. Input beyond it
+/// resets the connection after the FIN.
+const REFUSED_INPUT_LIMIT: usize = 64 * 1024;
 
 /// A source of accepted connections. Production listeners are `TcpListener`s.
 pub trait Accept {
@@ -31,10 +40,11 @@ impl Accept for TcpListener {
 /// Accepts connections until shutdown and returns the tasks still running.
 ///
 /// `connection` admits each socket and returns the task that serves it, or
-/// `None` to close it. A failed accept never ends the loop: an error that
-/// belongs to one connection is skipped, and any other error waits briefly for
-/// capacity. The listening socket closes before this returns, so the kernel
-/// refuses new connections while the caller drains.
+/// hands the socket back to refuse it; the loop closes a refused socket so
+/// that the client reads end of stream. A failed accept never ends the loop:
+/// an error that belongs to one connection is skipped, and any other error
+/// waits briefly for capacity. The listening socket closes before this
+/// returns, so the kernel refuses new connections while the caller drains.
 pub async fn serve_listener<L, F, Fut>(
     mut listener: L,
     shutdown: &Shutdown,
@@ -42,7 +52,7 @@ pub async fn serve_listener<L, F, Fut>(
 ) -> JoinSet<()>
 where
     L: Accept,
-    F: FnMut(TcpStream, SocketAddr) -> Option<Fut>,
+    F: FnMut(TcpStream, SocketAddr) -> Result<Fut, TcpStream>,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let mut connections = JoinSet::new();
@@ -55,8 +65,11 @@ where
         match accepted {
             Ok((stream, peer)) => {
                 let _ = configure_socket(&stream);
-                if let Some(task) = connection(stream, peer) {
-                    connections.spawn(task);
+                match connection(stream, peer) {
+                    Ok(task) => {
+                        connections.spawn(task);
+                    }
+                    Err(stream) => close_refused(stream),
                 }
             }
             Err(error) if belongs_to_one_connection(&error) => {}
@@ -80,6 +93,28 @@ pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
         .with_interval(KEEPALIVE_INTERVAL)
         .with_retries(KEEPALIVE_RETRIES);
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Closes a refused socket so that the client reads end of stream.
+///
+/// Linux resets a connection that closes with unread input, and a client's
+/// first bytes, such as a TLS ClientHello, often arrive before the loop
+/// refuses its socket. A relay such as `kubectl port-forward` fails on that
+/// reset. The socket therefore sends FIN first, so the client reads end of
+/// stream even if more input arrives later, and then discards the input
+/// already buffered, so the close sends nothing more. Neither step waits.
+fn close_refused(stream: TcpStream) {
+    let socket = SockRef::from(&stream);
+    let _ = socket.shutdown(std::net::Shutdown::Write);
+    let mut buffer = [0; 4096];
+    let mut remaining = REFUSED_INPUT_LIMIT;
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len());
+        match (&*socket).read(&mut buffer[..limit]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => remaining -= read,
+        }
+    }
 }
 
 /// Linux reports a network error already pending on the new socket through
@@ -153,7 +188,7 @@ mod tests {
         let server = tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
-                serve_listener(listener, &shutdown, |stream, _| Some(echo_one_byte(stream))).await
+                serve_listener(listener, &shutdown, |stream, _| Ok(echo_one_byte(stream))).await
             }
         });
 
@@ -177,7 +212,7 @@ mod tests {
             let shutdown = shutdown.clone();
             async move {
                 serve_listener(listener, &shutdown, |stream, _| {
-                    Some(echo_until_closed(stream))
+                    Ok(echo_until_closed(stream))
                 })
                 .await
             }
@@ -224,7 +259,7 @@ mod tests {
                     if let Some(options) = options.take() {
                         let _ = options.send(observed);
                     }
-                    None::<std::future::Ready<()>>
+                    Err::<std::future::Ready<()>, _>(stream)
                 })
                 .await
             }
@@ -232,6 +267,45 @@ mod tests {
 
         let _client = TcpStream::connect(addr).await.unwrap();
         assert_eq!(observed.await.unwrap(), (true, true, KEEPALIVE_IDLE));
+        shutdown.shutdown();
+        server.await.unwrap();
+    }
+
+    /// Hands over each connection once the client's first bytes have arrived,
+    /// as a busy accept loop does.
+    struct AcceptAfterInput(TcpListener);
+
+    impl Accept for AcceptAfterInput {
+        async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+            let (stream, peer) = self.0.accept().await?;
+            stream.readable().await?;
+            Ok((stream, peer))
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_sockets_with_unread_input_close_with_fin() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Shutdown::new();
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                serve_listener(AcceptAfterInput(listener), &shutdown, |stream, _| {
+                    Err::<std::future::Ready<()>, _>(stream)
+                })
+                .await
+            }
+        });
+
+        for _ in 0..8 {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&[0x16, 0x03, 0x01, 0, 42]).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut [0; 1]))
+                .await
+                .unwrap();
+            assert_eq!(read.unwrap(), 0, "a refused socket ends with FIN");
+        }
         shutdown.shutdown();
         server.await.unwrap();
     }
