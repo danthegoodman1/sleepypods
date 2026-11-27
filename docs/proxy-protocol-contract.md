@@ -75,6 +75,9 @@ sidecar -> frontline   the same line
   certifies a new backend generation. A stale Pod address therefore costs a
   frontline one HTTP attempt and one WebSocket attempt. Each remembers up to
   4,096 failed addresses and starts over when full.
+- `sleepypods_runtime_pod_route_connects_total` counts every attempt by
+  outcome: `pod`, `refused`, `timeout`, `claim_rejected`, `error`, or
+  `known_failed` for an address skipped because it already failed.
 - Pooled upstream connections are keyed by Service address, instance, Pod
   address and backend generation, so a pool never mixes instances. A
   connection that fell back to the Service stays in its pool and serves later
@@ -158,8 +161,9 @@ closing is found after about 90 seconds on any protocol.
   platform blocking DNS work may still outlive caller cancellation until the
   OS resolver returns. Protocol handshakes, HTTP requests, bodies and
   established streams are never replayed by this connection policy.
-- HTTP/2 server connections use a 30-second keepalive interval and a 10-second
-  acknowledgement timeout to detect an unresponsive peer. Frontline's HTTP/2
+- HTTP/2 server connections use a 30-second keepalive interval and the setup
+  timeout (10 seconds by default) as the acknowledgement timeout to detect an
+  unresponsive peer. Frontline's HTTP/2
   connections to a sidecar use the same interval, also while idle, with the
   setup timeout as the acknowledgement timeout. The sidecar sends no HTTP/2
   pings to the app: gRPC servers close a connection that pings too often, and
@@ -231,9 +235,8 @@ with no active work. The floor is unconditional: a quick successful request does
 not release protection for another first request still establishing its backend
 connection. Restarting a control plane does not restart the floor. A wake with
 no application request still becomes eligible after this finite interval; a
-300-second class idle interval continues to dominate the default minimum uptime.
-The internal explicit `BeginSleep` operation can bypass the automatic-idle floor;
-there is currently no public operator Sleep RPC.
+class idle interval longer than 190 seconds sets the minimum uptime instead.
+There is no operator Sleep RPC.
 
 Supported frontline listener configuration must satisfy:
 
@@ -256,14 +259,14 @@ never enter this accounting. The runtime drain gauge can therefore briefly read
 two for one first HTTP request: it counts admitted setup and stream work, not an
 exact number of concurrent user streams.
 
-Known activation deferral uses an advisory database-clock age check before
-Kubernetes membership reads, followed by an authoritative generation-fenced
-transaction when eligible. `FailedPrecondition` may include
-`sleepypods-idle-retry-after-ms` in the range `1..=190000`. Updated sidecars defer
-that next report without polling Kubernetes; real activity interrupts the wait
-and starts a complete new idle interval. Missing, malformed or oversized hints
-use the ordinary configured retry policy. A deferral is not an acknowledgement
-of Pod membership or permission to sleep.
+An idle report first verifies Kubernetes membership, then begins sleep in one
+generation-fenced transaction that checks the Ready age on the database clock.
+A report inside the activation floor receives `FailedPrecondition`, which may
+carry `sleepypods-idle-retry-after-ms` in the range `1..=190000`. The sidecar
+defers its next report by that hint; real activity interrupts the wait and
+starts a complete new idle interval. Missing, malformed or oversized hints use
+the ordinary configured retry policy. A deferral is not an acknowledgement of
+Pod membership or permission to sleep.
 
 The sidecar reports for as long as it runs. After any answer, including an
 accepted report, it reports again every retry backoff while the pod stays

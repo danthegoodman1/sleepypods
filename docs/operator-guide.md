@@ -569,17 +569,9 @@ The control plane only accepts nonterminating ready EndpointSlice members owned
 by the observed current Service UID; stale slices from a deleted same-name
 Service cannot publish readiness.
 
-Upgrade custom sidecar images to implement this environment variable and health
-endpoint before using the new renderer. An older image leaves new Pods unready
-and wake retries eventually reach the configured operation deadline. Existing
-Running Pods are not automatically reprojected by this change: use ordinary
-sleep/wake after upgrading to obtain the probe and auxiliary-label isolation.
-An already-Pending wake with no old objects can adopt the new renderer. A
-partially applied old same-generation projection has an obsolete rendered hash;
-it becomes a permanent wake failure and the scheduler queues its recorded refs
-for safe cleanup before an ordinary wake retry can recreate it.
-Quiesce managed work when correcting legacy raw templates that explicitly set
-the reserved selector label; ownership and retained-storage rules still apply.
+A custom sidecar image must implement this environment variable and health
+endpoint; without them its Pods never turn ready and the wake fails at its
+operation deadline.
 
 Add a route or custom domain:
 
@@ -684,8 +676,8 @@ cluster and namespace, and returns current state, lease metadata, recorded
 object refs, live projection observations, next attempt, operation deadline,
 failure count, kind and message, and the original terminal wake reason. Set
 `status_only=true` to inspect without changing its schedule. Otherwise it also
-clears the failure state and schedules eligible `Pending`, `Deleting` or legacy
-`Failed` work through the same scheduler; `attempted` means the schedule was
+clears the failure state and schedules eligible `Pending` or `Deleting` work
+through the same scheduler; `attempted` means the schedule was
 accepted, not that the work completed. Scheduling honors active leases and the
 immutable drain deadline. Work retries on its own, so the scheduling half is
 needed only for a cleanup that an ownership conflict parked. Recorded-ref
@@ -863,7 +855,9 @@ Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 | `POSITIVE_ROUTE_CACHE_TTL_MS` | 90000, at most 900000, and at least `SUBSCRIPTION_LIFETIME_MS` plus 10000 |
 
 Admission occurs before connection tasks or protobuf decoding. Each connection
-allows 32 H2 streams; protobuf requests/responses are capped at 256KiB/1MiB.
+allows 32 H2 streams. The operator and sidecar services cap protobuf
+requests at 256 KiB and the proxy service at 512 KiB; responses are capped at
+1 MiB.
 A subscribed host is at most 253 bytes. Each stream runs 16 rule-set lookups at
 once and queues 64 responses; it ends when a response waits for the response
 timeout to be queued. Transport capacity may remain held until the subscription
@@ -1002,6 +996,9 @@ Important environment variables:
 | control plane / frontline / sidecar | `SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM` optional public trust for a private platform CA; control plane injects it into rendered sidecars |
 | frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` hosts with routes and as many hosts without; keep it under the control plane's `MAX_SUBSCRIPTIONS_PER_STREAM` |
 | frontline | `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS` optional, default `30000` |
+| frontline | `SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` optional, default `130000`: how long a request waits for a ready route |
+| frontline | `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` optional, default `5000`: one `WakeInstance` call |
+| frontline / sidecar | `SLEEPYPODS_PROXY_*` admission, pool and timeout limits; see [data-plane resource limits](proxy-protocol-contract.md#data-plane-resource-limits) |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
@@ -1025,30 +1022,29 @@ starts on an empty database, as
 [Store schema and lifecycle APIs](#store-schema-and-lifecycle-apis) describes.
 
 Managed static volumes require `Retain`; provider disk deletion is outside the
-lifecycle API. New classes and rendering of legacy classes reject `Delete`.
+lifecycle API. Class creation and rendering reject `Delete`.
 Rendered raw PV/PVC inventory must also use explicit Retain and static bindings
 within that inventory; dynamic or externally bound claims cannot be automatically
 managed. Existing live PVs with Delete/unknown policy, and PVCs whose retained
 binding cannot be proven, block the entire cleanup pass before any PVC deletion.
-Correct a legacy live policy only with controllers quiesced and an explicit
-storage retention decision. Use a Retain class version for subsequent creation;
-the controller never silently rewrites the operator's policy.
+Correct such a live policy only with controllers quiesced and an explicit
+storage retention decision; the controller never rewrites the operator's
+policy.
 The managed-storage contract requires exclusive control over PV/PVC specs,
 especially reclaim policies and bindings. Quiesce managed work before external
 policy or binding edits: a conditional PVC delete cannot atomically fence an
 independent change to its PV after the retention preflight.
 
-## Single-replica automatic sleep and upgrades
+## Single-replica automatic sleep
 
 Automatic sleep has a generation-specific minimum Ready age of
 `max(190 seconds, resolved idle_timeout)`, in addition to the sidecar's full quiet
 interval. The 190-second activation floor protects pending first requests even
 when another request finishes quickly. It also applies to an abandoned wake with
 no traffic and to successful short wakes; it is not extended by a control-plane
-restart. A revive during drain is a new Ready transition and restarts it. With
-the default 300-second idle policy, that longer interval determines
-the minimum uptime. The internal explicit `BeginSleep` operation remains able to
-bypass this automatic-idle restriction; there is no public operator Sleep RPC.
+restart. A revive during drain is a new Ready transition and restarts it. An
+idle timeout longer than 190 seconds sets the minimum uptime instead. There is
+no operator Sleep RPC.
 
 Frontline rejects configuration whose route timeout plus the greater of setup
 and upstream HTTP header idle timeouts exceeds 190 seconds. Defaults are
@@ -1077,23 +1073,9 @@ Full replacement fencing would require a new activation incarnation before a
 replacement Pod is admitted to traffic. Normal control-plane lifecycle changes
 remain guarded by instance generation.
 
-Before upgrading, audit pinned class versions for explicit `replicas: 0` or
-`replicas > 1`, and for raw Deployment or StatefulSet objects. Existing classes
-with unsupported replica counts or raw workload controllers remain readable and
-deletable, but cannot accept new instances, render a new activation, or
-authorize automatic sleep. Running instances are left awake; migration is
-explicit, without scaling or deleting active peers automatically. Create a new
-immutable class version with one replica and no raw workload controller, move
-consumers to a new instance through the operator API, and retire the old
-instance after its activity has drained. Existing RollingUpdate Deployments
-must be rematerialized through the control plane to acquire the Recreate
-strategy and downward-API Pod UID.
-
-Deploy the upgraded control plane and required read permissions first. Old
-sidecars omit `pod_uid`; their idle requests receive `FailedPrecondition` and
-cannot initiate sleep. Roll compatible sidecar images through normal
-rematerialization. These fail-closed behaviors intentionally favor keeping a
-workload awake over sleeping an unobserved busy peer.
+An idle report without `pod_uid` receives `FailedPrecondition` and cannot start
+sleep. These fail-closed checks keep a workload awake rather than sleep an
+unobserved busy peer.
 
 ## V1 Limits
 
@@ -1105,6 +1087,6 @@ workload awake over sleeping an unobserved busy peer.
   deferred.
 - Generated examples are illustrative request shapes until a CLI exists.
 - Prometheus metrics are intentionally limited to low-cardinality runtime,
-  proxy, reconciler, materialization backlog, held-key, and Kubernetes
+  reconciler, materialization backlog, held-key, and Kubernetes
   controller-operation metrics. Use Kubernetes/container telemetry for CPU,
   memory, restarts, pod scheduling, network, and filesystem metrics.

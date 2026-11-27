@@ -40,12 +40,14 @@ absence on their own.
 
 ## Clock ownership
 
-The store owns every timestamp it compares. Callers pass durations, never
+The store owns every timestamp it compares. Callers pass durations, not
 instants: a reconciliation lease is requested as a TTL, and the store starts it
 from the same clock that later decides whether the lease has lapsed. Backlog age
 and work eligibility are computed the same way. One clock supplies both operands
 of every comparison, so a caller whose clock runs fast cannot lengthen its own
-lease and a slow one cannot shorten it.
+lease and a slow one cannot shorten it. An HTTP-01 challenge is the one
+exception: its ACME owner supplies `expires_at`, and the store compares it with
+the database clock.
 
 Exclusivity does not rest on any clock. The fencing tokens every write
 revalidates carry it: `reconcile_owner`, `reconcile_attempt` and
@@ -105,8 +107,8 @@ is unavailable, backing off from 100ms to 2s.
 
 ## Statement cost
 
-Every statement runs through `postgres/sql.rs`, which prepares it once per
-pooled session, so a later run costs one round trip and no planning. The
+Every store operation's statement runs through `postgres/sql.rs`, which
+prepares it once per pooled session, so a later run costs one round trip and no planning. The
 process caches immutable workload class versions, up to 1,024 of them. A
 lifecycle write carries its guard in its own `WHERE` clause, so no read comes
 before it that the write repeats. `begin_sleep` checks the Ready age in its
@@ -206,8 +208,6 @@ A repeat that arrives while the first create is uncommitted waits for it and
 then compares with what it stored. A refused or failed create leaves no row and
 leaves the generation watermark where it was.
 
-Validation and measurements: [Phase 5 evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase5/README.md).
-
 ## Durable lifecycle transitions
 
 Each transition is a conditional `UPDATE` or `INSERT` whose `WHERE` clause
@@ -240,12 +240,10 @@ cannot claim another cluster's projection.
 
 `projection_generation` stays fixed from Pending through Ready and Deleting;
 instance `generation` remains the CAS revision.
-`instance_generation_watermarks` retain per-ID revisions permanently; neither
-key expiry nor resource deletion removes them. The optional wake
+`instance_generation_watermarks` retain per-ID revisions permanently; deleting
+the resource leaves them. The optional wake
 `backend_generation` is a floor: the transaction allocates at least that value
 and strictly above the prior stored value.
-
-Validation: [Phase 6A evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase6a/README.md).
 
 ## Lease fencing
 
@@ -344,8 +342,10 @@ Snapshots and operator metadata contain no private key material.
 Private keys use a versioned AES-256-GCM envelope. Associated data includes the
 certificate ID/version, sealing key ID and a digest of the complete chain.
 Deployment-provided active/read keys remain outside PostgreSQL; there is no
-default sealing key. Re-encryption handles one certificate per call and requires
-both its logical version and sealing revision. It changes only the envelope and
+default sealing key. `ReencryptCertificate` re-seals one certificate and
+requires both its logical version and sealing revision; `ReencryptCertificates`
+re-seals up to 16 certificates under a named key per call and reports how many
+remain. It changes only the envelope and
 sealing revision, preserving the logical certificate and hostname view. Old
 sealing keys remain read-capable while every control-plane writer is rolled to
 the new active key ID. Only then re-encrypt/check live records; an old-configured

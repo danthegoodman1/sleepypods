@@ -8,10 +8,12 @@ observability.type=metric metric.name=<name> metric.value=<number> metric.labels
 observability.type=event event.name=<name> <field=value ...>
 ```
 
-The control plane writes event lines for lifecycle changes, errors and rejected
-callers, and exports metric samples through its Prometheus listener. Metric
-samples and accepted callers write no line, so a successful RPC that changes no
-lifecycle state leaves stderr untouched.
+The control plane and frontline write event lines for lifecycle changes, errors
+and rejected callers, and export metric samples only through their Prometheus
+listeners. Metric samples and accepted callers write no line, so a successful
+RPC that changes no lifecycle state leaves stderr untouched; `WakeInstance` is
+the exception and writes `runtime.wake.event` for every call. The sidecar also
+writes its metric samples to stderr.
 
 Production binaries can also expose an opt-in Prometheus `/metrics` listener.
 It is disabled unless an explicit listen address is configured:
@@ -51,18 +53,10 @@ zero certificates remaining under them, and retained backups stop requiring them
 
 ## Metric Names
 
-Low-cardinality label keys are `protocol`, `direction`, `operation`,
-`outcome`, and `state`.
+Low-cardinality label keys are `operation`, `outcome`, and `state`.
 
 | Metric | Kind | Labels | Use |
 | --- | --- | --- | --- |
-| `sleepypods_proxy_active_streams` | gauge | `protocol` | Active proxy requests, streams, or upgraded sessions. |
-| `sleepypods_proxy_admission_decisions_total` | counter | `protocol`, `outcome` | Accepted/rejected new proxy work. |
-| `sleepypods_proxy_drain_events_total` | counter | `state`, `outcome` | Drain start, idle completion, rejection, timeout. |
-| `sleepypods_proxy_forwarded_bytes_total` | counter | `protocol`, `direction` | TCP/TLS byte forwarding. |
-| `sleepypods_proxy_forwarded_messages_total` | counter | `protocol`, `direction` | Message-oriented forwarding, including WebSocket. |
-| `sleepypods_proxy_operation_duration_seconds` | histogram | `protocol`, `operation`, `outcome` | Bounded proxy primitive duration. |
-| `sleepypods_proxy_tls_client_hello_total` | counter | `protocol`, `outcome` | TLS ClientHello/SNI parser outcomes. |
 | `sleepypods_runtime_control_plane_calls_total` | counter | `operation`, `outcome` | Runtime calls: `subscribe_stream` per Subscribe stream opened or refused, `subscribe_route` per host lookup, `unsubscribe`, `wake_instance`, `report_idle`. |
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
@@ -79,8 +73,9 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch and install outcomes. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline requests the route cache answered (`hit`) and requests that needed a lookup (`miss`), exported at scrape time. |
+| `sleepypods_runtime_pod_route_connects_total` | counter | `outcome` | Frontline connections to a Pod address, exported at scrape time: `pod` when the sidecar confirmed the instance; otherwise the request used the Service because the address refused the connection (`refused`), the attempt outlasted its 250 ms budget (`timeout`), the sidecar closed the claim or echoed another (`claim_rejected`), another connect error occurred (`error`), or the route already failed at this backend generation (`known_failed`). |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream events: `closed` for an orderly end, `error` for a failed stream that cost the cache, `updated` for a pushed rule set, `invalidated` for a host the control plane stopped serving. |
-| `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
+| `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Duration of one `WakeInstance` call, from request to the accepted or refused answer; the cold start that follows is not included. |
 | `sleepypods_control_plane_auth_decisions_total` | counter | `outcome` | Control-plane caller authentication decisions: `success` for accepted calls, `rejected` otherwise. |
 | `sleepypods_reconciler_runs_total` | counter | `outcome` | Scans that claim due wakes and cleanups. |
 | `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one claim scan. |
@@ -96,22 +91,15 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 
 Known bounded label values:
 
-- `protocol`: `tcp`, `http`, `websocket`, `tls`
-- `direction`: `client_to_upstream`, `upstream_to_client`
-- `operation`: `accept`, `admit`, `connect`, `forward`, `rewrite_request`,
-  `drain`, `tls_client_hello`, `route_cache_lookup`, `subscribe_route`,
-  `unsubscribe`, `subscribe_stream`, `wake_instance`, `materialize`,
-  `http01_resolve`, `report_idle`, `apply`, `delete`, `readiness`,
-  `certificate_fetch`, `certificate_refresh`, `certificate_watch`,
+- `operation`: `subscribe_route`, `unsubscribe`, `subscribe_stream`,
+  `wake_instance`, `materialize`, `report_idle`, `apply`, `delete`,
+  `readiness`, `certificate_fetch`, `certificate_refresh`, `certificate_watch`,
   `certificate_install`
 - `outcome`: `success`, `error`, `timeout`, `rejected`, `canceled`, `hit`,
   `miss`, `started`, `closed`, `updated`, `invalidated`, `already_running`,
-  `already_waking`, `already_draining`
-- `state`: `accepting`, `active`, `draining`, `idle`, `pending`, `ready`,
-  `failed`, `deleting`
-- TLS ClientHello outcomes use the `outcome` label with `sni`, `no_sni`,
-  `incomplete`, `not_tls`, `unsupported_version`, `not_client_hello`,
-  `record_too_large`, `malformed`, or `invalid_hostname`.
+  `already_waking`, `already_draining`; Pod-route connects use `pod`,
+  `refused`, `timeout`, `claim_rejected`, `error` and `known_failed`
+- `state`: `pending`, `ready`, `deleting`
 
 Certificate gauges are sampled from cache and worker ownership; separate gauges
 may observe slightly different instants during concurrent work. Check each
@@ -140,21 +128,24 @@ Event names:
 Lifecycle field keys:
 
 - `instance.id`
-- `route.id`
-- `subscription.id`
 - `generation`
-- `backend.generation`
 - `cluster.id`
 - `namespace`
 - `error.reason`
 - `error.message`
 - `active.count`
 - `duration.ms`
+- `exclusivity.action`
+- `exclusivity.key.name`
+- `exclusivity.owner.instance.id`
 - `auth.decision`
 - `auth.reason`
 - `auth.caller.role`
 - `auth.required.role`
 - `grpc.service`
+
+`runtime.materialization.reconciliation` also carries `operation` and
+`outcome`, and `runtime.http01.event` carries `http.status`.
 
 Use IDs and generations for correlation, but do not turn high-cardinality IDs
 into metric labels.
@@ -177,8 +168,10 @@ Build dashboards from the exact names above:
   `sleepypods_runtime_control_plane_calls_total` by `operation,outcome`.
   Alert on `outcome=error` for `subscribe_route`, `wake_instance`,
   `report_idle`, or `unsubscribe`.
-- Wake latency: p95/p99 over `sleepypods_runtime_wake_latency_seconds` by
-  `outcome`; alert on high latency and any sustained `error` or `timeout`.
+- Wake acceptance latency: p95/p99 over
+  `sleepypods_runtime_wake_latency_seconds` by `outcome`; alert on high latency
+  and any sustained `error`. It times the `WakeInstance` call; the stateless
+  and stateful kind gates measure the whole cold start.
 - Materialization failures: rate of
   `sleepypods_runtime_materialization_failures_total` by `operation,outcome`;
   page on nonzero sustained failures. The counter counts attempts that ended
@@ -212,21 +205,20 @@ Build dashboards from the exact names above:
   Use Kubernetes/container metrics for CPU, memory, restarts, pod scheduling,
   network, and filesystem signals instead of adding SleepyPods labels for them.
 - Drain duration and active streams:
-  `sleepypods_runtime_drain_duration_seconds`,
-  `sleepypods_runtime_active_streams`, and
-  `sleepypods_proxy_drain_events_total{outcome=timeout}`.
+  `sleepypods_runtime_drain_duration_seconds` (`outcome=timeout` marks a drain
+  that reached its grace timeout) and `sleepypods_runtime_active_streams`.
 - Sidecar idle reports:
   `sleepypods_runtime_control_plane_calls_total{operation=report_idle}` plus
   `runtime.idle_report.event` fields `instance.id`, `generation`, and
   `active.count`.
 - HTTP-01:
   `sleepypods_runtime_http01_results_total` and `runtime.http01.event`.
-- Proxy throughput:
-  `sleepypods_proxy_forwarded_bytes_total`,
-  `sleepypods_proxy_forwarded_messages_total`, and
-  `sleepypods_proxy_active_streams`.
-- TLS/SNI:
-  `sleepypods_proxy_tls_client_hello_total` and TLS listener errors.
+- Pod-first connects: rate of
+  `sleepypods_runtime_pod_route_connects_total` by `outcome`. `pod` should
+  dominate after cold wakes. Sustained `timeout` or `error` means frontline
+  cannot reach Pod addresses and every new connection pays up to 250 ms before
+  using the Service; `claim_rejected` means stale Pod addresses that another
+  instance's sidecar now holds.
 - Certificate delivery: inspect `sleepypods_runtime_certificate_events_total`
   by operation and outcome. Sustained refresh errors/timeouts together with
   increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
@@ -256,7 +248,10 @@ Build dashboards from the exact names above:
 
 Cold wakes are slow or failing:
 
-1. Check `sleepypods_runtime_wake_latency_seconds` by `outcome`.
+1. Check `sleepypods_runtime_wake_latency_seconds` by `outcome` for slow or
+   refused `WakeInstance` calls, and
+   `sleepypods_runtime_pod_route_connects_total` for first requests that
+   waited on a Pod address before using the Service.
 2. Search `event.name=runtime.wake.event` and
    `event.name=runtime.materialization.failure` for `instance.id`,
    `generation`, `cluster.id`, `namespace`, and `error.reason`.
@@ -272,8 +267,9 @@ Cold wakes are slow or failing:
 
 Rendered object name collision:
 
-1. Search `runtime.wake.event` for `error.reason=store` and an error containing
-   `rendered Kubernetes object ref collision`.
+1. The wake call returns `InvalidArgument` with a message containing
+   `rendered Kubernetes object ref collision`; `runtime.wake.event` records it
+   with `error.reason=store` and no message.
 2. The wake failed before Kubernetes apply; inspect the failed instance and the
    owner instance named in the error.
 3. Use DNS-label-safe `instance_id` values and readable base templates. The
@@ -381,8 +377,7 @@ of 190 seconds and the resolved class idle timeout. This expected activation
 deferral does not indicate stuck drain work; the sidecar also requires its full
 quiet interval after actual traffic.
 
-1. Check `sleepypods_runtime_active_streams` and
-   `sleepypods_proxy_active_streams` for stuck work.
+1. Check `sleepypods_runtime_active_streams` for stuck work.
 2. Search `runtime.idle_report.event` for `active.count` and `generation`.
 3. Check sidecar `SLEEPYPODS_IDLE_TIMEOUT_MS`,
    `SLEEPYPODS_IDLE_RETRY_BACKOFF_MS`, and
@@ -391,8 +386,9 @@ quiet interval after actual traffic.
 5. Read the report outcome. `already_draining` means the instance is draining on
    the reporting Pod's projection; the sidecar keeps reporting while idle, so a
    Pod revived by a wake during drain sleeps again after its next quiet
-   interval and a fresh activation floor. `unavailable` names an instance state
-   with no Running projection to sleep.
+   interval and a fresh activation floor. The sidecar records `rejected` when
+   the instance has no Running projection to sleep, its generation moved on, or
+   the control plane asked it to retry later.
 
 Delete cleanup is stuck or objects leak:
 
@@ -434,8 +430,9 @@ HTTP-01 challenge fails:
 
 TLS termination or SNI passthrough fails:
 
-1. Check `sleepypods_proxy_tls_client_hello_total` outcomes, especially
-   `no_sni`, `invalid_hostname`, `not_tls`, or `malformed`.
+1. Check `sleepypods_runtime_certificate_events_total` by `operation` and
+   `outcome` for failed fetches and installs, and confirm the client sends SNI:
+   frontline closes a ClientHello without a valid server name.
 2. For termination, verify `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR`,
    verified HTTPS control-plane connectivity and the proxy bearer token. Inspect
    the exact hostname's `GetTlsBinding` and `GetCertificateMetadata`; the active
