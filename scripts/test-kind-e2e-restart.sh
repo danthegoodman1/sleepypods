@@ -13,6 +13,13 @@ app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/routing-app:${image_
 # Each invocation needs a genuinely absent image, including the second HA run
 # against a retained cluster whose node already has the previous late image.
 late_app_image="${SLEEPYPODS_KIND_E2E_LATE_APP_IMAGE:-${image_prefix}/routing-app-late:${image_tag}-$(date +%s)-$$}"
+# Each dependency-interruption wake waits in image pull until the driver loads
+# its own image.
+postgres_wake_app_image="${late_app_image}-postgres-wake"
+api_wake_app_image="${late_app_image}-api-wake"
+# The driver parks the API server's static Pod manifest here while it is down.
+api_server_manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+api_server_parked_manifest=/etc/kubernetes/kube-apiserver.yaml.sleepypods-interrupted
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
 workload_port="${SLEEPYPODS_KIND_E2E_WORKLOAD_PORT:-19752}"
@@ -69,6 +76,19 @@ start_port_forward_loop() {
   port_forward_loop_pid="$!"
 }
 
+restore_api_server() {
+  local node="${cluster_name}-control-plane"
+
+  if docker exec "${node}" test -f "${api_server_parked_manifest}" >/dev/null 2>&1; then
+    echo "==> Restoring the parked kube-apiserver manifest"
+    docker exec "${node}" mv "${api_server_parked_manifest}" "${api_server_manifest}" || true
+    for _ in $(seq 1 120); do
+      KUBECONFIG="${kubeconfig}" kubectl get --raw /readyz >/dev/null 2>&1 && break
+      sleep 1
+    done
+  fi
+}
+
 cleanup() {
   local status=$?
 
@@ -78,6 +98,9 @@ cleanup() {
       wait "${loop_pid}" 2>/dev/null || true
     fi
   done
+
+  restore_api_server
+  docker image rm "${postgres_wake_app_image}" "${api_wake_app_image}" >/dev/null 2>&1 || true
 
   if [[ "${created_cluster}" == "1" && "${keep_cluster}" != "1" ]]; then
     KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster_name}" || true
@@ -128,6 +151,9 @@ docker build \
   --tag "${late_app_image}" \
   --file "${repo_root}/scripts/Dockerfile.kind-routing-app" \
   "${repo_root}"
+for image in "${postgres_wake_app_image}" "${api_wake_app_image}"; do
+  docker tag "${late_app_image}" "${image}"
+done
 
 echo "==> Pulling ${postgres_image}"
 docker pull "${postgres_image}"
@@ -149,7 +175,23 @@ KUBECONFIG="${kubeconfig}" kubectl label namespace "${namespace}" \
   sleepypods.io/kind-e2e=restart --overwrite
 
 echo "==> Deploying Postgres"
+# The data lives on a claim, so the driver can stop Postgres and start it again
+# with its data intact.
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" apply -f - <<YAML
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sleepypods-postgres
+  labels:
+    app.kubernetes.io/name: sleepypods-postgres
+    sleepypods.io/kind-e2e: restart
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -159,6 +201,8 @@ metadata:
     sleepypods.io/kind-e2e: restart
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: sleepypods-postgres
@@ -182,6 +226,8 @@ spec:
               value: sleepypods
             - name: POSTGRES_DB
               value: sleepypods
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
           readinessProbe:
             exec:
               command:
@@ -197,7 +243,8 @@ spec:
               mountPath: /var/lib/postgresql/data
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: sleepypods-postgres
 ---
 apiVersion: v1
 kind: Service
@@ -400,6 +447,10 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
   SLEEPYPODS_E2E_LATE_APP_IMAGE="${late_app_image}" \
+  SLEEPYPODS_E2E_POSTGRES_WAKE_APP_IMAGE="${postgres_wake_app_image}" \
+  SLEEPYPODS_E2E_API_WAKE_APP_IMAGE="${api_wake_app_image}" \
+  SLEEPYPODS_E2E_API_SERVER_MANIFEST="${api_server_manifest}" \
+  SLEEPYPODS_E2E_API_SERVER_PARKED_MANIFEST="${api_server_parked_manifest}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
   SLEEPYPODS_E2E_CONTROL_PLANE_REPLICAS="${control_plane_replicas}" \
   cargo test -p control-plane --test kind_e2e_restart -- --ignored --nocapture

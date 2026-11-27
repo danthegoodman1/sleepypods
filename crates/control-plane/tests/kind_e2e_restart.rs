@@ -1,5 +1,7 @@
 #[path = "support/http_once.rs"]
 mod http_once;
+#[path = "kind_e2e_restart/interruption.rs"]
+mod interruption;
 
 use std::{
     collections::HashMap,
@@ -119,8 +121,21 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
     operator = connect_operator(&config.operator_endpoint).await?;
 
     eprintln!("==> restart E2E: route reassignment recovery");
-    route_reassignment_after_restart_does_not_serve_stale_backend(&mut operator, kube, &config)
-        .await?;
+    route_reassignment_after_restart_does_not_serve_stale_backend(
+        &mut operator,
+        kube.clone(),
+        &config,
+    )
+    .await?;
+    operator = connect_operator(&config.operator_endpoint).await?;
+
+    eprintln!("==> restart E2E: dependency interruption recovery");
+    interruption::dependency_interruptions_recover_without_an_operator(
+        &mut operator,
+        kube,
+        &config,
+    )
+    .await?;
 
     Ok(())
 }
@@ -135,8 +150,14 @@ struct E2eConfig {
     cluster_name: String,
     app_image: String,
     late_app_image: String,
+    postgres_wake_app_image: String,
+    api_wake_app_image: String,
     sidecar_image: String,
     control_plane_replicas: i32,
+    /// The API server's static Pod manifest inside the kind node.
+    api_server_manifest: String,
+    /// Where the driver parks that manifest to stop the API server.
+    api_server_parked_manifest: String,
 }
 
 #[derive(Debug)]
@@ -164,6 +185,13 @@ impl E2eConfig {
                 .unwrap_or_else(|_| "sleepypods/routing-app:kind-e2e-restart".to_owned()),
             late_app_image: env::var("SLEEPYPODS_E2E_LATE_APP_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/routing-app-late:kind-e2e-restart".to_owned()),
+            postgres_wake_app_image: env::var("SLEEPYPODS_E2E_POSTGRES_WAKE_APP_IMAGE")
+                .unwrap_or_else(|_| {
+                    "sleepypods/routing-app-late:kind-e2e-restart-postgres-wake".to_owned()
+                }),
+            api_wake_app_image: env::var("SLEEPYPODS_E2E_API_WAKE_APP_IMAGE").unwrap_or_else(
+                |_| "sleepypods/routing-app-late:kind-e2e-restart-api-wake".to_owned(),
+            ),
             sidecar_image: env::var("SLEEPYPODS_E2E_SIDECAR_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/sidecar:kind-e2e-restart".to_owned()),
             control_plane_replicas: env::var("SLEEPYPODS_E2E_CONTROL_PLANE_REPLICAS")
@@ -171,6 +199,12 @@ impl E2eConfig {
                 .map(|value| value.parse::<i32>())
                 .transpose()?
                 .unwrap_or(1),
+            api_server_manifest: env::var("SLEEPYPODS_E2E_API_SERVER_MANIFEST")
+                .unwrap_or_else(|_| "/etc/kubernetes/manifests/kube-apiserver.yaml".to_owned()),
+            api_server_parked_manifest: env::var("SLEEPYPODS_E2E_API_SERVER_PARKED_MANIFEST")
+                .unwrap_or_else(|_| {
+                    "/etc/kubernetes/kube-apiserver.yaml.sleepypods-interrupted".to_owned()
+                }),
         })
     }
 }
@@ -248,7 +282,7 @@ async fn restart_during_wake_recovers_without_stale_backend(
         config.control_plane_replicas,
     )
     .await?;
-    load_late_image_into_kind(config)?;
+    load_image_into_kind(config, &config.late_app_image)?;
     delete_workload_pods(kube.clone(), &config.namespace, "restart-wake").await?;
     // An operator channel opened right after the pod restart rides a
     // port-forward that may still target the old terminating control-plane
@@ -1258,17 +1292,37 @@ async fn connect_workload(endpoint: &str) -> TestResult<ProxyControlPlaneClient<
 }
 
 async fn scale_control_plane(kube: Client, namespace: &str, replicas: i32) -> TestResult<()> {
+    scale_deployment(
+        kube,
+        namespace,
+        CONTROL_PLANE_DEPLOYMENT,
+        CONTROL_PLANE_LABEL,
+        replicas,
+    )
+    .await
+}
+
+/// Scales a Deployment and waits until exactly `replicas` of its Pods are
+/// ready, or until none is left when scaling to zero.
+async fn scale_deployment(
+    kube: Client,
+    namespace: &str,
+    name: &str,
+    pod_label: &str,
+    replicas: i32,
+) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), namespace);
     deployments
         .patch(
-            CONTROL_PLANE_DEPLOYMENT,
+            name,
             &PatchParams::default(),
             &Patch::Merge(json!({ "spec": { "replicas": replicas } })),
         )
         .await?;
-    wait_for_control_plane_ready_replicas(
+    wait_for_ready_replicas(
         kube,
         namespace,
+        pod_label,
         replicas as usize,
         Duration::from_secs(120),
     )
@@ -1308,18 +1362,17 @@ async fn wait_for_replacement_control_plane_pod(
     }
 }
 
-async fn wait_for_control_plane_ready_replicas(
+async fn wait_for_ready_replicas(
     kube: Client,
     namespace: &str,
+    pod_label: &str,
     expected: usize,
     timeout: Duration,
 ) -> TestResult<()> {
     let pods: Api<Pod> = Api::namespaced(kube, namespace);
     let deadline = Instant::now() + timeout;
     loop {
-        let listed = pods
-            .list(&ListParams::default().labels(CONTROL_PLANE_LABEL))
-            .await?;
+        let listed = pods.list(&ListParams::default().labels(pod_label)).await?;
         let ready = listed.iter().filter(|pod| pod_ready(pod)).count();
         if expected == 0 {
             if listed.items.is_empty() {
@@ -1331,7 +1384,8 @@ async fn wait_for_control_plane_ready_replicas(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for {expected} ready control-plane replicas; got {ready}"
+                "timed out waiting for {expected} ready {pod_label} replicas; got {ready} of {}",
+                listed.items.len()
             )
             .into());
         }
@@ -1354,20 +1408,20 @@ fn pod_ready(pod: &Pod) -> bool {
         })
 }
 
-fn load_late_image_into_kind(config: &E2eConfig) -> TestResult<()> {
+fn load_image_into_kind(config: &E2eConfig, image: &str) -> TestResult<()> {
     let status = Command::new("kind")
         .args([
             "load",
             "docker-image",
-            config.late_app_image.as_str(),
+            image,
             "--name",
             config.cluster_name.as_str(),
         ])
         .status()?;
     if !status.success() {
         return Err(format!(
-            "kind load docker-image {} --name {} failed with status {status}",
-            config.late_app_image, config.cluster_name
+            "kind load docker-image {image} --name {} failed with status {status}",
+            config.cluster_name
         )
         .into());
     }
