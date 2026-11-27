@@ -1,17 +1,13 @@
 use std::{error::Error, fmt, net::IpAddr};
 
 use bytes::Bytes;
-use http::{
-    uri::{InvalidUri, InvalidUriParts, PathAndQuery},
-    Request, Response, Uri,
-};
+use http::{uri::InvalidUri, Request, Response, Uri};
 use http_body::Body;
 use hyper::body::Incoming;
 use proxy_core::{
     apply_forwarded_header_policy, DrainTracker, HttpProxy, HttpProxyError, TrackedBody,
-    WebSocketProxy, WebSocketProxyError, WebSocketProxyStats,
+    WebSocketProxy, WebSocketProxyError,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::wake::ReadyBackend;
 
@@ -48,9 +44,6 @@ pub enum BackendForwardError {
     MissingScheme,
     MissingAuthority,
     UnsupportedHttpScheme(String),
-    UnsupportedWebSocketScheme(String),
-    InvalidWebSocketPath(InvalidUri),
-    InvalidWebSocketUri(InvalidUriParts),
 }
 
 impl FrontlineForwarder {
@@ -105,22 +98,6 @@ impl FrontlineForwarder {
         self.forward_http(ready, request).await
     }
 
-    pub async fn forward_websocket<Client>(
-        &self,
-        ready: &ReadyBackend,
-        client: Client,
-        upstream_path_and_query: &str,
-    ) -> Result<WebSocketProxyStats, FrontlineForwardError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let upstream_url = websocket_upstream_url(ready, upstream_path_and_query)?;
-        self.websocket
-            .accept_and_proxy(client, &upstream_url)
-            .await
-            .map_err(FrontlineForwardError::WebSocket)
-    }
-
     pub async fn prepare_websocket_upgrade<B>(
         &self,
         ready: &ReadyBackend,
@@ -134,14 +111,9 @@ impl FrontlineForwarder {
         FrontlineForwardError,
     > {
         context.apply_to_request(request);
-        let path = request
-            .uri()
-            .path_and_query()
-            .map(|path| path.as_str())
-            .unwrap_or("/");
-        let upstream_url = websocket_upstream_url(ready, path)?;
+        let upstream_origin = http_upstream_origin(ready)?;
         self.websocket
-            .prepare_upgrade(request, &upstream_url)
+            .prepare_upgrade(request, &upstream_origin)
             .await
             .map_err(FrontlineForwardError::WebSocket)
     }
@@ -186,38 +158,6 @@ pub fn http_upstream_origin(ready: &ReadyBackend) -> Result<Uri, BackendForwardE
     }
     require_authority(&uri)?;
     Ok(uri)
-}
-
-pub fn websocket_upstream_url(
-    ready: &ReadyBackend,
-    upstream_path_and_query: &str,
-) -> Result<String, BackendForwardError> {
-    let uri = parse_backend_uri(ready)?;
-    let scheme = match uri.scheme_str().ok_or(BackendForwardError::MissingScheme)? {
-        "http" | "ws" => "ws",
-        unsupported => {
-            return Err(BackendForwardError::UnsupportedWebSocketScheme(
-                unsupported.to_string(),
-            ));
-        }
-    };
-    let authority = require_authority(&uri)?.clone();
-    let path_and_query = if upstream_path_and_query.is_empty() {
-        PathAndQuery::from_static("/")
-    } else {
-        upstream_path_and_query
-            .parse()
-            .map_err(BackendForwardError::InvalidWebSocketPath)?
-    };
-
-    let mut parts = Uri::default().into_parts();
-    parts.scheme = Some(scheme.parse().expect("static scheme is valid"));
-    parts.authority = Some(authority);
-    parts.path_and_query = Some(path_and_query);
-
-    Uri::from_parts(parts)
-        .map(|uri| uri.to_string())
-        .map_err(BackendForwardError::InvalidWebSocketUri)
 }
 
 fn parse_backend_uri(ready: &ReadyBackend) -> Result<Uri, BackendForwardError> {
@@ -267,18 +207,6 @@ impl fmt::Display for BackendForwardError {
             Self::UnsupportedHttpScheme(scheme) => {
                 write!(f, "backend URI scheme {scheme:?} is not supported for HTTP")
             }
-            Self::UnsupportedWebSocketScheme(scheme) => {
-                write!(
-                    f,
-                    "backend URI scheme {scheme:?} is not supported for WebSocket"
-                )
-            }
-            Self::InvalidWebSocketPath(error) => {
-                write!(f, "websocket upstream path/query is invalid: {error}")
-            }
-            Self::InvalidWebSocketUri(error) => {
-                write!(f, "websocket upstream URI is invalid: {error}")
-            }
         }
     }
 }
@@ -286,12 +214,8 @@ impl fmt::Display for BackendForwardError {
 impl Error for BackendForwardError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidUri(error) | Self::InvalidWebSocketPath(error) => Some(error),
-            Self::InvalidWebSocketUri(error) => Some(error),
-            Self::MissingScheme
-            | Self::MissingAuthority
-            | Self::UnsupportedHttpScheme(_)
-            | Self::UnsupportedWebSocketScheme(_) => None,
+            Self::InvalidUri(error) => Some(error),
+            Self::MissingScheme | Self::MissingAuthority | Self::UnsupportedHttpScheme(_) => None,
         }
     }
 }

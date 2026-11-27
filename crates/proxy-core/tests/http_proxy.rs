@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     convert::Infallible,
     error::Error,
@@ -1155,7 +1157,7 @@ async fn shared_http_server_bounds_silent_partial_http1_and_partial_h2_setup() {
         tokio::io::AsyncWriteExt::write_all(&mut client, prefix)
             .await
             .unwrap();
-        let task = tokio::spawn(proxy_core::serve_http_connection(
+        let task = tokio::spawn(support::serve_http_connection(
             server,
             proxy_core::Shutdown::new(),
             |_| async {
@@ -1180,7 +1182,7 @@ async fn shared_http_server_does_not_apply_setup_deadline_to_an_active_request()
     let started = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
     let released = release.clone();
-    let task = tokio::spawn(proxy_core::serve_http_connection(
+    let task = tokio::spawn(support::serve_http_connection(
         server,
         proxy_core::Shutdown::new(),
         move |_| {
@@ -1239,7 +1241,7 @@ async fn upstream_pool_bounds_origin_churn_preserves_reuse_and_evicts_idle_socke
                 let (stream, _) = listener.accept().await.unwrap();
                 connections.fetch_add(1, Ordering::Relaxed);
                 while sessions.try_join_next().is_some() {}
-                sessions.spawn(proxy_core::serve_http_connection(
+                sessions.spawn(support::serve_http_connection(
                     stream,
                     proxy_core::Shutdown::new(),
                     |_| async {
@@ -1289,7 +1291,7 @@ async fn upstream_pool_bounds_origin_churn_preserves_reuse_and_evicts_idle_socke
     ));
     timeout(
         TEST_TIMEOUT,
-        proxy.upstream_connections().wait_for_in_flight(0),
+        support::wait_for_in_flight(proxy.upstream_connections(), 0),
     )
     .await
     .unwrap();
@@ -1311,4 +1313,43 @@ async fn upstream_pool_bounds_origin_churn_preserves_reuse_and_evicts_idle_socke
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn http1_keepalive_connection_outlives_the_setup_timeout_and_ends_at_its_idle_timeout() {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let mut task = tokio::spawn(support::serve_http_connection(
+        server,
+        proxy_core::Shutdown::new(),
+        |_| async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok")))) },
+    ));
+
+    // Requests 15 seconds apart: longer than the 10-second setup timeout.
+    for _ in 0..3 {
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let head = support::read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        let mut body = [0_u8; 2];
+        client.read_exact(&mut body).await.unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "an idle keep-alive connection stays open"
+        );
+    }
+
+    // 90 seconds without a request closes it.
+    tokio::time::advance(Duration::from_secs(74)).await;
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    timeout(Duration::from_secs(1), &mut task)
+        .await
+        .expect("the idle timeout closes the connection")
+        .unwrap();
+    assert_eq!(client.read(&mut [0_u8; 1]).await.unwrap(), 0);
 }

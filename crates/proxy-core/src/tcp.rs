@@ -2,16 +2,12 @@ use std::{
     error::Error,
     fmt, io,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
-use socket2::{SockRef, TcpKeepalive};
 use tokio::{
-    io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     time::{timeout, Instant},
 };
@@ -23,7 +19,6 @@ pub struct TcpProxyConfig {
     pub connect_timeout: Duration,
     pub stream_idle_timeout: Duration,
     pub write_idle_timeout: Duration,
-    pub tcp_keepalive: Duration,
 }
 
 impl Default for TcpProxyConfig {
@@ -32,7 +27,6 @@ impl Default for TcpProxyConfig {
             connect_timeout: Duration::from_secs(10),
             stream_idle_timeout: Duration::from_secs(60 * 60),
             write_idle_timeout: Duration::from_secs(60),
-            tcp_keepalive: Duration::from_secs(60),
         }
     }
 }
@@ -41,12 +35,6 @@ impl Default for TcpProxyConfig {
 pub struct TcpProxy {
     drain: DrainTracker,
     config: TcpProxyConfig,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpProxyStats {
-    pub client_to_upstream: u64,
-    pub upstream_to_client: u64,
 }
 
 #[derive(Debug)]
@@ -74,27 +62,9 @@ impl TcpProxy {
         &self,
         client: TcpStream,
         upstream_addr: SocketAddr,
-    ) -> Result<TcpProxyStats, TcpProxyError> {
+    ) -> Result<(), TcpProxyError> {
         let _permit = self.drain.try_acquire()?;
-        configure_tcp_keepalive(&client, self.config.tcp_keepalive)
-            .map_err(TcpProxyError::Proxy)?;
-        let upstream = self.connect_upstream(upstream_addr).await?;
-
-        proxy_streams_with_timeouts(
-            client,
-            upstream,
-            self.config.stream_idle_timeout,
-            self.config.write_idle_timeout,
-        )
-        .await
-        .map_err(TcpProxyError::Proxy)
-    }
-
-    async fn connect_upstream(
-        &self,
-        upstream_addr: SocketAddr,
-    ) -> Result<TcpStream, TcpProxyError> {
-        let stream = crate::connect_tcp(upstream_addr, self.config.connect_timeout)
+        let upstream = crate::connect_tcp(upstream_addr, self.config.connect_timeout)
             .await
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -105,120 +75,106 @@ impl TcpProxy {
                     TcpProxyError::Connect(error)
                 }
             })?;
-        configure_tcp_keepalive(&stream, self.config.tcp_keepalive)
-            .map_err(TcpProxyError::Connect)?;
-        Ok(stream)
+
+        proxy_streams_with_timeouts(
+            client,
+            upstream,
+            Some(self.config.stream_idle_timeout),
+            self.config.write_idle_timeout,
+            None,
+        )
+        .await
+        .map_err(TcpProxyError::Proxy)
     }
 }
 
-pub async fn proxy_streams<Client, Upstream>(
-    mut client: Client,
-    mut upstream: Upstream,
-) -> io::Result<TcpProxyStats>
-where
-    Client: AsyncRead + AsyncWrite + Unpin,
-    Upstream: AsyncRead + AsyncWrite + Unpin,
-{
-    let (client_to_upstream, upstream_to_client) =
-        tokio_io::copy_bidirectional(&mut client, &mut upstream).await?;
-
-    Ok(TcpProxyStats {
-        client_to_upstream,
-        upstream_to_client,
-    })
-}
-
-pub async fn proxy_streams_with_idle_timeout<Client, Upstream>(
-    client: Client,
-    upstream: Upstream,
-    idle_timeout: Duration,
-) -> io::Result<TcpProxyStats>
-where
-    Client: AsyncRead + AsyncWrite + Unpin,
-    Upstream: AsyncRead + AsyncWrite + Unpin,
-{
-    proxy_streams_with_timeouts(client, upstream, idle_timeout, idle_timeout).await
-}
-
-/// Session idleness and a pending write have independent clocks. Progress in
-/// the other direction cannot keep a blocked writer alive indefinitely.
+/// Copies bytes in both directions until each side has closed its half.
+///
+/// Each direction runs independently, so a stalled reader on one side never
+/// stops the other direction. Three deadlines bound a session:
+///
+/// - `idle_timeout` ends it when both directions stay silent that long. `None`
+///   leaves a quiet session open and relies on TCP keepalive to find a lost
+///   peer.
+/// - `write_timeout` bounds one pending write or shutdown. Progress in the
+///   other direction does not extend it.
+/// - `half_close_timeout` ends it that long after one side closed while the
+///   other still holds its half open. `None` keeps a half-closed session,
+///   which TCP protocols may use, until the idle timeout.
 pub async fn proxy_streams_with_timeouts<Client, Upstream>(
     client: Client,
     upstream: Upstream,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     write_timeout: Duration,
-) -> io::Result<TcpProxyStats>
+    half_close_timeout: Option<Duration>,
+) -> io::Result<()>
 where
     Client: AsyncRead + AsyncWrite + Unpin,
     Upstream: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-    let idle_clock = IdleClock::new();
-    let (client_to_upstream, upstream_to_client) = tokio::try_join!(
-        copy_direction(
-            &mut client_read,
-            &mut upstream_write,
-            idle_timeout,
-            write_timeout,
-            idle_clock.clone()
-        ),
-        copy_direction(
-            &mut upstream_read,
-            &mut client_write,
-            idle_timeout,
-            write_timeout,
-            idle_clock
-        ),
-    )?;
+    let idle = idle_timeout.map(IdleClock::new);
+    let to_upstream = copy_direction(
+        &mut client_read,
+        &mut upstream_write,
+        write_timeout,
+        idle.as_ref(),
+    );
+    let to_client = copy_direction(
+        &mut upstream_read,
+        &mut client_write,
+        write_timeout,
+        idle.as_ref(),
+    );
+    tokio::pin!(to_upstream, to_client);
 
-    Ok(TcpProxyStats {
-        client_to_upstream,
-        upstream_to_client,
-    })
-}
-
-pub fn configure_tcp_keepalive(stream: &TcpStream, idle: Duration) -> io::Result<()> {
-    let keepalive = TcpKeepalive::new().with_time(idle);
-    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+    let upstream_closed_first = tokio::select! {
+        closed = &mut to_upstream => { closed?; false }
+        closed = &mut to_client => { closed?; true }
+    };
+    let other_half = async {
+        if upstream_closed_first {
+            to_upstream.await
+        } else {
+            to_client.await
+        }
+    };
+    match half_close_timeout {
+        None => other_half.await,
+        // The remaining side had its chance to finish; the session is over.
+        Some(limit) => timeout(limit, other_half).await.unwrap_or(Ok(())),
+    }
 }
 
 async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
-    idle_timeout: Duration,
     write_timeout: Duration,
-    idle_clock: IdleClock,
-) -> io::Result<u64>
+    idle: Option<&IdleClock>,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut total = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
-        let read = wait_for_progress(reader.read(&mut buffer), idle_timeout, &idle_clock).await?;
+        let read = wait_for_progress(reader.read(&mut buffer), idle).await?;
         if read == 0 {
-            timeout(
-                write_timeout,
-                wait_for_progress(writer.shutdown(), idle_timeout, &idle_clock),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP shutdown write stalled"))??;
-            return Ok(total);
+            return timeout(write_timeout, wait_for_progress(writer.shutdown(), idle))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "TCP shutdown write stalled")
+                })?;
         }
 
-        idle_clock.record_activity();
+        record_activity(idle);
         let mut written = 0;
         while written < read {
             let count = timeout(
                 write_timeout,
-                wait_for_progress(
-                    writer.write(&buffer[written..read]),
-                    idle_timeout,
-                    &idle_clock,
-                ),
+                wait_for_progress(writer.write(&buffer[written..read]), idle),
             )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP write stalled"))??;
@@ -229,25 +185,29 @@ where
                 ));
             }
             written += count;
-            idle_clock.record_activity();
+            record_activity(idle);
         }
-        total += read as u64;
     }
 }
 
-async fn wait_for_progress<F, T>(
-    future: F,
-    idle_timeout: Duration,
-    idle_clock: &IdleClock,
-) -> io::Result<T>
+fn record_activity(idle: Option<&IdleClock>) {
+    if let Some(idle) = idle {
+        idle.record_activity();
+    }
+}
+
+async fn wait_for_progress<F, T>(future: F, idle: Option<&IdleClock>) -> io::Result<T>
 where
     F: std::future::Future<Output = io::Result<T>>,
 {
+    let Some(idle) = idle else {
+        return future.await;
+    };
     tokio::pin!(future);
     loop {
-        match timeout(idle_clock.remaining(idle_timeout), &mut future).await {
+        match timeout(idle.remaining(), &mut future).await {
             Ok(result) => return result,
-            Err(_) if idle_clock.is_idle_for(idle_timeout) => {
+            Err(_) if idle.remaining().is_zero() => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "stream idle timeout elapsed",
@@ -258,17 +218,20 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+/// Idleness shared by both directions: progress in either keeps the session.
+#[derive(Debug)]
 struct IdleClock {
+    timeout: Duration,
     started_at: Instant,
-    last_activity_nanos: Arc<AtomicU64>,
+    last_activity_nanos: AtomicU64,
 }
 
 impl IdleClock {
-    fn new() -> Self {
+    fn new(timeout: Duration) -> Self {
         Self {
+            timeout,
             started_at: Instant::now(),
-            last_activity_nanos: Arc::new(AtomicU64::new(0)),
+            last_activity_nanos: AtomicU64::new(0),
         }
     }
 
@@ -277,21 +240,12 @@ impl IdleClock {
             .store(self.elapsed_nanos(), Ordering::Relaxed);
     }
 
-    fn remaining(&self, idle_timeout: Duration) -> Duration {
-        idle_timeout
-            .checked_sub(self.idle_for())
-            .unwrap_or(Duration::ZERO)
-    }
-
-    fn is_idle_for(&self, idle_timeout: Duration) -> bool {
-        self.idle_for() >= idle_timeout
-    }
-
-    fn idle_for(&self) -> Duration {
-        Duration::from_nanos(
+    fn remaining(&self) -> Duration {
+        let idle_for = Duration::from_nanos(
             self.elapsed_nanos()
                 .saturating_sub(self.last_activity_nanos.load(Ordering::Relaxed)),
-        )
+        );
+        self.timeout.saturating_sub(idle_for)
     }
 
     fn elapsed_nanos(&self) -> u64 {

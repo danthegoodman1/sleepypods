@@ -1,7 +1,10 @@
 use std::{
     error::Error,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -24,15 +27,10 @@ pub struct DrainTracker {
 
 #[derive(Debug)]
 struct Inner {
-    state: Mutex<State>,
+    draining: AtomicBool,
     active: ActiveConnectionCounter,
     grace_timeout: Duration,
     observability: ObservabilityRecorder,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    draining: bool,
 }
 
 /// Active work admitted before drain started.
@@ -52,7 +50,7 @@ impl DrainTracker {
     pub fn new(grace_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Inner {
-                state: Mutex::new(State::default()),
+                draining: AtomicBool::new(false),
                 active: ActiveConnectionCounter::new(),
                 grace_timeout,
                 observability: ObservabilityRecorder::default(),
@@ -66,7 +64,7 @@ impl DrainTracker {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                state: Mutex::new(State::default()),
+                draining: AtomicBool::new(false),
                 active: ActiveConnectionCounter::new(),
                 grace_timeout,
                 observability,
@@ -74,45 +72,30 @@ impl DrainTracker {
         }
     }
 
-    pub fn grace_timeout(&self) -> Duration {
-        self.inner.grace_timeout
-    }
-
     pub fn active_count(&self) -> usize {
         self.inner.active.active()
     }
 
     pub fn is_draining(&self) -> bool {
-        self.inner
-            .state
-            .lock()
-            .expect("drain tracker lock poisoned")
-            .draining
+        self.inner.draining.load(Ordering::SeqCst)
     }
 
+    /// Counts the work before the second drain check, so a drain that starts
+    /// concurrently either waits for this permit or sees it refused.
     pub fn try_acquire(&self) -> Result<DrainPermit, DrainError> {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("drain tracker lock poisoned");
-
-        if state.draining {
+        if self.is_draining() {
             return Err(DrainError::Draining);
         }
-
         let active = self.inner.active.track();
+        if self.is_draining() {
+            return Err(DrainError::Draining);
+        }
 
         Ok(DrainPermit { active })
     }
 
     pub fn start_drain(&self) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("drain tracker lock poisoned");
-        state.draining = true;
+        self.inner.draining.store(true, Ordering::SeqCst);
     }
 
     pub async fn wait_for_idle(&self) -> Result<(), DrainError> {

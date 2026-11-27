@@ -1,7 +1,6 @@
 use std::{convert::Infallible, time::Duration};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::{channel::Channel, BodyExt, Empty, Full};
 use hyper::{
@@ -12,22 +11,11 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use proxy_core::DrainTracker;
 use sleepypods_api::{BackendEndpoint, BackendGeneration, Generation, InstanceId};
-use tokio::{net::TcpListener, sync::oneshot};
-use tokio_tungstenite::{
-    accept_hdr_async, connect_async,
-    tungstenite::{
-        handshake::server::{
-            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
-        },
-        protocol::CloseFrame,
-        Bytes as WsBytes, Message,
-    },
-};
+use tokio::net::TcpListener;
 
 use crate::{
     forward::{
-        http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardError,
-        FrontlineForwarder,
+        http_upstream_origin, BackendForwardError, FrontlineForwardError, FrontlineForwarder,
     },
     ReadyBackend,
 };
@@ -326,184 +314,11 @@ async fn frontline_h2c_grpc_shaped_forwarding_preserves_body_and_trailers() {
     upstream_task.await.expect("upstream task completes");
 }
 
-#[tokio::test]
-async fn frontline_websocket_forwards_ready_backend_bidirectionally_and_closes() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream binds");
-    let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
-    let ready = ready_backend(format!("http://{upstream_addr}"));
-    let (path_seen_tx, path_seen_rx) = oneshot::channel();
-
-    let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener.accept().await.expect("upstream accepts");
-        let mut websocket = accept_hdr_async(
-            stream,
-            AssertForwardedWebSocketPath {
-                path_seen_tx: Some(path_seen_tx),
-            },
-        )
-        .await
-        .expect("upstream accepts websocket");
-
-        let first = websocket
-            .next()
-            .await
-            .expect("upstream receives text")
-            .expect("text frame valid");
-        assert_eq!(first, Message::Text("frontline text".into()));
-        websocket
-            .send(Message::Text("backend text".into()))
-            .await
-            .expect("upstream sends text");
-
-        let second = websocket
-            .next()
-            .await
-            .expect("upstream receives binary")
-            .expect("binary frame valid");
-        assert_eq!(
-            second,
-            Message::Binary(WsBytes::from_static(b"frontline bytes"))
-        );
-        websocket
-            .send(Message::Binary(WsBytes::from_static(b"backend bytes")))
-            .await
-            .expect("upstream sends binary");
-
-        let close = websocket
-            .next()
-            .await
-            .expect("upstream receives close")
-            .expect("close frame valid");
-        assert!(matches!(close, Message::Close(Some(_))));
-        websocket.flush().await.expect("upstream flushes close");
-    });
-
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
-    let forwarder = FrontlineForwarder::new(DrainTracker::new(Duration::from_secs(5)));
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener.accept().await.expect("proxy accepts");
-        forwarder
-            .forward_websocket(&ready, stream, "/socket?room=blue")
-            .await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}/client"))
-        .await
-        .expect("client connects to proxy websocket");
-    path_seen_rx.await.expect("upstream saw websocket path");
-
-    client
-        .send(Message::Text("frontline text".into()))
-        .await
-        .expect("client sends text");
-    let from_upstream = client
-        .next()
-        .await
-        .expect("client receives text")
-        .expect("text valid");
-    assert_eq!(from_upstream, Message::Text("backend text".into()));
-
-    client
-        .send(Message::Binary(WsBytes::from_static(b"frontline bytes")))
-        .await
-        .expect("client sends binary");
-    let from_upstream = client
-        .next()
-        .await
-        .expect("client receives binary")
-        .expect("binary valid");
-    assert_eq!(
-        from_upstream,
-        Message::Binary(WsBytes::from_static(b"backend bytes"))
-    );
-
-    client
-        .send(Message::Close(Some(CloseFrame {
-            code: 1000.into(),
-            reason: "done".into(),
-        })))
-        .await
-        .expect("client sends close");
-    let close = client
-        .next()
-        .await
-        .expect("client receives close")
-        .expect("close valid");
-    assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "done"));
-
-    let stats = proxy_task
-        .await
-        .expect("proxy task completes")
-        .expect("proxy succeeds");
-    assert_eq!(stats.client_to_upstream_messages, 3);
-    assert_eq!(stats.upstream_to_client_messages, 2);
-
-    upstream_task.await.expect("upstream task completes");
-}
-
-#[test]
-fn websocket_backend_url_conversion_and_rejection_are_typed() {
-    assert_eq!(
-        websocket_upstream_url(&ready_backend("http://127.0.0.1:8080"), "/ws?x=1")
-            .expect("http backend converts"),
-        "ws://127.0.0.1:8080/ws?x=1"
-    );
-    assert_eq!(
-        websocket_upstream_url(&ready_backend("ws://127.0.0.1:8080"), "")
-            .expect("ws backend converts"),
-        "ws://127.0.0.1:8080/"
-    );
-    assert!(matches!(
-        websocket_upstream_url(&ready_backend("https://127.0.0.1:8080"), "/ws"),
-        Err(BackendForwardError::UnsupportedWebSocketScheme(scheme)) if scheme == "https"
-    ));
-    assert!(matches!(
-        websocket_upstream_url(&ready_backend("/missing-scheme"), "/ws"),
-        Err(BackendForwardError::MissingScheme)
-    ));
-    assert!(matches!(
-        websocket_upstream_url(&ready_backend("http://127.0.0.1:8080"), "not/a/path"),
-        Err(BackendForwardError::InvalidWebSocketPath(_))
-    ));
-}
-
 fn ready_backend(uri: impl Into<String>) -> ReadyBackend {
     ReadyBackend {
         instance_id: InstanceId::new("instance-a").expect("instance id"),
         instance_generation: Generation::new(7),
         backend: BackendEndpoint::new(uri).expect("backend endpoint"),
         backend_generation: Some(BackendGeneration::new(11)),
-    }
-}
-
-struct AssertForwardedWebSocketPath {
-    path_seen_tx: Option<oneshot::Sender<()>>,
-}
-
-impl Callback for AssertForwardedWebSocketPath {
-    fn on_request(
-        mut self,
-        request: &WsRequest,
-        response: WsResponse,
-    ) -> Result<WsResponse, ErrorResponse> {
-        assert_eq!(
-            request
-                .uri()
-                .path_and_query()
-                .expect("ws path query")
-                .as_str(),
-            "/socket?room=blue"
-        );
-        self.path_seen_tx
-            .take()
-            .expect("path signal unused")
-            .send(())
-            .expect("test waits for websocket path");
-        Ok(response)
     }
 }

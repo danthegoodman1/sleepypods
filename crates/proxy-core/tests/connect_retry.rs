@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     convert::Infallible,
     io,
@@ -65,7 +67,7 @@ async fn refused_http_connect(version: Version) {
     let server_shutdown = shutdown.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let connection = proxy_core::serve_http_connection(stream, server_shutdown, move |req| {
+        let connection = support::serve_http_connection(stream, server_shutdown, move |req| {
             server_calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 assert_eq!(req.version(), version);
@@ -118,7 +120,7 @@ async fn reset_after_dispatch(version: Version) {
         socket2::SockRef::from(&stream)
             .set_linger(Some(Duration::ZERO))
             .unwrap();
-        proxy_core::serve_http_connection(stream, Shutdown::new(), move |req| {
+        support::serve_http_connection(stream, Shutdown::new(), move |req| {
             server_calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 assert_eq!(
@@ -183,9 +185,12 @@ async fn refused_http_connect_expires_and_releases_its_single_pool_permit() {
     .await
     .unwrap();
     assert!(result.is_err());
-    timeout(BOUND, proxy.upstream_connections().wait_for_in_flight(0))
-        .await
-        .unwrap();
+    timeout(
+        BOUND,
+        support::wait_for_in_flight(proxy.upstream_connections(), 0),
+    )
+    .await
+    .unwrap();
     assert_eq!(drain.active_count(), 0);
 }
 
@@ -209,15 +214,18 @@ async fn cancelled_refused_http_setup_releases_pool_and_drain() {
                 )
                 .await
         });
-        timeout(BOUND, proxy.upstream_connections().wait_for_in_flight(1))
-            .await
-            .unwrap();
+        timeout(
+            BOUND,
+            support::wait_for_in_flight(proxy.upstream_connections(), 1),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         timeout(
             Duration::from_millis(250),
-            proxy.upstream_connections().wait_for_in_flight(0),
+            support::wait_for_in_flight(proxy.upstream_connections(), 0),
         )
         .await
         .unwrap();
@@ -305,9 +313,8 @@ async fn refused_websocket_connect_waits_then_sends_one_handshake_and_message() 
     );
     let proxy_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        proxy
-            .accept_and_proxy(stream, &format!("ws://{upstream_addr}/once"))
-            .await
+        let origin = format!("http://{upstream_addr}").parse().unwrap();
+        support::proxy_websocket_connection(proxy, stream, origin).await
     });
     let mut client = tokio::spawn(connect_async(format!("ws://{proxy_addr}/once")));
     assert!(timeout(Duration::from_millis(80), &mut client)
@@ -341,7 +348,8 @@ async fn refused_websocket_connect_waits_then_sends_one_handshake_and_message() 
     );
     client.close(None).await.unwrap();
     let _ = client.next().await;
-    timeout(BOUND, proxy_task).await.unwrap().unwrap().unwrap();
+    drop(client);
+    let _ = timeout(BOUND, proxy_task).await.unwrap().unwrap();
     timeout(BOUND, server).await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(drain.active_count(), 0);
@@ -349,26 +357,31 @@ async fn refused_websocket_connect_waits_then_sends_one_handshake_and_message() 
 
 #[tokio::test]
 async fn cancelled_refused_websocket_setup_releases_drain_and_stops_dialing() {
+    use tokio::io::AsyncWriteExt;
     let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reservation.local_addr().unwrap();
     drop(reservation);
     let drain = DrainTracker::new(BOUND);
     let proxy = proxy_core::WebSocketProxy::new(drain.clone());
-    let task = tokio::spawn(async move {
-        proxy
-            .connect_accepted_upstream_with_headers(
-                &format!("ws://{addr}"),
-                &http::HeaderMap::new(),
-            )
-            .await
-    });
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let task = tokio::spawn(support::proxy_websocket_connection(
+        proxy,
+        client,
+        format!("http://{addr}").parse().unwrap(),
+    ));
+    peer.write_all(support::WEBSOCKET_UPGRADE_REQUEST.as_bytes())
+        .await
+        .unwrap();
     timeout(BOUND, drain.wait_for_active_count(1))
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
+    // The client leaves while the proxy is still dialing.
+    drop(peer);
+    timeout(BOUND, drain.wait_for_active_count(0))
+        .await
+        .unwrap();
     task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(drain.active_count(), 0);
     let listener = TcpListener::bind(addr).await.unwrap();
     assert!(timeout(Duration::from_millis(100), listener.accept())
         .await
@@ -403,6 +416,7 @@ async fn cancelled_refused_tcp_setup_releases_drain_and_stops_dialing() {
 
 #[tokio::test]
 async fn refused_websocket_setup_keeps_timeout_504_and_releases_drain() {
+    use tokio::io::AsyncWriteExt;
     let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -415,22 +429,79 @@ async fn refused_websocket_setup_keeps_timeout_504_and_releases_drain() {
             ..Default::default()
         },
     );
+    let (client, mut peer) = tokio::io::duplex(1024);
     let started = tokio::time::Instant::now();
-    let error = timeout(
-        BOUND,
-        proxy.connect_accepted_upstream_with_headers(
-            &format!("ws://{address}/once"),
-            &http::HeaderMap::new(),
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+    let task = tokio::spawn(support::proxy_websocket_connection(
+        proxy,
+        client,
+        format!("http://{address}").parse().unwrap(),
+    ));
+    peer.write_all(support::WEBSOCKET_UPGRADE_REQUEST.as_bytes())
+        .await
+        .unwrap();
+    let response = timeout(BOUND, support::read_head(&mut peer)).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 504 "), "{response}");
     assert!(started.elapsed() >= budget);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(
-        proxy_core::websocket_error_response(&error).status(),
-        http::StatusCode::GATEWAY_TIMEOUT
-    );
+    assert!(timeout(BOUND, task).await.unwrap().unwrap().is_err());
     assert_eq!(drain.active_count(), 0);
+}
+
+/// A full accept queue drops SYNs, as a Service address does before the node
+/// has programmed it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn http_connect_completes_one_short_probe_after_dropped_syns_stop() {
+    use socket2::{Domain, Socket, Type};
+
+    const OUTAGE: Duration = Duration::from_millis(300);
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    socket.listen(0).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(socket.into()).unwrap();
+    let address = listener.local_addr().unwrap();
+    let _filler = tokio::net::TcpStream::connect(address).await.unwrap();
+    let server = tokio::spawn(async move {
+        tokio::time::sleep(OUTAGE).await;
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(support::serve_http_connection(
+                stream,
+                Shutdown::new(),
+                |_| async {
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(
+                        b"ready",
+                    ))))
+                },
+            ));
+        }
+    });
+    let proxy = HttpProxy::new(DrainTracker::new(BOUND));
+    let request = Request::builder()
+        .uri("/")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let response = proxy
+        .proxy(request, &format!("http://{address}").parse().unwrap())
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "ready"
+    );
+    assert!(elapsed >= OUTAGE, "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    server.abort();
 }

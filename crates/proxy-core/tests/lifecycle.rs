@@ -18,7 +18,7 @@ async fn shutdown_cancellation_releases_admission_and_active_lifecycle() {
         let shutdown = shutdown.clone();
 
         async move {
-            let _permit = limiter.acquire().await.expect("worker admitted");
+            let _permit = limiter.try_acquire().expect("worker admitted");
             let _active = counter.track();
 
             entered_tx.send(()).expect("test waits for active worker");
@@ -28,7 +28,6 @@ async fn shutdown_cancellation_releases_admission_and_active_lifecycle() {
 
     entered_rx.await.expect("worker entered active lifecycle");
     assert_eq!(limiter.in_flight(), 1);
-    assert_eq!(limiter.available(), 0);
     assert_eq!(counter.active(), 1);
     assert_eq!(
         limiter.try_acquire().expect_err("admission is saturated"),
@@ -37,11 +36,9 @@ async fn shutdown_cancellation_releases_admission_and_active_lifecycle() {
 
     shutdown.shutdown();
     worker.await.expect("worker completed after cancellation");
-    limiter.wait_for_in_flight(0).await;
     counter.wait_for_zero().await;
 
     assert_eq!(limiter.in_flight(), 0);
-    assert_eq!(limiter.available(), 1);
     assert_eq!(counter.active(), 0);
 
     let _permit = limiter
