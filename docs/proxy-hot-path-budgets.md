@@ -1,10 +1,9 @@
 # Proxy Hot-Path Latency Budgets
 
-Milestone 1F adds benchmark harnesses and deterministic allocation checks for
-the proxy-core primitives that future frontline and sidecar binaries will call
-on hot routing paths. The numbers are budgets and regression signals, not hard
-CI latency gates yet, because local and CI hosts vary too much for stable
-wall-clock assertions.
+Benchmark harnesses and deterministic allocation checks cover the proxy-core
+primitives that the frontline and sidecar call on hot paths. The numbers are
+budgets and regression signals, not CI latency gates, because local and CI hosts
+vary too much for stable wall-clock assertions.
 
 Run the harness with:
 
@@ -20,8 +19,8 @@ cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measure
 
 ## Frontline Route Lookup Benchmark
 
-Milestone 9F adds a frontend-owned route lookup benchmark for hot positive
-route-cache hits with thousands of unrelated cached routes present:
+The frontline route lookup benchmark times hot route-cache hits with thousands
+of unrelated hosts cached:
 
 ```sh
 cargo bench -p frontline --bench route_lookup
@@ -33,36 +32,33 @@ For a quick compile-and-smoke run:
 cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1
 ```
 
-The benchmark covers HTTP exact-host lookup, HTTP wildcard-suffix lookup,
-same-host HTTP path-prefix lookup, and SNI lookup. These paths should stay
-indexed by route identity components rather than scanning every cached positive
-route on each hot-cache hit.
+The benchmark covers an HTTP host lookup, the last of 256 path rules on one
+host, an SNI host lookup, the full resolve through the production coordinator,
+its scaling across tasks, and cache writes. The cache answers by exact host, so
+a hit costs one host lookup and a scan of that host's rules, whatever else is
+cached.
 
 ## Criterion Benchmark Regression Gate
 
-Dynamic certificate delivery adds a matched warm TLS handshake workload:
+`tls_handshake/warm_sni_tls13_full` times a warm terminated handshake: P-256
+certificate, TLS 1.3 with resumption disabled, verified SNI and peer
+certificate, `h2` ALPN, one connection at a time over a 64 KiB in-memory
+transport, and one response byte. Certificate creation, validation and cache
+population are outside timing, and a warm handshake makes no certificate RPC.
+It isolates certificate delivery overhead; it does not measure deployed
+throughput, resumed sessions or operating-system networking.
+
+To compare a change to the certificate lookup path, record three rounds before
+and after it on the same machine, each with 2 seconds of warmup and 100 samples
+over 10 seconds:
 
 ```sh
 cargo bench -p frontline --bench tls_handshake -- --save-baseline before-r1
 ```
 
-Before changing the certificate lookup path, record three rounds (`before-r1`
-through `before-r3`) and preserve their raw artifacts separately. Repeat against
-the completed implementation on the same machine with the same workload: P-256
-certificate, TLS 1.3 with resumption disabled, verified SNI/peer certificate and
-`h2` ALPN, one connection at a time, 64 KiB in-memory transport, and one response
-byte. Each round uses 2 seconds of warmup and 100 samples over 10 seconds.
-Certificate creation, validation and cache population are outside timing. The
-completed cache must prove that measured warm handshakes make zero additional
-certificate RPCs. This isolates certificate delivery overhead; it does not
-measure deployed throughput, resumed sessions or operating-system networking.
-
-Freeze the comparison before implementation: compare the median of the three
-round means; warn above 15% regression and fail above 25%. Keep individual round
-results so inconsistent measurements remain visible. Existing route, allocation
-and deployed load budgets still apply. Raw Criterion data belongs in ignored
-local artifacts; record commands, source identifiers and the three means in the
-phase evidence document.
+Compare the median of the three round means; warn above 15% regression and fail
+above 25%. Keep the individual round results so inconsistent measurements stay
+visible. Raw Criterion data belongs in ignored local artifacts.
 
 Criterion stores benchmark baselines and comparison results under
 `target/criterion`. After running the proxy primitive and frontline route lookup
@@ -110,8 +106,7 @@ into the repository.
 
 ## Production Image Sidecar HTTP Load Smoke
 
-Milestone 7E starts with a small production-image smoke for the sidecar HTTP/1.1
-hot path:
+A small production-image smoke covers the sidecar HTTP/1.1 hot path:
 
 ```sh
 ./scripts/smoke-sidecar-load.sh
@@ -156,8 +151,7 @@ general end-to-end latency SLO.
 
 ## Production Image Sidecar TCP Load Smoke
 
-Milestone 7E also includes a small production-image smoke for the sidecar TCP
-hot path:
+A second smoke covers the sidecar TCP hot path:
 
 ```sh
 ./scripts/smoke-sidecar-tcp-load.sh
@@ -209,9 +203,9 @@ latency SLOs.
 
 ## Production Image Frontline HTTP, h2/gRPC, WebSocket, and Cold-Wake Load Smoke
 
-Milestone 7E also has a narrow production-image smoke for the frontline
-HTTP/1.1, h2c gRPC-shaped, negotiated h2-over-TLS gRPC-shaped, real generated
-gRPC, WebSocket, and cold-wake paths:
+A narrow production-image smoke covers the frontline HTTP/1.1, h2c
+gRPC-shaped, negotiated h2-over-TLS gRPC-shaped, real generated gRPC,
+WebSocket, and cold-wake paths:
 
 ```sh
 ./scripts/smoke-frontline-load.sh
@@ -416,22 +410,20 @@ defaults to `5000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 | TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip`, `tcp/proxy_streams_with_idle_timeout_duplex_4k_round_trip` | Measure the byte relay without external network variance: first with no idle deadline, as a WebSocket session runs it, then with one, as TCP and SNI passthrough run it. |
 | HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
 | WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Two WebSocket peers exchange a binary message and close through the byte relay, without an external service. The peers frame; the relay copies bytes. |
-| TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
+| TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded. |
+| Warm TLS termination | `tls_handshake/warm_sni_tls13_full` | Keep certificate delivery off the warm handshake path. |
 | Frontline route lookup | `route_lookup/http_host_many_unrelated`, `route_lookup/http_host_256_path_rules_last_match`, `route_lookup/sni_host_many_unrelated`, `route_lookup/full_resolve_*` | Keep a hot host lookup indexed with 4096 unrelated hosts cached, and bound the scan of the largest rule set a host may have. |
 | Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/{1,8,32}` | Each value times one hit by every task, so it stays near the single-task time while throughput rises with cores. |
 | Frontline route cache writes | `route_cache_scale/*` | Track expiry, eviction and the snapshot copy a cache change publishes, at 1000, 10000 and 100000 hosts. |
 | Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. A permit is a semaphore operation, and a guard is a few atomic operations that wake a task only while one waits for the count. |
-| Observability helpers | `observability/label_as_str_and_outcome_mapping` | Keep label and outcome mapping low-cardinality and allocation-free. |
 
-## Provisional Latency Budgets
+## Latency Budgets
 
-These initial budgets are intentionally conservative relative to the 1F smoke
-run. They are review thresholds for future regressions, not CI pass/fail gates.
-If a future change exceeds one of these budgets, the change should either reduce
-the overhead, update the benchmark workload, or document why the new cost is
-expected.
+These budgets are conservative review thresholds for regressions, not CI
+pass/fail gates. A change that exceeds one either reduces the overhead, updates
+the benchmark workload, or documents why the new cost is expected.
 
-| Path | Benchmark | Initial budget |
+| Path | Benchmark | Budget |
 | --- | --- | --- |
 | TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip` | <= 10 us per 4 KiB in-memory round trip |
 | HTTP request rewrite | `http/prepare_reverse_proxy_request` | <= 2 us per request |
@@ -443,17 +435,15 @@ expected.
 | Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/1` | <= 157 ns per hit; the 8- and 32-task values stay within a small multiple of it |
 | Admission acquire/release | `admission/try_acquire_release` | <= 100 ns per steady-state permit |
 | Active connection track/release | `accounting/track_release` | <= 100 ns per steady-state guard |
-| Observability label/outcome helpers | `observability/label_as_str_and_outcome_mapping` | <= 50 ns per mapping batch |
 
 ## Allocation Budgets
 
 The deterministic allocation tests in `allocation_hot_paths.rs` enforce these
-initial budgets. Setup allocations are outside the measured closures; the
+budgets. Setup allocations are outside the measured closures; the
 budgets describe steady-state helper behavior.
 
 | Path | Test label | Allocation budget |
 | --- | --- | --- |
-| Observability label helpers | `observability labels` | 0 allocations |
 | Active connection track/release | `active connection track/release` | 0 allocations after setup warm-up |
 | Admission acquire/release | `admission try_acquire/release` | 0 allocations after setup warm-up |
 | HTTP upstream URI rewrite | `upstream request URI rewrite` | <= 2 allocations |

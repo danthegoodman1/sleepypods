@@ -79,6 +79,7 @@ pub struct RpcAdmissionLayer {
     delivery_timeout: Duration,
 }
 impl RpcAdmissionLayer {
+    #[cfg(test)]
     pub fn new(limit: usize) -> Self {
         Self::with_delivery_timeout(limit, Duration::from_secs(5))
     }

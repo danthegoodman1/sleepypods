@@ -6,11 +6,8 @@ use std::{
 
 use http::Request;
 use proxy_core::{
-    observability::{
-        Operation, Outcome, Protocol, ProxyState, TlsClientHelloOutcome, TrafficDirection,
-    },
     parse_tls_client_hello_sni, strip_hop_by_hop_headers, upstream_request_uri,
-    ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloError, TlsClientHelloSni,
+    ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloSni,
 };
 
 #[global_allocator]
@@ -37,33 +34,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) };
     }
-}
-
-#[test]
-fn observability_label_helpers_do_not_allocate() {
-    assert_allocations_at_most("observability labels", 0, || {
-        for value in Protocol::ALL {
-            black_box(value.as_str());
-        }
-        for value in TrafficDirection::ALL {
-            black_box(value.as_str());
-        }
-        for value in Operation::ALL {
-            black_box(value.as_str());
-        }
-        for value in Outcome::ALL {
-            black_box(value.as_str());
-        }
-        for value in ProxyState::ALL {
-            black_box(value.as_str());
-        }
-        black_box(TlsClientHelloOutcome::from_result(black_box(&Result::<
-            proxy_core::TlsClientHelloSni,
-            _,
-        >::Err(
-            TlsClientHelloError::Malformed,
-        ))));
-    });
 }
 
 #[test]

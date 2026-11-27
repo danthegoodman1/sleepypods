@@ -221,6 +221,7 @@ pub struct CertificateCacheUsage {
 }
 
 impl TlsCertificateStore {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(resolver: Arc<dyn CertificateResolver>) -> (Self, TlsCertificateWorker) {
         Self::with_observability(resolver, ObservabilityRecorder::default())
     }
@@ -267,6 +268,7 @@ impl TlsCertificateStore {
         (cache, worker)
     }
     /// A passthrough-only adapter has no certificate delivery worker.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn disabled() -> Self {
         struct Disabled;
         impl CertificateResolver for Disabled {

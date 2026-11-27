@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Constructors and probes for tests, benches and examples.
+test-support = ["proxy-core/test-support"]
+
 [dependencies]
 arc-swap = "1.9.5"
 bytes = { workspace = true, default-features = false }
@@ -21,6 +25,7 @@ tonic = { workspace = true, features = ["channel", "codegen"] }
 
 [dev-dependencies]
 criterion = { workspace = true, default-features = false }
+frontline = { path = ".", features = ["test-support"] }
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 http-body-util = { workspace = true, default-features = false, features = ["channel", "full"] }
 hyper = { workspace = true, default-features = false, features = ["client", "server", "http1", "http2"] }
@@ -28,6 +33,7 @@ hyper-util = { workspace = true, default-features = false, features = ["client-l
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 rustls-pemfile = "2.2.0"
 sidecar = { path = "../sidecar" }
+sleepypods-observability = { path = "../sleepypods-observability", features = ["test-support"] }
 tokio = { workspace = true, default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
 tonic = { workspace = true, features = ["server", "router"] }

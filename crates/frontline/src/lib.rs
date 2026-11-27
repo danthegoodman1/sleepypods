@@ -1,8 +1,6 @@
-//! Frontline route-resolution and HTTP listener primitives.
-//!
-//! This crate models local route state, forwarding adapters, control-plane
-//! transports, and the minimal HTTP listener runtime used by the frontline
-//! binary.
+//! The frontline proxy: host-keyed route cache, route coordinator, wake
+//! requests, HTTP-01 interception, certificate delivery and the HTTP, TLS
+//! termination and SNI passthrough listeners.
 
 pub mod cache;
 pub mod certificates;
@@ -19,48 +17,46 @@ pub mod subscription;
 pub mod tls;
 pub mod wake;
 
-pub use cache::{HostEntry, HostKey, RouteSnapshot, RouteTable};
-pub use config::{FrontlineEnvConfig, FrontlineEnvConfigError};
-pub use control_plane::{
-    http01_challenge_key_to_proto, http01_challenge_record_from_proto,
-    proxy_wake_response_from_proto, route_stream_reply_from_proto, route_stream_request_to_proto,
-    wake_instance_request_to_proto, ProxyProtocolAdapterError,
-};
+pub use cache::{HostKey, RouteSnapshot, RouteTable};
+pub use config::FrontlineEnvConfig;
 pub use control_plane_transport::{
     GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError, GrpcProxyHttp01Resolver,
-    GrpcProxyHttp01ResolverError,
 };
-pub use forward::{
-    http_upstream_origin, BackendForwardError, FrontlineForwardContext, FrontlineForwardError,
-    FrontlineForwarder,
-};
-pub use http01::{
-    http01_challenge_key, http01_challenge_token, intercept_http01_challenge,
-    is_http01_challenge_candidate_path, Http01ChallengeResolveFuture, Http01ChallengeResolver,
-    Http01ChallengeResponse, Http01InterceptDecision, Http01InterceptError,
-    NoopHttp01ChallengeResolver, HTTP01_CHALLENGE_PREFIX, HTTP01_CONTENT_TYPE,
-};
-pub use identity::{RequestIdentityError, RouteRequestIdentity};
-pub use listener::{
-    serve_frontline, serve_frontline_listeners, FrontlineHttpListenerConfig,
-    FrontlineListenerError, FrontlineListenerKind, FrontlineListeners, FrontlineListenersConfig,
-    FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
-};
+pub use identity::RequestIdentityError;
+pub use listener::{serve_frontline, serve_frontline_listeners, FrontlineListeners};
 pub use route::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
     RouteLookupCounters, SharedFrontlineRouteCoordinator, WakeClient, WakeClientFuture,
 };
-pub use runtime::{FrontlineHttpRuntime, FrontlineRuntimeBody};
+pub use runtime::FrontlineHttpRuntime;
 pub use subscription::{
     RouteStream, RouteStreamEvent, RouteStreamReply, RouteStreamRequest, RouteSubscriptionClient,
-    RouteSubscriptionFuture, SubscribeErrorCode, SubscriptionId,
+    RouteSubscriptionFuture, SubscribeErrorCode,
 };
-pub use tls::{
-    passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateStore,
-    TlsPassthroughBackendError, TlsPassthroughClientHello, TlsPassthroughError,
-    TlsTerminationError,
+pub use tls::{FrontlineTlsAdapter, TlsCertificateStore};
+pub use wake::{WakeInstanceRequest, WakeInstanceResponse};
+
+// Paths the crate's own modules import from its root.
+pub(crate) use control_plane::{
+    http01_challenge_key_to_proto, http01_challenge_record_from_proto,
+    proxy_wake_response_from_proto, route_stream_reply_from_proto, route_stream_request_to_proto,
+    wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
-pub use wake::{
-    route_disposition, ReadyBackend, RouteDisposition, WakeInstanceRequest, WakeInstanceResponse,
-    WakeUnavailable, WakeUnavailableReason,
+pub(crate) use forward::{FrontlineForwardContext, FrontlineForwardError, FrontlineForwarder};
+pub(crate) use http01::{
+    intercept_http01_challenge, is_http01_challenge_candidate_path, Http01ChallengeResolveFuture,
+    Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
+    NoopHttp01ChallengeResolver,
 };
+pub(crate) use identity::RouteRequestIdentity;
+pub(crate) use listener::{
+    FrontlineHttpListenerConfig, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
+    FrontlineTlsTerminationListenerConfig,
+};
+pub(crate) use runtime::FrontlineRuntimeBody;
+pub(crate) use subscription::SubscriptionId;
+#[cfg(test)]
+pub(crate) use tls::TlsTerminationError;
+#[cfg(test)]
+pub(crate) use wake::WakeUnavailableReason;
+pub(crate) use wake::{route_disposition, ReadyBackend, RouteDisposition, WakeUnavailable};

@@ -54,10 +54,12 @@ impl TcpProxy {
         Self { drain, config }
     }
 
+    #[cfg(test)]
     pub fn drain_tracker(&self) -> &DrainTracker {
         &self.drain
     }
 
+    #[cfg(test)]
     pub fn config(&self) -> &TcpProxyConfig {
         &self.config
     }

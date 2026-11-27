@@ -130,10 +130,6 @@ impl HostRules {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
-
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
 }
 
 /// Exact host first, then the longer host, then the longer path prefix.
@@ -331,7 +327,8 @@ impl CachePolicy {
 }
 
 impl InvalidRouteHost {
-    pub fn reason(&self) -> &'static str {
+    #[cfg(test)]
+    fn reason(&self) -> &'static str {
         self.reason
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 
 use super::metrics::{MetricDescriptor, MetricLabel};
@@ -17,10 +17,7 @@ pub const EVENT_CONTROL_PLANE_AUTH: &str = "control_plane.auth.decision";
 pub const EVENT_CONTROL_PLANE_STORE_ERROR: &str = "control_plane.store.error";
 
 pub const FIELD_INSTANCE_ID: &str = "instance.id";
-pub const FIELD_ROUTE_ID: &str = "route.id";
-pub const FIELD_SUBSCRIPTION_ID: &str = "subscription.id";
 pub const FIELD_GENERATION: &str = "generation";
-pub const FIELD_BACKEND_GENERATION: &str = "backend.generation";
 pub const FIELD_CLUSTER_ID: &str = "cluster.id";
 pub const FIELD_NAMESPACE: &str = "namespace";
 pub const FIELD_ERROR_REASON: &str = "error.reason";
@@ -35,28 +32,6 @@ pub const FIELD_AUTH_REASON: &str = "auth.reason";
 pub const FIELD_AUTH_CALLER_ROLE: &str = "auth.caller.role";
 pub const FIELD_AUTH_REQUIRED_ROLE: &str = "auth.required.role";
 pub const FIELD_GRPC_SERVICE: &str = "grpc.service";
-
-pub const LIFECYCLE_FIELDS: &[&str] = &[
-    FIELD_INSTANCE_ID,
-    FIELD_ROUTE_ID,
-    FIELD_SUBSCRIPTION_ID,
-    FIELD_GENERATION,
-    FIELD_BACKEND_GENERATION,
-    FIELD_CLUSTER_ID,
-    FIELD_NAMESPACE,
-    FIELD_ERROR_REASON,
-    FIELD_ERROR_MESSAGE,
-    FIELD_ACTIVE_COUNT,
-    FIELD_DURATION_MS,
-    FIELD_EXCLUSIVITY_ACTION,
-    FIELD_EXCLUSIVITY_KEY_NAME,
-    FIELD_EXCLUSIVITY_OWNER_INSTANCE_ID,
-    FIELD_AUTH_DECISION,
-    FIELD_AUTH_REASON,
-    FIELD_AUTH_CALLER_ROLE,
-    FIELD_AUTH_REQUIRED_ROLE,
-    FIELD_GRPC_SERVICE,
-];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MetricObservation {
@@ -92,9 +67,11 @@ pub struct ObservabilityRecorder {
     sink: Option<Arc<dyn ObservabilitySink>>,
 }
 
+/// Keeps every event in memory for tests to inspect.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryObservability {
-    events: Arc<Mutex<Vec<ObservabilityEvent>>>,
+    events: Arc<std::sync::Mutex<Vec<ObservabilityEvent>>>,
 }
 
 #[derive(Debug)]
@@ -147,6 +124,7 @@ impl LifecycleLogEvent {
         &self.fields
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn field_value(&self, key: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -175,20 +153,8 @@ impl LogField {
         Self::new(FIELD_INSTANCE_ID, value)
     }
 
-    pub fn route_id(value: impl ToString) -> Self {
-        Self::new(FIELD_ROUTE_ID, value)
-    }
-
-    pub fn subscription_id(value: impl ToString) -> Self {
-        Self::new(FIELD_SUBSCRIPTION_ID, value)
-    }
-
     pub fn generation(value: impl ToString) -> Self {
         Self::new(FIELD_GENERATION, value)
-    }
-
-    pub fn backend_generation(value: impl ToString) -> Self {
-        Self::new(FIELD_BACKEND_GENERATION, value)
     }
 
     pub fn cluster_id(value: impl ToString) -> Self {
@@ -253,6 +219,7 @@ impl ObservabilityRecorder {
         Self { sink: Some(sink) }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stderr() -> Self {
         Self::new(Arc::new(StderrObservabilitySink))
     }
@@ -303,6 +270,7 @@ impl fmt::Debug for ObservabilityRecorder {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl InMemoryObservability {
     pub fn recorder(&self) -> ObservabilityRecorder {
         ObservabilityRecorder::new(Arc::new(self.clone()))
@@ -322,6 +290,7 @@ impl CompositeObservabilitySink {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ObservabilitySink for InMemoryObservability {
     fn record(&self, event: ObservabilityEvent) {
         self.events
@@ -392,35 +361,8 @@ mod tests {
     use super::{
         suppressed_on_stderr, InMemoryObservability, LifecycleLogEvent, LogField,
         MetricObservation, ObservabilityEvent, EVENT_DRAIN_STARTED, EVENT_WAKE, FIELD_INSTANCE_ID,
-        LIFECYCLE_FIELDS,
     };
     use crate::metrics::RUNTIME_ACTIVE_STREAMS;
-
-    #[test]
-    fn lifecycle_log_fields_include_required_identity_context() {
-        for field in [
-            "instance.id",
-            "route.id",
-            "subscription.id",
-            "generation",
-            "backend.generation",
-            "cluster.id",
-            "namespace",
-            "error.reason",
-            "active.count",
-            "duration.ms",
-            "exclusivity.action",
-            "exclusivity.key.name",
-            "exclusivity.owner.instance.id",
-            "auth.decision",
-            "auth.reason",
-            "auth.caller.role",
-            "auth.required.role",
-            "grpc.service",
-        ] {
-            assert!(LIFECYCLE_FIELDS.contains(&field));
-        }
-    }
 
     // The filtered stderr sink drops every metric sample, which fires per
     // forwarded request, and lets lifecycle and error events through.

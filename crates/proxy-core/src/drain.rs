@@ -47,6 +47,7 @@ pub enum DrainError {
 }
 
 impl DrainTracker {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(grace_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -157,6 +158,7 @@ impl DrainTracker {
 }
 
 impl DrainPermit {
+    #[cfg(test)]
     pub fn release(&mut self) {
         if self.active.is_active() {
             self.active.release();

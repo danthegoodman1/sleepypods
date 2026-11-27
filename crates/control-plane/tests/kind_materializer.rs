@@ -10,13 +10,12 @@ use control_plane::{
     projection::{ProjectionPlan, ProjectionReconciler},
     render_manifests, BackendGeneration, ContainerPortTemplate, ContainerTemplate, Generation,
     InstanceId, InstanceRecord, InstanceState, InstanceValues, KubeMaterializerClient,
-    KubeMaterializerClientConfig, KubernetesMaterializer, KubernetesMaterializerClient,
-    ManifestTemplate, MaterializationId, MaterializationRecord, MaterializationState,
-    MaterializationTarget, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSourceTemplate, RenderManifestRequest, RenderedManifest, RenderedObjectRef,
-    ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, VolumeTemplate, WorkloadClassId, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadTemplate,
+    KubernetesMaterializer, KubernetesMaterializerClient, ManifestTemplate, MaterializationId,
+    MaterializationRecord, MaterializationState, MaterializationTarget, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RenderManifestRequest,
+    RenderedManifest, RenderedObjectRef, ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate,
+    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassId,
+    WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
 };
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
@@ -72,11 +71,7 @@ fn install_rustls_crypto_provider() {
 async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResult<()> {
     let pv_seed = pv_name(namespace);
     let marker = marker_value(namespace);
-    let config = KubeMaterializerClientConfig {
-        readiness_timeout: Duration::from_secs(90),
-        ..KubeMaterializerClientConfig::default()
-    };
-    let kube_client = KubeMaterializerClient::with_config(client.clone(), config)?;
+    let kube_client = KubeMaterializerClient::new(client.clone());
     let materializer = KubernetesMaterializer::new(kube_client);
     let projection = ProjectionReconciler::new(&materializer);
     let manifest = kind_manifest(namespace, &pv_seed)?;

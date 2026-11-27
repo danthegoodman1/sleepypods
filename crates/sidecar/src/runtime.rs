@@ -9,7 +9,7 @@ use proxy_core::{
     serve_listener, Accept, AppHttpProxyError, AppProtocol, DrainError, DrainTracker,
     HttpProxyError, Shutdown,
 };
-use sleepypods_types::{Generation, InstanceId};
+use sleepypods_api::{Generation, InstanceId};
 use tokio::{sync::Mutex, task::JoinSet};
 
 use crate::{

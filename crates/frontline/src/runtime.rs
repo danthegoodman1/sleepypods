@@ -35,29 +35,21 @@ pub struct FrontlineHttpRuntime<RouteClient, Wake, Http01 = NoopHttp01ChallengeR
 }
 
 impl<RouteClient, Wake> FrontlineHttpRuntime<RouteClient, Wake, NoopHttp01ChallengeResolver> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
         drain: DrainTracker,
     ) -> Self {
-        Self::with_http01_resolver(coordinator, NoopHttp01ChallengeResolver, drain)
+        Self::with_http01_resolver_and_observability(
+            coordinator,
+            NoopHttp01ChallengeResolver,
+            drain,
+            ObservabilityRecorder::default(),
+        )
     }
 }
 
 impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> {
-    pub fn with_http01_resolver(
-        coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
-        http01_resolver: Http01,
-        drain: DrainTracker,
-    ) -> Self {
-        Self {
-            coordinator,
-            http01_resolver,
-            forwarder: FrontlineForwarder::new(drain.clone()),
-            drain,
-            observability: ObservabilityRecorder::default(),
-        }
-    }
-
     pub fn with_http01_resolver_and_observability(
         coordinator: FrontlineRouteCoordinator<RouteClient, Wake>,
         http01_resolver: Http01,
@@ -77,22 +69,17 @@ impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> 
         &self.coordinator
     }
 
-    pub fn coordinator_mut(&mut self) -> &mut FrontlineRouteCoordinator<RouteClient, Wake> {
-        &mut self.coordinator
-    }
-
+    #[cfg(test)]
     pub fn http01_resolver(&self) -> &Http01 {
         &self.http01_resolver
     }
 
-    pub fn http01_resolver_mut(&mut self) -> &mut Http01 {
-        &mut self.http01_resolver
-    }
-
+    #[cfg(test)]
     pub fn forwarder(&self) -> &FrontlineForwarder {
         &self.forwarder
     }
 
+    #[cfg(test)]
     pub fn drain(&self) -> &DrainTracker {
         &self.drain
     }

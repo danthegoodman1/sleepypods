@@ -159,6 +159,7 @@ impl FrontlineEnvConfig {
         })
     }
 
+    #[cfg(test)]
     pub fn listener(&self) -> FrontlineHttpListenerConfig {
         self.listeners.http()
     }
@@ -167,10 +168,12 @@ impl FrontlineEnvConfig {
         self.listeners
     }
 
+    #[cfg(test)]
     pub fn tls_termination_listener(&self) -> Option<FrontlineTlsTerminationListenerConfig> {
         self.listeners.tls_termination()
     }
 
+    #[cfg(test)]
     pub fn tls_passthrough_listener(&self) -> Option<FrontlineTlsPassthroughListenerConfig> {
         self.listeners.tls_passthrough()
     }

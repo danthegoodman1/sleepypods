@@ -23,8 +23,8 @@ use crate::store::StoreError;
 
 pub use grpc_web::operator_grpc_web_cors_layer;
 pub use proxy::{
-    proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
-    StoreBackedProxyApi, StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
+    proxy_grpc_service_with_store_and_route_events, StoreBackedProxyApi,
+    StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
 };
 pub use route_events::RouteSubscriptionBroker;
 pub use server::{

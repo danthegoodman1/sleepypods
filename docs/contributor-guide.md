@@ -1,8 +1,8 @@
 # SleepyPods Contributor And Agent Guide
 
-This repo favors the least code that satisfies the current milestone and its
-tests. Keep changes small, avoid mega files, and update the development-plan
-status when a documented gap actually closes.
+This repo favors the least code that satisfies the current plan item and its
+tests. Keep changes small, avoid mega files, and record evidence in
+`docs/improvement-plan.md` when a gap actually closes.
 
 ## Repo Map
 
@@ -14,21 +14,29 @@ status when a documented gap actually closes.
   interception, HTTP/TLS/SNI listeners, and frontline load-smoke helper.
 - `crates/sidecar`: workload-local HTTP/TCP proxy, drain/idle detection,
   `ReportIdle` client, and sidecar load-smoke helper.
-- `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
-  accounting, drain, shutdown, timeout, proxy-specific metrics adapters, and hot-path benches.
-- `crates/sleepypods-api`: generated protobuf clients/services, shared routing and
-  HTTP-01/certificate contracts, state/backend/target values, and native transport
-  and client bearer authentication.
+- `crates/proxy-core`: shared proxy primitives, the Pod-address hop and its
+  instance claim, TLS ClientHello/SNI parsing, accounting, drain, shutdown,
+  timeout, Prometheus collectors for proxy state, the protocol fixture app, and
+  hot-path benches.
+- `crates/sleepypods-api`: generated protobuf clients/services, resource IDs and
+  generations with the shared DNS-label check, routing and HTTP-01/certificate
+  contracts, state/backend/target values, and native transport and client
+  bearer authentication.
 - `crates/sleepypods-certificate`: maintained-library certificate/key/chain and
   hostname validation shared by publication and Frontline installation, without
   persistence or sealing dependencies.
-- `crates/sleepypods-observability`: metric and tracing vocabulary, the single
-  process-wide recorder, sinks, and Prometheus exporter.
-- `crates/sleepypods-types`: shared ID/value types.
-- `scripts`: production-image smokes, kind E2E gates, soak gates, load-budget
-  helpers, and Criterion regression checker.
-- `docs`: north-star, development plan, operator docs, runbook, contributor
-  guide, and hot-path budgets.
+- `crates/sleepypods-observability`: metric and log-event vocabulary, the
+  single process-wide recorder, sinks, and Prometheus exporter.
+- `scripts`: production-image smokes, kind E2E gates and their fixture apps
+  (`kind-*-app.py`, `Dockerfile.kind-*`, `lib/`), soak gates, load-budget
+  helpers, the Postgres store gate and its execution checker, the dependency
+  boundary check, and the Criterion regression checker.
+- `tests/support/runtime_shutdown.rs`: the signal handling all three binaries
+  include.
+- `docs`: north star, operator guide and runbook, the proxy protocol, Postgres
+  store and projection safety contracts, hot-path budgets, this guide, the
+  current improvement plan, and the earlier development, review-remediation
+  and dynamic-certificates plans kept as records.
 
 ## Source Of Truth
 
@@ -66,13 +74,17 @@ status when a documented gap actually closes.
   `crates/sleepypods-certificate/src/lib.rs`; encrypted persistence and native
   management/resolution APIs: `crates/control-plane/src/certificate/`,
   `postgres/certificate_ops.rs` and `api/certificates.rs`.
-- Sidecar idle: `crates/sidecar/src/idle.rs` and
-  `crates/sidecar/src/idle/control_plane.rs`
+- Sidecar idle: `crates/sidecar/src/idle.rs`; its `ReportIdle` client is
+  `crates/sidecar/src/control_plane_transport.rs`
+- Pod-address hop, instance claim and Pod-route connect counts:
+  `crates/proxy-core/src/pod_route.rs`
 - Observability: `crates/sleepypods-observability/src/metrics.rs`,
-  `recorder.rs`, and `lib.rs`; proxy adapters stay in `crates/proxy-core/src/observability/`.
+  `recorder.rs`, `prometheus.rs` and `lib.rs`; proxy adapters stay in
+  `crates/proxy-core/src/observability/`.
 - Hot-path/load gates: `docs/proxy-hot-path-budgets.md`,
   `crates/proxy-core/benches/proxy_primitives.rs`,
-  `crates/frontline/benches/route_lookup.rs`, and `scripts/smoke-*-load.sh`
+  `crates/frontline/benches/route_lookup.rs`,
+  `crates/frontline/benches/tls_handshake.rs`, and `scripts/smoke-*-load.sh`
 - kind E2E: `scripts/test-kind-e2e-*.sh` and
   `crates/control-plane/tests/kind_e2e_*.rs`
 
@@ -97,7 +109,8 @@ or cross-component contracts move.
 
 | Change | Commands |
 | --- | --- |
-| Any Rust change | `cargo fmt --check`, `cargo test` |
+| Any Rust change | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` |
+| Production build | `cargo check --workspace --lib --bins` builds without the `test-support` features, so it catches production code that calls a test-only item |
 | Whitespace/docs | `git diff --check` |
 | Proxy-core primitives | `cargo test -p proxy-core` and, for hot paths, `cargo bench -p proxy-core --bench proxy_primitives -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Frontline route/cache/listener | `cargo test -p frontline`; route lookup changes also run `cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
@@ -112,6 +125,7 @@ or cross-component contracts move.
 | Kubernetes materializer | `./scripts/test-kind-materializer.sh` |
 | Full platform behavior | the targeted `./scripts/test-kind-e2e-*.sh` gate |
 | Protocol fixture | `cargo test --locked -p proxy-core --example kind_protocol_app` executes direct HTTP/2, two-proxy-hop and WebSocket fixture regressions |
+| Load helpers | `cargo check --locked -p frontline --example frontline_load_smoke` and `cargo check --locked -p sidecar --example sidecar_load_smoke` |
 | Soak inventory reader/polling | `python3 scripts/test-full-wake-sleep-inventory.py` (mocked Kubernetes; no cluster) |
 | Repeated wake/sleep leaks | `./scripts/soak-kind-full-wake-sleep.sh` or `./scripts/soak-kind-materializer.sh` |
 
@@ -156,6 +170,12 @@ Targeted gates live in `scripts/`:
   control-plane container may restart.
 - `test-kind-e2e-lifecycle-races.sh`: concurrent wake/sleep/delete/stale
   lifecycle races.
+- `test-kind-e2e-exclusivity.sh`: rendered exclusivity keys through the
+  deployed platform, run by the stateful gate.
+- `test-kind-e2e-projection-drift.sh`: projection drift and finalizer safety
+  through the deployed platform, run by the stateful gate.
+- `test-kind-e2e-metrics.sh`: each binary serves Prometheus `/metrics` on its
+  dedicated listener and not on its main listener.
 
 The stateless and stateful gates end by measuring wake latency. Each sample
 sends one cold request to a fresh instance and prints a `wake-latency:` line
@@ -220,20 +240,28 @@ latency exceeds them.
 - HTTP/3, multi-cluster remote forwarding, and rich route predicates are
   deferred.
 - Observability metric names and log event fields must match
-  `sleepypods-observability/src`; update operator docs when they change.
+  `sleepypods-observability/src`; update the runbook's metric and field lists
+  when they change. A metric descriptor exists only while production code
+  records it.
+- Production modules hold production code. A `pub` item that only tests call
+  is `#[cfg(test)]` when its own crate's unit tests use it, and otherwise sits
+  behind `#[cfg(any(test, feature = "test-support"))]`. `proxy-core`,
+  `frontline`, `control-plane` and `sleepypods-observability` define
+  `test-support`, and dev-dependencies enable it (a crate enables its own for
+  its integration tests, benches and examples).
 - Add dependencies through the ecosystem command (`cargo add`, `npm install`,
   etc.) unless there is no suitable command or an exact manual constraint is
   required. Inspect manifest and lockfile diffs afterward.
 
 ## Agent Workflow
 
-1. Read `docs/development-plan.md` for the current milestone and any
+1. Read `docs/improvement-plan.md` for the current phase and any
    `Incomplete` rows before editing.
 2. Read the source-of-truth files listed above for the area being changed.
 3. Make the smallest complete change. Split files by responsibility only when
    it keeps ownership clear.
 4. Run focused tests first, then the release gate that matches the behavior.
-5. Update docs and development-plan evidence only after the behavior or docs are
-   actually present.
+5. Update docs and improvement-plan evidence only after the behavior or docs
+   are actually present.
 6. Run `git diff --check` before review.
 7. Do not commit or push unless the user explicitly asks.

@@ -14,7 +14,12 @@ use tokio::{
     time::{timeout, Instant},
 };
 
-use super::{claim_line, read_instance_claim, PodRoute, PodRoutes, SidecarIo, POD_ATTEMPT_TIMEOUT};
+use sleepypods_observability::PodRouteOutcome;
+
+use super::{
+    claim_line, read_instance_claim, PodRoute, PodRouteConnects, PodRoutes, SidecarIo,
+    POD_ATTEMPT_TIMEOUT,
+};
 
 /// A sidecar's view of a connection after its claim.
 async fn accept_instance_claim<IO>(mut io: IO, instance_id: &str) -> std::io::Result<SidecarIo<IO>>
@@ -23,6 +28,17 @@ where
 {
     let first = read_instance_claim(&mut io, instance_id).await?;
     Ok(SidecarIo::new(io, first))
+}
+
+/// Routes whose attempts count apart from every other test's.
+fn counted_routes() -> (PodRoutes, &'static PodRouteConnects) {
+    let connects: &'static PodRouteConnects = Box::leak(Box::new(PodRouteConnects::new()));
+    (PodRoutes::counted_in(connects), connects)
+}
+
+/// Each outcome's count, in `PodRouteOutcome::ALL` order.
+fn counts(connects: &PodRouteConnects) -> [u64; 6] {
+    PodRouteOutcome::ALL.map(|outcome| connects.get(outcome))
 }
 
 fn route(instance: &str, address: &str) -> PodRoute {
@@ -175,7 +191,7 @@ async fn sidecar(instance: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
 #[tokio::test]
 async fn a_pod_whose_sidecar_confirms_the_instance_connects() {
     let (address, accepted) = sidecar("tenant-a").await;
-    let routes = PodRoutes::default();
+    let (routes, connects) = counted_routes();
     let route = PodRoute::new("tenant-a", 1, address).unwrap();
 
     assert!(routes
@@ -187,12 +203,13 @@ async fn a_pod_whose_sidecar_confirms_the_instance_connects() {
         .await
         .is_some());
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    assert_eq!(counts(connects), [2, 0, 0, 0, 0, 0]);
 }
 
 #[tokio::test]
 async fn a_pod_of_another_instance_fails_once_per_backend_generation() {
     let (address, accepted) = sidecar("tenant-b").await;
-    let routes = PodRoutes::default();
+    let (routes, connects) = counted_routes();
     let stale = PodRoute::new("tenant-a", 1, address).unwrap();
 
     assert!(routes
@@ -212,6 +229,8 @@ async fn a_pod_of_another_instance_fails_once_per_backend_generation() {
         .await
         .is_none());
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    // Two claims the sidecar closed and one attempt skipped as known failed.
+    assert_eq!(counts(connects), [0, 0, 0, 2, 0, 1]);
 }
 
 #[tokio::test]
@@ -222,8 +241,9 @@ async fn a_refusing_pod_address_fails_at_once() {
         .local_addr()
         .unwrap();
     let started = Instant::now();
+    let (routes, connects) = counted_routes();
 
-    let connected = PodRoutes::default()
+    let connected = routes
         .connect(
             &PodRoute::new("tenant-a", 1, address).unwrap(),
             Duration::from_secs(10),
@@ -236,6 +256,7 @@ async fn a_refusing_pod_address_fails_at_once() {
         "{:?}",
         started.elapsed()
     );
+    assert_eq!(counts(connects), [0, 1, 0, 0, 0, 0]);
 }
 
 #[tokio::test]
@@ -249,8 +270,9 @@ async fn a_silent_pod_address_fails_after_the_attempt_timeout() {
         }
     });
     let started = Instant::now();
+    let (routes, connects) = counted_routes();
 
-    let connected = PodRoutes::default()
+    let connected = routes
         .connect(
             &PodRoute::new("tenant-a", 1, address).unwrap(),
             Duration::from_secs(10),
@@ -261,6 +283,7 @@ async fn a_silent_pod_address_fails_after_the_attempt_timeout() {
     let elapsed = started.elapsed();
     assert!(elapsed >= POD_ATTEMPT_TIMEOUT, "{elapsed:?}");
     assert!(elapsed < POD_ATTEMPT_TIMEOUT * 2, "{elapsed:?}");
+    assert_eq!(counts(connects), [0, 0, 1, 0, 0, 0]);
     held.abort();
 }
 

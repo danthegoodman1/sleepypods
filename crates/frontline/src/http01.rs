@@ -85,6 +85,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub fn http01_challenge_token(path: &str) -> Option<&str> {
     let token = path.strip_prefix(HTTP01_CHALLENGE_PREFIX)?;
     if token.is_empty() || token.contains('/') {
@@ -109,6 +110,7 @@ impl Http01ChallengeResolver for NoopHttp01ChallengeResolver {
     }
 }
 
+#[cfg(test)]
 pub fn http01_challenge_key(
     host: &str,
     token: &str,
@@ -140,6 +142,7 @@ impl Http01ChallengeResponse {
         }
     }
 
+    #[cfg(test)]
     pub fn key_authorization(&self) -> &str {
         &self.key_authorization
     }

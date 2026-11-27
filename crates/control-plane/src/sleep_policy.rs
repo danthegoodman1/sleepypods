@@ -47,6 +47,7 @@ pub enum SleepPolicyError {
 }
 
 impl WorkloadSleepPolicy {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         idle_timeout_ms: u64,
         idle_retry_backoff_ms: u64,
@@ -62,6 +63,7 @@ impl WorkloadSleepPolicy {
         Ok(policy)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_idle_timeout_override(
         mut self,
         override_policy: IdleTimeoutOverridePolicy,
@@ -129,6 +131,7 @@ impl WorkloadSleepPolicy {
 }
 
 impl IdleTimeoutOverridePolicy {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         value_field: impl Into<String>,
         min_idle_timeout_ms: u64,

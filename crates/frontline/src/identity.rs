@@ -48,6 +48,7 @@ impl RouteRequestIdentity {
         })
     }
 
+    #[cfg(test)]
     pub fn identity(&self) -> &RouteIdentity {
         &self.identity
     }

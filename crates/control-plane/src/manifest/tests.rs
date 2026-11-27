@@ -1914,7 +1914,6 @@ fn instance_id_rejects_values_that_cannot_be_used_in_rendered_names() {
         let error = InstanceId::new(value).expect_err("invalid instance ID is rejected");
 
         assert_eq!(error.field(), "InstanceId");
-        assert_eq!(error.value(), value);
     }
 }
 

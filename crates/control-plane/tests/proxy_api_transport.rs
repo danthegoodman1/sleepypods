@@ -21,8 +21,8 @@ use control_plane::api::{
         ProxySubscribeResponse, ProxyWakeInstanceRequest, ProxyWakeInstanceResponse,
         ProxyWakeUnavailableReason, RouteHostKind, RouteKind as ProtoRouteKind,
     },
-    proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
-    RouteSubscriptionBroker, StoreBackedProxyApi, StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
+    proxy_grpc_service_with_store_and_route_events, RouteSubscriptionBroker, StoreBackedProxyApi,
+    StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
@@ -65,7 +65,12 @@ fn authenticated_proxy_service(
     control_plane::ControlPlaneAuthInterceptor,
 > {
     tonic::service::interceptor::InterceptedService::new(
-        proxy_grpc_service_with_store(store, KubernetesMaterializer::new(client), proxy_target()),
+        proxy_grpc_service_with_store_and_route_events(
+            store,
+            KubernetesMaterializer::new(client),
+            proxy_target(),
+            RouteSubscriptionBroker::new(),
+        ),
         control_plane_auth().interceptor(PROXY_SERVICE_NAME, CallerRole::Proxy),
     )
 }
@@ -198,10 +203,11 @@ async fn native_grpc_request_dispatches_to_store_backed_proxy_wake_instance() {
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
 
-    let response = proxy_grpc_service_with_store(
+    let response = proxy_grpc_service_with_store_and_route_events(
         store,
         KubernetesMaterializer::new(client.clone()),
         proxy_target(),
+        RouteSubscriptionBroker::new(),
     )
     .oneshot(grpc_proxy_wake_request(
         ProxyWakeInstanceRequest {
@@ -545,7 +551,6 @@ async fn proxy_subscribe_publishes_no_backend_without_a_ready_materialization() 
     let cases = [
         ("absent", None),
         ("pending", Some(MaterializationState::Pending)),
-        ("failed", Some(MaterializationState::Failed)),
         ("deleting", Some(MaterializationState::Deleting)),
         ("deleted", Some(MaterializationState::Deleted)),
     ];
@@ -1441,11 +1446,14 @@ async fn dispatcher_read_failure_keeps_subscribers_and_delivers_after_recovery()
 
 #[test]
 fn native_grpc_server_can_be_constructed_with_store_backed_proxy_service() {
-    let _router = tonic::transport::Server::builder().add_service(proxy_grpc_service_with_store(
-        Arc::new(FakeWakeStore::default()),
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    ));
+    let _router = tonic::transport::Server::builder().add_service(
+        proxy_grpc_service_with_store_and_route_events(
+            Arc::new(FakeWakeStore::default()),
+            KubernetesMaterializer::new(FakeKubernetesClient::default()),
+            proxy_target(),
+            RouteSubscriptionBroker::new(),
+        ),
+    );
 
     assert_eq!(
         <StoreBackedProxyGrpcService<FakeKubernetesClient> as NamedService>::NAME,

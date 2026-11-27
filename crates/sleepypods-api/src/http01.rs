@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    fmt,
-    time::{Duration, SystemTime},
-};
+use std::{error::Error, fmt, time::SystemTime};
 
 use crate::route::{InvalidRouteHost, RouteHost};
 
@@ -116,15 +112,6 @@ impl PutHttp01ChallengeRequest {
         })
     }
 
-    pub fn with_ttl(
-        key: Http01ChallengeKey,
-        key_authorization: impl Into<String>,
-        ttl: Duration,
-        now: SystemTime,
-    ) -> Result<Self, InvalidHttp01Challenge> {
-        Self::new(key, key_authorization, now + ttl, now)
-    }
-
     pub fn key(&self) -> &Http01ChallengeKey {
         &self.key
     }
@@ -196,10 +183,10 @@ mod tests {
     fn put_request_exposes_validated_fields_by_accessor() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let key = Http01ChallengeKey::new("example.com", "token").expect("valid key");
-        let request = PutHttp01ChallengeRequest::with_ttl(
+        let request = PutHttp01ChallengeRequest::new(
             key.clone(),
             "authorization",
-            Duration::from_secs(60),
+            now + Duration::from_secs(60),
             now,
         )
         .expect("valid put request");

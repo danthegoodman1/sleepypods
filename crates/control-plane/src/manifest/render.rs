@@ -22,10 +22,9 @@ use k8s_openapi::{
 use serde_json::{Map, Value};
 
 use crate::{
+    ids::is_dns_label,
     instance::InstanceRecord,
-    kubernetes_name::{
-        instance_suffix, is_dns_label, render_instance_scoped_name, STATEFUL_SET_NAME_MAX_LEN,
-    },
+    kubernetes_name::{instance_suffix, render_instance_scoped_name, STATEFUL_SET_NAME_MAX_LEN},
 };
 
 use super::{
