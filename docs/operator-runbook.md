@@ -473,6 +473,21 @@ Postgres or database outage:
    control plane.
 4. Use backups as the source for disaster recovery; Kubernetes objects are not
    the durable resource model.
+5. No operator RPC is needed after the outage. The restart gate
+   (`scripts/test-kind-e2e-restart.sh`) stops Postgres for 30 seconds during a
+   wake and during a drain and requires both to finish on their own.
+
+Kubernetes API server outage:
+
+1. Search `runtime.materialization.failure` and
+   `runtime.materialization.reconciliation` with `operation=reconcile` and
+   `outcome=error` for Kubernetes connection errors. A refused or broken API
+   connection is transient: a wake retries until its operation deadline and
+   cleanup until it succeeds. The control-plane process stays up.
+2. Wakes in flight complete once the API server answers and the kubelet
+   publishes Pod readiness; no operator RPC is needed. The restart gate stops
+   the API server for 20 seconds during a wake and requires it to finish on
+   its own.
 
 Proxy `Subscribe` disconnects:
 
