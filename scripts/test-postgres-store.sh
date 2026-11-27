@@ -39,7 +39,8 @@ if [[ -z "${postgres_url}" ]]; then
       --env POSTGRES_USER=sleepypods \
       --env POSTGRES_PASSWORD=sleepypods \
       --publish 127.0.0.1::5432 \
-      "${postgres_image}"
+      "${postgres_image}" \
+      -c max_connections=1000
   )"
 
   deadline=$((SECONDS + ready_timeout))
