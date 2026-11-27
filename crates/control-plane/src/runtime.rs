@@ -13,8 +13,8 @@ use sleepypods_observability::{
     },
     prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
     recorder::{
-        CompositeObservabilitySink, MetricObservation, ObservabilityRecorder,
-        StderrObservabilitySink,
+        CompositeObservabilitySink, FilteredStderrObservabilitySink, MetricObservation,
+        ObservabilityRecorder,
     },
 };
 use tokio::{sync::watch, task::JoinSet};
@@ -737,15 +737,18 @@ async fn maintain_runtime(
     }
 }
 
-fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
+/// Installs the process-wide sinks. Stderr carries lifecycle and error events;
+/// metric samples reach only the Prometheus sink, so a successful RPC writes
+/// no line.
+pub fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
     if !metrics_enabled {
-        let _ = ObservabilityRecorder::install_stderr_global();
+        let _ = ObservabilityRecorder::install_global(Arc::new(FilteredStderrObservabilitySink));
         return None;
     }
 
     let prometheus = PrometheusMetricsSink::new();
     let _ = ObservabilityRecorder::install_global(Arc::new(CompositeObservabilitySink::new(vec![
-        Arc::new(StderrObservabilitySink),
+        Arc::new(FilteredStderrObservabilitySink),
         Arc::new(prometheus.clone()),
     ])));
     Some(prometheus)

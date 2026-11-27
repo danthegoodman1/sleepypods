@@ -3,6 +3,8 @@
 mod unexpected_store;
 #[path = "api_transport/create_validation.rs"]
 mod create_validation;
+#[path = "api_transport/quiet_logging.rs"]
+mod quiet_logging;
 mod support;
 use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
 use support::TestStore as FakeInstanceStore;
