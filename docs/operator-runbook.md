@@ -251,7 +251,12 @@ Cold wakes are slow or failing:
 1. Check `sleepypods_runtime_wake_latency_seconds` by `outcome` for slow or
    refused `WakeInstance` calls, and
    `sleepypods_runtime_pod_route_connects_total` for first requests that
-   waited on a Pod address before using the Service.
+   waited on a Pod address before using the Service. Frontline counts each
+   wake attempt in
+   `sleepypods_runtime_control_plane_calls_total{operation=wake_instance}`;
+   while the control plane is unavailable it repeats the call at most every
+   2 seconds and holds the cold request, so `outcome=error` or `timeout`
+   with no 503s marks a wake waiting for the control plane to return.
 2. Search `event.name=runtime.wake.event` and
    `event.name=runtime.materialization.failure` for `instance.id`,
    `generation`, `cluster.id`, `namespace`, and `error.reason`.
@@ -261,9 +266,9 @@ Cold wakes are slow or failing:
    holds its Pod until the claim binds.
 4. Check Postgres availability and the instance state/generation with
    `GetInstance`. A wake that cannot succeed, or passes its operation deadline,
-   leaves the instance `Failed` and cleans up; the next request starts a fresh
-   wake. `ReconcileMaterialization` with `status_only=true` returns the reason
-   in `wake_failure_message`.
+   leaves the instance `Failed` and cleans up; requests waiting on it get 503,
+   and the next request starts a fresh wake. `ReconcileMaterialization` with
+   `status_only=true` returns the reason in `wake_failure_message`.
 
 Rendered object name collision:
 

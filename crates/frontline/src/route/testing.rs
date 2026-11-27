@@ -352,6 +352,21 @@ impl RouteSubscriptionClient for FakeControlPlane {
     }
 }
 
+/// A scripted wake failure. The coordinator retries a transient one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WakeError {
+    Transient(&'static str),
+    Refused(&'static str),
+}
+
+impl std::fmt::Display for WakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) | Self::Refused(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Answers wake calls from a script and records them.
 #[derive(Clone, Default)]
 pub(crate) struct FakeWake {
@@ -360,19 +375,51 @@ pub(crate) struct FakeWake {
 
 #[derive(Default)]
 struct WakeState {
-    calls: Vec<WakeInstanceRequest>,
-    error: Option<TestError>,
+    calls: Vec<(tokio::time::Instant, WakeInstanceRequest)>,
+    error: Option<WakeError>,
     response: Option<WakeInstanceResponse>,
     hang: bool,
+    in_flight: usize,
+    most_in_flight: usize,
+}
+
+/// Counts a call as in flight until its future completes or is dropped.
+struct InFlight(Arc<Mutex<WakeState>>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().in_flight -= 1;
+    }
 }
 
 impl FakeWake {
     pub(crate) fn calls(&self) -> Vec<WakeInstanceRequest> {
-        self.state.lock().unwrap().calls.clone()
+        let state = self.state.lock().unwrap();
+        state.calls.iter().map(|(_, call)| call.clone()).collect()
     }
 
-    pub(crate) fn fail_with(&self, error: TestError) {
+    /// The time between each call and the one before it.
+    pub(crate) fn gaps(&self) -> Vec<Duration> {
+        let state = self.state.lock().unwrap();
+        state
+            .calls
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].0)
+            .collect()
+    }
+
+    /// The most calls that were in flight at once.
+    pub(crate) fn most_in_flight(&self) -> usize {
+        self.state.lock().unwrap().most_in_flight
+    }
+
+    /// Fails every call with `error` until `heal`.
+    pub(crate) fn fail_with(&self, error: WakeError) {
         self.state.lock().unwrap().error = Some(error);
+    }
+
+    pub(crate) fn heal(&self) {
+        self.state.lock().unwrap().error = None;
     }
 
     /// Answers every call with `response`. Without one, a call is accepted
@@ -387,14 +434,19 @@ impl FakeWake {
 }
 
 impl WakeClient for FakeWake {
-    type Error = TestError;
+    type Error = WakeError;
 
     fn wake_instance(
         &mut self,
         request: WakeInstanceRequest,
     ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         let mut state = self.state.lock().unwrap();
-        state.calls.push(request.clone());
+        state
+            .calls
+            .push((tokio::time::Instant::now(), request.clone()));
+        state.in_flight += 1;
+        state.most_in_flight = state.most_in_flight.max(state.in_flight);
+        let in_flight = InFlight(self.state.clone());
         let hang = state.hang;
         let result = match (&state.error, &state.response) {
             (Some(error), _) => Err(error.clone()),
@@ -405,11 +457,16 @@ impl WakeClient for FakeWake {
             }),
         };
         Box::pin(async move {
+            let _in_flight = in_flight;
             if hang {
                 std::future::pending::<()>().await;
             }
             result
         })
+    }
+
+    fn is_transient(error: &Self::Error) -> bool {
+        matches!(error, WakeError::Transient(_))
     }
 }
 

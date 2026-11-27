@@ -51,6 +51,16 @@ struct HeldWake {
     control_plane: ControlPlanePods,
 }
 
+/// What the cold request that began a held wake must get.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColdRequest {
+    /// Frontline holds it through the outage and serves it.
+    Served,
+    /// Its port-forward runs through the API server and dies with it, so a
+    /// retry may stand in for it.
+    ServedOrRetried,
+}
+
 /// The drain scenario's Pod, which a test finalizer keeps present.
 struct HeldPod {
     name: String,
@@ -99,7 +109,8 @@ pub(super) async fn dependency_interruptions_recover_without_an_operator(
 }
 
 /// Postgres stops while a wake waits for its Pod, and the Pod becomes ready
-/// during the outage. The wake completes once Postgres returns.
+/// during the outage. The wake completes once Postgres returns, and frontline
+/// serves the cold request that began it.
 async fn postgres_outage_during_wake(kube: &Client, config: &E2eConfig) -> TestResult<()> {
     let spec = POSTGRES_WAKE;
     let wake = begin_held_wake(kube, config, spec).await?;
@@ -117,7 +128,7 @@ async fn postgres_outage_during_wake(kube: &Client, config: &E2eConfig) -> TestR
         .await
     })
     .await?;
-    finish_interrupted_wake(kube, config, spec, wake).await
+    finish_interrupted_wake(kube, config, spec, wake, ColdRequest::Served).await
 }
 
 /// The API server stops while a wake waits for its Pod. The image arrives
@@ -130,7 +141,7 @@ async fn api_server_outage_during_wake(kube: &Client, config: &E2eConfig) -> Tes
         load_image_into_kind(config, &config.api_wake_app_image)
     })
     .await?;
-    finish_interrupted_wake(kube, config, spec, wake).await
+    finish_interrupted_wake(kube, config, spec, wake, ColdRequest::ServedOrRetried).await
 }
 
 /// Postgres stops while a drain waits for its held Pod to go, and the Pod goes
@@ -253,13 +264,15 @@ async fn begin_held_wake(
     })
 }
 
-/// The cold request or a retry is served, the instance completes exactly one
-/// Waking-to-Running transition, and no control-plane container restarted.
+/// The cold request is served as `cold_request` requires, the instance
+/// completes exactly one Waking-to-Running transition, and no control-plane
+/// container restarted.
 async fn finish_interrupted_wake(
     kube: &Client,
     config: &E2eConfig,
     spec: InstanceRouteSpec<'static>,
     wake: HeldWake,
+    cold_request: ColdRequest,
 ) -> TestResult<()> {
     let context = format!("{} after the outage", spec.instance_id);
     let recovered = Instant::now();
@@ -276,6 +289,12 @@ async fn finish_interrupted_wake(
                 Ok(response) => format!("HTTP {} {:?}", response.status, response.body),
                 Err(error) => error.to_string(),
             };
+            if cold_request == ColdRequest::Served {
+                return Err(format!(
+                    "{context}: the cold request ended after {took:?} with {ended}; frontline should hold it until the instance runs"
+                )
+                .into());
+            }
             eprintln!(
                 "==> restart E2E: {context}: the cold request ended after {took:?} with {ended}; retrying"
             );

@@ -5,17 +5,17 @@ use tokio::task::JoinHandle;
 
 use super::{
     testing::{
-        entry, http_rule, http_wildcard_rule, running, FakeControlPlane, FakeWake, TestError,
+        entry, http_rule, http_wildcard_rule, running, FakeControlPlane, FakeWake, WakeError,
     },
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
-    SharedFrontlineRouteCoordinator, MAX_ROUTE_FLIGHTS, MAX_ROUTE_WAITERS,
+    SharedFrontlineRouteCoordinator, MAINTENANCE_INTERVAL, MAX_ROUTE_FLIGHTS, MAX_ROUTE_WAITERS,
 };
 use crate::{
     RequestIdentityError, SubscribeErrorCode, WakeInstanceResponse, WakeUnavailableReason,
 };
 
 type Shared = SharedFrontlineRouteCoordinator<FakeControlPlane, FakeWake>;
-type RouteResult = Result<FrontlineRouteOutcome, FrontlineRouteCoordinatorError<TestError>>;
+type RouteResult = Result<FrontlineRouteOutcome, FrontlineRouteCoordinatorError<WakeError>>;
 
 struct Harness {
     control: FakeControlPlane,
@@ -663,42 +663,263 @@ async fn requests_that_leave_while_parked_stop_all_work() {
     assert!(again.iter().all(|request| !request.is_finished()));
 }
 
+/// Asserts each gap between wake calls is `expected`, give or take one
+/// maintenance tick.
+fn assert_wake_gaps(wake: &FakeWake, expected: &[Duration]) {
+    let gaps = wake.gaps();
+    assert_eq!(gaps.len(), expected.len(), "gaps {gaps:?}");
+    for (gap, expected) in gaps.iter().zip(expected) {
+        assert!(
+            *gap >= *expected && *gap < *expected + MAINTENANCE_INTERVAL,
+            "gaps {gaps:?}, expected {expected:?}"
+        );
+    }
+}
+
+fn millis(values: &[u64]) -> Vec<Duration> {
+    values.iter().copied().map(Duration::from_millis).collect()
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_failed_wake_call_fails_the_requests_parked_on_that_instance() {
+async fn a_refused_wake_call_fails_the_requests_parked_on_that_instance_at_once() {
     let h = harness();
     h.control
         .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
     h.control.set_http("other.example.com", running("other"));
-    h.wake.fail_with(TestError("wake refused"));
+    h.wake.fail_with(WakeError::Refused("instance not found"));
 
+    let started = tokio::time::Instant::now();
     let requests: Vec<_> = (0..5)
         .map(|index| h.spawn_http("app.example.com", &format!("/{index}")))
         .collect();
     for request in requests {
         assert_eq!(
             request.await.unwrap(),
-            Err(FrontlineRouteCoordinatorError::Wake(TestError(
-                "wake refused"
+            Err(FrontlineRouteCoordinatorError::Wake(WakeError::Refused(
+                "instance not found"
             )))
         );
     }
+    assert_eq!(started.elapsed(), Duration::ZERO);
     assert_eq!(h.wake.calls().len(), 1);
     assert_eq!(instance(h.http("other.example.com", "/").await), "other");
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_wake_call_with_no_answer_fails_at_its_deadline() {
-    let h = harness_with(|coordinator| coordinator.with_wake_deadline(Duration::from_millis(300)));
+async fn parked_requests_outlast_transient_wake_failures_and_are_served_once_running() {
+    let h = harness();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    h.wake
+        .fail_with(WakeError::Transient("control plane unavailable"));
+
+    let requests: Vec<_> = (0..5)
+        .map(|index| h.spawn_http("app.example.com", &format!("/{index}")))
+        .collect();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    assert!(requests.iter().all(|request| !request.is_finished()));
+    // One call at a time, 250 ms after the first failure, doubling to 2 s.
+    assert_wake_gaps(&h.wake, &millis(&[250, 500, 1000, 2000, 2000]));
+    assert_eq!(h.wake.most_in_flight(), 1);
+
+    // The control plane returns and accepts the next call.
+    h.wake.heal();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(h.wake.calls().len(), 7);
+    assert!(requests.iter().all(|request| !request.is_finished()));
+
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Running, 8));
+    for request in requests {
+        assert_eq!(instance(request.await.unwrap()), "app");
+    }
+    assert_eq!(h.wake.calls().len(), 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_after_transient_wake_failures_fails_the_parked_requests() {
+    let h = harness();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    h.wake
+        .fail_with(WakeError::Transient("control plane unavailable"));
+
+    let started = tokio::time::Instant::now();
+    let request = h.spawn_http("app.example.com", "/");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!request.is_finished());
+    h.wake.fail_with(WakeError::Refused("instance deleted"));
+
+    assert_eq!(
+        request.await.unwrap(),
+        Err(FrontlineRouteCoordinatorError::Wake(WakeError::Refused(
+            "instance deleted"
+        )))
+    );
+    // The third retry, 1 s after the second, met the refusal.
+    assert_wake_gaps(&h.wake, &millis(&[250, 500, 1000]));
+    assert!(started.elapsed() < Duration::from_millis(1800));
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_parked_on_a_wake_that_fails_get_the_failure_and_wake_nothing_again() {
+    let h = harness();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    let requests: Vec<_> = (0..5)
+        .map(|index| h.spawn_http("app.example.com", &format!("/{index}")))
+        .collect();
+    settle().await;
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Waking, 8));
+    settle().await;
+    assert!(requests.iter().all(|request| !request.is_finished()));
+
+    let started = tokio::time::Instant::now();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Failed, 9));
+    for request in requests {
+        assert_eq!(
+            request.await.unwrap(),
+            Err(FrontlineRouteCoordinatorError::WakeFailed)
+        );
+    }
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(h.wake.calls().len(), 1, "the failed instance stays Failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_after_a_failed_wake_wakes_again_once_cleanup_finishes() {
+    let h = harness();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Failed, 9));
+    h.wake.fail_with(WakeError::Transient(
+        "previous materialization cleanup is still pending",
+    ));
+
+    let request = h.spawn_http("app.example.com", "/");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!request.is_finished());
+    assert_eq!(h.wake.calls().len(), 3);
+
+    // Cleanup finishes, and the next call is accepted.
+    h.wake.heal();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let calls = h.wake.calls();
+    assert_eq!(calls.len(), 4);
+    assert!(calls.iter().all(|call| call.expected_generation.get() == 9));
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Waking, 10));
+    settle().await;
+    assert!(!request.is_finished());
+
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Running, 11));
+    assert_eq!(instance(request.await.unwrap()), "app");
+    assert_eq!(h.wake.calls().len(), 4);
+}
+
+/// Parks one request on a wake the control plane accepted, then takes the
+/// control plane's store away: every lookup fails, and so does the stream,
+/// which empties the cache.
+async fn park_through_a_store_outage(h: &Harness) -> JoinHandle<RouteResult> {
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    let request = h.spawn_http("app.example.com", "/");
+    settle().await;
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Waking, 8));
+    settle().await;
+    h.control.fail_host(
+        RouteKind::Http,
+        "app.example.com",
+        SubscribeErrorCode::Unavailable,
+    );
+    h.control.fail_streams();
+    request
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_outlasts_a_failed_stream_while_lookups_fail() {
+    let h = harness();
+    let request = park_through_a_store_outage(&h).await;
+    let before = h.control.subscribes_for(RouteKind::Http, "app.example.com");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    assert!(!request.is_finished());
+    // Lookups follow the backoff: 250 ms doubling to 2 s.
+    let lookups = h.control.subscribes_for(RouteKind::Http, "app.example.com") - before;
+    assert!((15..=20).contains(&lookups), "{lookups} lookups");
+
+    // The store returns with the instance running.
+    h.control.heal_host(RouteKind::Http, "app.example.com");
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Running, 9));
+    assert_eq!(instance(request.await.unwrap()), "app");
+    assert_eq!(h.wake.calls().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_whose_lookups_keep_failing_ends_at_the_route_deadline() {
+    let h = harness_with(|coordinator| coordinator.with_route_deadline(Duration::from_secs(5)));
+    let started = tokio::time::Instant::now();
+    let request = park_through_a_store_outage(&h).await;
+
+    assert_eq!(
+        request.await.unwrap(),
+        Err(FrontlineRouteCoordinatorError::RouteDeadline)
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_that_leave_stop_the_wake_retries() {
+    let h = harness();
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    h.wake
+        .fail_with(WakeError::Transient("control plane unavailable"));
+
+    let requests: Vec<_> = (0..3)
+        .map(|index| h.spawn_http("app.example.com", &format!("/{index}")))
+        .collect();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(requests.iter().all(|request| !request.is_finished()));
+    assert_eq!(h.wake.calls().len(), 4);
+
+    for request in &requests {
+        request.abort();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    assert_eq!(h.wake.calls().len(), 4, "no call with no waiter");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wake_call_with_no_answer_is_retried_until_the_route_deadline() {
+    let h = harness_with(|coordinator| {
+        coordinator
+            .with_wake_deadline(Duration::from_millis(300))
+            .with_route_deadline(Duration::from_secs(5))
+    });
     h.control
         .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
     h.wake.hang();
 
     let started = tokio::time::Instant::now();
-    assert!(matches!(
+    assert_eq!(
         h.http("app.example.com", "/").await,
-        Err(FrontlineRouteCoordinatorError::WakeDeadline(_))
-    ));
-    assert_eq!(started.elapsed(), Duration::from_millis(300));
+        Err(FrontlineRouteCoordinatorError::RouteDeadline)
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    // Each call times out after 300 ms, and the next follows the backoff.
+    assert_wake_gaps(&h.wake, &millis(&[550, 800, 1300, 2300]));
+    assert_eq!(h.wake.most_in_flight(), 1);
+
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(h.wake.calls().len(), 5, "no call after the request left");
 }
 
 #[tokio::test(start_paused = true)]

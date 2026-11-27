@@ -216,6 +216,9 @@ impl TestStore {
         let FakeStoreError::Unavailable(message) = error;
         *self.get_error.lock().unwrap() = Some(message);
     }
+    pub fn clear_get_error(&self) {
+        *self.get_error.lock().unwrap() = None;
+    }
     pub fn instance(&self) -> InstanceRecord {
         self.instances
             .lock()

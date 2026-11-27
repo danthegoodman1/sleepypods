@@ -268,13 +268,20 @@ A lookup flight covers the resolve only. Up to 64 hosts resolve at once with at
 most 256 waiting callers, and a flight ends when its last waiter leaves.
 Requests for an instance that is not yet running park on that instance and
 generation, and hold no flight, so hosts on waking instances leave lookups for
-other hosts free. The proxy asks for one wake per instance generation. Parked
-requests continue when a pushed rule set reports the instance Running; as a
-fallback each asks for its host's rule set again every 1.5 seconds. Wake
-acceptance is not readiness: the frontline waits for Running under
-`SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` (130000ms by default). The wake RPC
-retains its separate `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` deadline
-(5000ms by default). Frontline also rejects configuration where the route
+other hosts free. The proxy asks for one wake per instance generation, with one
+call in flight. Parked requests continue when a pushed rule set reports the
+instance Running; as a fallback each asks for its host's rule set again every
+1.5 seconds. Wake acceptance is not readiness: the frontline waits for Running
+under `SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` (130000ms by default). The wake
+RPC retains its separate `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS`
+deadline (5000ms by default). A call that passes that deadline, fails in
+transport, or meets an `UNAVAILABLE` or `DEADLINE_EXCEEDED` control plane is
+repeated after 250 ms, doubling to 2 seconds, while requests stay parked; the
+retries stop when the last parked request leaves. A parked request whose
+host's lookup fails as `UNAVAILABLE` or times out, as after a failed stream
+emptied the cache, asks again on the same backoff. A refused call fails the
+parked requests at once, and requests parked on a wake that leaves the instance
+Failed get that failure without another wake. Frontline also rejects configuration where the route
 timeout plus the greater of setup and upstream HTTP header idle timeouts exceeds
 190 seconds. Defaults are `130 + max(10, 60) = 190` seconds. This ceiling
 matches the activation handoff window described in the

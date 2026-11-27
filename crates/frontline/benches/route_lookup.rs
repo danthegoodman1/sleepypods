@@ -84,6 +84,10 @@ impl WakeClient for BenchWakeClient {
     ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         Box::pin(async { panic!("hot benchmark must not wake") })
     }
+
+    fn is_transient(_: &Self::Error) -> bool {
+        false
+    }
 }
 
 fn rules_reply(id: u64, kind: RouteKind, host: &RouteHost) -> RouteStreamEvent {

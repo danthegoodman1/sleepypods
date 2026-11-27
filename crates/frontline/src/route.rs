@@ -39,7 +39,8 @@ use proxy_core::observability::{
     Operation, Outcome,
 };
 use sleepypods_api::{
-    Generation, HostRules, InstanceId, RouteHost, RouteIdentity, RouteKind, RouteRule,
+    Generation, HostRules, InstanceId, InstanceState, RouteHost, RouteIdentity, RouteKind,
+    RouteRule,
 };
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
@@ -61,6 +62,11 @@ pub trait WakeClient {
         &mut self,
         request: WakeInstanceRequest,
     ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error>;
+
+    /// Whether the same call may succeed later: the transport failed, or the
+    /// control plane could not answer for now. Requests stay parked through a
+    /// transient failure, and a definite one fails them.
+    fn is_transient(error: &Self::Error) -> bool;
 }
 
 /// Hosts being resolved at once, demand and background together.
@@ -75,13 +81,20 @@ const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_WAKE_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_ROUTE_DEADLINE: Duration = Duration::from_secs(130);
-const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// The wait after a failed stream before the next connect. A stream that
+/// ended in order is replaced at once.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a parked request trusts the push before it asks for its host's
 /// rule set again.
 const PARKED_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// The least time between wake calls for one instance generation.
 const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// The wait before a wake call or a waiting request's lookup is repeated
+/// after the control plane failed it transiently. Each further failure
+/// doubles it, up to `MAX_RETRY_BACKOFF`.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// Times a request resolves a host whose answer left the cache before the
 /// request could read it.
 const MAX_RESOLVE_ATTEMPTS: usize = 3;
@@ -110,8 +123,10 @@ pub enum FrontlineRouteCoordinatorError<WakeClientError> {
         message: String,
     },
     SubscribeDeadline,
+    /// The control plane refused the wake call.
     Wake(WakeClientError),
-    WakeDeadline(WakeInstanceRequest),
+    /// The wake the request waited on left the instance Failed.
+    WakeFailed,
     /// The instance did not run within the route deadline.
     RouteDeadline,
     Saturated,
@@ -122,7 +137,8 @@ type RouteResult<W> = Result<FrontlineRouteOutcome, FrontlineRouteCoordinatorErr
 /// Tells a waiting request that its host's flight ended.
 type FlightReply<W> = oneshot::Sender<FlightResult<W>>;
 type FlightResult<W> = Result<(), FrontlineRouteCoordinatorError<W>>;
-type WakeResult<W> = Result<WakeInstanceResponse, FrontlineRouteCoordinatorError<W>>;
+/// A wake call's answer, or `None` when none arrived within the wake deadline.
+type WakeResult<W> = Option<Result<WakeInstanceResponse, W>>;
 
 /// Route-cache lookups counted without shared writes between cores.
 #[derive(Clone, Debug)]
@@ -209,7 +225,6 @@ pub struct FrontlineRouteCoordinator<RouteClient, Wake> {
     wake_client: Wake,
     wake_deadline: Duration,
     route_deadline: Duration,
-    reconnect_backoff: Duration,
     observability: ObservabilityRecorder,
     counters: RouteLookupCounters,
 }
@@ -222,7 +237,6 @@ impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
             wake_client,
             wake_deadline: DEFAULT_WAKE_DEADLINE,
             route_deadline: DEFAULT_ROUTE_DEADLINE,
-            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
             observability: ObservabilityRecorder::default(),
             counters: RouteLookupCounters::default(),
         }
@@ -245,13 +259,6 @@ impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
 
     pub fn with_route_deadline(mut self, deadline: Duration) -> Self {
         self.route_deadline = deadline;
-        self
-    }
-
-    /// The wait after a failed stream before the next connect. A stream that
-    /// ended in order is replaced at once.
-    pub fn with_reconnect_backoff(mut self, backoff: Duration) -> Self {
-        self.reconnect_backoff = backoff;
         self
     }
 
@@ -292,7 +299,6 @@ where
             wake_calls: tokio::task::JoinSet::new(),
             effects: Effects::default(),
             wake_deadline: self.wake_deadline,
-            reconnect_backoff: self.reconnect_backoff,
             observability: self.observability,
         };
         SharedFrontlineRouteCoordinator {
@@ -373,11 +379,12 @@ fn clock() -> Instant {
 /// What the snapshot says about one request.
 enum Lookup {
     Answer(FrontlineRouteOutcome),
-    /// The route's instance is not running. `version` identifies the rule set
-    /// this was read from.
+    /// The route's instance is not running. `failed` means the instance is
+    /// Failed. `version` identifies the rule set this was read from.
     Pending {
         instance: WakeKey,
         wake: bool,
+        failed: bool,
         version: u64,
     },
     Absent,
@@ -416,6 +423,7 @@ where
     }
 
     /// Lookups the cache answered and lookups that needed the control plane.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn lookup_counters(&self) -> &RouteLookupCounters {
         &self.shared.state.counters
     }
@@ -470,6 +478,7 @@ where
                     generation,
                 },
                 wake,
+                failed: rule.entry.instance_state == InstanceState::Failed,
                 version: entry.version,
             },
         }
@@ -494,6 +503,9 @@ where
         let key = HostKey::new(kind, host);
         let deadline = tokio::time::Instant::now() + self.shared.route_deadline;
         let mut resolves = 0;
+        let mut backoff = RETRY_BACKOFF;
+        // The instance generation this request last waited on.
+        let mut waited_on: Option<WakeKey> = None;
         loop {
             match seen {
                 Lookup::Answer(outcome) => return Ok(outcome),
@@ -504,15 +516,44 @@ where
                             message: "the host's rule set did not stay cached".to_owned(),
                         });
                     }
-                    resolves += 1;
-                    self.resolve(&key, &subscribed_host, None).await?;
+                    let resolved = tokio::select! {
+                        resolved = self.resolve(&key, &subscribed_host, None) => resolved,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            return Err(FrontlineRouteCoordinatorError::RouteDeadline);
+                        }
+                    };
+                    match resolved {
+                        Ok(()) => resolves += 1,
+                        // A request already waiting on a wake outlasts a
+                        // control plane that is briefly out of reach, as when
+                        // a failed stream emptied the cache. A new request
+                        // fails at once.
+                        Err(error) if waited_on.is_some() && error.is_transient_lookup() => {
+                            let retry_at = tokio::time::Instant::now() + backoff;
+                            tokio::time::sleep_until(retry_at.min(deadline)).await;
+                            backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Lookup::Pending {
                     instance,
                     wake,
+                    failed,
                     version,
                 } => {
                     resolves = 0;
+                    backoff = RETRY_BACKOFF;
+                    // The wake this request waited on ended in Failed. Only a
+                    // request that arrives later wakes the instance again.
+                    if failed
+                        && waited_on.as_ref().is_some_and(|waited| {
+                            waited.instance_id == instance.instance_id
+                                && waited.generation != instance.generation
+                        })
+                    {
+                        return Err(FrontlineRouteCoordinatorError::WakeFailed);
+                    }
                     let mut parked = self.shared.state.parking.park(&instance);
                     // The rule set may have changed between the lookup and
                     // parking; only an unchanged one is worth waiting on.
@@ -521,6 +562,7 @@ where
                         Lookup::Pending { version: current, .. } if current == version
                     );
                     if unchanged {
+                        waited_on = Some(instance.clone());
                         if wake {
                             self.command(Command::Wake {
                                 instance,
@@ -538,7 +580,8 @@ where
                                 // The push may be late or lost. A failed
                                 // refresh leaves the cached rule set in place,
                                 // and the request keeps waiting on it.
-                                let _ = self.resolve(&key, &subscribed_host, Some(version)).await;
+                                let refresh = self.resolve(&key, &subscribed_host, Some(version));
+                                let _ = tokio::time::timeout_at(deadline, refresh).await;
                             }
                             _ = tokio::time::sleep_until(deadline) => {
                                 return Err(FrontlineRouteCoordinatorError::RouteDeadline);
@@ -604,7 +647,8 @@ impl WakeKey {
 }
 
 /// Requests parked per instance generation. The actor signals a slot when a
-/// rule set naming that generation changes or its wake call fails.
+/// rule set naming that generation changes or the control plane refuses its
+/// wake.
 struct Parking<W> {
     slots: Mutex<HashMap<WakeKey, Arc<ParkSlot<W>>>>,
 }
@@ -663,6 +707,11 @@ impl<W: Clone> Parking<W> {
             signal,
             parked_at,
         }
+    }
+
+    /// Whether any request is parked on `key`.
+    fn is_waited_on(&self, key: &WakeKey) -> bool {
+        self.slots.lock().expect("route parking").contains_key(key)
     }
 
     fn signal(&self, key: &WakeKey) {
@@ -752,9 +801,14 @@ struct Flight<W> {
     exhausted: usize,
 }
 
+/// The wake calls for one instance generation.
 struct WakeCall {
-    started: Instant,
     in_flight: bool,
+    /// The earliest start of the next call.
+    next_at: Instant,
+    /// Set while calls fail transiently: the actor calls again at `next_at`
+    /// while requests stay parked, and waits this long after another failure.
+    backoff: Option<Duration>,
     /// Hosts whose requests asked for this wake.
     hosts: HashSet<HostKey>,
 }
@@ -798,7 +852,6 @@ struct Actor<Client, Wake: WakeClient> {
     wake_calls: tokio::task::JoinSet<(WakeKey, WakeResult<Wake::Error>)>,
     effects: Effects<Wake::Error>,
     wake_deadline: Duration,
-    reconnect_backoff: Duration,
     observability: ObservabilityRecorder,
 }
 
@@ -846,7 +899,7 @@ where
                     self.record_call(Operation::SubscribeStream, Outcome::Error);
                     // Nothing was lost: no stream existed to lose it.
                     self.session = Session::Idle {
-                        connect_at: tokio::time::Instant::now() + self.reconnect_backoff,
+                        connect_at: tokio::time::Instant::now() + RECONNECT_BACKOFF,
                     };
                 }
                 Step::Session(SessionEvent::Stream(event)) => {
@@ -950,7 +1003,7 @@ where
         let backoff = if in_order {
             Duration::ZERO
         } else {
-            self.reconnect_backoff
+            RECONNECT_BACKOFF
         };
         self.session = Session::Idle {
             connect_at: tokio::time::Instant::now() + backoff,
@@ -1212,55 +1265,84 @@ where
 
     fn on_wake(&mut self, instance: WakeKey, host: HostKey) {
         let now = clock();
-        if let Some(call) = self.wakes.get_mut(&instance) {
-            if call.in_flight || now < call.started + WAKE_RETRY_INTERVAL {
-                call.hosts.insert(host);
-                return;
-            }
+        let call = self
+            .wakes
+            .entry(instance.clone())
+            .or_insert_with(|| WakeCall {
+                in_flight: false,
+                next_at: now,
+                backoff: None,
+                hosts: HashSet::new(),
+            });
+        call.hosts.insert(host);
+        // A call is running or due later; the request waits for it.
+        if call.in_flight || call.backoff.is_some() || now < call.next_at {
+            return;
         }
         if self.wake_calls.len() >= MAX_WAKE_CALLS {
+            self.wakes.remove(&instance);
             self.effects
                 .failures
                 .push((instance, FrontlineRouteCoordinatorError::Saturated));
             return;
         }
-        let request = WakeInstanceRequest {
+        self.call_wake(instance, now);
+    }
+
+    fn call_wake(&mut self, instance: WakeKey, now: Instant) {
+        let Some(call) = self.wakes.get_mut(&instance) else {
+            return;
+        };
+        call.in_flight = true;
+        call.next_at = now + WAKE_RETRY_INTERVAL;
+        let call = self.wake_client.wake_instance(WakeInstanceRequest {
             instance_id: instance.instance_id.clone(),
             expected_generation: instance.generation,
-        };
-        let call = self.wake_client.wake_instance(request.clone());
-        let deadline = self.wake_deadline;
-        let key = instance.clone();
-        self.wake_calls.spawn(async move {
-            let result = match tokio::time::timeout(deadline, call).await {
-                Ok(result) => result.map_err(FrontlineRouteCoordinatorError::Wake),
-                Err(_) => Err(FrontlineRouteCoordinatorError::WakeDeadline(request)),
-            };
-            (key, result)
         });
-        self.wakes.insert(
-            instance,
-            WakeCall {
-                started: now,
-                in_flight: true,
-                hosts: HashSet::from([host]),
-            },
-        );
+        let deadline = self.wake_deadline;
+        self.wake_calls.spawn(async move {
+            let result = tokio::time::timeout(deadline, call).await.ok();
+            (instance, result)
+        });
     }
 
     fn on_wake_finished(&mut self, instance: WakeKey, result: WakeResult<Wake::Error>) {
-        let hosts = match self.wakes.get_mut(&instance) {
-            Some(call) => {
-                call.in_flight = false;
-                std::mem::take(&mut call.hosts)
-            }
-            None => HashSet::new(),
+        let Some(call) = self.wakes.get_mut(&instance) else {
+            return;
         };
-        match result {
-            Ok(WakeInstanceResponse::StillWaking { .. }) => {
+        call.in_flight = false;
+        let response = match result {
+            Some(Ok(response)) => response,
+            Some(Err(error)) if !Wake::is_transient(&error) => {
+                call.backoff = None;
+                call.hosts.clear();
+                self.record_call(Operation::WakeInstance, Outcome::Error);
+                self.effects
+                    .failures
+                    .push((instance, FrontlineRouteCoordinatorError::Wake(error)));
+                return;
+            }
+            failed => {
+                // The control plane may be briefly out of reach. The requests
+                // stay parked, and `maintain` calls again after the backoff.
+                let backoff = call.backoff.unwrap_or(RETRY_BACKOFF);
+                call.next_at = clock() + backoff;
+                call.backoff = Some((backoff * 2).min(MAX_RETRY_BACKOFF));
+                let outcome = match failed {
+                    None => Outcome::Timeout,
+                    Some(_) => Outcome::Error,
+                };
+                self.record_call(Operation::WakeInstance, outcome);
+                return;
+            }
+        };
+        call.backoff = None;
+        let hosts = std::mem::take(&mut call.hosts);
+        match response {
+            WakeInstanceResponse::StillWaking { .. } => {
                 self.record_call(Operation::WakeInstance, Outcome::Started);
             }
-            Ok(response) => {
+            response => {
                 // Running, deleted or at another generation: the cached rule
                 // set is behind, so each waiting host asks for its own again.
                 self.record_call(
@@ -1274,9 +1356,24 @@ where
                     self.refresh(host);
                 }
             }
-            Err(error) => {
-                self.record_call(Operation::WakeInstance, Outcome::Error);
-                self.effects.failures.push((instance, error));
+        }
+    }
+
+    /// Calls again for each instance whose wake failed transiently, while
+    /// requests still wait on it.
+    fn retry_wakes(&mut self, now: Instant) {
+        let due: Vec<WakeKey> = self
+            .wakes
+            .iter()
+            .filter(|(_, call)| call.backoff.is_some() && !call.in_flight && now >= call.next_at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            if !self.state.parking.is_waited_on(&key) {
+                // The last waiter left.
+                self.wakes.remove(&key);
+            } else if self.wake_calls.len() < MAX_WAKE_CALLS {
+                self.call_wake(key, now);
             }
         }
     }
@@ -1315,8 +1412,9 @@ where
         }
 
         let wall = clock();
+        self.retry_wakes(wall);
         self.wakes
-            .retain(|_, call| call.in_flight || wall < call.started + WAKE_RETRY_INTERVAL);
+            .retain(|_, call| call.in_flight || call.backoff.is_some() || wall < call.next_at);
     }
 
     /// Releases what a table change displaced: the control plane drops the
@@ -1392,6 +1490,20 @@ async fn session_event(session: &mut Session) -> SessionEvent {
     }
 }
 
+impl<W> FrontlineRouteCoordinatorError<W> {
+    /// A lookup the control plane may answer if asked again: it was
+    /// unavailable or did not answer in time.
+    fn is_transient_lookup(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolve {
+                code: SubscribeErrorCode::Unavailable,
+                ..
+            } | Self::SubscribeDeadline
+        )
+    }
+}
+
 impl<W: fmt::Display> fmt::Display for FrontlineRouteCoordinatorError<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1401,12 +1513,7 @@ impl<W: fmt::Display> fmt::Display for FrontlineRouteCoordinatorError<W> {
             }
             Self::SubscribeDeadline => f.write_str("route lookup timed out"),
             Self::Wake(error) => write!(f, "wake request failed: {error}"),
-            Self::WakeDeadline(request) => write!(
-                f,
-                "wake request timed out for instance {} generation {}",
-                request.instance_id.as_str(),
-                request.expected_generation.get()
-            ),
+            Self::WakeFailed => f.write_str("the instance failed to wake"),
             Self::RouteDeadline => f.write_str("route readiness timed out"),
             Self::Saturated => f.write_str("frontline route admission is saturated"),
             Self::RouteActorClosed => f.write_str("frontline route actor is closed"),

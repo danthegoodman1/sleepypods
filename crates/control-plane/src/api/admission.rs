@@ -182,10 +182,7 @@ where
             return Box::pin(async move { Ok(response) });
         };
         let subscription = certificate_watch
-            || request
-                .uri()
-                .path()
-                .ends_with("/ProxyControlPlane/Subscribe");
+            || request.uri().path() == "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe";
         let connection = connection_progress(request.extensions()).cloned();
         let delivery_timeout = self.delivery_timeout;
         let future = self.inner.call(request);
