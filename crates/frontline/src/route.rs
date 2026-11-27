@@ -88,10 +88,11 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
 const PARKED_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// The least time between wake calls for one instance generation.
 const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-/// The wait before the first call after a transient wake failure. Each
-/// further failure doubles it, up to `MAX_WAKE_BACKOFF`.
-const WAKE_BACKOFF: Duration = Duration::from_millis(250);
-const MAX_WAKE_BACKOFF: Duration = Duration::from_secs(2);
+/// The wait before a wake call or a waiting request's lookup is repeated
+/// after the control plane failed it transiently. Each further failure
+/// doubles it, up to `MAX_RETRY_BACKOFF`.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// Times a request resolves a host whose answer left the cache before the
 /// request could read it.
 const MAX_RESOLVE_ATTEMPTS: usize = 3;
@@ -509,6 +510,7 @@ where
         let key = HostKey::new(kind, host);
         let deadline = tokio::time::Instant::now() + self.shared.route_deadline;
         let mut resolves = 0;
+        let mut backoff = RETRY_BACKOFF;
         // The instance generation this request last waited on.
         let mut waited_on: Option<WakeKey> = None;
         loop {
@@ -521,8 +523,25 @@ where
                             message: "the host's rule set did not stay cached".to_owned(),
                         });
                     }
-                    resolves += 1;
-                    self.resolve(&key, &subscribed_host, None).await?;
+                    let resolved = tokio::select! {
+                        resolved = self.resolve(&key, &subscribed_host, None) => resolved,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            return Err(FrontlineRouteCoordinatorError::RouteDeadline);
+                        }
+                    };
+                    match resolved {
+                        Ok(()) => resolves += 1,
+                        // A request already waiting on a wake outlasts a
+                        // control plane that is briefly out of reach, as when
+                        // a failed stream emptied the cache. A new request
+                        // fails at once.
+                        Err(error) if waited_on.is_some() && error.is_transient_lookup() => {
+                            let retry_at = tokio::time::Instant::now() + backoff;
+                            tokio::time::sleep_until(retry_at.min(deadline)).await;
+                            backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Lookup::Pending {
                     instance,
@@ -531,6 +550,7 @@ where
                     version,
                 } => {
                     resolves = 0;
+                    backoff = RETRY_BACKOFF;
                     // The wake this request waited on ended in Failed. Only a
                     // request that arrives later wakes the instance again.
                     if failed
@@ -567,7 +587,8 @@ where
                                 // The push may be late or lost. A failed
                                 // refresh leaves the cached rule set in place,
                                 // and the request keeps waiting on it.
-                                let _ = self.resolve(&key, &subscribed_host, Some(version)).await;
+                                let refresh = self.resolve(&key, &subscribed_host, Some(version));
+                                let _ = tokio::time::timeout_at(deadline, refresh).await;
                             }
                             _ = tokio::time::sleep_until(deadline) => {
                                 return Err(FrontlineRouteCoordinatorError::RouteDeadline);
@@ -1312,9 +1333,9 @@ where
             failed => {
                 // The control plane may be briefly out of reach. The requests
                 // stay parked, and `maintain` calls again after the backoff.
-                let backoff = call.backoff.unwrap_or(WAKE_BACKOFF);
+                let backoff = call.backoff.unwrap_or(RETRY_BACKOFF);
                 call.next_at = clock() + backoff;
-                call.backoff = Some((backoff * 2).min(MAX_WAKE_BACKOFF));
+                call.backoff = Some((backoff * 2).min(MAX_RETRY_BACKOFF));
                 let outcome = match failed {
                     None => Outcome::Timeout,
                     Some(_) => Outcome::Error,
@@ -1474,6 +1495,20 @@ async fn session_event(session: &mut Session) -> SessionEvent {
         }
         Session::Connecting(connect) => SessionEvent::Connected(connect.await.ok().flatten()),
         Session::Open(stream) => SessionEvent::Stream(stream.events.recv().await),
+    }
+}
+
+impl<W> FrontlineRouteCoordinatorError<W> {
+    /// A lookup the control plane may answer if asked again: it was
+    /// unavailable or did not answer in time.
+    fn is_transient_lookup(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolve {
+                code: SubscribeErrorCode::Unavailable,
+                ..
+            } | Self::SubscribeDeadline
+        )
     }
 }
 

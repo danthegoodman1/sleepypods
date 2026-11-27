@@ -821,6 +821,59 @@ async fn a_request_after_a_failed_wake_wakes_again_once_cleanup_finishes() {
     assert_eq!(h.wake.calls().len(), 4);
 }
 
+/// Parks one request on a wake the control plane accepted, then takes the
+/// control plane's store away: every lookup fails, and so does the stream,
+/// which empties the cache.
+async fn park_through_a_store_outage(h: &Harness) -> JoinHandle<RouteResult> {
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Cold, 7));
+    let request = h.spawn_http("app.example.com", "/");
+    settle().await;
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Waking, 8));
+    settle().await;
+    h.control.fail_host(
+        RouteKind::Http,
+        "app.example.com",
+        SubscribeErrorCode::Unavailable,
+    );
+    h.control.fail_streams();
+    request
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_outlasts_a_failed_stream_while_lookups_fail() {
+    let h = harness();
+    let request = park_through_a_store_outage(&h).await;
+    let before = h.control.subscribes_for(RouteKind::Http, "app.example.com");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    assert!(!request.is_finished());
+    // Lookups follow the backoff: 250 ms doubling to 2 s.
+    let lookups = h.control.subscribes_for(RouteKind::Http, "app.example.com") - before;
+    assert!((15..=20).contains(&lookups), "{lookups} lookups");
+
+    // The store returns with the instance running.
+    h.control.heal_host(RouteKind::Http, "app.example.com");
+    h.control
+        .set_http("app.example.com", entry("app", InstanceState::Running, 9));
+    assert_eq!(instance(request.await.unwrap()), "app");
+    assert_eq!(h.wake.calls().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_request_whose_lookups_keep_failing_ends_at_the_route_deadline() {
+    let h = harness_with(|coordinator| coordinator.with_route_deadline(Duration::from_secs(5)));
+    let started = tokio::time::Instant::now();
+    let request = park_through_a_store_outage(&h).await;
+
+    assert_eq!(
+        request.await.unwrap(),
+        Err(FrontlineRouteCoordinatorError::RouteDeadline)
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+}
+
 #[tokio::test(start_paused = true)]
 async fn requests_that_leave_stop_the_wake_retries() {
     let h = harness();

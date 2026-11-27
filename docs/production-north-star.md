@@ -277,7 +277,9 @@ RPC retains its separate `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS`
 deadline (5000ms by default). A call that passes that deadline, fails in
 transport, or meets an `UNAVAILABLE` or `DEADLINE_EXCEEDED` control plane is
 repeated after 250 ms, doubling to 2 seconds, while requests stay parked; the
-retries stop when the last parked request leaves. A refused call fails the
+retries stop when the last parked request leaves. A parked request whose
+host's lookup fails as `UNAVAILABLE` or times out, as after a failed stream
+emptied the cache, asks again on the same backoff. A refused call fails the
 parked requests at once, and requests parked on a wake that leaves the instance
 Failed get that failure without another wake. Frontline also rejects configuration where the route
 timeout plus the greater of setup and upstream HTTP header idle timeouts exceeds

@@ -217,9 +217,11 @@ keep serving. A request for an instance that is not running waits for it under
 the route timeout, and the proxy asks the control plane to wake each instance
 generation once. A wake call that times out, fails in transport, or meets a
 control plane that answers `UNAVAILABLE` or `DEADLINE_EXCEEDED` is repeated
-after 250 ms, doubling to 2 seconds, while any request still waits; the
-requests keep waiting, so a control-plane or store outage shorter than the
-route timeout only delays a cold request. Any other failed call
+after 250 ms, doubling to 2 seconds, while any request still waits. A request
+that has waited on a wake also keeps waiting when its host's lookup fails as
+`UNAVAILABLE` or times out, as after a failed stream emptied the cache, and
+asks again on the same backoff. A control-plane or store outage shorter than
+the route timeout therefore only delays a cold request. Any other failed call
 answers the waiting requests at once. Requests waiting on a wake that leaves
 the instance Failed get 503 and start no further wake; a later request wakes it
 again. Requests waiting on a wake hold no lookup slot, so lookups for other
