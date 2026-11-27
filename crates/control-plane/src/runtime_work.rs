@@ -3,9 +3,6 @@ use crate::ids::{Generation, MaterializationId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MaterializationWorkStatus {
-    /// Advisory age measured with the database clock. Only present while Ready;
-    /// automatic sleep still rechecks eligibility atomically.
-    pub ready_age: Option<std::time::Duration>,
     pub next_attempt_at_unix_millis: i64,
     pub operation_deadline_unix_millis: i64,
     /// Remaining duration sampled with the persistence clock, never computed

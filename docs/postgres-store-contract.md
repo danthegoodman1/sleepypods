@@ -10,17 +10,18 @@ the request path; `HostRules` in `sleepypods-api` holds that ranking for both
 sides, and a property test checks it against Postgres for random binding sets.
 A host with more than 256 applicable bindings is refused. Route creation keeps
 every name within that count and a 1 MiB budget of rule bytes: it checks the
-rule sets a new binding joins after its insert, while it holds the route-change
-revision row, so concurrent creates take turns. An uncommitted concurrent
+rule sets a new binding joins after its insert, while it holds a
+transaction-scoped advisory lock on route bindings, so concurrent creates take
+turns and other writers do not wait for them. An uncommitted concurrent
 deletion leaves the old complete snapshot visible; once the deletion commits,
 the rule set is empty. This is snapshot consistency, with no promise
 that a returned backend stays live after the query completes. The rule sets the
 control plane pushes to subscribed proxies carry every later change.
 
-Every write that can change a rule set records a row in the route-change outbox
-and calls `pg_notify` from the same trigger, on a channel named for the store's
-schema. PostgreSQL delivers the notification at commit, so a rolled-back write
-wakes nobody. Each control-plane process holds one dedicated listening
+Every write that can change a rule set records its changes in the route-change
+outbox as its transaction commits and calls `pg_notify` on a channel named for
+the store's schema. PostgreSQL delivers the notification at commit, so a
+rolled-back write wakes nobody. Each control-plane process holds one dedicated listening
 connection beside its pool and reads the outbox when notified; the outbox, read
 by revision, stays the record of what changed. `LISTEN` needs a session
 connection: behind a transaction-pooling proxy the listener hears nothing, and
@@ -35,8 +36,7 @@ materialization state, refs or keys change; deleted materializations and physica
 cascading deletes release their reservations. Lease-only changes skip the work.
 The lifecycle driver remains responsible for proving cleanup before it commits
 Deleted or clears refs/keys. Reservation constraints do not establish Kubernetes
-absence on their own. Migration backfill rejects conflicting existing owners
-and rolls back rather than selecting one arbitrarily.
+absence on their own.
 
 ## Clock ownership
 
@@ -47,13 +47,12 @@ and work eligibility are computed the same way. One clock supplies both operands
 of every comparison, so a caller whose clock runs fast cannot lengthen its own
 lease and a slow one cannot shorten it.
 
-Exclusivity does not rest on any clock. Two clock-free mechanisms carry it: the
-fencing tokens revalidated on every write (`reconcile_owner`, `reconcile_attempt`
-and `instance_generation`), and the unresolved-effect barrier, which blocks
-claims, candidate scans and requeues while a Kubernetes call is in flight. The
-lease clock only decides when idle work may be reclaimed from an owner presumed
-dead, so clock skew costs a duplicated reconcile pass or a delayed recovery, not
-a duplicated effect.
+Exclusivity does not rest on any clock. The fencing tokens every write
+revalidates carry it: `reconcile_owner`, `reconcile_attempt` and
+`instance_generation`. The lease clock only decides when work may be reclaimed
+from an owner presumed dead, so clock skew costs a duplicated reconcile pass or
+a delayed recovery. [Projection safety](projection-safety.md) describes how a
+pass treats objects an earlier pass left.
 
 A store backend without a server clock may designate its own reference; the
 contract requires a single monotonic reference per comparison, not this
@@ -72,16 +71,16 @@ Reconciliation stores three separate timestamps:
 - `drain_not_before_unix_millis` records the sleep grace deadline independently
   of queue position. Both candidate scans and direct claims enforce it.
 
-For records created before migration 7, exact historical state age cannot be
-reconstructed from the old overloaded `updated_at` field. Backfill preserves
-its drain deadline and queue position, and caps a future state-age value at the
-migration time. New records do not have this ambiguity. A lease conflict is a
-nonretryable ownership error, distinct from a temporary database outage.
+A lease conflict is a nonretryable ownership error, distinct from a temporary
+database outage.
 
-Startup migrations run inside one transaction protected by a transaction-scoped
-Postgres advisory lock. Concurrent processes serialize before metadata/schema
-creation. Errors, cancellation and disconnect roll back and release the lock;
-a pooled connection cannot retain a manually opened migration transaction.
+The schema is one baseline migration,
+`crates/control-plane/migrations/0001_baseline.sql`. Startup applies it inside
+one transaction protected by a transaction-scoped Postgres advisory lock, so
+concurrent processes serialize, and errors, cancellation and disconnect roll
+back and release the lock. A database whose recorded migration 1 has another
+name fails startup: the store reads no earlier schema, so a deployment from an
+earlier schema starts on an empty database.
 
 ## Pool and operation budgets
 
@@ -100,47 +99,84 @@ A one-connection pool is supported;
 workload class creation reuses its held client. The route-change listener's
 connection is separate from the pool: allow one more connection per
 control-plane process. It reconnects one second after a failure, and the 250ms
-outbox poll covers the gap. Pool/query budgets bound an
-individual attempt; a retry wrapper can perform additional attempts according
-to its retry policy.
+outbox poll covers the gap. Pool and query budgets bound one attempt. An
+operation that is safe to repeat makes up to four attempts while the database
+is unavailable, backing off from 100ms to 2s.
 
-## Required capabilities and automatic retries
+## Statement cost
 
-`ControlPlaneStore` requires every persistence capability at compile time.
-PostgreSQL and `RetryingControlPlaneStore` implement every method explicitly;
-production implementations cannot inherit runtime "unsupported" behavior.
+Every statement runs through `postgres/sql.rs`, which prepares it once per
+pooled session, so a later run costs one round trip and no planning. The
+process caches immutable workload class versions, up to 1,024 of them. A
+lifecycle write carries its guard in its own `WHERE` clause, so no read comes
+before it that the write repeats. `begin_sleep` checks the Ready age in its
+write, so an idle report reads no work status first.
 
-An `Unavailable` response can follow a committed write. The retry wrapper only
-replays operations with a stable predicate, immutable value or exact ownership
-fence. Reads, immutable workload-class creation, generation-checked lifecycle
-transitions, exact lease/effect/failure operations and predicate-based maintenance
-retain bounded retries. Maintenance counts describe the successful final attempt,
-not an exact total across an uncertain earlier commit; every attempt retains its
-batch limit.
+`round_trips.rs` counts round trips at a relay in front of the database once a
+session has served each operation, and holds each to half its earlier count:
 
-The following mutations run once and return uncertain errors to their caller:
+| Operation | Round trips | Budget |
+| --- | --- | --- |
+| Proxy wake of a Cold instance | 5 | 8 |
+| Accepted idle report | 6 | 10 |
+| Lease check around one Kubernetes mutation | 1 | 7 |
 
-- Instance/route creation: a retry after a concurrent delete would create the
-  resource again.
-- Legacy instance deletion, route deletion, challenge put/delete and operator
-  force deletion/key release: a reused name or key can refer to a replacement.
-- Materialization recording: the upsert can overwrite newer same-generation
-  state and clear its lease.
-- Reconciliation claim and admin enqueue: neither request carries an exact
-  incarnation/attempt fence for replay after another worker advances the row.
-- Beginning a Kubernetes effect: an uncertain durable begin must not authorize
-  another dispatch. Exact effect acknowledgement remains safe to retry.
-- Certificate publication/removal, hostname binding changes and key
-  re-encryption: an uncertain response requires reading current metadata and
-  deciding whether another conditional mutation is appropriate.
+`store_throughput.rs` drives wake, completion, sleep and cleanup cycles
+through a relay that delays every round trip, counting four instance
+transitions per cycle. Transitions per second on a developer workstation, ten
+seconds per point:
 
-Callers must inspect current state before deciding how to resolve these uncertain
-outcomes. A one-shot mutation can consequently report `Unavailable` after it
-succeeded; the wrapper does not convert uncertainty into a second mutation.
+| Store | 1 writer, 0.5ms | 8 writers, 0.5ms | 1 writer, 2ms | 8 writers, 2ms |
+| --- | --- | --- | --- | --- |
+| Revision numbered per statement | 69 | 170 | 28 | 83 |
+| Revision numbered at commit | 68 | 332 | 27 | 214 |
+| Prepared statements and folded guards | 142 | 354 | 67 | 333 |
+
+Numbering at commit lets concurrent writers overlap; prepared statements and
+folded guards shorten each writer's cycle.
+
+## Store roles and automatic retries
+
+`store.rs` defines one trait per consumer. `LifecycleReads` holds the instance,
+class and projection reads several consumers share. `WakeStore` serves a
+proxy's wake, `SleepStore` a sidecar's idle report, `ReconcilerStore` the
+lifecycle driver, `OperatorStore` the operator service, `RouteStore` route and
+HTTP-01 resolution, `CertificateStore` certificate administration and
+resolution, `TlsWatchStore` the certificate watch and `RuntimeStore` the
+dispatcher, maintenance and metrics. The services take the composites they
+need (`ProxyServiceStore`, `OperatorServiceStore`, `WorkloadServiceStore`), and
+`ControlPlaneStore` gathers every role. A store implements each operation of
+every role it takes on, so a missing operation fails to compile.
+
+An `Unavailable` answer can follow a committed write, so `PostgresStore`
+repeats an operation only when a repeat is safe: reads, immutable class
+creation, generation-checked lifecycle transitions, operations fenced by an
+exact lease owner and attempt, and predicate-based maintenance. Maintenance
+counts describe the final attempt, not a total across an uncertain earlier
+commit; every attempt keeps its batch limit.
+
+These operations run once and report an uncertain outcome to their caller:
+
+- Instance and route creation: a repeat after a concurrent delete would create
+  the resource again.
+- Route deletion, HTTP-01 challenge put and delete, and the operator's force
+  deletion and key release: the name or key can refer to a replacement.
+- Reconciliation claim and admin enqueue: neither carries a fence that would
+  stop a repeat after another worker advances the row.
+- Certificate publication and removal, hostname binding changes and
+  re-encryption: the caller reads current metadata and decides whether another
+  conditional write is appropriate.
+
+`replay_policy.rs` in the Postgres suite pins this list. A relay in front of
+the database loses the answer to each operation's first request: an operation
+that repeats answers from its second attempt, and one that runs once reports
+`Unavailable`. The replacement tests in `retry_boundaries.rs` lose the answer to
+a commit after a second writer has replaced what it touched, and check that
+the replacement survives.
+
 The three API transport suites share an explicitly limited test fixture. The
-same lifecycle assertions also run against PostgreSQL, alongside actual
-commit/response-loss/replacement tests. The fixture does not model database
-transactions, retention or distributed effect ownership.
+same lifecycle assertions also run against PostgreSQL. The fixture does not
+model database transactions, retention or distributed ownership.
 
 ## Repeated creates
 
@@ -162,9 +198,9 @@ from it.
 A create that follows a completed delete creates the resource again. The
 instance generation watermark starts the new incarnation above every generation
 the deleted one used, so stale sidecar and worker observations and stale
-`expected_generation` values are rejected. The retry wrapper therefore sends a
-create once: a delete that lands after a lost response stays in effect unless
-the caller repeats the create.
+`expected_generation` values are rejected. The store therefore sends a create
+once: a delete that lands after a lost response stays in effect unless the
+caller repeats the create.
 
 A repeat that arrives while the first create is uncommitted waits for it and
 then compares with what it stored. A refused or failed create leaves no row and
@@ -172,60 +208,69 @@ leaves the generation watermark where it was.
 
 Validation and measurements: [Phase 5 evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase5/README.md).
 
-## Durable lifecycle transactions (migration 8)
+## Durable lifecycle transitions
 
-`accept_wake` commits the next Waking revision and complete Pending projection
-(refs, reservations, target, immutable projection stamp, backend freshness) in
-one transaction. Requests arriving during Draining persist a deferred intent;
-`finalize_sleep` releases the old refs and promotes that intent in the same
-transaction. Cancellation after any successful acceptance therefore leaves
-work the next reconciler can discover. A prior Failed/Cold active projection
-must finish cleanup before a new wake can replace its recorded inventory.
+Each transition is a conditional `UPDATE` or `INSERT` whose `WHERE` clause
+holds its guard: the expected state and generation, and for a completion the
+lease owner, attempt and expiry. Under READ COMMITTED, PostgreSQL evaluates
+those same-row predicates again after a lock wait, so a write that queued
+behind another applies only if its guard still holds. A refused write costs one
+more read, which names the error.
+
+`accept_wake` commits the next Waking revision and the complete Pending
+projection (refs, reservations, target, projection stamp, backend freshness)
+in one transaction. A wake that arrives during Draining persists a deferred
+intent; `finalize_sleep_reconciliation` releases the old refs and promotes that
+intent in the same transaction. Cancellation after any successful acceptance
+therefore leaves work the next reconciler can discover. A prior Failed or Cold
+active projection must finish cleanup before a new wake can replace its
+recorded inventory.
+
+A wake or sleep transition locks the instance row before its materialization
+row. A cleanup completion updates its fenced materialization alone. Neither
+order can deadlock against a deletion request, which locks the instance first.
 
 `request_instance_deletion` checks the caller's explicit CAS revision, sets
 Deleting, cancels any deferred wake, and marks every nondeleted target Deleting
 atomically. It preserves the drain deadline and existing worker lease. A
 bounded finalization scan removes only Deleting instances with no unresolved
-materializations, including instances that never had a materialization. The
-low-level hard-delete method enforces the same cleanup prerequisite. Candidate
-scans are target-scoped in production, and a direct reconciliation cannot claim
-another cluster's projection.
+materializations, including instances that never had a materialization.
+Candidate scans are target-scoped in production, and a direct reconciliation
+cannot claim another cluster's projection.
 
 `projection_generation` stays fixed from Pending through Ready and Deleting;
-instance `generation` remains the CAS revision. Migration backfills the actual
-legacy projected stamp and converts orphaned old Waking states to explicit
-Failed outcomes. `instance_generation_watermarks` retain per-ID revisions
-permanently; known pre-upgrade deleted IDs have no trustworthy revision and are
-retired. Neither key expiry nor resource deletion removes these watermarks.
-See the operator upgrade instructions for incompatible client and erased-history
-constraints. Optional wake `backend_generation` is a floor: the transaction
-allocates at least that value and strictly above the prior stored value.
+instance `generation` remains the CAS revision.
+`instance_generation_watermarks` retain per-ID revisions permanently; neither
+key expiry nor resource deletion removes them. The optional wake
+`backend_generation` is a floor: the transaction allocates at least that value
+and strictly above the prior stored value.
 
 Validation: [Phase 6A evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase6a/README.md).
 
-## Lease and Kubernetes effect fencing
+## Lease fencing
 
-Migration 9 introduces `materialization_effects`, a single outstanding mutation
-barrier per materialization. Claims, begin and ACK lock the materialization row
-before taking a fresh statement snapshot. Lease renew/release and exact effect
-ACK include the materialization generation as well as owner/attempt, preventing
-aliases after instance ID reuse. ACK additionally requires the individual effect
-ID. Unresolved barriers block claims and automatic completion/reservation release;
-an inspected absent name cannot clear an ambiguous create. Read/wait failures do
-not create barriers. The audited force-delete operation is the explicit override.
-See [projection safety](projection-safety.md) for retry semantics, bounded steps,
-coordinated upgrade and the documented liveness limitation.
+Lease renewal and release, every completion and failure publication carry the
+owner, the attempt and the materialization's instance generation, so a write
+from an earlier incarnation of a reused instance ID changes nothing. The
+audited force-delete operation is the explicit override. See
+[projection safety](projection-safety.md) for retry semantics, bounded steps
+and the documented liveness limitation.
 
+## Runtime work and ordered notifications
 
-## Runtime work and ordered notifications (migration 10)
-
-Migration 10 adds durable next-attempt/failure/deadline diagnostics and targeted
-route/lifecycle event history. Statement triggers record bundled route creation,
-state transitions, completion/failure and deletion without post-commit dependency
-lookups. Lease-only changes do not produce route events. Each statement reserves
-one contiguous revision range by updating a singleton row whose lock is held
-until commit. PostgreSQL sequences alone are insufficient because allocation is
-not commit order. Concurrent readers only advance through committed ranges.
+The store keeps durable next-attempt, failure and deadline diagnostics and a
+targeted route/lifecycle change history. Statement triggers collect bundled
+route creation, state transitions, completion, failure and deletion into one
+pending row per transaction. Lease-only changes produce no route events. A
+deferred constraint trigger runs once as the transaction commits: it takes the
+singleton revision row's lock, numbers the transaction's changes, writes them to
+the outbox and sends the notification. PostgreSQL makes a commit visible before
+it releases the commit's locks, so revisions become visible in commit order and
+a reader caught up to a cursor never misses a later revision. The lock is held
+only from the numbering to the end of the commit, so an open lifecycle
+transaction never stalls another writer; synchronous replication lengthens that
+window by the standby's acknowledgement. PostgreSQL sequences alone are
+insufficient because allocation is not commit order.
 
 All CP processes read independently; no single consumer deletes acknowledged
 records. Reads use one snapshot for revision, retained prefix and event page.
@@ -236,8 +281,8 @@ holds one scalar cursor and reads at most 1024 records per batch.
 
 Failure publication locks and checks the acquired generation/owner/attempt and
 fresh lease time. Permanent/deadline failed wakes become discoverable cleanup;
-failed cleanup and unresolved effects keep inventory/exclusivity. Admin enqueue
-uses the same state/barrier/grace rules. The operation deadline is persisted at
+failed cleanup keeps inventory and exclusivity. Admin enqueue uses the same
+state and grace rules. The operation deadline is persisted at
 phase entry using the connection's validated `SLEEPYPODS_OPERATION_TIMEOUT_MS`
 (default 600000); restarting or renewing a lease does not extend it.
 
@@ -250,7 +295,7 @@ reaches the persisted deadline. Failure publication compares the deadline and
 lease against fresh database time after acquiring its row locks, so a lock wait
 cannot preserve an obsolete pre-deadline classification.
 
-## Certificate resources and ordered changes (migration 11)
+## Certificate resources and ordered changes
 
 Application certificates and exact hostname TLS bindings are separate from
 routes and lifecycle state. Publication accepts a bounded, leaf-first DER chain
@@ -313,8 +358,8 @@ backups need it. The store's row CAS does not coordinate deployment keyring
 configuration. An unavailable key or failed authentication is an error, never
 an authoritative certificate miss.
 
-Certificate writes are one-shot through the retry wrapper. Callers inspect
-metadata after an uncertain outcome before choosing a new conditional write.
+Certificate writes run once. Callers inspect metadata after an uncertain outcome
+before choosing a new conditional write.
 Certificate metadata, bindings, resolution and snapshot reads retain bounded
 read retries. Certificate operations have their own local admission limit of
 `min(4, pool_capacity - 1)` and two blocking-crypto slots, preserving an ordinary

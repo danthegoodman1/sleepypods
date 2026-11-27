@@ -1,211 +1,45 @@
-//! Response loss is injected only after an actual PostgreSQL operation commits.
-//! A second real writer replaces the row before the wrapper observes Unavailable.
+//! Each run-once operation commits, a second writer replaces what it touched,
+//! and only then does the caller lose the answer. A repeat would act on the
+//! replacement, so the store reports the uncertain outcome instead.
 use super::*;
-use control_plane::{
-    materialization::*, CreateInstanceResult, DeleteHttp01ChallengeRequest, Http01ChallengeRecord,
-    RetryPolicy, RetryingControlPlaneStore, RouteBindingRecord, StoreFuture, StoreResult,
-};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use control_plane::{materialization::*, DeleteHttp01ChallengeRequest, RetryPolicy, StoreResult};
+use std::future::Future;
 
-type AfterCommit = Arc<dyn Fn() -> StoreFuture<'static, StoreResult<()>> + Send + Sync>;
-struct LostResponseStore {
-    inner: PostgresStore,
-    after_commit: AfterCommit,
-    calls: AtomicUsize,
+/// A store whose sessions pass through a relay that can lose an answer after
+/// the database has acted on the request.
+struct Lossy {
+    relay: postgres_relay::Relay,
+    store: PostgresStore,
 }
-impl LostResponseStore {
-    async fn lost<T>(&self, value: T) -> StoreResult<T> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            (self.after_commit)().await?;
-            Err(StoreError::unavailable(
-                "response lost after committed mutation",
-            ))
-        } else {
-            Ok(value)
+
+impl Lossy {
+    /// Runs `operation` and loses the answer to its request that carries
+    /// `trigger`. While the relay holds that answer, `replace` runs as a
+    /// second writer would.
+    async fn run<T: std::fmt::Debug>(
+        &self,
+        trigger: &[u8],
+        operation: impl Future<Output = StoreResult<T>>,
+        replace: impl Future<Output = StoreResult<()>>,
+    ) -> TestResult<StoreResult<T>> {
+        self.relay.lose_answer_to(trigger);
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => {
+                return Err(format!("the operation answered before its answer was lost: {result:?}").into());
+            }
+            () = self.relay.wait_until_answer_held() => {}
         }
+        replace.await?;
+        self.relay.drop_held_answer();
+        Ok(operation.await)
     }
 }
-impl ControlPlaneStore for LostResponseStore {
-    unexpected_store_methods!(
-        publish_certificate,
-        get_certificate_metadata,
-        set_tls_binding,
-        get_tls_binding,
-        remove_certificate,
-        resolve_tls_certificate,
-        reencrypt_certificate,
-        reencrypt_certificates_sealed_by,
-        snapshot_tls_bindings,
-        load_route_changes,
-        load_route_change_revision,
-        load_materialization_work_status,
-        maintain_runtime_records,
-        accept_wake,
-        request_instance_deletion,
-        finalize_instance_deletions,
-        get_instance,
-        create_workload_class_version,
-        load_workload_class_version,
-        get_route_binding,
-        list_route_bindings_for_instance,
-        resolve_host_rules,
-        compare_and_swap_instance_state,
-        load_ready_materialization,
-        load_active_materialization,
-        load_materialization,
-        complete_wake,
-        begin_sleep,
-        finalize_sleep,
-        load_materialization_operational_metrics,
-        renew_materialization_reconciliation_lease,
-        release_materialization_reconciliation_lease,
-        complete_wake_reconciliation,
-        finalize_sleep_reconciliation,
-        delete_materialization_reconciliation,
-        lookup_route_dependencies,
-        resolve_http01_challenge
-    );
-    fn record_materialization_failure(
-        &self,
-        request: control_plane::runtime_work::RecordMaterializationFailure,
-    ) -> StoreFuture<'_, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.record_materialization_failure(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn enqueue_materialization(
-        &self,
-        id: control_plane::ids::MaterializationId,
-    ) -> StoreFuture<'_, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.enqueue_materialization(id).await?;
-            self.lost(result).await
-        })
-    }
-    fn create_instance<'a>(
-        &'a self,
-        request: CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        Box::pin(async move {
-            let result = self.inner.create_instance(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.delete_instance(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn create_route_binding<'a>(
-        &'a self,
-        request: CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
-        Box::pin(async move {
-            let result = self.inner.create_route_binding(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn delete_route_binding<'a>(
-        &'a self,
-        request: DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.delete_route_binding(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        Box::pin(async move {
-            let result = self.inner.record_materialization(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn claim_next_materialization_reconciliation<'a>(
-        &'a self,
-        request: ClaimNextMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move {
-            let result = self
-                .inner
-                .claim_next_materialization_reconciliation(request)
-                .await?;
-            self.lost(result).await
-        })
-    }
-    fn force_delete_materialization<'a>(
-        &'a self,
-        request: ForceDeleteMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move {
-            let result = self.inner.force_delete_materialization(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn force_release_exclusivity_key<'a>(
-        &'a self,
-        request: ForceReleaseExclusivityKeyRequest,
-    ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
-        Box::pin(async move {
-            let result = self.inner.force_release_exclusivity_key(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn put_http01_challenge<'a>(
-        &'a self,
-        request: PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
-        Box::pin(async move {
-            let result = self.inner.put_http01_challenge(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        request: DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.delete_http01_challenge(request).await?;
-            self.lost(result).await
-        })
-    }
-}
-fn lossy(
-    inner: &PostgresStore,
-    after_commit: impl Fn() -> StoreFuture<'static, StoreResult<()>> + Send + Sync + 'static,
-) -> (RetryingControlPlaneStore, Arc<LostResponseStore>) {
-    let fault = Arc::new(LostResponseStore {
-        inner: inner.clone(),
-        after_commit: Arc::new(after_commit),
-        calls: AtomicUsize::new(0),
-    });
-    (
-        RetryingControlPlaneStore::new(
-            fault.clone(),
-            RetryPolicy::new(2, Duration::ZERO, Duration::ZERO),
-        ),
-        fault,
-    )
-}
-fn assert_one_shot<T: std::fmt::Debug>(result: StoreResult<T>, fault: &LostResponseStore) {
+
+fn assert_one_shot<T: std::fmt::Debug>(result: StoreResult<T>) {
     assert!(
         matches!(result, Err(StoreError::Unavailable { .. })),
-        "uncertain outcome reaches caller: {result:?}"
-    );
-    assert_eq!(
-        fault.calls.load(Ordering::SeqCst),
-        1,
-        "replacement cannot be touched by automatic replay"
+        "the uncertain outcome reaches the caller: {result:?}"
     );
 }
 
@@ -225,8 +59,18 @@ async fn postgres_retry_boundaries_preserve_real_replacements() -> TestResult {
         .await?;
     let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
     let pg = PostgresStore::connect(&config).await?;
-    let result = replacement_checks(&pg).await;
-    drop(pg);
+    let relay = postgres_relay::Relay::start(&base).await?;
+    let mut relayed =
+        PostgresStoreConfig::new(connection_url_with_search_path(&relay.url(&base)?, &schema))?;
+    relayed.max_connections = 1;
+    let lossy = Lossy {
+        store: PostgresStore::connect(&relayed)
+            .await?
+            .with_retry_policy(RetryPolicy::new(3, Duration::ZERO, Duration::ZERO)),
+        relay,
+    };
+    let result = replacement_checks(&pg, &lossy).await;
+    drop((pg, lossy));
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await?;
@@ -234,7 +78,7 @@ async fn postgres_retry_boundaries_preserve_real_replacements() -> TestResult {
     result
 }
 
-async fn replacement_checks(pg: &PostgresStore) -> TestResult {
+async fn replacement_checks(pg: &PostgresStore, lossy: &Lossy) -> TestResult {
     super::transport_support::lifecycle_conformance(pg).await?;
     let class = workload_class("retry-boundary-class", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
@@ -249,9 +93,10 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         .instance;
     let target = MaterializationTarget::new("retry-cluster", "apps")?;
 
-    // Force operations are ID/key scoped. A second writer installs a new projection
-    // or key owner after commit, before the old caller observes response loss.
-    for operation in ["force-delete", "force-release", "record"] {
+    // Force operations are ID or key scoped. A second writer installs a new
+    // projection or key owner after commit, before the old caller observes
+    // response loss; an automatic replay would act on that replacement.
+    for operation in ["force-delete", "force-release"] {
         let instance = pg
             .create_instance(create_instance_request(
                 operation,
@@ -260,95 +105,87 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
             ))
             .await?
             .instance;
-        let mut request = RecordMaterializationRequest::new(
-            instance.id.clone(),
-            instance.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        );
-        request.exclusivity_keys = vec![RenderedExclusivityKey {
+        let key = vec![RenderedExclusivityKey {
             name: "storage".into(),
             value: operation.into(),
         }];
-        let initial = pg.record_materialization(request.clone()).await?;
-        let mut replacement = request.clone();
-        replacement.backend_generation = BackendGeneration::new(2);
-        replacement.rendered_objects = vec![RenderedObjectRef {
+        let initial = accept_projection(pg, &instance, &target, vec![], key.clone()).await?;
+        let replacement_refs = vec![RenderedObjectRef {
             api_version: "v1".into(),
             kind: "Service".into(),
             namespace: "apps".into(),
             name: format!("{operation}-replacement"),
         }];
-        let next = pg.clone();
-        let replacement_id = initial.id.clone();
-        let replacement_target = target.clone();
-        let (store, fault) = lossy(pg, move || {
-            let db = next.clone();
-            let request = replacement.clone();
-            let id = replacement_id.clone();
-            let target = replacement_target.clone();
-            Box::pin(async move {
-                db.record_materialization(request).await?;
-                // Every earlier Pending row in this target is already leased.
-                let claimed = db
-                    .claim_next_materialization_reconciliation(
-                        ClaimNextMaterializationRequest::new(
-                            MaterializationState::Pending,
-                            target,
-                            "replacement-owner",
-                            Duration::from_secs(60),
-                        ),
-                    )
-                    .await?;
-                assert_eq!(claimed.map(|claimed| claimed.id), Some(id));
-                Ok(())
-            })
-        });
-        match operation {
-            "force-delete" => assert_one_shot(
-                store
-                    .force_delete_materialization(ForceDeleteMaterializationRequest::new(
-                        initial.id.clone(),
-                        "operator",
-                        "old process fenced",
-                    ))
-                    .await,
-                &fault,
-            ),
-            "force-release" => assert_one_shot(
-                store
-                    .force_release_exclusivity_key(ForceReleaseExclusivityKeyRequest::new(
-                        target.clone(),
-                        "storage",
-                        operation,
-                        "operator",
-                        "old process fenced",
-                    ))
-                    .await,
-                &fault,
-            ),
-            "record" => {
-                // Same backend generation makes replay able to overwrite state;
-                // a monotonic backend counter alone is not an exact write fence.
-                request.backend_generation = BackendGeneration::new(2);
-                assert_one_shot(store.record_materialization(request).await, &fault);
-            }
-            _ => unreachable!(),
-        }
-        let current = pg
-            .load_materialization(LoadMaterializationRequest::new(initial.id))
+        let replacement_owner = if operation == "force-delete" {
+            instance.id.clone()
+        } else {
+            pg.create_instance(create_instance_request(
+                &format!("{operation}-replacement"),
+                class.reference.clone(),
+                vec![],
+            ))
             .await?
-            .unwrap();
+            .instance
+            .id
+        };
+        let replace = async {
+            let current = pg
+                .get_instance(GetInstanceRequest::new(replacement_owner.clone()))
+                .await?
+                .expect("the replacement owner exists");
+            let replacement =
+                accept_projection(pg, &current, &target, replacement_refs, key.clone()).await?;
+            claim_row(pg, &replacement, "replacement-owner").await?;
+            Ok(())
+        };
+        let result = match operation {
+            "force-delete" => lossy
+                .run(
+                    b"COMMIT",
+                    lossy.store.force_delete_materialization(
+                        ForceDeleteMaterializationRequest::new(
+                            initial.id.clone(),
+                            "operator",
+                            "old process fenced",
+                        ),
+                    ),
+                    replace,
+                )
+                .await?
+                .map(|_| ()),
+            "force-release" => lossy
+                .run(
+                    b"COMMIT",
+                    lossy.store.force_release_exclusivity_key(
+                        ForceReleaseExclusivityKeyRequest::new(
+                            target.clone(),
+                            "storage",
+                            operation,
+                            "operator",
+                            "old process fenced",
+                        ),
+                    ),
+                    replace,
+                )
+                .await?
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert_one_shot(result);
+        let current = pg
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                replacement_owner,
+                target.clone(),
+            ))
+            .await?
+            .expect("the replacement projection survives response loss");
         assert_eq!(current.state, MaterializationState::Pending);
-        assert_eq!(current.backend_generation, BackendGeneration::new(2));
         assert_eq!(
             current.rendered_objects[0].name,
             format!("{operation}-replacement")
         );
         assert_eq!(
-            current.exclusivity_keys.len(),
-            1,
+            current.exclusivity_keys, key,
             "replacement ownership survives response loss"
         );
         assert_eq!(
@@ -368,23 +205,21 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         owner.id.as_str(),
         http_identity("new.retry.example", None),
     );
-    let next = pg.clone();
-    let replacement = replacement_route.clone();
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let request = replacement.clone();
-        Box::pin(async move {
-            db.create_route_binding(request).await?;
-            Ok(())
-        })
-    });
     assert_one_shot(
-        store
-            .delete_route_binding(DeleteRouteBindingRequest::new(
-                original_route.route_binding_id,
-            ))
-            .await,
-        &fault,
+        lossy
+            .run(
+                b"delete-route",
+                lossy
+                    .store
+                    .delete_route_binding(DeleteRouteBindingRequest::new(
+                        original_route.route_binding_id,
+                    )),
+                async {
+                    pg.create_route_binding(replacement_route.clone()).await?;
+                    Ok(())
+                },
+            )
+            .await?,
     );
     assert_eq!(
         pg.get_route_binding(GetRouteBindingRequest::new(
@@ -412,25 +247,33 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
             now + Duration::from_secs(600),
             now,
         )?;
-        let next = pg.clone();
-        let (store, fault) = lossy(pg, move || {
-            let db = next.clone();
-            let request = replacement.clone();
-            Box::pin(async move {
-                db.put_http01_challenge(request).await?;
-                Ok(())
-            })
-        });
+        let replace = async {
+            pg.put_http01_challenge(replacement).await?;
+            Ok(())
+        };
         if operation == "put" {
-            assert_one_shot(store.put_http01_challenge(original).await, &fault);
+            assert_one_shot(
+                lossy
+                    .run(
+                        b"old-authorization",
+                        lossy.store.put_http01_challenge(original),
+                        replace,
+                    )
+                    .await?,
+            );
         } else {
             assert_one_shot(
-                store
-                    .delete_http01_challenge(control_plane::DeleteHttp01ChallengeRequest::new(
-                        key.clone(),
-                    ))
-                    .await,
-                &fault,
+                lossy
+                    .run(
+                        b"retry.example",
+                        lossy
+                            .store
+                            .delete_http01_challenge(DeleteHttp01ChallengeRequest::new(
+                                key.clone(),
+                            )),
+                        replace,
+                    )
+                    .await?,
             );
         }
         assert_eq!(
@@ -442,72 +285,32 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         );
     }
 
-    // A legacy ID-only delete must not delete a fresh incarnation, even if that
-    // new incarnation has independently entered Deleting as well.
-    let old = pg
-        .create_instance(create_instance_request(
-            "delete-reused",
-            class.reference.clone(),
-            vec![],
-        ))
-        .await?
-        .instance;
-    pg.request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
-        instance_id: old.id.clone(),
-        expected_generation: old.generation,
-    })
-    .await?;
-    let replacement = create_instance_request("delete-reused", class.reference.clone(), vec![]);
-    let next = pg.clone();
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let request = replacement.clone();
-        Box::pin(async move {
-            let created = db.create_instance(request).await?.instance;
-            db.request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
-                instance_id: created.id,
-                expected_generation: created.generation,
-            })
-            .await?;
-            Ok(())
-        })
-    });
-    assert_one_shot(
-        store
-            .delete_instance(DeleteInstanceRequest::new(old.id.clone()))
-            .await,
-        &fault,
-    );
-    let current = pg
-        .get_instance(GetInstanceRequest::new(old.id))
-        .await?
-        .unwrap();
-    assert!(current.generation > old.generation);
-    assert_eq!(current.state, InstanceState::Deleting);
-
-    // A repeated create makes a deleted resource again, so the wrapper sends a
-    // create once: a delete that lands after a lost response stays in effect.
+    // A repeated create makes a deleted resource again, so the store sends a
+    // create once: a delete that lands after a lost answer stays in effect.
     let create = create_instance_request("create-lost", class.reference.clone(), vec![]);
-    let next = pg.clone();
-    let id = create.instance_id.clone();
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let id = id.clone();
-        Box::pin(async move {
-            let current = db
-                .get_instance(GetInstanceRequest::new(id.clone()))
-                .await?
-                .unwrap();
-            db.request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
-                instance_id: id.clone(),
-                expected_generation: current.generation,
-            })
-            .await?;
-            db.delete_instance(DeleteInstanceRequest::new(id)).await?;
-            Ok(())
-        })
-    });
-    assert_one_shot(store.create_instance(create.clone()).await, &fault);
+    assert_one_shot(
+        lossy
+            .run(
+                b"COMMIT",
+                lossy.store.create_instance(create.clone()),
+                async {
+                    let current = pg
+                        .get_instance(GetInstanceRequest::new(create.instance_id.clone()))
+                        .await?
+                        .unwrap();
+                    pg.request_instance_deletion(
+                        control_plane::instance::RequestInstanceDeletion {
+                            instance_id: create.instance_id.clone(),
+                            expected_generation: current.generation,
+                        },
+                    )
+                    .await?;
+                    pg.finalize_instance_deletions(1024).await?;
+                    Ok(())
+                },
+            )
+            .await?,
+    );
     assert!(pg
         .get_instance(GetInstanceRequest::new(create.instance_id.clone()))
         .await?
@@ -523,18 +326,21 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         owner.id.as_str(),
         http_identity("create.retry.example", None),
     );
-    let next = pg.clone();
-    let id = create.route_binding_id.clone();
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let id = id.clone();
-        Box::pin(async move {
-            db.delete_route_binding(DeleteRouteBindingRequest::new(id))
-                .await?;
-            Ok(())
-        })
-    });
-    assert_one_shot(store.create_route_binding(create.clone()).await, &fault);
+    assert_one_shot(
+        lossy
+            .run(
+                b"COMMIT",
+                lossy.store.create_route_binding(create.clone()),
+                async {
+                    pg.delete_route_binding(DeleteRouteBindingRequest::new(
+                        create.route_binding_id.clone(),
+                    ))
+                    .await?;
+                    Ok(())
+                },
+            )
+            .await?,
+    );
     assert!(pg
         .get_route_binding(GetRouteBindingRequest::new(create.route_binding_id.clone()))
         .await?
@@ -544,12 +350,13 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         create.route_binding_id,
         "a caller's own repeat binds the route again"
     );
-    exact_fence_retries(pg, &class, &target).await?;
+    exact_fence_retries(pg, lossy, &class, &target).await?;
     Ok(())
 }
 
 async fn exact_fence_retries(
     pg: &PostgresStore,
+    lossy: &Lossy,
     class: &WorkloadClassVersion,
     target: &MaterializationTarget,
 ) -> TestResult {
@@ -561,44 +368,24 @@ async fn exact_fence_retries(
         ))
         .await?
         .instance;
-    let pending = pg
-        .record_materialization(RecordMaterializationRequest::new(
-            instance.id,
-            instance.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        ))
-        .await?;
-    let claimed = pg
-        .claim_next_materialization_reconciliation(ClaimNextMaterializationRequest::new(
-            MaterializationState::Pending,
-            target.clone(),
-            "fenced-owner",
-            Duration::from_secs(60),
-        ))
-        .await?
-        .unwrap();
-    assert_eq!(claimed.id, pending.id);
+    let pending = accept_projection(pg, &instance, target, vec![], vec![]).await?;
+    let claimed = claim_row(pg, &pending, "fenced-owner").await?;
     let attempt = claimed.reconciliation_lease.as_ref().unwrap().attempt;
-    let (store, fault) = lossy(pg, || Box::pin(async { Ok(()) }));
-    assert!(
-        !store
-            .record_materialization_failure(
-                control_plane::runtime_work::RecordMaterializationFailure {
-                    expected_state: control_plane::MaterializationState::Pending,
-                    materialization_id: pending.id.clone(),
-                    owner: "fenced-owner".into(),
-                    attempt,
-                    generation: pending.instance_generation,
-                    permanent: false,
-                    message: "temporary failure".into()
-                }
-            )
-            .await?,
-        "replayed failure cannot clear a newer owner or increment twice"
+    let failure = lossy.store.record_materialization_failure(
+        control_plane::runtime_work::RecordMaterializationFailure {
+            expected_state: control_plane::MaterializationState::Pending,
+            materialization_id: pending.id.clone(),
+            owner: "fenced-owner".into(),
+            attempt,
+            generation: pending.instance_generation,
+            permanent: false,
+            message: "temporary failure".into(),
+        },
     );
-    assert_eq!(fault.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !lossy.run(b"COMMIT", failure, async { Ok(()) }).await??,
+        "a repeated failure finds the lease it released and changes nothing"
+    );
     assert_eq!(
         pg.load_materialization_work_status(pending.id)
             .await?

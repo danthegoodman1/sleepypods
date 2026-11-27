@@ -1,4 +1,6 @@
-use super::{connection::PostgresStore, error::map_postgres_error, mapping::generation_to_i64};
+use super::{
+    connection::PostgresStore, error::map_postgres_error, mapping::generation_to_i64, sql,
+};
 use crate::{
     ids::MaterializationId,
     runtime_work::{DurableRouteChanges, MaterializationWorkStatus, RecordMaterializationFailure},
@@ -102,13 +104,12 @@ async fn listen_for_route_changes(
 
 pub(super) async fn revision(store: &PostgresStore) -> StoreResult<u64> {
     let client = store.client().await?;
-    let row = client
-        .query_one(
-            "SELECT revision FROM route_change_revision WHERE singleton",
-            &[],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let row = sql::query_one(
+        &client,
+        "SELECT revision FROM route_change_revision WHERE singleton",
+        &[],
+    )
+    .await?;
     Ok(row.get::<_, i64>(0) as u64)
 }
 
@@ -122,7 +123,7 @@ pub(super) async fn changes(
     let limit = i64::from(limit.clamp(1, 1024));
     let client = store.client().await?;
     // One statement/snapshot makes retained range and event records consistent.
-    let row = client.query_one("SELECT revision, (SELECT min(revision) FROM route_change_outbox) AS oldest, COALESCE((SELECT jsonb_agg(jsonb_build_object('revision', revision, 'payload', payload) ORDER BY revision) FROM (SELECT revision, payload FROM route_change_outbox WHERE revision > $1 ORDER BY revision LIMIT $2) events), '[]'::jsonb) AS events FROM route_change_revision WHERE singleton", &[&cursor, &limit]).await.map_err(map_postgres_error)?;
+    let row = sql::query_one(&client, "SELECT revision, (SELECT min(revision) FROM route_change_outbox) AS oldest, COALESCE((SELECT jsonb_agg(jsonb_build_object('revision', revision, 'payload', payload) ORDER BY revision) FROM (SELECT revision, payload FROM route_change_outbox WHERE revision > $1 ORDER BY revision LIMIT $2) events), '[]'::jsonb) AS events FROM route_change_revision WHERE singleton", &[&cursor, &limit]).await?;
     let current: i64 = row.get("revision");
     let oldest: Option<i64> = row.get("oldest");
     let reset =
@@ -152,13 +153,8 @@ pub(super) async fn status(
     id: MaterializationId,
 ) -> StoreResult<Option<MaterializationWorkStatus>> {
     let client = store.client().await?;
-    let Some(row) = client
-        .query_opt(
-            "
-            SELECT CASE WHEN state = 'ready'
-                    THEN GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint - state_entered_at_unix_millis)
-                    ELSE NULL END AS ready_age_millis,
-                next_attempt_at_unix_millis,
+    let Some(row) = sql::query_opt(&client, "
+            SELECT next_attempt_at_unix_millis,
                 operation_deadline_unix_millis,
                 CASE WHEN operation_deadline_unix_millis > 0
                     THEN GREATEST(0::bigint, operation_deadline_unix_millis - (extract(epoch from clock_timestamp()) * 1000)::bigint)
@@ -167,17 +163,11 @@ pub(super) async fn status(
             FROM materializations
             WHERE materialization_id = $1
             ",
-            &[&id.as_str()],
-        )
-        .await
-        .map_err(map_postgres_error)?
+            &[&id.as_str()],).await?
     else {
         return Ok(None);
     };
     Ok(Some(MaterializationWorkStatus {
-        ready_age: row
-            .get::<_, Option<i64>>("ready_age_millis")
-            .map(|millis| std::time::Duration::from_millis(millis as u64)),
         next_attempt_at_unix_millis: row.get("next_attempt_at_unix_millis"),
         operation_deadline_unix_millis: row.get("operation_deadline_unix_millis"),
         operation_remaining: row
@@ -209,19 +199,18 @@ pub(super) async fn record_failure(
     // Match lifecycle acceptance's instance -> materialization lock order. A
     // fresh statement after the instance lock observes a committed Delete before
     // checking the exact claimed work state, including when this call waited.
-    if tx.query_opt("SELECT i.instance_id FROM instances i JOIN materializations m USING(instance_id) WHERE m.materialization_id = $1 FOR UPDATE OF i", &[&id]).await.map_err(map_postgres_error)?.is_none() {
+    if sql::query_opt(&tx, "SELECT i.instance_id FROM instances i JOIN materializations m USING(instance_id) WHERE m.materialization_id = $1 FOR UPDATE OF i", &[&id]).await?.is_none() {
         return Ok(false);
     }
     let expected_state = super::mapping::materialization_state_to_db(request.expected_state);
-    let Some(row) = tx.query_opt("SELECT state, instance_id, failure_count, reconcile_lease_expires_at_unix_millis, operation_deadline_unix_millis FROM materializations WHERE materialization_id = $1 AND reconcile_owner = $2 AND reconcile_attempt = $3 AND instance_generation = $4 AND state = $5 FOR UPDATE", &[&id, &request.owner, &attempt, &generation, &expected_state]).await.map_err(map_postgres_error)? else { return Ok(false) };
-    let now = tx
-        .query_one(
-            "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint",
-            &[],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .get::<_, i64>(0);
+    let Some(row) = sql::query_opt(&tx, "SELECT state, instance_id, failure_count, reconcile_lease_expires_at_unix_millis, operation_deadline_unix_millis FROM materializations WHERE materialization_id = $1 AND reconcile_owner = $2 AND reconcile_attempt = $3 AND instance_generation = $4 AND state = $5 FOR UPDATE", &[&id, &request.owner, &attempt, &generation, &expected_state]).await? else { return Ok(false) };
+    let now = sql::query_one(
+        &tx,
+        "SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint",
+        &[],
+    )
+    .await?
+    .get::<_, i64>(0);
     if row
         .get::<_, Option<i64>>("reconcile_lease_expires_at_unix_millis")
         .is_none_or(|expiry| expiry <= now)
@@ -245,13 +234,13 @@ pub(super) async fn record_failure(
     let message = request.message.chars().take(512).collect::<String>();
     let cleanup_required = terminal && waking;
     if cleanup_required {
-        tx.execute(
+        sql::execute(
+            &tx,
             "UPDATE materializations SET state = 'deleting' WHERE materialization_id = $1",
             &[&id],
         )
-        .await
-        .map_err(map_postgres_error)?;
-        tx.execute("UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = $1 AND generation = $2 AND state = 'waking'", &[&row.get::<_, String>("instance_id"), &generation]).await.map_err(map_postgres_error)?;
+        .await?;
+        sql::execute(&tx, "UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = $1 AND generation = $2 AND state = 'waking'", &[&row.get::<_, String>("instance_id"), &generation]).await?;
     }
     // A failed wake's cleanup starts at once and with a fresh backoff. Clearing
     // the owner makes a retry after a committed, lost response an exact no-op.
@@ -260,7 +249,7 @@ pub(super) async fn record_failure(
     } else {
         (count, delay)
     };
-    tx.execute("UPDATE materializations SET failure_count = $2, failure_kind = $3, failure_message = $4, failure_requires_cleanup = $6, wake_failure_message = CASE WHEN $6 THEN $4 ELSE wake_failure_message END, next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $5, reconcile_owner = NULL, reconcile_lease_expires_at_unix_millis = NULL WHERE materialization_id = $1", &[&id, &count, &kind, &message, &delay, &cleanup_required]).await.map_err(map_postgres_error)?;
+    sql::execute(&tx, "UPDATE materializations SET failure_count = $2, failure_kind = $3, failure_message = $4, failure_requires_cleanup = $6, wake_failure_message = CASE WHEN $6 THEN $4 ELSE wake_failure_message END, next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $5, reconcile_owner = NULL, reconcile_lease_expires_at_unix_millis = NULL WHERE materialization_id = $1", &[&id, &count, &kind, &message, &delay, &cleanup_required]).await?;
     tx.commit().await.map_err(map_postgres_error)?;
     if cleanup_required {
         crate::runtime_work::signal_lifecycle_work();
@@ -271,8 +260,8 @@ pub(super) async fn record_failure(
 pub(super) async fn enqueue(store: &PostgresStore, id: MaterializationId) -> StoreResult<bool> {
     let client = store.client().await?;
     // An admin request schedules normal work. It cannot override grace or a
-    // live attempt. Failed wakes first clean their retained inventory.
-    let changed = client.execute("UPDATE materializations SET state = CASE WHEN state = 'failed' THEN 'deleting' ELSE state END, failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting', 'failed') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint)", &[&id.as_str()]).await.map_err(map_postgres_error)?;
+    // live attempt.
+    let changed = sql::execute(&client, "UPDATE materializations SET failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint)", &[&id.as_str()]).await?;
     if changed == 1 {
         crate::runtime_work::signal_lifecycle_work();
     }
@@ -284,6 +273,6 @@ pub(super) async fn maintain(store: &PostgresStore, limit: u32) -> StoreResult<u
     let http01 =
         super::http01_ops::collect_expired_http01_challenges(store, limit as usize).await?;
     let client = store.client().await?;
-    let outbox = client.execute("DELETE FROM route_change_outbox WHERE revision IN (SELECT revision FROM route_change_outbox WHERE revision < COALESCE((SELECT min(revision) FROM route_change_outbox WHERE created_at_unix_millis >= (extract(epoch from clock_timestamp()) * 1000)::bigint - 600000), 9223372036854775807) ORDER BY revision LIMIT $1)", &[&i64::from(limit)]).await.map_err(map_postgres_error)?;
+    let outbox = sql::execute(&client, "DELETE FROM route_change_outbox WHERE revision IN (SELECT revision FROM route_change_outbox WHERE revision < COALESCE((SELECT min(revision) FROM route_change_outbox WHERE created_at_unix_millis >= (extract(epoch from clock_timestamp()) * 1000)::bigint - 600000), 9223372036854775807) ORDER BY revision LIMIT $1)", &[&i64::from(limit)]).await?;
     Ok(http01 as u64 + outbox)
 }

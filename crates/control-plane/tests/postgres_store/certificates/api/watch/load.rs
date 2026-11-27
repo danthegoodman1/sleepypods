@@ -1,6 +1,7 @@
 //! Maximum disjoint interests on the minimum supported database pool. Raw SQL
 //! only seeds the inventory; measured mutations use the real conditional store.
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn ordinary_progress(
     operator: &mut OperatorControlPlaneClient<Channel>,
@@ -67,7 +68,7 @@ async fn postgres_sixteen_disjoint_maximum_watches_preserve_ordinary_progress_un
         let mut servers = tokio::task::JoinSet::new();
         let mut consumers = tokio::task::JoinSet::<TestResult<()>>::new();
         let result = async {
-            let served = server(RetryingControlPlaneStore::with_default_policy(Arc::new(limited)), tokens(), true, &mut servers).await?;
+            let served = server(limited, tokens(), true, &mut servers).await?;
             let ca = served.ca;
             let mut proxy =
                 ProxyControlPlaneClient::new(channel(served.workload_url, Some(&ca)).await?);

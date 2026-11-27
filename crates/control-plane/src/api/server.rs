@@ -22,7 +22,7 @@ use crate::{
     projection::{ProjectionObservation, ProjectionPlan, ProjectionReconciler},
     route as domain_route,
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
-    store::ControlPlaneStore,
+    store::OperatorServiceStore,
     workload::{self as domain_workload, WorkloadClassVersion, WorkloadClassVersionRef},
 };
 
@@ -38,14 +38,14 @@ pub const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorCont
 
 #[derive(Clone)]
 pub struct StoreBackedOperatorApi<C> {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn OperatorServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
 }
 
 impl<C> StoreBackedOperatorApi<C> {
     pub fn new(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn OperatorServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
@@ -102,7 +102,7 @@ where
 pub type StoreBackedOperatorGrpcService<C> = OperatorControlPlaneServer<StoreBackedOperatorApi<C>>;
 
 pub fn operator_grpc_service_with_store<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn OperatorServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
 ) -> StoreBackedOperatorGrpcService<C>

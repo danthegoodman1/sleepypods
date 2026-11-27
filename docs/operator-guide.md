@@ -806,9 +806,11 @@ commit. Each control-plane process holds one dedicated listening connection and
 reads the change history when notified, in batches of 1024; a 250ms poll covers
 a missed notification or a listening connection that is reconnecting. The
 dispatcher loads its cursor before any listener serves, so a subscription can
-never predate it. Transactional revision reservation orders commits; it adds a
-short shared row-lock section to semantic writes. History retains at most 100000
-records and maintenance removes an expired ten-minute prefix.
+never predate it. Each transaction numbers its changes as it commits, under one
+shared row lock held only while the commit completes, so changes become
+visible in commit order and an open transaction never stalls another writer.
+History retains at most 100000 records and maintenance removes an expired
+ten-minute prefix.
 
 A proxy subscribes to one exact host at a time and receives that host's complete
 rule set. The control plane sends the set again when a binding for the host or
@@ -934,32 +936,21 @@ generation watermarks are preserved.
   Declare workload-class exclusivity keys for external resources that require
   single-writer or single-attachment behavior across instances.
 
-## Upgrading lifecycle APIs and state
+## Store schema and lifecycle APIs
 
-Migrations 8 and 9 require a coordinated control-plane/client upgrade: stop old
-control-plane writers, settle their in-flight mutating Kubernetes requests, apply migrations, and
-start the new controller with regenerated operator clients. Mixed old/new
-lifecycle drivers are unsupported. The `DeleteInstance` request now requires
-presence of `expected_generation`. The old response tag/name `deleted` is
-reserved; `accepted` uses tag 2 so old clients cannot misread acceptance as
-completed deletion. Poll `GetInstance` for completion instead of repeatedly
-issuing deletion to drive cleanup.
+The store schema is one baseline migration. The control plane applies it to an
+empty database at startup and refuses a database an earlier schema created;
+start a deployment from an earlier schema on an empty database and recreate
+its classes, instances, routes and certificates. Stop every control-plane
+writer and settle its in-flight Kubernetes requests before the new controller
+starts; mixed old and new lifecycle drivers are unsupported.
 
-Existing Pending ownership stamps are backfilled from the old future Running
-stamp; Ready and Deleting stamps retain their deployed generation. An old
-`Waking` instance with no Pending record has no durable target, so migration
-marks it `Failed` with an advanced revision. An explicit wake retry can then
-choose the configured target. Legacy failed projections are queued for cleanup
-before any new incarnation can replace their recorded inventory.
+`DeleteInstance` requires `expected_generation` and answers `accepted` once
+deletion is durable. Poll `GetInstance` for completion instead of repeating the
+deletion to drive cleanup.
 
-Per-ID generation watermarks are permanent. An ID deleted before watermarks
-existed is permanently
-retired when deletion history is available; create a new ID. If historical
-deletion records were manually erased before this migration, the
-old incarnation is unknowable: use new instance IDs for those historical
-resources and quiesce incompatible clients during upgrade. Never restore a
-database without its generation watermarks while allowing old clients or
-sidecars to continue.
+Per-ID generation watermarks are permanent. Never restore a database without
+its generation watermarks while old clients or sidecars continue.
 
 Each reconciler processes only its configured cluster/namespace. Delete marks
 all targets as work, but deletion completes only after each target's controller
@@ -1025,12 +1016,13 @@ inspect ownership, retained volume bindings or descendants keeps cleanup and
 exclusivity held.
 The default field manager is `sleepypods-control-plane`.
 
-Back up Postgres with its generation watermarks. For
-migrations 8/9, quiesce old writers and settle their mutating Kubernetes requests
-before starting the new driver and regenerated clients; ordinary mixed-version
-rolling lifecycle drivers are unsupported. Then update frontlines and recreate
-sidecars through normal workload materialization. Keep old images available for
-an explicitly coordinated rollback that respects the new state contract.
+Back up Postgres with its generation watermarks. To change control-plane
+versions, quiesce old writers and settle their mutating Kubernetes requests
+before starting the new driver and regenerated clients; mixed-version rolling
+lifecycle drivers are unsupported. Then update frontlines and recreate sidecars
+through normal workload materialization. A version with another store schema
+starts on an empty database, as
+[Store schema and lifecycle APIs](#store-schema-and-lifecycle-apis) describes.
 
 Managed static volumes require `Retain`; provider disk deletion is outside the
 lifecycle API. New classes and rendering of legacy classes reject `Delete`.

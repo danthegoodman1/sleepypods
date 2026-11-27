@@ -4,11 +4,6 @@ use crate::store::StoreError;
 
 pub(crate) fn map_postgres_error(error: tokio_postgres::Error) -> StoreError {
     if let Some(db_error) = error.as_db_error() {
-        if db_error.message() == "instance_id_retired" {
-            return StoreError::invalid_argument(
-                "instance ID was deleted before incarnation fencing; use a new instance ID",
-            );
-        }
         if db_error.code().code() == "P0001" {
             if db_error.message() == "rendered_object_ref_collision" {
                 return StoreError::invalid_argument(

@@ -117,25 +117,30 @@ async fn postgres_create_after_delete_starts_a_fenced_incarnation() -> TestResul
             vec![http_identity("recreated.example.com", None)],
         );
         let created = store.create_instance(request.clone()).await?;
+        assert!(
+            store
+                .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+                    instance_id: created.instance.id.clone(),
+                    expected_generation: created.instance.generation,
+                })
+                .await?
+        );
         let deleting = store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                created.instance.id.clone(),
-                created.instance.generation,
-                InstanceState::Deleting,
-                StateTransitionReason::DeleteRequested,
-            ))
-            .await?;
+            .get_instance(GetInstanceRequest::new(created.instance.id.clone()))
+            .await?
+            .expect("a deleting instance remains until its deletion finishes");
+        assert_eq!(deleting.state, InstanceState::Deleting);
 
         // Until its deletion finishes, the instance holds its ID.
         assert_eq!(
             store.create_instance(request.clone()).await?.instance,
             deleting
         );
-        assert!(
-            store
-                .delete_instance(DeleteInstanceRequest::new(deleting.id.clone()))
-                .await?
-        );
+        store.finalize_instance_deletions(1024).await?;
+        assert!(store
+            .get_instance(GetInstanceRequest::new(deleting.id.clone()))
+            .await?
+            .is_none());
 
         let recreated = store.create_instance(request.clone()).await?;
         assert_eq!(recreated.instance.state, InstanceState::Cold);
@@ -143,12 +148,10 @@ async fn postgres_create_after_delete_starts_a_fenced_incarnation() -> TestResul
         assert_eq!(recreated.route_bindings, created.route_bindings);
         for stale in [created.instance.generation, deleting.generation] {
             let acted = store
-                .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                    recreated.instance.id.clone(),
-                    stale,
-                    InstanceState::Deleting,
-                    StateTransitionReason::DeleteRequested,
-                ))
+                .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+                    instance_id: recreated.instance.id.clone(),
+                    expected_generation: stale,
+                })
                 .await;
             assert!(
                 matches!(acted, Err(StoreError::GenerationConflict { .. })),
@@ -247,15 +250,30 @@ async fn postgres_repeat_racing_the_first_create_returns_its_instance() -> TestR
         let [(winner, winning_request)] = &winners[..] else {
             return Err(format!("{} of two different creates won", winners.len()).into());
         };
-        assert_eq!(
-            store
-                .list_route_bindings_for_instance(
-                    control_plane::ListRouteBindingsForInstanceRequest::new(
-                        winner.instance.id.clone()
-                    )
-                )
-                .await?,
-            winner.route_bindings
+        for route in &winner.route_bindings {
+            assert_eq!(
+                store
+                    .get_route_binding(GetRouteBindingRequest::new(route.id.clone()))
+                    .await?
+                    .as_ref(),
+                Some(route)
+            );
+        }
+        let losing_host = requests
+            .iter()
+            .find(|request| !std::ptr::eq(*request, *winning_request))
+            .map(|request| request.route_bindings[0].identity.host().clone())
+            .expect("two requests raced");
+        let unbound = store
+            .resolve_host_rules(ResolveHostRulesRequest::new(
+                control_plane::RouteKind::Http,
+                losing_host,
+                MaterializationTarget::new("create-repeat", "apps")?,
+            ))
+            .await?;
+        assert!(
+            unbound.rules().is_empty(),
+            "the refused create binds none of its routes"
         );
         assert_eq!(
             store.create_instance((*winning_request).clone()).await?,

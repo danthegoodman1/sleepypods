@@ -8,7 +8,7 @@ use crate::{
         MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    store::{ControlPlaneStore, StoreError},
+    store::{SleepStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
 
@@ -82,7 +82,7 @@ pub async fn report_idle<S, C>(
     request: ReportIdleRequest,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     if request.active_count > 0 {
@@ -94,8 +94,9 @@ where
     let current = load_instance(store, request.instance_id.clone()).await?;
     match current.state {
         InstanceState::Running => {
-            verify_idle_member(store, materializer, &target, &request, &current).await?;
-            begin_running_sleep(store, target, request, &current).await
+            let policy =
+                verify_idle_member(store, materializer, &target, &request, &current).await?;
+            begin_running_sleep(store, target, request, &current, policy).await
         }
         InstanceState::Draining => already_draining(store, &target, &request, current).await,
         state => Ok(ReportIdleResult::Unavailable {
@@ -117,7 +118,7 @@ async fn already_draining<S>(
     current: InstanceRecord,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
     let projection = store
         .load_active_materialization(LoadActiveMaterializationRequest::new(
@@ -142,16 +143,19 @@ where
     }
 }
 
+/// Begins the drain. The store refuses it, and names when to report again,
+/// until the Ready projection has been up for the idle timeout and the initial
+/// activation window.
 async fn begin_running_sleep<S>(
     store: &S,
     target: MaterializationTarget,
     request: ReportIdleRequest,
     current: &InstanceRecord,
+    sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
-    let sleep_policy = sleep_policy(store, current).await?;
     let minimum_ready_age = Duration::from_millis(sleep_policy.idle_timeout_ms)
         .max(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT);
     let begin = match store
@@ -184,15 +188,17 @@ where
     })
 }
 
+/// Checks that the report comes from a member of the running projection, and
+/// resolves the sleep policy the drain follows.
 async fn verify_idle_member<S, C>(
     store: &S,
     materializer: &KubernetesMaterializer<C>,
     target: &MaterializationTarget,
     request: &ReportIdleRequest,
     current: &InstanceRecord,
-) -> Result<(), ReportIdleError>
+) -> Result<crate::sleep_policy::ResolvedSleepPolicy, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     if request.pod_uid.trim().is_empty() {
@@ -239,20 +245,6 @@ where
         .sleep_policy
         .resolve(&current.values)
         .map_err(|error| ReportIdleError::SleepPolicy(error.to_string()))?;
-    let minimum_ready_age = Duration::from_millis(policy.idle_timeout_ms)
-        .max(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT);
-    if let Some(age) = store
-        .load_materialization_work_status(materialization.id.clone())
-        .await
-        .map_err(ReportIdleError::Store)?
-        .and_then(|status| status.ready_age)
-    {
-        if age < minimum_ready_age {
-            return Err(ReportIdleError::Store(StoreError::SleepDeferred {
-                retry_after: minimum_ready_age - age,
-            }));
-        }
-    }
 
     let identity = crate::materializer::IdleMemberIdentity {
         instance_id: current.id.clone(),
@@ -264,28 +256,8 @@ where
         .client()
         .verify_idle_member(&materialization.rendered_objects, &identity)
         .await
-        .map_err(|error| ReportIdleError::UnsupportedSleep(error.to_string()))
-}
-
-async fn sleep_policy<S>(
-    store: &S,
-    instance: &InstanceRecord,
-) -> Result<crate::sleep_policy::ResolvedSleepPolicy, ReportIdleError>
-where
-    S: ControlPlaneStore + ?Sized,
-{
-    let workload_class = store
-        .load_workload_class_version(LoadWorkloadClassVersionRequest::new(
-            instance.workload_class.clone(),
-        ))
-        .await
-        .map_err(ReportIdleError::Store)?
-        .ok_or(ReportIdleError::WorkloadClassNotFound)?;
-    let sleep_policy = workload_class
-        .sleep_policy
-        .resolve(&instance.values)
-        .map_err(|error| ReportIdleError::SleepPolicy(error.to_string()))?;
-    Ok(sleep_policy)
+        .map_err(|error| ReportIdleError::UnsupportedSleep(error.to_string()))?;
+    Ok(policy)
 }
 
 async fn load_instance<S>(
@@ -293,7 +265,7 @@ async fn load_instance<S>(
     instance_id: InstanceId,
 ) -> Result<InstanceRecord, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
     store
         .get_instance(GetInstanceRequest::new(instance_id))

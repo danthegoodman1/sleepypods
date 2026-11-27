@@ -1,15 +1,7 @@
 //! Real PostgreSQL conformance for certificate authority, not a database fake.
 use super::*;
-use control_plane::{
-    certificate::*, RetryPolicy, RetryingControlPlaneStore, StoreFuture, StoreResult,
-};
-use std::{
-    future::Future,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use control_plane::{certificate::*, RetryPolicy, StoreResult};
+use std::{future::Future, sync::Arc};
 use tokio_postgres::Client;
 
 fn id(value: &str) -> CertificateId {
@@ -70,9 +62,7 @@ async fn snapshot(
     hosts: Vec<TlsHostname>,
     known: Option<CertificateRevision>,
 ) -> StoreResult<Option<TlsBindingSnapshot>> {
-    RetryingControlPlaneStore::with_default_policy(Arc::new(store.clone()))
-        .snapshot_tls_bindings(hosts, known)
-        .await
+    store.snapshot_tls_bindings(hosts, known).await
 }
 async fn global_revision(store: &PostgresStore) -> StoreResult<CertificateRevision> {
     Ok(snapshot(store, Vec::new(), None)
@@ -649,138 +639,58 @@ fn ring_digest(bytes: &[u8]) -> Vec<u8> {
 #[path = "certificates/snapshot.rs"]
 mod snapshot;
 
-/// Injects a lost response only after the real database commit; no fake state.
-struct LostCertificateResponse {
-    inner: PostgresStore,
-    calls: AtomicUsize,
+/// Runs `write` and loses the answer to its COMMIT, so the write commits and
+/// its caller cannot tell.
+async fn commit_answer_lost<T: std::fmt::Debug>(
+    relay: &postgres_relay::Relay,
+    write: impl Future<Output = StoreResult<T>>,
+) -> TestResult<StoreResult<T>> {
+    relay.lose_answer_to(b"COMMIT");
+    tokio::pin!(write);
+    tokio::select! {
+        result = &mut write => return Err(format!("the write answered: {result:?}").into()),
+        () = relay.wait_until_answer_held() => {}
+    }
+    relay.drop_held_answer();
+    Ok(write.await)
 }
-impl ControlPlaneStore for LostCertificateResponse {
-    unexpected_store_methods!(
-        get_certificate_metadata,
-        reencrypt_certificates_sealed_by,
-        get_tls_binding,
-        resolve_tls_certificate,
-        snapshot_tls_bindings,
-        load_route_changes,
-        load_route_change_revision,
-        load_materialization_work_status,
-        record_materialization_failure,
-        enqueue_materialization,
-        maintain_runtime_records,
-        accept_wake,
-        request_instance_deletion,
-        finalize_instance_deletions,
-        create_instance,
-        get_instance,
-        delete_instance,
-        create_workload_class_version,
-        load_workload_class_version,
-        create_route_binding,
-        get_route_binding,
-        delete_route_binding,
-        list_route_bindings_for_instance,
-        resolve_host_rules,
-        compare_and_swap_instance_state,
-        record_materialization,
-        load_ready_materialization,
-        load_active_materialization,
-        load_materialization,
-        complete_wake,
-        begin_sleep,
-        finalize_sleep,
-        load_materialization_operational_metrics,
-        claim_next_materialization_reconciliation,
-        renew_materialization_reconciliation_lease,
-        release_materialization_reconciliation_lease,
-        complete_wake_reconciliation,
-        finalize_sleep_reconciliation,
-        delete_materialization_reconciliation,
-        force_delete_materialization,
-        force_release_exclusivity_key,
-        lookup_route_dependencies,
-        put_http01_challenge,
-        resolve_http01_challenge,
-        delete_http01_challenge,
-    );
-    fn publish_certificate(
-        &self,
-        request: PublishCertificateRequest,
-    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.publish_certificate(request).await?;
-            Err(StoreError::unavailable(
-                "response lost after certificate commit",
-            ))
-        })
-    }
-    fn set_tls_binding(
-        &self,
-        request: SetTlsBindingRequest,
-    ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.set_tls_binding(request).await?;
-            Err(StoreError::unavailable(
-                "response lost after certificate commit",
-            ))
-        })
-    }
-    fn remove_certificate(
-        &self,
-        request: RemoveCertificateRequest,
-    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.remove_certificate(request).await?;
-            Err(StoreError::unavailable(
-                "response lost after certificate commit",
-            ))
-        })
-    }
-    fn reencrypt_certificate(
-        &self,
-        request: ReencryptCertificateRequest,
-    ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.reencrypt_certificate(request).await?;
-            Err(StoreError::unavailable(
-                "response lost after certificate commit",
-            ))
-        })
-    }
-}
+
 #[tokio::test]
 async fn postgres_certificate_committed_response_loss_is_not_replayed() -> TestResult {
-    database_test(|store, _raw, _| async move {
+    database_test(|store, _raw, config| async move {
         let store = store.with_certificate_sealer(ring("b", &[("a", 7), ("b", 8)]));
-        let loss = Arc::new(LostCertificateResponse {
-            inner: store.clone(),
-            calls: AtomicUsize::new(0),
-        });
-        let retry = RetryingControlPlaneStore::new(
-            loss.clone(),
-            RetryPolicy::new(3, Duration::from_millis(1), Duration::from_millis(2)),
-        );
+        let relay = postgres_relay::Relay::start(config.connection_url()).await?;
+        let mut relayed = PostgresStoreConfig::new(relay.url(config.connection_url())?)?;
+        // Certificate work keeps one session for other work, so it needs two.
+        relayed.max_connections = 2;
+        let retry = PostgresStore::connect(&relayed)
+            .await?
+            .with_certificate_sealer(ring("b", &[("a", 7), ("b", 8)]))
+            .with_retry_policy(RetryPolicy::new(
+                3,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+            ));
         let request = publish("lost", 0, &["lost.example.test"]);
         let expected_key = request.bundle.private_key_pkcs8_der().to_vec();
         let expected_chain = request.bundle.chain_der().to_vec();
         assert!(matches!(
-            retry.publish_certificate(request.clone()).await,
+            commit_answer_lost(&relay, retry.publish_certificate(request.clone())).await?,
             Err(StoreError::Unavailable { .. })
         ));
-        assert_eq!(loss.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(relay.answers_lost(), 1);
         let original = store.get_certificate_metadata(id("lost")).await?.unwrap();
         assert_eq!(original.version, rev(1));
         assert!(store.publish_certificate(request).await.is_err());
         assert!(matches!(
-            retry
-                .set_tls_binding(bind("lost.example.test", rev(0), Some("lost")))
-                .await,
+            commit_answer_lost(
+                &relay,
+                retry.set_tls_binding(bind("lost.example.test", rev(0), Some("lost"))),
+            )
+            .await?,
             Err(StoreError::Unavailable { .. })
         ));
-        assert_eq!(loss.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(relay.answers_lost(), 2);
         let bound = store.get_tls_binding(host("lost.example.test")).await?;
         assert_eq!(bound.certificate_id, Some(id("lost")));
         match resolve(&store, "lost.example.test").await?.value {
@@ -798,25 +708,29 @@ async fn postgres_certificate_committed_response_loss_is_not_replayed() -> TestR
         }
 
         assert!(matches!(
-            retry
-                .reencrypt_certificate(ReencryptCertificateRequest {
+            commit_answer_lost(
+                &relay,
+                retry.reencrypt_certificate(ReencryptCertificateRequest {
                     id: id("lost"),
                     expected_version: original.version,
                     expected_sealing_revision: original.sealing_revision
-                })
-                .await,
+                }),
+            )
+            .await?,
             Err(StoreError::Unavailable { .. })
         ));
-        assert_eq!(loss.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(relay.answers_lost(), 3);
         let reencrypted = store.get_certificate_metadata(id("lost")).await?.unwrap();
         assert!(reencrypted.sealing_revision > original.sealing_revision);
         assert!(matches!(
-            retry
-                .publish_certificate(publish("lost", 1, &["lost.example.test"]))
-                .await,
+            commit_answer_lost(
+                &relay,
+                retry.publish_certificate(publish("lost", 1, &["lost.example.test"])),
+            )
+            .await?,
             Err(StoreError::Unavailable { .. })
         ));
-        assert_eq!(loss.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(relay.answers_lost(), 4);
         let latest = store.get_certificate_metadata(id("lost")).await?.unwrap();
         assert_eq!(latest.version, rev(2));
         assert!(store
@@ -824,15 +738,17 @@ async fn postgres_certificate_committed_response_loss_is_not_replayed() -> TestR
             .await
             .is_err());
         assert!(matches!(
-            retry
-                .remove_certificate(RemoveCertificateRequest {
+            commit_answer_lost(
+                &relay,
+                retry.remove_certificate(RemoveCertificateRequest {
                     id: id("lost"),
                     expected_version: latest.version
-                })
-                .await,
+                }),
+            )
+            .await?,
             Err(StoreError::Unavailable { .. })
         ));
-        assert_eq!(loss.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(relay.answers_lost(), 5);
         assert_eq!(
             store
                 .get_certificate_metadata(id("lost"))
