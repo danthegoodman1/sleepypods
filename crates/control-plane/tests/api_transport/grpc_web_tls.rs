@@ -188,3 +188,52 @@ async fn grpc_web_listener_serves_allowed_origins_and_refuses_others() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(grpc_status(&headers, &body).as_deref(), Some("0"));
 }
+
+/// The kind gate's driver speaks HTTP/1.1 and offers no ALPN protocol.
+#[tokio::test]
+async fn grpc_web_listener_serves_http1_over_tls_without_alpn() {
+    let listener = serve_grpc_web().await;
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots
+        .add(listener.certificate.der().clone())
+        .expect("root certificate");
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(listener.address)
+        .await
+        .expect("TCP connects");
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect("localhost".try_into().expect("server name"), tcp)
+        .await
+        .expect("TLS handshake completes");
+    let message = GetInstanceRequest {
+        instance_id: "web".to_owned(),
+    }
+    .encode_to_vec();
+    let mut request = format!(
+        "POST {} HTTP/1.1\r\nhost: localhost\r\norigin: {ALLOWED_ORIGIN}\r\n\
+         content-type: application/grpc-web+proto\r\nx-grpc-web: 1\r\n\
+         authorization: Bearer operator-token\r\nconnection: close\r\n\
+         content-length: {}\r\n\r\n",
+        operator_method_uri("GetInstance"),
+        message.len() + 5
+    )
+    .into_bytes();
+    request.push(0);
+    request.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    request.extend_from_slice(&message);
+    tls.write_all(&request).await.expect("request is written");
+
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
+        .await
+        .expect("the listener answers and closes");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.contains(&format!("access-control-allow-origin: {ALLOWED_ORIGIN}")),
+        "{response}"
+    );
+    assert!(response.contains("grpc-status:0"), "{response}");
+}
