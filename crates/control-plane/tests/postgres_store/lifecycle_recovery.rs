@@ -16,13 +16,13 @@ use pb::{
 };
 use std::{future::Future, sync::Arc};
 
-const LEASE: Duration = Duration::from_secs(60);
+pub(super) const LEASE: Duration = Duration::from_secs(60);
 const SESSIONS_PER_STORE: usize = 4;
 /// The ready Pod's own address, as a completed wake records it.
 const POD_BACKEND: &str = "http://10.244.0.7:15000";
 
 /// Runs `body` against a store and a raw session in a schema of their own.
-async fn with_store<Body, BodyFuture>(body: Body) -> TestResult
+pub(super) async fn with_store<Body, BodyFuture>(body: Body) -> TestResult
 where
     Body: FnOnce(PostgresStore, tokio_postgres::Client) -> BodyFuture,
     BodyFuture: Future<Output = TestResult>,
@@ -63,7 +63,7 @@ where
     result
 }
 
-async fn class(store: &PostgresStore, id: &str) -> TestResult<WorkloadClassVersion> {
+pub(super) async fn class(store: &PostgresStore, id: &str) -> TestResult<WorkloadClassVersion> {
     let class = workload_class(id, 1);
     store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
@@ -112,7 +112,7 @@ async fn active(
 }
 
 /// A new instance whose wake is accepted: it is Waking with a Pending row.
-async fn accepted(
+pub(super) async fn accepted(
     store: &PostgresStore,
     class: &WorkloadClassVersion,
     target: &MaterializationTarget,
@@ -156,7 +156,7 @@ async fn complete(
 }
 
 /// A new instance woken to Running.
-async fn running(
+pub(super) async fn running(
     store: &PostgresStore,
     class: &WorkloadClassVersion,
     target: &MaterializationTarget,
@@ -175,7 +175,7 @@ async fn schedule_at(raw: &tokio_postgres::Client, id: &str, next_attempt: i64) 
     Ok(())
 }
 
-fn target(cluster: &str) -> MaterializationTarget {
+pub(super) fn target(cluster: &str) -> MaterializationTarget {
     MaterializationTarget::new(cluster, "apps").expect("valid target")
 }
 
@@ -1017,140 +1017,6 @@ async fn postgres_completions_and_deletion_share_one_lock_order() -> TestResult 
     .await
 }
 
-/// A TCP relay in front of Postgres. Cutting it resets every session and
-/// every new connection, as a database outage does; restoring it lets new
-/// connections through.
-struct Relay {
-    address: std::net::SocketAddr,
-    cut: Arc<tokio::sync::watch::Sender<bool>>,
-    /// Bytes whose next appearance in a request cuts the relay. That request
-    /// is held, so it is in flight on its session when the reset arrives.
-    trigger: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// The single TCP server a test database URL names.
-fn database_server(base: &str) -> TestResult<String> {
-    let config: tokio_postgres::Config = base.parse()?;
-    let [tokio_postgres::config::Host::Tcp(host)] = config.get_hosts() else {
-        return Err("the test database URL must name one TCP host".into());
-    };
-    let server = format!(
-        "{host}:{}",
-        config.get_ports().first().copied().unwrap_or(5432)
-    );
-    if !base.contains(&server) {
-        return Err(format!("the test database URL must spell out {server}").into());
-    }
-    Ok(server)
-}
-
-impl Relay {
-    async fn start(base: &str) -> TestResult<Self> {
-        let upstream = tokio::net::lookup_host(database_server(base)?)
-            .await?
-            .next()
-            .ok_or("the test database host does not resolve")?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let cut = Arc::new(tokio::sync::watch::channel(false).0);
-        let trigger = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-        let (relay_cut, relay_trigger) = (cut.clone(), trigger.clone());
-        let task = tokio::spawn(async move {
-            while let Ok((inbound, _)) = listener.accept().await {
-                if *relay_cut.borrow() {
-                    let _ = inbound.set_zero_linger();
-                    continue;
-                }
-                let (cut, trigger) = (relay_cut.clone(), relay_trigger.clone());
-                tokio::spawn(async move {
-                    if let Ok(outbound) = tokio::net::TcpStream::connect(upstream).await {
-                        relay_session(inbound, outbound, &cut, &trigger).await;
-                    }
-                });
-            }
-        });
-        Ok(Self {
-            address,
-            cut,
-            trigger,
-            task,
-        })
-    }
-
-    /// The connection URL `base` names, with this relay as its server.
-    fn url(&self, base: &str) -> TestResult<String> {
-        Ok(base.replacen(&database_server(base)?, &self.address.to_string(), 1))
-    }
-
-    /// Cuts the relay at the next request that carries `bytes`.
-    fn cut_at(&self, bytes: &[u8]) {
-        *self.trigger.lock().unwrap() = Some(bytes.to_vec());
-    }
-
-    async fn wait_until_cut(&self) {
-        let _ = self.cut.subscribe().wait_for(|cut| *cut).await;
-    }
-
-    fn restore(&self) {
-        self.cut.send_replace(false);
-    }
-}
-
-impl Drop for Relay {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// Copies one session in both directions until either side closes or the
-/// relay is cut, and then resets both connections.
-async fn relay_session(
-    mut inbound: tokio::net::TcpStream,
-    mut outbound: tokio::net::TcpStream,
-    cut: &tokio::sync::watch::Sender<bool>,
-    trigger: &std::sync::Mutex<Option<Vec<u8>>>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut watched = cut.subscribe();
-    {
-        let (mut client_read, mut client_write) = inbound.split();
-        let (mut server_read, mut server_write) = outbound.split();
-        let requests = async {
-            let mut buffer = vec![0; 64 * 1024];
-            loop {
-                let read = client_read.read(&mut buffer).await?;
-                if read == 0 {
-                    return Ok::<_, std::io::Error>(());
-                }
-                let request = &buffer[..read];
-                let fires = {
-                    let mut armed = trigger.lock().unwrap();
-                    let fires = armed.as_ref().is_some_and(|bytes| {
-                        request.windows(bytes.len()).any(|window| window == bytes)
-                    });
-                    if fires {
-                        *armed = None;
-                    }
-                    fires
-                };
-                if fires {
-                    cut.send_replace(true);
-                    std::future::pending::<()>().await;
-                }
-                server_write.write_all(request).await?;
-            }
-        };
-        tokio::select! {
-            _ = requests => {}
-            _ = tokio::io::copy(&mut server_read, &mut client_write) => {}
-            _ = watched.wait_for(|cut| *cut) => {}
-        }
-    }
-    let _ = inbound.set_zero_linger();
-    let _ = outbound.set_zero_linger();
-}
-
 /// Pods that become ready, and stop, at a fixed time.
 #[derive(Clone)]
 struct PodsSettleAt(LifecycleKubernetes, tokio::time::Instant);
@@ -1245,7 +1111,7 @@ async fn postgres_reconciler_rides_out_a_thirty_second_outage() -> TestResult {
             .await?
             .get(0);
 
-        let relay = Relay::start(&base).await?;
+        let relay = postgres_relay::Relay::start(&base).await?;
         let mut relayed = PostgresStoreConfig::new(connection_url_with_search_path(
             &relay.url(&base)?,
             &schema,

@@ -1,6 +1,8 @@
 #[macro_use]
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
+#[path = "support/postgres_relay.rs"]
+mod postgres_relay;
 #[path = "support/mod.rs"]
 mod transport_support;
 use std::{
@@ -4992,3 +4994,5 @@ mod crash_boundaries;
 mod host_rule_bounds;
 #[path = "postgres_store/lifecycle_recovery.rs"]
 mod lifecycle_recovery;
+#[path = "postgres_store/round_trips.rs"]
+mod round_trips;
