@@ -211,9 +211,14 @@ and the runtime have separate costs.
 
 Identical misses share one fetch. Lookup has a three-second deadline within the
 overall five-second TLS setup bound. A lookup that finds all three fetch slots
-busy waits its turn in arrival order until that deadline. Eviction ends a wait
-early only when all 1,024 hostnames without a certificate have handshakes
-waiting at once. A lookup whose handshakes have all left starts no fetch.
+busy waits its turn in arrival order until that deadline. At most 64 handshakes
+wait on lookups at once, counting those that join a lookup already queued or in
+flight for the same hostname; a further lookup fails its handshake at once. The
+limit is half the default `SLEEPYPODS_PROXY_MAX_HANDSHAKES` of 128, so a flood
+of unknown names leaves handshake permits for hostnames whose certificates are
+cached, and those handshakes complete without waiting. Eviction passes over a
+hostname with a handshake waiting; with at most 64 waiting, a full budget always
+holds another to evict. A lookup whose handshakes have all left starts no fetch.
 Background refreshes wait for the same slots in their own queue. When both
 queues hold work the slots alternate between them, so a burst of unknown names
 leaves refreshes running and a wave of refreshes leaves new hostnames resolving.

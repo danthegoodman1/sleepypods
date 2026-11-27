@@ -128,6 +128,12 @@ impl Rig {
         let state = self.cache.shared.state.lock().unwrap();
         state.entries.contains_key(host)
     }
+    /// Handshakes waiting on a lookup, across every hostname.
+    fn waiting(&self) -> usize {
+        let state = self.cache.shared.state.lock().unwrap();
+        let waiters = |entry: &Entry| entry.changed.receiver_count();
+        state.entries.values().map(waiters).sum()
+    }
     async fn finish(mut self) {
         self.shutdown.shutdown();
         while let Some(result) = self.tasks.join_next().await {
@@ -377,6 +383,55 @@ async fn handshake_waits_for_a_busy_fetch_slot_and_succeeds_within_the_lookup_de
 
     drop(releases);
     while busy.join_next().await.is_some() {}
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_lookup_wait_serves_cached_hostnames_and_fails_further_lookups_at_once() {
+    let rig = Rig::new();
+    let (cached, der) = rig.install(1).await.remove(0);
+    let mut held = rig.gate();
+    let mut callers = JoinSet::new();
+    let mut releases = rig.occupy(&mut held, &mut callers).await;
+    for i in 0..CERTIFICATE_LOOKUP_WAITERS - CERTIFICATE_FETCHES {
+        let cache = rig.cache.clone();
+        callers.spawn(async move { cache.resolve(&format!("unknown{i}.example")).await });
+        until(|| rig.cache.usage().queued == i + 1).await;
+    }
+    assert_eq!(rig.waiting(), CERTIFICATE_LOOKUP_WAITERS);
+
+    let arrived = Instant::now();
+    let verified = handshake(rig.cache.clone(), cached, der.clone()).await;
+    assert_eq!(verified.unwrap(), der);
+    // One more unknown hostname, and one whose lookup is already in flight.
+    for refused in ["one-more.example", "busy0.example"] {
+        let refusal = handshake(rig.cache.clone(), refused.into(), der.clone()).await;
+        assert!(
+            matches!(
+                refusal,
+                Err(crate::TlsTerminationError::Certificate(
+                    CertificateLookupError::Capacity
+                ))
+            ),
+            "{refused} joined a full wait: {refusal:?}"
+        );
+    }
+    assert_eq!(arrived.elapsed(), Duration::ZERO);
+    assert!(!rig.cached("one-more.example"));
+    assert_eq!(rig.requested("one-more.example"), 0);
+    assert_eq!(rig.waiting(), CERTIFICATE_LOOKUP_WAITERS);
+
+    // A handshake that leaves the wait makes room for another.
+    releases.remove(0).send(()).unwrap();
+    until(|| rig.waiting() == CERTIFICATE_LOOKUP_WAITERS - 1).await;
+    let cache = rig.cache.clone();
+    callers.spawn(async move { cache.resolve("one-more.example").await });
+    until(|| rig.waiting() == CERTIFICATE_LOOKUP_WAITERS).await;
+    assert!(rig.cached("one-more.example"));
+
+    drop(releases);
+    drop(held);
+    while callers.join_next().await.is_some() {}
     rig.finish().await;
 }
 

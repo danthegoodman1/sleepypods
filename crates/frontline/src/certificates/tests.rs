@@ -78,7 +78,8 @@ async fn until(mut condition: impl FnMut() -> bool) {
 async fn coalesced_cold_waiters_and_independent_host_then_zero_rpc_warm() {
     let mut rig = Rig::new();
     let mut waiters = JoinSet::new();
-    for _ in 0..64 {
+    let coalesced = CERTIFICATE_LOOKUP_WAITERS - 1;
+    for _ in 0..coalesced {
         let c = rig.cache.clone();
         waiters.spawn(async move { c.resolve("App.Example.").await });
     }
@@ -88,7 +89,7 @@ async fn coalesced_cold_waiters_and_independent_host_then_zero_rpc_warm() {
         rig.cache.shared.state.lock().unwrap().entries["app.example"]
             .changed
             .receiver_count()
-            == 64
+            == coalesced
     })
     .await;
     let c = rig.cache.clone();

@@ -74,8 +74,8 @@ TLS 1.2 and 1.3 use full handshakes; sessions, tickets and early data cannot byp
 current SNI authorization.
 
 Resource limits are 1,024 hostnames with a certificate, a separate 1,024
-hostnames without one, three concurrent fetches, 128 KiB bundles, 16 chain
-entries and 100 SANs. These counts and the 256 KiB resolve and 512 KiB watch
+hostnames without one, three concurrent fetches, 64 handshakes waiting on
+lookups, 128 KiB bundles, 16 chain entries and 100 SANs. These counts and the 256 KiB resolve and 512 KiB watch
 message caps bound cache memory at about 220 MiB in the worst case; the operator
 guide derives it. The watch admits at most 16 streams per control plane, 1,024
 interests per stream, 512 KiB messages and two queued responses.

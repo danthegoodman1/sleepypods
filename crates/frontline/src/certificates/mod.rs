@@ -8,7 +8,8 @@
 //! A fetch waits in one of two queues until the worker has a slot for it. A
 //! lookup has a handshake waiting on it; a refresh comes from a notification
 //! or a due lease. Slots alternate between the queues when both hold work, so
-//! neither a flood of lookups nor a wave of refreshes starves the other.
+//! neither a flood of lookups nor a wave of refreshes starves the other. A
+//! bounded number of handshakes wait at once; the next one fails immediately.
 mod client;
 mod metrics;
 mod notifications;
@@ -46,6 +47,11 @@ pub const CERTIFICATE_CACHE_ENTRIES: usize = 1024;
 /// Hostnames cached without a certificate: missing, pending or failed lookups.
 pub const CERTIFICATE_NEGATIVE_ENTRIES: usize = 1024;
 pub const CERTIFICATE_FETCHES: usize = 3;
+/// Handshakes that may wait for a lookup at once, counting those that join a
+/// lookup already queued or in flight. A further lookup fails at once. Half
+/// the default handshake admission, so lookups for unknown names leave
+/// handshake permits for hostnames whose certificates are cached.
+pub const CERTIFICATE_LOOKUP_WAITERS: usize = 64;
 pub const CERTIFICATE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CERTIFICATE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 // Worst-case memory follows from these counts and the message caps, about
@@ -118,6 +124,8 @@ struct Shared {
     wall: Arc<dyn Fn() -> i64 + Send + Sync>,
     state: Mutex<State>,
     fetches: Arc<Semaphore>,
+    /// One permit for each handshake waiting on a lookup.
+    lookup_waiters: Semaphore,
     /// Wakes the worker when a fetch joins a queue.
     queued: Notify,
 }
@@ -251,6 +259,7 @@ impl TlsCertificateStore {
                 stopped: false,
             }),
             fetches: Arc::new(Semaphore::new(CERTIFICATE_FETCHES)),
+            lookup_waiters: Semaphore::new(CERTIFICATE_LOOKUP_WAITERS),
             queued: Notify::new(),
         });
         let cache = Self { shared };
@@ -284,10 +293,13 @@ impl TlsCertificateStore {
             queued: state.lookups.len() + state.refreshes.len(),
         }
     }
-    /// Each waiter remains owned by its admitted handshake. A lookup waits for
-    /// a fetch slot and then for its fetch, all within one deadline. Canceling
-    /// a waiter does not cancel a running fetch; a lookup whose waiters all
-    /// left before it reached a slot starts no fetch.
+    /// Each waiter remains owned by its admitted handshake. A cached answer
+    /// returns at once. Otherwise the handshake takes one of
+    /// `CERTIFICATE_LOOKUP_WAITERS` places, or fails with `Capacity` when all
+    /// are taken, and waits for a fetch slot and then for its fetch, all
+    /// within one deadline. Canceling a waiter does not cancel a running
+    /// fetch; a lookup whose waiters all left before it reached a slot starts
+    /// no fetch.
     pub async fn resolve(
         &self,
         sni: &str,
@@ -296,7 +308,7 @@ impl TlsCertificateStore {
             .map_err(|_| CertificateLookupError::Invalid)?
             .to_string();
         let deadline = Instant::now() + CERTIFICATE_LOOKUP_TIMEOUT;
-        let mut receiver = {
+        let (_place, mut receiver) = {
             let mut state = self.shared.state.lock().unwrap();
             if state.stopped {
                 return Err(CertificateLookupError::Stopped);
@@ -309,7 +321,13 @@ impl TlsCertificateStore {
                         return Ok(view.config.clone());
                     }
                 }
-            } else {
+            }
+            let place = self
+                .shared
+                .lookup_waiters
+                .try_acquire()
+                .map_err(|_| CertificateLookupError::Capacity)?;
+            if !state.entries.contains_key(&hostname) {
                 let (changed, _) = watch::channel(0);
                 state.entries.insert(
                     hostname.clone(),
@@ -330,7 +348,7 @@ impl TlsCertificateStore {
             }
             state.queue_lookup(&hostname, serial);
             self.shared.queued.notify_one();
-            state.entries[&hostname].changed.subscribe()
+            (place, state.entries[&hostname].changed.subscribe())
         };
         loop {
             {
