@@ -36,7 +36,7 @@ use crate::{
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     projection::{ProjectionError, ProjectionPlan, ProjectionReconciler},
-    store::{ControlPlaneStore, StoreError, StoreResult},
+    store::{ReconcilerStore, StoreError, StoreResult},
     workload::LoadWorkloadClassVersionRequest,
 };
 
@@ -73,7 +73,7 @@ pub struct InvalidReconcilerLimit {
 }
 
 pub struct MaterializationReconciler<C> {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn ReconcilerStore>,
     materializer: KubernetesMaterializer<C>,
     target: crate::materialization::MaterializationTarget,
     config: MaterializationReconcilerConfig,
@@ -99,7 +99,7 @@ pub enum MaterializationReconcileError {
 /// failing store is retried: until then the lease may still be held, so the
 /// work continues; after it the lease can have passed to another driver.
 pub(crate) struct HeldLease {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn ReconcilerStore>,
     renewal: RenewMaterializationReconciliationLeaseRequest,
     expires: Mutex<tokio::time::Instant>,
     observability: ObservabilityRecorder,
@@ -154,7 +154,7 @@ impl std::error::Error for InvalidReconcilerLimit {}
 
 impl HeldLease {
     fn new(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ReconcilerStore>,
         claimed: &MaterializationRecord,
         config: &MaterializationReconcilerConfig,
         claim_started: tokio::time::Instant,
@@ -254,7 +254,7 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     pub fn new(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ReconcilerStore>,
         materializer: KubernetesMaterializer<C>,
         target: crate::materialization::MaterializationTarget,
         config: MaterializationReconcilerConfig,

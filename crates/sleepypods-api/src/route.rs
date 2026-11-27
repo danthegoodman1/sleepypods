@@ -55,11 +55,6 @@ pub struct DeleteRouteBindingRequest {
     pub route_binding_id: RouteBindingId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListRouteBindingsForInstanceRequest {
-    pub instance_id: InstanceId,
-}
-
 /// The listener family an identity routes: HTTP by Host and path, or TLS
 /// passthrough by SNI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -166,18 +161,6 @@ pub struct RouteEntry {
     pub backend_generation: Option<BackendGeneration>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteDependencyLookup {
-    route_binding_id: RouteBindingId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteDependencySet {
-    pub route_binding_id: RouteBindingId,
-    pub instance_id: InstanceId,
-    pub materialization_generation: Option<BackendGeneration>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RouteHost {
     kind: RouteHostKind,
@@ -234,26 +217,6 @@ impl GetRouteBindingRequest {
 impl DeleteRouteBindingRequest {
     pub fn new(route_binding_id: RouteBindingId) -> Self {
         Self { route_binding_id }
-    }
-}
-
-impl ListRouteBindingsForInstanceRequest {
-    pub fn new(instance_id: InstanceId) -> Self {
-        Self { instance_id }
-    }
-}
-
-impl RouteDependencyLookup {
-    pub fn new(route_binding_id: RouteBindingId) -> Self {
-        Self { route_binding_id }
-    }
-
-    pub fn from_route_entry(entry: &RouteEntry) -> Self {
-        Self::new(entry.route_binding_id.clone())
-    }
-
-    pub fn route_binding_id(&self) -> &RouteBindingId {
-        &self.route_binding_id
     }
 }
 
@@ -424,8 +387,8 @@ fn normalize_host(value: &str, wildcard: bool) -> Result<String, InvalidRouteHos
 #[cfg(test)]
 mod tests {
     use super::{
-        HostRules, InvalidPathPrefix, PathPrefix, RouteDependencyLookup, RouteEntry, RouteHost,
-        RouteHostKind, RouteIdentity, RouteKind, RouteRule, MAX_ROUTE_PATH_BYTES,
+        HostRules, InvalidPathPrefix, PathPrefix, RouteEntry, RouteHost, RouteHostKind,
+        RouteIdentity, RouteKind, RouteRule, MAX_ROUTE_PATH_BYTES,
     };
     use crate::{
         ids::{Generation, InstanceId, RouteBindingId},
@@ -623,14 +586,5 @@ mod tests {
         ]);
 
         assert_eq!(selected(&rules, ""), Some("exact"));
-    }
-
-    #[test]
-    fn dependency_lookup_uses_matched_route_binding_id() {
-        let entry = entry("route-1");
-
-        let lookup = RouteDependencyLookup::from_route_entry(&entry);
-
-        assert_eq!(lookup.route_binding_id(), &entry.route_binding_id);
     }
 }

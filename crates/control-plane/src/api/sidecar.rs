@@ -11,21 +11,21 @@ use crate::{
     ids::{Generation, InstanceId},
     materialization::MaterializationTarget,
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    store::ControlPlaneStore,
+    store::SleepStore,
 };
 
 pub const SIDECAR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.SidecarControlPlane";
 
 #[derive(Clone)]
 pub struct StoreBackedSidecarApi<C> {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn SleepStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
 }
 
 impl<C> StoreBackedSidecarApi<C> {
     pub fn new(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn SleepStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
@@ -40,7 +40,7 @@ impl<C> StoreBackedSidecarApi<C> {
 pub type StoreBackedSidecarGrpcService<C> = SidecarControlPlaneServer<StoreBackedSidecarApi<C>>;
 
 pub fn sidecar_grpc_service_with_store<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn SleepStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
 ) -> StoreBackedSidecarGrpcService<C>

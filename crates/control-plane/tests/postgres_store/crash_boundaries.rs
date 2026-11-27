@@ -77,38 +77,24 @@ async fn crash_boundary(
         "license-crash",
     )
     .await?;
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-
-    // Acquiring the key is recording the row, so every crash point is reached
+    // Accepting the wake acquires the key, so every crash point is reached
     // with the key already held.
-    let mut pending = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    pending.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&waking.values)
+    let keys = workload_class
+        .render_exclusivity_keys(&owner.instance.values)
         .map_err(|error| StoreError::internal(error.to_string()))?;
-    if point != CrashPoint::BeforeApply {
+    let refs = if point == CrashPoint::BeforeApply {
+        vec![]
+    } else {
         // An owner that reached the apply recorded what it created, so recovery
         // inherits the inventory it has to finish or tear down.
-        pending.rendered_objects = vec![RenderedObjectRef {
+        vec![RenderedObjectRef {
             api_version: "apps/v1".to_owned(),
             kind: "StatefulSet".to_owned(),
             namespace: "apps".to_owned(),
             name: "instance-crash-owner".to_owned(),
-        }];
-    }
-    let record = store.record_materialization(pending).await?;
+        }]
+    };
+    let record = accept_projection(store, &owner.instance, &target, refs, keys).await?;
     assert_eq!(
         record.rendered_objects.is_empty(),
         point == CrashPoint::BeforeApply,
@@ -160,26 +146,16 @@ async fn crash_boundary(
         "license-contender",
     )
     .await?;
-    let contender_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut contender_pending = RecordMaterializationRequest::new(
-        contender.instance.id.clone(),
-        contender_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    contender_pending.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&contender_waking.values)
+    let contender_keys = workload_class
+        .render_exclusivity_keys(&contender.instance.values)
         .map_err(|error| StoreError::internal(error.to_string()))?;
     let conflict = store
-        .record_materialization(contender_pending)
+        .accept_wake(accept_request(
+            &contender.instance,
+            &target,
+            vec![],
+            contender_keys,
+        ))
         .await
         .expect_err("a crashed owner still holds its key");
     assert_exclusivity_conflict(conflict, "disk", Some("instance-crash-owner"));
@@ -560,8 +536,7 @@ async fn fault_recovery(
         );
     }
     let (owner, contender) = (instances[0].clone(), instances[1].clone());
-    let store =
-        Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     let kube = FaultyKubernetes::default();
     let materializer = control_plane::KubernetesMaterializer::new(kube.clone());
     let wake = |instance: &control_plane::InstanceRecord| {

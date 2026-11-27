@@ -549,9 +549,11 @@ async fn postgres_sealing_key_rotation_reencrypts_certificates_in_bulk() -> Test
 async fn postgres_cancelled_certificate_sql_retains_capacity_until_drained() -> TestResult {
     database_test(|_store, raw, mut config| async move {
         config.max_connections = 2;
+        // One attempt, so a call reports exhausted capacity rather than waiting.
         let store = PostgresStore::connect(&config)
             .await?
-            .with_certificate_sealer(ring("a", &[("a", 7)]));
+            .with_certificate_sealer(ring("a", &[("a", 7)]))
+            .with_retry_policy(RetryPolicy::new(1, Duration::ZERO, Duration::ZERO));
         let (mut blocker, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { connection.await.unwrap() });
@@ -638,9 +640,11 @@ async fn postgres_cancelled_certificate_sql_retains_capacity_until_drained() -> 
 async fn postgres_certificate_stalled_drain_discards_dirty_session() -> TestResult {
     database_test(|_store, raw, mut config| async move {
         config.max_connections = 2;
+        // One attempt, so a call reports exhausted capacity rather than waiting.
         let store = PostgresStore::connect(&config)
             .await?
-            .with_certificate_sealer(ring("a", &[("a", 7)]));
+            .with_certificate_sealer(ring("a", &[("a", 7)]))
+            .with_retry_policy(RetryPolicy::new(1, Duration::ZERO, Duration::ZERO));
         let (mut blocker, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { connection.await.unwrap() });

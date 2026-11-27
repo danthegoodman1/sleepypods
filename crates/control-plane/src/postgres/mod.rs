@@ -2,6 +2,7 @@
 
 mod certificate_connection;
 mod certificate_ops;
+mod class_cache;
 mod connection;
 mod error;
 mod http01_ops;
@@ -11,6 +12,7 @@ mod mapping;
 mod materialization_ops;
 mod migrations;
 mod route_ops;
+mod sql;
 mod store;
 
 pub use connection::PostgresStore;

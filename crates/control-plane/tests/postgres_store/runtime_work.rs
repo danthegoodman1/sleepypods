@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::{api::RouteSubscriptionBroker, RetryingControlPlaneStore};
+use control_plane::api::RouteSubscriptionBroker;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -15,7 +15,7 @@ async fn postgres_runtime_ordered_notifications_and_retention() -> TestResult {
         .await?;
     let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
     let pg = PostgresStore::connect(&config).await?;
-    let result = ordered_notifications(pg, &config, &admin).await;
+    let result = ordered_notifications(pg, &config).await;
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await?;
@@ -23,15 +23,11 @@ async fn postgres_runtime_ordered_notifications_and_retention() -> TestResult {
     result
 }
 
-async fn ordered_notifications(
-    pg: PostgresStore,
-    config: &PostgresStoreConfig,
-    admin: &tokio_postgres::Client,
-) -> TestResult {
+async fn ordered_notifications(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResult {
     let class = workload_class("runtime-events", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     for id in ["order-a", "order-b"] {
         store
             .create_instance(create_instance_request(
@@ -49,42 +45,45 @@ async fn ordered_notifications(
         "bundled instance and route writes both persist intent"
     );
     let cursor = initial.cursor;
+    let instances = |changes: &control_plane::runtime_work::DurableRouteChanges| {
+        changes
+            .events
+            .iter()
+            .map(|event| event["instance_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // A transaction that has written and not committed holds nothing another
+    // writer waits on. The later writer commits first and takes the earlier
+    // revision; the open transaction numbers its change when it commits.
     let (mut first, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let first_task = tokio::spawn(connection);
     let tx = first.transaction().await?;
     tx.execute("UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-a'", &[]).await?;
     let (second, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let second_task = tokio::spawn(connection);
-    let contender = tokio::spawn(async move {
-        second.execute("/* runtime-second-commit */ UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-b'", &[]).await
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let blocked: bool = admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%runtime-second-commit%' AND pid <> pg_backend_pid())", &[]).await.unwrap().get(0);
-            if blocked { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        second.execute("UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-b'", &[]),
+    )
+    .await
+    .map_err(|_| "an open lifecycle transaction stalled another writer")??;
+    let visible = store.load_route_changes(cursor, 1024).await?;
     assert_eq!(
-        store.load_route_changes(cursor, 1024).await?.cursor,
-        cursor,
-        "uncommitted revision ranges are invisible"
+        instances(&visible),
+        ["order-b"],
+        "an uncommitted change is invisible"
     );
     tx.commit().await?;
-    contender.await??;
-    let committed = store.load_route_changes(cursor, 1024).await?;
+    let committed = store.load_route_changes(visible.cursor, 1024).await?;
     assert_eq!(
-        committed
-            .events
-            .iter()
-            .map(|event| event["instance_id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["order-a", "order-b"]
+        instances(&committed),
+        ["order-a"],
+        "a reader caught up before a commit receives it"
     );
     assert_eq!(
         committed.cursor,
         cursor + 2,
-        "later transaction cannot publish an overtaking revision"
+        "revisions follow commit order"
     );
     let tx = first.transaction().await?;
     tx.execute("UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = 'order-a'", &[]).await?;
@@ -388,7 +387,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     let class = workload_class("runtime-scheduler", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     let (raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let raw_task = tokio::spawn(connection);
     let client = SchedulerKubernetes::default();
@@ -754,7 +753,7 @@ async fn postgres_runtime_delete_supersedes_pending_attempt() -> TestResult {
         PostgresStoreConfig::new(format!("{url}{separator}application_name=6l-supersession"))?;
     let result = async {
         let pg = PostgresStore::connect(&config).await?;
-        let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+        let store = Arc::new(pg);
         let (raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
         connections.spawn(connection);
         let mut failures = Vec::new();
@@ -788,7 +787,7 @@ async fn postgres_runtime_delete_supersedes_pending_attempt() -> TestResult {
 const SUPERSESSION_LEASE_TTL: Duration = Duration::from_secs(2);
 
 async fn delete_supersedes_pending_case(
-    store: Arc<RetryingControlPlaneStore>,
+    store: Arc<PostgresStore>,
     raw: &tokio_postgres::Client,
     behavior: &'static str,
 ) -> TestResult {
@@ -1042,7 +1041,7 @@ async fn supersession_snapshot(raw: &tokio_postgres::Client, id: &str) -> TestRe
 }
 
 async fn deletion_and_failure_use_one_lock_order(
-    store: Arc<RetryingControlPlaneStore>,
+    store: Arc<PostgresStore>,
     config: &PostgresStoreConfig,
 ) -> TestResult {
     use control_plane::{
@@ -1092,20 +1091,20 @@ async fn deletion_and_failure_use_one_lock_order(
     } else {
         '?'
     };
-    let delete_store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(
+    let delete_store = Arc::new(
         PostgresStore::connect(&PostgresStoreConfig::new(format!(
             "{}{separator}application_name=6l-delete-order",
             config.connection_url()
         ))?)
         .await?,
-    )));
-    let failure_store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(
+    );
+    let failure_store = Arc::new(
         PostgresStore::connect(&PostgresStoreConfig::new(format!(
             "{}{separator}application_name=6l-failure-order",
             config.connection_url()
         ))?)
         .await?,
-    )));
+    );
     let (mut blocker, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let mut connections = tokio::task::JoinSet::new();
     connections.spawn(connection);

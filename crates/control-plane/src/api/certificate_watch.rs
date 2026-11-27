@@ -3,7 +3,7 @@
 use super::{
     admission::SubscriptionLease, certificates, pb, route_events::RouteSubscriptionBroker,
 };
-use crate::{auth::CallerRole, certificate::*, store::ControlPlaneStore};
+use crate::{auth::CallerRole, certificate::*, store::TlsWatchStore};
 use std::{
     collections::HashSet,
     pin::Pin,
@@ -31,7 +31,7 @@ pub(crate) type WatchStream = Pin<
 >;
 
 pub(crate) async fn watch(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn TlsWatchStore>,
     broker: RouteSubscriptionBroker,
     request: Request<tonic::Streaming<pb::WatchTlsCertificatesRequest>>,
 ) -> Result<Response<WatchStream>, Status> {
@@ -61,7 +61,7 @@ pub(crate) async fn watch(
 // Kept separate so timer/backpressure ownership can be tested with controlled
 // decoded input; native TLS/body decoding is exercised by the real API tests.
 async fn produce<S>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn TlsWatchStore>,
     broker: RouteSubscriptionBroker,
     mut requests: S,
     responses: mpsc::Sender<Result<pb::WatchTlsCertificatesResponse, Status>>,
@@ -151,7 +151,7 @@ impl WatchState {
     // While pending, input reads stop instead of collecting registration work.
     async fn poll(
         &mut self,
-        store: &dyn ControlPlaneStore,
+        store: &dyn TlsWatchStore,
     ) -> Result<Option<pb::WatchTlsCertificatesResponse>, Status> {
         if self.pending.is_none() && self.hosts.is_empty() {
             return Ok(None);

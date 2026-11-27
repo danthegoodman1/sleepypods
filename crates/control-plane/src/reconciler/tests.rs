@@ -28,9 +28,8 @@ use crate::{
         KubernetesClientResult,
     },
     projection::{LiveObjectIdentity, LiveObjectMetadata, ProjectionObjectInspection},
-    route::{ListRouteBindingsForInstanceRequest, RouteBindingRecord},
     runtime_work::{MaterializationWorkStatus, RecordMaterializationFailure},
-    store::StoreFuture,
+    store::{LifecycleReads, StoreFuture},
     workload::{WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueSchema},
     WorkloadSleepPolicy,
 };
@@ -298,56 +297,25 @@ fn new_row(record: &MaterializationRecord) -> Row {
     }
 }
 
-impl ControlPlaneStore for FakeStore {
-    unexpected_store_methods!(
-        publish_certificate,
-        get_certificate_metadata,
-        set_tls_binding,
-        get_tls_binding,
-        remove_certificate,
-        resolve_tls_certificate,
-        reencrypt_certificate,
-        reencrypt_certificates_sealed_by,
-        snapshot_tls_bindings,
-        load_route_changes,
-        load_route_change_revision,
-        enqueue_materialization,
-        maintain_runtime_records,
-        accept_wake,
-        request_instance_deletion,
-        create_instance,
-        delete_instance,
-        create_workload_class_version,
-        create_route_binding,
-        get_route_binding,
-        delete_route_binding,
-        resolve_host_rules,
-        compare_and_swap_instance_state,
-        record_materialization,
-        load_ready_materialization,
-        load_active_materialization,
-        load_materialization,
-        complete_wake,
-        begin_sleep,
-        finalize_sleep,
-        load_materialization_operational_metrics,
-        force_delete_materialization,
-        force_release_exclusivity_key,
-        lookup_route_dependencies,
-        put_http01_challenge,
-        resolve_http01_challenge,
-        delete_http01_challenge
-    );
-
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        _request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn finalize_instance_deletions(&self, _limit: usize) -> StoreFuture<'_, StoreResult<usize>> {
-        Box::pin(async { Ok(0) })
+impl LifecycleReads for FakeStore {
+    fn load_active_materialization(
+        &self,
+        request: crate::materialization::LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            let state = self.state();
+            state.reachable()?;
+            Ok(state
+                .rows
+                .values()
+                .map(|row| &row.record)
+                .find(|record| {
+                    record.instance_id == request.instance_id
+                        && record.target == request.target
+                        && record.state != MaterializationState::Deleted
+                })
+                .cloned())
+        })
     }
 
     fn load_materialization_work_status(
@@ -383,6 +351,12 @@ impl ControlPlaneStore for FakeStore {
         _request: LoadWorkloadClassVersionRequest,
     ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
         Box::pin(async { Ok(Some(class())) })
+    }
+}
+
+impl ReconcilerStore for FakeStore {
+    fn finalize_instance_deletions(&self, _limit: usize) -> StoreFuture<'_, StoreResult<usize>> {
+        Box::pin(async { Ok(0) })
     }
 
     fn claim_next_materialization_reconciliation<'a>(

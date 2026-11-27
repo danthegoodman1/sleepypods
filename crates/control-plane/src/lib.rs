@@ -1,12 +1,5 @@
 //! Domain model and persistence contract for the SleepyPods control plane.
 
-#[cfg(test)]
-extern crate self as control_plane;
-#[cfg(test)]
-#[macro_use]
-#[path = "../tests/support/unexpected_store.rs"]
-mod unexpected_store;
-
 pub mod api;
 pub mod auth;
 pub mod certificate;
@@ -52,9 +45,8 @@ pub use ids::{
     NonEmptyString, RouteBindingId, WorkloadClassId,
 };
 pub use instance::{
-    CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-    CreateInstanceValidationError, DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
-    InstanceRoute, InstanceState, InstanceValues, StateTransitionReason,
+    CreateInstanceRequest, CreateInstanceResult, CreateInstanceValidationError, GetInstanceRequest,
+    InstanceRecord, InstanceRoute, InstanceState, InstanceValues,
 };
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
@@ -89,8 +81,7 @@ pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig}
 pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-    HostRules, ListRouteBindingsForInstanceRequest, PathPrefix, ResolveHostRulesRequest,
-    RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost,
+    HostRules, PathPrefix, ResolveHostRulesRequest, RouteBindingRecord, RouteEntry, RouteHost,
     RouteHostKind, RouteIdentity, RouteKind, RouteRule, HOST_RULE_OVERHEAD_BYTES, MAX_HOST_RULES,
     MAX_HOST_RULES_BYTES, MAX_ROUTE_HOST_BYTES, MAX_ROUTE_PATH_BYTES,
 };
@@ -98,7 +89,9 @@ pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,
 };
 pub use store::{
-    ControlPlaneStore, RetryingControlPlaneStore, StoreError, StoreFuture, StoreResult,
+    CertificateStore, ControlPlaneStore, LifecycleReads, OperatorServiceStore, OperatorStore,
+    ProxyServiceStore, ReconcilerStore, RouteStore, RuntimeStore, SleepStore, StoreError,
+    StoreFuture, StoreResult, TlsWatchStore, WakeStore, WorkloadServiceStore,
 };
 pub use workload::{
     CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, RenderedExclusivityKey,

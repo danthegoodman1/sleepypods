@@ -3,7 +3,7 @@ use super::pb;
 use crate::{
     auth::CallerRole,
     certificate::*,
-    store::{ControlPlaneStore, StoreError},
+    store::{CertificateStore, StoreError},
 };
 use tonic::{Request, Response, Status};
 
@@ -86,7 +86,7 @@ fn binding(b: TlsBinding) -> pb::TlsBinding {
     }
 }
 pub(crate) async fn publish(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::PublishCertificateRequest>,
 ) -> Result<Response<pb::CertificateMetadata>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -106,7 +106,7 @@ pub(crate) async fn publish(
     Ok(Response::new(metadata(result)))
 }
 pub(crate) async fn get_metadata(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::GetCertificateMetadataRequest>,
 ) -> Result<Response<pb::CertificateMetadata>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -120,7 +120,7 @@ pub(crate) async fn get_metadata(
     Ok(Response::new(metadata(result)))
 }
 pub(crate) async fn set_binding(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::SetTlsBindingRequest>,
 ) -> Result<Response<pb::TlsBinding>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -140,7 +140,7 @@ pub(crate) async fn set_binding(
     Ok(Response::new(binding(result)))
 }
 pub(crate) async fn get_binding(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::GetTlsBindingRequest>,
 ) -> Result<Response<pb::TlsBinding>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -152,7 +152,7 @@ pub(crate) async fn get_binding(
     )))
 }
 pub(crate) async fn remove(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::RemoveCertificateRequest>,
 ) -> Result<Response<pb::CertificateMetadata>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -168,7 +168,7 @@ pub(crate) async fn remove(
     )))
 }
 pub(crate) async fn reencrypt(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::ReencryptCertificateRequest>,
 ) -> Result<Response<pb::CertificateMetadata>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -185,7 +185,7 @@ pub(crate) async fn reencrypt(
     )))
 }
 pub(crate) async fn reencrypt_sealed_by(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::ReencryptCertificatesRequest>,
 ) -> Result<Response<pb::ReencryptCertificatesResponse>, Status> {
     require_secure(&request, CallerRole::Operator)?;
@@ -203,7 +203,7 @@ pub(crate) async fn reencrypt_sealed_by(
     }))
 }
 pub(crate) async fn resolve(
-    store: &dyn ControlPlaneStore,
+    store: &dyn CertificateStore,
     request: Request<pb::ResolveTlsCertificateRequest>,
 ) -> Result<Response<pb::ResolveTlsCertificateResponse>, Status> {
     require_secure(&request, CallerRole::Proxy)?;

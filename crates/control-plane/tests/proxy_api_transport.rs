@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "support/unexpected_store.rs"]
-mod unexpected_store;
 #[path = "proxy_api_transport/route_edge.rs"]
 mod route_edge;
 mod support;
@@ -37,6 +34,7 @@ use control_plane::{
     PathPrefix, RenderedObjectRef, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
     StaticBearerTokens,
 };
+use control_plane::{RuntimeStore, WakeStore};
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use tonic::body::Body;

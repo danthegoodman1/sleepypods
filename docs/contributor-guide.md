@@ -103,6 +103,7 @@ or cross-component contracts move.
 | Frontline route/cache/listener | `cargo test -p frontline`; route lookup changes also run `cargo bench -p frontline --bench route_lookup -- --sample-size 10 --measurement-time 1 --warm-up-time 1` |
 | Control-plane API/store/lifecycle | `cargo test -p control-plane`; Postgres-backed store work also run `./scripts/test-postgres-store.sh` |
 | PostgreSQL execution gate | `python3 scripts/test-postgres-execution.py`; CI and `test-postgres-store.sh` use the same complete-target skip/count checker |
+| Store lifecycle throughput | `SLEEPYPODS_POSTGRES_URL=… SLEEPYPODS_STORE_THROUGHPUT_SECONDS=10 cargo test --release --locked -p control-plane --test store_throughput -- --nocapture` measures transitions per second through a latency relay; without both variables it does nothing |
 | Sidecar runtime/idle | `cargo test -p sidecar` |
 | API/observability crate boundaries | `./scripts/test-dependency-boundaries.py`, `cargo test -p sleepypods-api -p sleepypods-observability -p proxy-core -p frontline -p sidecar` |
 | Production images | `./scripts/smoke-images.sh` |
@@ -176,8 +177,18 @@ latency exceeds them.
   user-facing Kubernetes manifest workflow.
 - The database is the source of truth. Proxies, sidecars, and users do not write
   it directly.
-- Keep provider-specific semantics behind traits such as `ControlPlaneStore`
-  and `KubernetesMaterializerClient`.
+- Keep provider-specific semantics behind the store roles in `store.rs` and
+  `KubernetesMaterializerClient`. A consumer names the role it calls
+  (`WakeStore`, `SleepStore`, `ReconcilerStore`, `OperatorStore`, …), so a test
+  fake implements its consumer's roles and nothing else. Every store method has
+  a production caller; a test reaches a state through those methods.
+- A new store operation either repeats while the database is unavailable or
+  runs once, in `postgres/store.rs`, and `replay_policy.rs` lists it. It runs
+  once when a repeat after a committed write could act on a replacement.
+- Every store statement goes through `postgres/sql.rs`, which prepares it once
+  per session. A lifecycle write carries its guard in its own `WHERE` clause
+  rather than in a read before it. The schema is one baseline migration,
+  `migrations/0001_baseline.sql`.
 - `WorkloadClassVersion` is immutable; instances pin a class version.
 - A create inserts under the caller-chosen ID or compares with the stored
   resource: the same request returns it and any other returns `AlreadyExists`.
