@@ -335,16 +335,16 @@ async fn stateful_wake_latency_through_deployed_platform() -> TestResult<()> {
         );
     }
 
-    // Static volumes are cluster-scoped, so each sample is removed before the
-    // namespace goes away.
-    for instance_id in instance_ids {
+    // Static volumes are cluster-scoped, so every sample is removed before
+    // the namespace goes away.
+    futures_util::future::try_join_all(instance_ids.iter().map(|instance_id| {
         delete_instance_until_cleanup_complete(
             &config.operator_endpoint,
-            &instance_id,
+            instance_id,
             STATEFUL_CLEANUP_TIMEOUT,
         )
-        .await?;
-    }
+    }))
+    .await?;
     wake_latency::report("stateful", &samples)
 }
 

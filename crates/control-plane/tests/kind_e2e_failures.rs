@@ -1006,33 +1006,41 @@ fn assert_inventory_ownership_for_accepted_wake(
     Ok(())
 }
 
+/// The workload is created without waiting for its claim, and the scheduler
+/// holds its Pod until the claim binds. A claim that never binds therefore
+/// leaves nothing of this instance running.
 async fn assert_no_stateful_backend(kube: Client, namespace: &str) -> TestResult<()> {
     let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
-    assert_no_labeled_objects(
-        "StatefulSet",
-        UNBOUND_INSTANCE_ID,
-        Api::<StatefulSet>::namespaced(kube.clone(), namespace)
-            .list(&selector)
-            .await?,
-    )?;
-    assert_no_labeled_objects(
-        "Service",
-        UNBOUND_INSTANCE_ID,
-        Api::<Service>::namespaced(kube, namespace)
-            .list(&selector)
-            .await?,
-    )?;
+    let pods = Api::<k8s_openapi::api::core::v1::Pod>::namespaced(kube, namespace)
+        .list(&selector)
+        .await?;
+    if let Some(started) = pods.iter().find(|pod| {
+        pod.status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref())
+            != Some("Pending")
+    }) {
+        return Err(format!(
+            "Pod {:?} left Pending although its claim never bound",
+            started.metadata.name
+        )
+        .into());
+    }
     Ok(())
 }
 
 async fn wait_for_unbound_inventory_cleanup(kube: Client, namespace: &str) -> TestResult<()> {
     let pvs: Api<PersistentVolume> = Api::all(kube.clone());
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube, namespace);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube.clone(), namespace);
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(kube, namespace);
     let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if pvs.list(&selector).await?.items.is_empty()
             && pvcs.list(&selector).await?.items.is_empty()
+            && stateful_sets.list(&selector).await?.items.is_empty()
+            && services.list(&selector).await?.items.is_empty()
         {
             return Ok(());
         }

@@ -787,17 +787,24 @@ async fn wake_during_drain_grace_is_served_by_the_running_pod(
         return Err(format!("repeated idle report while draining: {repeated:?}").into());
     }
 
+    // Every request in the grace is served by the running Pod. One that
+    // frontline resolves after the drain's invalidation wakes the instance.
     let asked = Instant::now();
-    let response = http_get(config.frontline_addr, HOST, "/").await?;
-    assert_response_identifies(&response, "revive")?;
-    if asked.elapsed() > Duration::from_secs(5) {
-        return Err(format!(
-            "a request during drain grace waited {:?} for a Pod that was running",
-            asked.elapsed()
-        )
-        .into());
-    }
-    let revived = wait_for_instance_state(operator, INSTANCE, PbInstanceState::Running, 5).await?;
+    let revived = loop {
+        let response = http_get(config.frontline_addr, HOST, "/").await?;
+        assert_response_identifies(&response, "revive")?;
+        let instance = get_instance(operator, INSTANCE).await?;
+        if instance_state(&instance) == PbInstanceState::Running {
+            break instance;
+        }
+        if asked.elapsed() > Duration::from_secs(10) {
+            return Err(format!(
+                "requests during drain grace did not return the instance to Running: {instance:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
     if revived.generation != draining.generation + 1 {
         return Err(format!(
             "revive must advance the draining generation {} once, got {}",
