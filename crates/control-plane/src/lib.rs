@@ -46,7 +46,7 @@ pub use ids::{
 };
 pub use instance::{
     CreateInstanceRequest, CreateInstanceResult, CreateInstanceValidationError, GetInstanceRequest,
-    InstanceRecord, InstanceRoute, InstanceState, InstanceValues, StateTransitionReason,
+    InstanceRecord, InstanceRoute, InstanceState, InstanceValues,
 };
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,

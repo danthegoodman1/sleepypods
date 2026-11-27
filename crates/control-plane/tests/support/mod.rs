@@ -248,8 +248,8 @@ impl TestStore {
         &self,
         instance_id: InstanceId,
         expected_generation: Generation,
+        from: &[DomainInstanceState],
         next_state: DomainInstanceState,
-        reason: StateTransitionReason,
     ) -> StoreResult<InstanceRecord> {
         let mut instances = self.instances.lock().unwrap();
         let instance = instances
@@ -263,12 +263,12 @@ impl TestStore {
                 actual: instance.generation,
             });
         }
-        control_plane::instance::validate_instance_state_transition(
-            instance.state,
-            next_state,
-            &reason,
-        )
-        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
+        if !from.contains(&instance.state) {
+            return Err(StoreError::invalid_argument(format!(
+                "invalid instance state transition: {:?} -> {next_state:?}",
+                instance.state
+            )));
+        }
         self.transition_requests.lock().unwrap().push((
             instance_id,
             expected_generation,
@@ -317,8 +317,8 @@ impl TestStore {
         let instance = self.transition_instance(
             request.instance_id.clone(),
             request.expected_waking_generation,
+            &[DomainInstanceState::Waking],
             DomainInstanceState::Running,
-            StateTransitionReason::MaterializationReady,
         )?;
         let projection_generation = self
             .materializations
@@ -352,8 +352,8 @@ impl TestStore {
         let instance = self.transition_instance(
             request.instance_id.clone(),
             request.expected_draining_generation,
+            &[DomainInstanceState::Draining],
             DomainInstanceState::Cold,
-            StateTransitionReason::DrainCompleted,
         )?;
         let materialization = self.mark_materialization(
             request.instance_id,
@@ -543,8 +543,8 @@ impl WakeStore for TestStore {
             let instance = self.transition_instance(
                 request.pending.instance_id.clone(),
                 request.expected_generation,
+                &[DomainInstanceState::Cold, DomainInstanceState::Failed],
                 DomainInstanceState::Waking,
-                StateTransitionReason::WakeRequested,
             )?;
             assert_eq!(instance.generation, request.pending.instance_generation);
             self.seed_materialization(fake_materialization_record(request.pending));
@@ -567,8 +567,8 @@ impl SleepStore for TestStore {
             let updated = self.transition_instance(
                 request.instance_id.clone(),
                 request.expected_running_generation,
+                &[DomainInstanceState::Running],
                 DomainInstanceState::Draining,
-                StateTransitionReason::IdleReported,
             )?;
             let materialization = self.mark_materialization(
                 request.instance_id,
