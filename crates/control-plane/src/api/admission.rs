@@ -17,17 +17,28 @@ pub struct ApiLimits {
     pub write_timeout: Duration,
     pub unary_delivery_timeout: Duration,
     pub subscription_streams: usize,
+    /// Host subscriptions one stream may hold. A proxy holds one per cached
+    /// host plus its lookups in flight, so this covers the proxy's route cache
+    /// capacity with room to spare.
     pub subscriptions_per_stream: usize,
+    /// How long a Subscribe stream lives before the control plane ends it in
+    /// order. The proxy keeps its cached rule sets and registers them on the
+    /// replacement stream.
     pub subscription_lifetime: Duration,
     pub lookup_timeout: Duration,
     pub response_timeout: Duration,
-    /// Positive route cache lifetime handed to proxies. Subscription
-    /// invalidations are the primary freshness mechanism; this is the bound on
-    /// how long a dropped event can go unnoticed. It outlives
-    /// `subscription_lifetime`, because a proxy carries cached answers across an
-    /// orderly stream rotation and registers them on the replacement stream.
+    /// How long a proxy may serve a rule set with no word from the control
+    /// plane. A live stream replaces every set at each rotation, so this bounds
+    /// a proxy whose stream is gone. It exceeds `subscription_lifetime` by
+    /// `ROUTE_TTL_MARGIN`, which leaves the proxy time to register again.
     pub positive_route_cache_ttl: Duration,
+    /// How long a proxy remembers that no binding applies to a host.
+    pub negative_route_cache_ttl: Duration,
 }
+
+/// The least a rule set's lifetime exceeds the stream's.
+pub const ROUTE_TTL_MARGIN: Duration = Duration::from_secs(10);
+
 impl Default for ApiLimits {
     fn default() -> Self {
         Self {
@@ -37,12 +48,25 @@ impl Default for ApiLimits {
             write_timeout: Duration::from_secs(5),
             unary_delivery_timeout: Duration::from_secs(5),
             subscription_streams: 64,
-            subscriptions_per_stream: 256,
+            subscriptions_per_stream: 2048,
             subscription_lifetime: Duration::from_secs(60),
             lookup_timeout: Duration::from_secs(3),
             response_timeout: Duration::from_secs(1),
-            positive_route_cache_ttl: Duration::from_secs(60),
+            positive_route_cache_ttl: Duration::from_secs(90),
+            negative_route_cache_ttl: Duration::from_secs(1),
         }
+    }
+}
+
+impl ApiLimits {
+    /// Names the first setting that contradicts another.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.positive_route_cache_ttl < self.subscription_lifetime + ROUTE_TTL_MARGIN {
+            return Err(
+                "the positive route cache TTL must exceed the subscription lifetime by at least 10 seconds",
+            );
+        }
+        Ok(())
     }
 }
 

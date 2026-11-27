@@ -5,9 +5,10 @@ use deadpool_postgres::GenericClient;
 use crate::{
     materialization::MaterializationRecord,
     route::{
-        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteResolution,
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
+        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteKind, RouteRule,
+        MAX_HOST_RULES,
     },
     store::{StoreError, StoreResult},
 };
@@ -18,8 +19,8 @@ use super::{
     idempotency::{self, CREATE_ROUTE_BINDING_OPERATION},
     instance_ops::load_instance,
     mapping::{
-        default_negative_cache_policy, generation_to_i64, materialization_from_row,
-        route_binding_from_row, route_binding_row_from_row, route_identity_parts, RouteBindingRow,
+        generation_to_i64, materialization_from_row, route_binding_from_row,
+        route_binding_row_from_row, route_identity_parts, RouteBindingRow,
     },
 };
 
@@ -117,86 +118,93 @@ pub(crate) async fn list_route_bindings_for_instance(
     rows.iter().map(route_binding_from_row).collect()
 }
 
-// One statement selects the route and target backend from the same MVCC snapshot.
-// SQL matching mirrors route_match_score; literal prefix comparisons avoid LIKE escaping.
-pub(crate) const RESOLVE_ROUTE_SQL: &str = "
-    WITH selected AS (
-        SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
-        FROM route_bindings
-        WHERE identity_kind = $1
-            AND ((host_kind = 'exact' AND host = $2)
-                OR (host_kind = 'wildcard_suffix' AND host = ANY($3::text[])))
-            AND (path_prefix IS NULL OR ($4::text IS NOT NULL AND (
-                path_prefix = '/' OR path_prefix = $4
-                OR (right(path_prefix, 1) = '/' AND starts_with($4, path_prefix))
-                OR starts_with($4, path_prefix || '/')
-            )))
-        ORDER BY (host_kind = 'exact') DESC, octet_length(host) DESC,
-            COALESCE(octet_length(path_prefix), 0) DESC, route_binding_id
-        LIMIT 1
-    )
-    SELECT selected.*, instances.state, instances.generation,
-        ready.backend_uri, ready.backend_generation
-    FROM selected JOIN instances USING (instance_id)
+// One statement reads every applicable binding, its instance and the target's
+// ready backend from the same MVCC snapshot. The order is the ranking
+// `HostRules` keeps: exact host, longer suffix, longer path prefix.
+pub(crate) const HOST_RULES_SQL: &str = "
+    SELECT bindings.route_binding_id, bindings.instance_id, bindings.identity_kind,
+        bindings.host_kind, bindings.host, bindings.path_prefix,
+        instances.state, instances.generation, ready.backend_uri, ready.backend_generation
+    FROM route_bindings bindings JOIN instances USING (instance_id)
     LEFT JOIN LATERAL (
         SELECT backend_uri, backend_generation FROM materializations
-        WHERE instance_id = selected.instance_id
+        WHERE instance_id = bindings.instance_id
             AND instance_generation = instances.generation
-            AND cluster_id = $5 AND namespace = $6 AND state = 'ready'
+            AND cluster_id = $4 AND namespace = $5 AND state = 'ready'
         LIMIT 1
     ) ready ON true
+    WHERE bindings.identity_kind = $1
+        AND ((bindings.host_kind = 'exact' AND bindings.host = $2)
+            OR (bindings.host_kind = 'wildcard_suffix' AND bindings.host = ANY($3::text[])))
+    ORDER BY (bindings.host_kind = 'exact') DESC, octet_length(bindings.host) DESC,
+        COALESCE(octet_length(bindings.path_prefix), 0) DESC, bindings.route_binding_id
+    LIMIT $6
 ";
 
-pub(crate) async fn resolve_route(
+pub(crate) async fn resolve_host_rules(
     store: &PostgresStore,
-    request: ResolveRouteRequest,
-) -> StoreResult<RouteResolution> {
+    request: ResolveHostRulesRequest,
+) -> StoreResult<HostRules> {
     let client = store.client().await?;
-    let parts = route_identity_parts(&request.identity);
-    let suffixes: Vec<&str> = parts
-        .host
+    let host = request.host.as_str();
+    let suffixes: Vec<&str> = host
         .match_indices('.')
-        .map(|(index, _)| &parts.host[index + 1..])
+        .map(|(index, _)| &host[index + 1..])
         .collect();
-    let row = client
-        .query_opt(
-            RESOLVE_ROUTE_SQL,
+    let rows = client
+        .query(
+            HOST_RULES_SQL,
             &[
-                &parts.identity_kind,
-                &parts.host,
+                &route_kind_to_db(request.kind),
+                &host,
                 &suffixes,
-                &parts.path_prefix,
                 &request.target.cluster_id(),
                 &request.target.namespace(),
+                &(MAX_HOST_RULES as i64 + 1),
             ],
         )
         .await
         .map_err(map_postgres_error)?;
-    let Some(row) = row else {
-        return Ok(RouteResolution::Miss {
-            negative_cache: default_negative_cache_policy(),
-        });
-    };
-    let route = route_binding_row_from_row(&row)?;
-    let state: String = row.get("state");
-    let backend_uri: Option<String> = row.get("backend_uri");
-    let backend_generation: Option<i64> = row.get("backend_generation");
-    Ok(RouteResolution::Resolved {
-        matched_identity: route.identity,
-        entry: RouteEntry {
-            route_binding_id: route.id,
-            instance_id: route.instance_id,
-            instance_state: super::mapping::instance_state_from_db(&state)?,
-            instance_generation: super::mapping::generation_from_i64(row.get("generation"))?,
-            backend: backend_uri
-                .map(crate::materialization::BackendEndpoint::new)
-                .transpose()
-                .map_err(|error| StoreError::internal(error.to_string()))?,
-            backend_generation: backend_generation
-                .map(super::mapping::backend_generation_from_i64)
-                .transpose()?,
-        },
-    })
+    if rows.len() > MAX_HOST_RULES {
+        return Err(StoreError::invalid_argument(format!(
+            "more than {MAX_HOST_RULES} route bindings apply to host {host}"
+        )));
+    }
+    let rules = rows
+        .iter()
+        .map(|row| {
+            let route = route_binding_row_from_row(row)?;
+            let state: String = row.get("state");
+            let backend_uri: Option<String> = row.get("backend_uri");
+            let backend_generation: Option<i64> = row.get("backend_generation");
+            Ok(RouteRule {
+                identity: route.identity,
+                entry: RouteEntry {
+                    route_binding_id: route.id,
+                    instance_id: route.instance_id,
+                    instance_state: super::mapping::instance_state_from_db(&state)?,
+                    instance_generation: super::mapping::generation_from_i64(
+                        row.get("generation"),
+                    )?,
+                    backend: backend_uri
+                        .map(crate::materialization::BackendEndpoint::new)
+                        .transpose()
+                        .map_err(|error| StoreError::internal(error.to_string()))?,
+                    backend_generation: backend_generation
+                        .map(super::mapping::backend_generation_from_i64)
+                        .transpose()?,
+                },
+            })
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(HostRules::ranked(rules))
+}
+
+fn route_kind_to_db(kind: RouteKind) -> &'static str {
+    match kind {
+        RouteKind::Http => "http",
+        RouteKind::Sni => "sni",
+    }
 }
 
 pub(crate) async fn lookup_route_dependencies(

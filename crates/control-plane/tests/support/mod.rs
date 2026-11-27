@@ -21,7 +21,8 @@ pub struct TestStore {
     workload_classes: Mutex<BTreeMap<(String, u64), WorkloadClassVersion>>,
     route_bindings: Mutex<BTreeMap<String, RouteBindingRecord>>,
     materializations: Mutex<Vec<MaterializationRecord>>,
-    route_resolution: Mutex<Option<FakeRouteResolution>>,
+    route_entries: Mutex<BTreeMap<String, RouteEntry>>,
+    route_error: Mutex<Option<String>>,
     resolve_route_requests: Mutex<usize>,
     resolve_gate: Mutex<Option<Arc<Notify>>>,
     route_changes: Mutex<Vec<serde_json::Value>>,
@@ -111,28 +112,38 @@ impl TestStore {
     pub fn seed_ready_materialization(&self, record: MaterializationRecord) {
         self.seed_materialization(record);
     }
-    pub fn seed_route_resolved(&self, matched_identity: RouteIdentity, entry: RouteEntry) {
+    /// Adds or replaces one binding. Its instance state and generation come
+    /// from `entry` until an instance with that ID is seeded; its backend
+    /// always comes from the target's ready materialization.
+    pub fn seed_route_resolved(&self, identity: RouteIdentity, entry: RouteEntry) {
         self.route_bindings.lock().unwrap().insert(
             entry.route_binding_id.as_str().to_owned(),
             RouteBindingRecord {
                 id: entry.route_binding_id.clone(),
                 instance_id: entry.instance_id.clone(),
-                identity: matched_identity.clone(),
+                identity,
             },
         );
-        *self.route_resolution.lock().unwrap() = Some(FakeRouteResolution::Resolved {
-            matched_identity,
-            entry,
-        });
+        self.route_entries
+            .lock()
+            .unwrap()
+            .insert(entry.route_binding_id.as_str().to_owned(), entry);
+        *self.route_error.lock().unwrap() = None;
     }
-    pub fn seed_route_miss(&self, ttl: Duration) {
-        *self.route_resolution.lock().unwrap() = Some(FakeRouteResolution::Miss {
-            negative_cache: CachePolicy::new(ttl),
-        });
+    pub fn remove_route(&self, route_binding_id: &str) {
+        self.route_bindings.lock().unwrap().remove(route_binding_id);
+        self.route_entries.lock().unwrap().remove(route_binding_id);
+    }
+    pub fn clear_routes(&self) {
+        self.route_bindings.lock().unwrap().clear();
+        self.route_entries.lock().unwrap().clear();
+        *self.route_error.lock().unwrap() = None;
     }
     pub fn seed_route_error_unavailable(&self, message: &str) {
-        *self.route_resolution.lock().unwrap() =
-            Some(FakeRouteResolution::Unavailable(message.into()));
+        *self.route_error.lock().unwrap() = Some(message.into());
+    }
+    pub fn clear_route_error(&self) {
+        *self.route_error.lock().unwrap() = None;
     }
     pub fn resolve_route_requests(&self) -> usize {
         *self.resolve_route_requests.lock().unwrap()
@@ -205,6 +216,7 @@ impl TestStore {
             });
         instance.state = next_state;
         instance.generation = expected_generation.next();
+        self.record_instance_change(instance.id.as_str());
         Ok(instance.clone())
     }
     fn mark_materialization(
@@ -233,6 +245,7 @@ impl TestStore {
             record.exclusivity_keys.clear();
             record.reconciliation_lease = None;
         }
+        self.record_instance_change(record.instance_id.as_str());
         Some(record.clone())
     }
 }
@@ -241,18 +254,6 @@ impl TestStore {
 pub enum FakeStoreError {
     Unavailable(&'static str),
 }
-#[derive(Clone, Debug)]
-enum FakeRouteResolution {
-    Resolved {
-        matched_identity: RouteIdentity,
-        entry: RouteEntry,
-    },
-    Miss {
-        negative_cache: CachePolicy,
-    },
-    Unavailable(String),
-}
-
 fn fake_materialization_record(request: RecordMaterializationRequest) -> MaterializationRecord {
     MaterializationRecord {
         id: MaterializationId::new(format!(
@@ -653,10 +654,10 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: control_plane::ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteResolution>> {
+        request: control_plane::ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::HostRules>> {
         Box::pin(async move {
             *self
                 .resolve_route_requests
@@ -666,51 +667,56 @@ impl ControlPlaneStore for TestStore {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
-            match self
-                .route_resolution
-                .lock()
-                .expect("fake store lock is available")
-                .clone()
-            {
-                Some(FakeRouteResolution::Resolved {
-                    matched_identity,
-                    mut entry,
-                }) => {
-                    // The store contract returns the selected target's backend
-                    // as part of route resolution, independent of a later read.
-                    entry.backend = None;
-                    entry.backend_generation = None;
-                    if let Some(materialization) = self
-                        .materializations
-                        .lock()
-                        .expect("fake store lock is available")
-                        .iter()
-                        .find(|materialization| {
-                            materialization.instance_id == entry.instance_id
-                                && materialization.instance_generation == entry.instance_generation
-                                && materialization.target == request.target
-                                && materialization.state == MaterializationState::Ready
-                        })
-                    {
-                        entry.backend = materialization.backend.clone();
-                        entry.backend_generation = entry
-                            .backend
-                            .as_ref()
-                            .map(|_| materialization.backend_generation);
-                    }
-                    Ok(RouteResolution::Resolved {
-                        matched_identity,
-                        entry,
-                    })
-                }
-                Some(FakeRouteResolution::Miss { negative_cache }) => {
-                    Ok(RouteResolution::Miss { negative_cache })
-                }
-                Some(FakeRouteResolution::Unavailable(message)) => {
-                    Err(StoreError::unavailable(message))
-                }
-                None => Err(StoreError::internal("fake store method is not implemented")),
+            if let Some(message) = self.route_error.lock().unwrap().clone() {
+                return Err(StoreError::unavailable(message));
             }
+            let bindings = self.route_bindings.lock().unwrap();
+            let entries = self.route_entries.lock().unwrap();
+            let instances = self.instances.lock().unwrap();
+            let materializations = self.materializations.lock().unwrap();
+            let rules = bindings
+                .values()
+                .filter(|binding| {
+                    binding
+                        .identity
+                        .applies_to(request.kind, request.host.as_str())
+                })
+                .map(|binding| {
+                    let seeded = entries.get(binding.id.as_str());
+                    let instance = instances.get(binding.instance_id.as_str());
+                    let instance_state = instance
+                        .map(|instance| instance.state)
+                        .or(seeded.map(|entry| entry.instance_state))
+                        .unwrap_or(DomainInstanceState::Cold);
+                    let instance_generation = instance
+                        .map(|instance| instance.generation)
+                        .or(seeded.map(|entry| entry.instance_generation))
+                        .unwrap_or(Generation::new(1));
+                    // The backend is the target's ready materialization for
+                    // the instance's current generation, as in the store query.
+                    let ready = materializations.iter().find(|materialization| {
+                        materialization.instance_id == binding.instance_id
+                            && materialization.instance_generation == instance_generation
+                            && materialization.target == request.target
+                            && materialization.state == MaterializationState::Ready
+                    });
+                    let backend = ready.and_then(|materialization| materialization.backend.clone());
+                    control_plane::RouteRule {
+                        identity: binding.identity.clone(),
+                        entry: RouteEntry {
+                            route_binding_id: binding.id.clone(),
+                            instance_id: binding.instance_id.clone(),
+                            instance_state,
+                            instance_generation,
+                            backend_generation: backend
+                                .as_ref()
+                                .and(ready.map(|ready| ready.backend_generation)),
+                            backend,
+                        },
+                    }
+                })
+                .collect();
+            Ok(control_plane::HostRules::ranked(rules))
         })
     }
 

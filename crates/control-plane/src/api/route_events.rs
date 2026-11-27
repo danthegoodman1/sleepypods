@@ -1,5 +1,5 @@
 use super::admission::ApiLimits;
-use crate::{InstanceId, RouteBindingId, RouteBindingRecord, RouteIdentity};
+use crate::{InstanceId, RouteBindingId, RouteIdentity};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 
@@ -15,14 +15,17 @@ pub struct RouteSubscriptionBroker {
     pub(crate) cancellation: crate::runtime_work::Cancellation,
 }
 
+/// One committed change that a host subscription may depend on.
 #[derive(Clone, Debug)]
 pub enum RouteBindingChange {
+    /// A binding was added, changed or removed.
     Route {
         route_binding_id: RouteBindingId,
-        removed: bool,
-        identity: Option<RouteIdentity>,
+        identity: RouteIdentity,
     },
+    /// An instance or its materialization changed state.
     Instance(InstanceId),
+    /// Changes were lost; every subscriber starts over.
     Reset,
 }
 
@@ -56,29 +59,11 @@ impl RouteSubscriptionBroker {
     pub fn notify_instance_changed(&self, id: InstanceId) {
         let _ = self.sender.send(RouteBindingChange::Instance(id));
     }
-    pub fn notify_route_removed(&self, route_binding_id: RouteBindingId) {
-        let _ = self.sender.send(RouteBindingChange::Route {
-            route_binding_id,
-            removed: true,
-            identity: None,
-        });
-    }
-    pub fn notify_routes_removed(&self, bindings: &[RouteBindingRecord]) {
-        for binding in bindings {
-            self.notify_route_removed(binding.id.clone());
-        }
-    }
     pub fn notify_route_changed(&self, route_binding_id: RouteBindingId, identity: RouteIdentity) {
         let _ = self.sender.send(RouteBindingChange::Route {
             route_binding_id,
-            removed: false,
-            identity: Some(identity),
+            identity,
         });
-    }
-    pub fn notify_routes_changed(&self, bindings: &[RouteBindingRecord]) {
-        for binding in bindings {
-            self.notify_route_changed(binding.id.clone(), binding.identity.clone());
-        }
     }
     pub(crate) fn publish_durable(
         &self,
@@ -97,10 +82,6 @@ impl RouteSubscriptionBroker {
         } else {
             let id = RouteBindingId::new(field("route_binding_id")?)
                 .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-            if payload["removed"].as_bool() == Some(true) {
-                self.notify_route_removed(id);
-                return Ok(());
-            }
             let host = match field("host_kind")? {
                 "exact" => crate::RouteHost::exact(field("host")?),
                 _ => crate::RouteHost::wildcard_suffix(field("host")?),

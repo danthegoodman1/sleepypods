@@ -196,12 +196,12 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (resolve_route $(, $rest:ident)* $(,)?) => {
-    fn resolve_route<'a>(
+    (resolve_host_rules $(, $rest:ident)* $(,)?) => {
+    fn resolve_host_rules<'a>(
         &'a self,
-        _request: control_plane::ResolveRouteRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::RouteResolution>> {
-        panic!("unexpected test store capability: resolve_route")
+        _request: control_plane::ResolveHostRulesRequest,
+    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::HostRules>> {
+        panic!("unexpected test store capability: resolve_host_rules")
     }
         unexpected_store_methods!($($rest),*);
     };

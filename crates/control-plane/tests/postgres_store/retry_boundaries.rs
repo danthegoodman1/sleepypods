@@ -50,7 +50,7 @@ impl ControlPlaneStore for LostResponseStore {
         load_workload_class_version,
         get_route_binding,
         list_route_bindings_for_instance,
-        resolve_route,
+        resolve_host_rules,
         compare_and_swap_instance_state,
         load_ready_materialization,
         load_active_materialization,

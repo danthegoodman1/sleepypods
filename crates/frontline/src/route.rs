@@ -1,36 +1,61 @@
+//! Route coordination: the request-side lookup and the actor that keeps the
+//! route cache current.
+//!
+//! A request reads the published cache snapshot. A host the snapshot holds is
+//! answered there, with no lock, task hop or control-plane call. A host it
+//! lacks is resolved by one flight per host: the actor subscribes to the host
+//! and installs the rule set the control plane returns. A request whose route
+//! points at an instance that is not running parks on that instance until its
+//! rule set changes.
+//!
+//! The actor owns the Subscribe stream. It reads every control-plane message
+//! in stream order, so a rule set and a later change to it are applied in the
+//! order the control plane sent them.
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
+    marker::PhantomData,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use proxy_core::observability::{
-    metrics::RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
-    recorder::{MetricObservation, ObservabilityRecorder},
+    metrics::{
+        RUNTIME_CONTROL_PLANE_CALLS_TOTAL, RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+        RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+    },
+    prometheus::PrometheusMetricsSink,
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        EVENT_SUBSCRIBE_STREAM,
+    },
     Operation, Outcome,
 };
-use sleepypods_api::{InstanceState, RouteEntry, RouteIdentity};
-
-#[cfg(test)]
-use crate::FrontlineRouteResolution;
+use sleepypods_api::{
+    Generation, HostRules, InstanceId, RouteHost, RouteIdentity, RouteKind, RouteRule,
+};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::{
-    route_wake_decision, validate_wake_response, ApplyUpdateOutcome, FrontlineRouteResolver,
-    FrontlineRouteResolverError, NegativeCacheEntry, ReadyBackend, RouteSubscriptionClient,
-    StaleWakeObservation, SubscribeControlPlaneOutput, SubscriptionState, WakeAdmission,
-    WakeInstanceRequest, WakeInstanceResponse, WakeResponseDisposition, WakeTracker,
-    WakeUnavailable, WakeWait,
+    cache::{Displaced, HostEntry, HostKey, RouteSnapshot, RouteTable},
+    identity::{canonical_request_host, canonical_request_path, route_host},
+    route_disposition, ReadyBackend, RequestIdentityError, RouteDisposition, RouteStream,
+    RouteStreamEvent, RouteStreamReply, RouteStreamRequest, RouteSubscriptionClient,
+    SubscribeErrorCode, SubscriptionId, WakeInstanceRequest, WakeInstanceResponse, WakeUnavailable,
 };
 
 pub type WakeClientFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
-const DEFAULT_WAKE_INSTANCE_DEADLINE: Duration = Duration::from_secs(5);
-const ROUTE_ACTOR_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
 
 pub trait WakeClient {
-    type Error: Send;
+    /// Shared with every request parked on the instance the call was for.
+    type Error: Clone + Send + Sync + 'static;
 
     fn wake_instance(
         &mut self,
@@ -38,44 +63,282 @@ pub trait WakeClient {
     ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error>;
 }
 
+/// Hosts being resolved at once, demand and background together.
+const MAX_ROUTE_FLIGHTS: usize = 64;
+/// Flights that keep cached rule sets current. Demand keeps the other half,
+/// so background work cannot crowd out a host the cache has never seen.
+const MAX_BACKGROUND_FLIGHTS: usize = MAX_ROUTE_FLIGHTS / 2;
+/// Requests waiting on a flight or parked on an instance.
+const MAX_ROUTE_WAITERS: usize = 256;
+const MAX_WAKE_CALLS: usize = 64;
+const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
+const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
+const DEFAULT_WAKE_DEADLINE: Duration = Duration::from_secs(5);
+const DEFAULT_ROUTE_DEADLINE: Duration = Duration::from_secs(130);
+const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a parked request trusts the push before it asks for its host's
+/// rule set again.
+const PARKED_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+/// The least time between wake calls for one instance generation.
+const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Times a request resolves a host whose answer left the cache before the
+/// request could read it.
+const MAX_RESOLVE_ATTEMPTS: usize = 3;
+const EXPIRY_BATCH: usize = 64;
+/// Stream replies applied before the cache snapshot is published again.
+const REPLY_BATCH: usize = 64;
+const COMMAND_BUFFER: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontlineRouteOutcome {
+    /// Forward to this backend.
+    Ready(ReadyBackend),
+    /// No route covers the request.
+    Miss,
+    /// The route's instance is being deleted.
+    Unavailable(WakeUnavailable),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontlineRouteCoordinatorError<WakeClientError> {
+    /// The request names a host or path the proxy does not route.
+    Identity(RequestIdentityError),
+    /// The control plane refused or failed the lookup for this host.
+    Resolve {
+        code: SubscribeErrorCode,
+        message: String,
+    },
+    SubscribeDeadline,
+    Wake(WakeClientError),
+    WakeDeadline(WakeInstanceRequest),
+    /// The instance did not run within the route deadline.
+    RouteDeadline,
+    Saturated,
+    RouteActorClosed,
+}
+
+type RouteResult<W> = Result<FrontlineRouteOutcome, FrontlineRouteCoordinatorError<W>>;
+/// Tells a waiting request that its host's flight ended.
+type FlightReply<W> = oneshot::Sender<FlightResult<W>>;
+type FlightResult<W> = Result<(), FrontlineRouteCoordinatorError<W>>;
+type WakeResult<W> = Result<WakeInstanceResponse, FrontlineRouteCoordinatorError<W>>;
+
+/// Route-cache lookups counted without shared writes between cores.
+#[derive(Clone, Debug)]
+pub struct RouteLookupCounters {
+    stripes: Arc<[LookupStripe]>,
+    reported: Arc<Mutex<(u64, u64)>>,
+}
+
+impl Default for RouteLookupCounters {
+    fn default() -> Self {
+        Self {
+            stripes: (0..LOOKUP_STRIPES)
+                .map(|_| LookupStripe::default())
+                .collect(),
+            reported: Arc::default(),
+        }
+    }
+}
+
+const LOOKUP_STRIPES: usize = 64;
+
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct LookupStripe {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl RouteLookupCounters {
+    fn stripe(&self) -> &LookupStripe {
+        thread_local! {
+            static STRIPE: usize = {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed) % LOOKUP_STRIPES
+            };
+        }
+        &self.stripes[STRIPE.with(|stripe| *stripe)]
+    }
+
+    fn hit(&self) {
+        self.stripe().hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn miss(&self) {
+        self.stripe().misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lookups the cache answered and lookups that needed the control plane.
+    pub fn totals(&self) -> (u64, u64) {
+        self.stripes.iter().fold((0, 0), |(hits, misses), stripe| {
+            (
+                hits + stripe.hits.load(Ordering::Relaxed),
+                misses + stripe.misses.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Adds the lookups since the last collection to the exported counters.
+    pub fn collect(&self, sink: &PrometheusMetricsSink) {
+        let (hits, misses) = self.totals();
+        let mut reported = self.reported.lock().expect("route lookup counters");
+        let (reported_hits, reported_misses) = &mut *reported;
+        for (outcome, total, last) in [
+            (Outcome::Hit, hits, reported_hits),
+            (Outcome::Miss, misses, reported_misses),
+        ] {
+            if total > *last {
+                sink.record_observation(MetricObservation::new(
+                    RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+                    vec![outcome.metric_label()],
+                    (total - *last) as f64,
+                ));
+                *last = total;
+            }
+        }
+    }
+}
+
+/// The parts of a coordinator, before its actor starts.
 #[derive(Clone, Debug)]
 pub struct FrontlineRouteCoordinator<RouteClient, Wake> {
-    resolver: FrontlineRouteResolver<RouteClient>,
-    wake_tracker: WakeTracker,
+    cache_capacity: usize,
+    route_client: RouteClient,
     wake_client: Wake,
     wake_deadline: Duration,
     route_deadline: Duration,
+    reconnect_backoff: Duration,
     observability: ObservabilityRecorder,
+    counters: RouteLookupCounters,
 }
 
-#[derive(Debug)]
+impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
+    pub fn new(cache_capacity: usize, route_client: RouteClient, wake_client: Wake) -> Self {
+        Self {
+            cache_capacity,
+            route_client,
+            wake_client,
+            wake_deadline: DEFAULT_WAKE_DEADLINE,
+            route_deadline: DEFAULT_ROUTE_DEADLINE,
+            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
+            observability: ObservabilityRecorder::default(),
+            counters: RouteLookupCounters::default(),
+        }
+    }
+
+    pub fn with_observability(mut self, observability: ObservabilityRecorder) -> Self {
+        self.observability = observability;
+        self
+    }
+
+    pub fn with_lookup_counters(mut self, counters: RouteLookupCounters) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    pub fn with_wake_deadline(mut self, wake_deadline: Duration) -> Self {
+        self.wake_deadline = wake_deadline;
+        self
+    }
+
+    pub fn with_route_deadline(mut self, deadline: Duration) -> Self {
+        self.route_deadline = deadline;
+        self
+    }
+
+    /// The wait after a failed stream before the next connect. A stream that
+    /// ended in order is replaced at once.
+    pub fn with_reconnect_backoff(mut self, backoff: Duration) -> Self {
+        self.reconnect_backoff = backoff;
+        self
+    }
+
+    pub(crate) fn route_deadline(&self) -> Duration {
+        self.route_deadline
+    }
+}
+
+impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake>
+where
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send + Sync + 'static,
+{
+    /// Starts the actor on the current Tokio runtime.
+    pub fn into_shared(self) -> SharedFrontlineRouteCoordinator<RouteClient, Wake> {
+        let state = Arc::new(State {
+            snapshot: ArcSwap::from_pointee(RouteSnapshot::default()),
+            parking: Parking::default(),
+            counters: self.counters,
+        });
+        let (commands, receiver) = mpsc::channel(COMMAND_BUFFER);
+        let actor = Actor {
+            client: self.route_client,
+            wake_client: self.wake_client,
+            state: state.clone(),
+            commands: receiver,
+            table: RouteTable::new(self.cache_capacity),
+            session: Session::Idle {
+                connect_at: tokio::time::Instant::now(),
+            },
+            next_subscription: 0,
+            pending: HashMap::new(),
+            resolving: HashMap::new(),
+            registrations: VecDeque::new(),
+            outbox: VecDeque::new(),
+            wakes: HashMap::new(),
+            wake_calls: tokio::task::JoinSet::new(),
+            effects: Effects::default(),
+            wake_deadline: self.wake_deadline,
+            reconnect_backoff: self.reconnect_backoff,
+            observability: self.observability,
+        };
+        SharedFrontlineRouteCoordinator {
+            shared: Arc::new(Shared {
+                state,
+                commands,
+                waiters: Arc::new(Semaphore::new(MAX_ROUTE_WAITERS)),
+                route_deadline: self.route_deadline,
+                actor: ActorTask(tokio::spawn(actor.run())),
+            }),
+            _client: PhantomData,
+        }
+    }
+}
+
+/// What request tasks and the actor share.
+struct State<W> {
+    snapshot: ArcSwap<RouteSnapshot>,
+    parking: Parking<W>,
+    counters: RouteLookupCounters,
+}
+
+struct Shared<W> {
+    state: Arc<State<W>>,
+    commands: mpsc::Sender<Command<W>>,
+    waiters: Arc<Semaphore>,
+    route_deadline: Duration,
+    actor: ActorTask,
+}
+
+struct ActorTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ActorTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The request-side handle. Cloning shares one cache and one actor.
 pub struct SharedFrontlineRouteCoordinator<RouteClient, Wake>
 where
     RouteClient: RouteSubscriptionClient,
     Wake: WakeClient,
 {
-    state: Arc<tokio::sync::RwLock<SubscriptionState>>,
-    commands: tokio::sync::mpsc::Sender<RouteActorCommand<RouteClient::Error, Wake::Error>>,
-    flights: RouteFlights<RouteClient::Error, Wake::Error>,
-    _task: Arc<RouteActorTask>,
-    waiters: Arc<tokio::sync::Semaphore>,
-    route_deadline: Duration,
-    observability: ObservabilityRecorder,
-}
-
-const MAX_ROUTE_FLIGHTS: usize = 64;
-// Re-registration is background repair of answers that are already serving, so
-// it may never consume the budget a first-time miss needs to reach the control
-// plane. Half the flights stay reserved for demand.
-const MAX_REREGISTRATION_FLIGHTS: usize = MAX_ROUTE_FLIGHTS / 2;
-const MAX_ROUTE_WAITERS: usize = 256;
-const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
-#[derive(Debug)]
-struct RouteActorTask(tokio::task::JoinHandle<()>);
-impl Drop for RouteActorTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+    shared: Arc<Shared<Wake::Error>>,
+    _client: PhantomData<fn() -> RouteClient>,
 }
 
 impl<RouteClient, Wake> Clone for SharedFrontlineRouteCoordinator<RouteClient, Wake>
@@ -85,1290 +348,1058 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            state: self.state.clone(),
-            commands: self.commands.clone(),
-            flights: self.flights.clone(),
-            _task: self._task.clone(),
-            waiters: self.waiters.clone(),
-            route_deadline: self.route_deadline,
-            observability: self.observability.clone(),
+            shared: self.shared.clone(),
+            _client: PhantomData,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrontlineRouteOutcome {
-    Ready(ReadyBackend),
-    Miss(Arc<NegativeCacheEntry>),
-    Waiting(WakeWait),
-    Waking {
-        instance_id: sleepypods_api::InstanceId,
-        generation: sleepypods_api::Generation,
-    },
-    Unavailable(WakeUnavailable),
-    WakeFailed {
-        instance_id: sleepypods_api::InstanceId,
-        generation: sleepypods_api::Generation,
-        reason: String,
-    },
-    WakeUnavailable {
-        instance_id: sleepypods_api::InstanceId,
-        generation: sleepypods_api::Generation,
-        reason: String,
-    },
-    GenerationConflict {
-        instance_id: sleepypods_api::InstanceId,
-        expected_generation: sleepypods_api::Generation,
-        actual_generation: sleepypods_api::Generation,
-    },
-    RejectedWakeObservation(StaleWakeObservation),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrontlineRouteCoordinatorError<RouteClientError, WakeClientError> {
-    Resolve(FrontlineRouteResolverError<RouteClientError>),
-    Wake(WakeClientError),
-    WakeDeadline(WakeInstanceRequest),
-    RouteActorClosed,
-    Saturated,
-    SubscribeDeadline,
-    RouteDeadline,
-    InvalidatedDuringResolution,
-    RejectedCacheUpdate(ApplyUpdateOutcome),
-}
-
-type RouteResult<RouteClientError, WakeClientError> = Result<
-    FrontlineRouteOutcome,
-    FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>,
->;
-type RouteFlights<RouteClientError, WakeClientError> = Arc<
-    tokio::sync::Mutex<HashMap<RouteIdentity, Arc<RouteFlight<RouteClientError, WakeClientError>>>>,
->;
-
-#[derive(Debug)]
-struct RouteFlight<RouteClientError, WakeClientError> {
-    result: tokio::sync::Mutex<Option<RouteResult<RouteClientError, WakeClientError>>>,
-    notify: tokio::sync::Notify,
-}
-
-#[derive(Debug)]
-enum RouteActorCommand<RouteClientError, WakeClientError> {
-    Route {
-        identity: RouteIdentity,
-        now: Instant,
-        refresh: bool,
-        response: tokio::sync::oneshot::Sender<RouteResult<RouteClientError, WakeClientError>>,
-    },
-}
-
-impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
-    pub fn new(
-        resolver: FrontlineRouteResolver<RouteClient>,
-        wake_tracker: WakeTracker,
-        wake_client: Wake,
-    ) -> Self {
-        Self {
-            resolver,
-            wake_tracker,
-            wake_client,
-            wake_deadline: DEFAULT_WAKE_INSTANCE_DEADLINE,
-            route_deadline: Duration::from_secs(130),
-            observability: ObservabilityRecorder::default(),
-        }
-    }
-
-    pub fn with_observability(
-        resolver: FrontlineRouteResolver<RouteClient>,
-        wake_tracker: WakeTracker,
-        wake_client: Wake,
-        observability: ObservabilityRecorder,
-    ) -> Self {
-        Self {
-            resolver,
-            wake_tracker,
-            wake_client,
-            wake_deadline: DEFAULT_WAKE_INSTANCE_DEADLINE,
-            route_deadline: Duration::from_secs(130),
-            observability,
-        }
-    }
-
-    pub fn with_wake_deadline(mut self, wake_deadline: Duration) -> Self {
-        self.wake_deadline = wake_deadline;
-        self
-    }
-
-    pub(crate) fn route_deadline(&self) -> Duration {
-        self.route_deadline
-    }
-
-    pub fn with_route_deadline(mut self, deadline: Duration) -> Self {
-        self.route_deadline = deadline;
-        self
-    }
-
-    pub fn resolver(&self) -> &FrontlineRouteResolver<RouteClient> {
-        &self.resolver
-    }
-
-    pub fn resolver_mut(&mut self) -> &mut FrontlineRouteResolver<RouteClient> {
-        &mut self.resolver
-    }
-
-    pub fn wake_tracker(&self) -> &WakeTracker {
-        &self.wake_tracker
-    }
-
-    pub fn wake_tracker_mut(&mut self) -> &mut WakeTracker {
-        &mut self.wake_tracker
-    }
-
-    pub fn wake_client(&self) -> &Wake {
-        &self.wake_client
-    }
-
-    pub fn wake_client_mut(&mut self) -> &mut Wake {
-        &mut self.wake_client
-    }
-}
-
-impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake>
-where
-    RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Clone + Send + 'static,
-    Wake: WakeClient + Send + 'static,
-    Wake::Error: Clone + Send + 'static,
-{
-    pub fn into_shared(self) -> SharedFrontlineRouteCoordinator<RouteClient, Wake> {
-        SharedFrontlineRouteCoordinator::new(self)
-    }
-}
-
-impl<RouteClient, Wake> SharedFrontlineRouteCoordinator<RouteClient, Wake>
-where
-    RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Clone + Send + 'static,
-    Wake: WakeClient + Send + 'static,
-    Wake::Error: Clone + Send + 'static,
-{
-    pub fn new(coordinator: FrontlineRouteCoordinator<RouteClient, Wake>) -> Self {
-        let FrontlineRouteCoordinator {
-            resolver,
-            wake_client,
-            wake_deadline,
-            route_deadline,
-            observability,
-            ..
-        } = coordinator;
-        let (initial_state, client, _) = resolver.into_parts();
-        let state = Arc::new(tokio::sync::RwLock::new(initial_state));
-        let (commands, rx) = tokio::sync::mpsc::channel(64);
-        let task_state = state.clone();
-        let task = tokio::spawn(route_actor(
-            client,
-            wake_client,
-            wake_deadline,
-            observability.clone(),
-            task_state,
-            rx,
-        ));
-
-        Self {
-            state,
-            commands,
-            flights: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            _task: Arc::new(RouteActorTask(task)),
-            waiters: Arc::new(tokio::sync::Semaphore::new(MAX_ROUTE_WAITERS)),
-            route_deadline,
-            observability,
-        }
-    }
-
-    pub async fn route(
-        &self,
-        identity: RouteIdentity,
-        now: Instant,
-    ) -> RouteResult<RouteClient::Error, Wake::Error> {
-        if self._task.0.is_finished() {
-            return Err(FrontlineRouteCoordinatorError::RouteActorClosed);
-        }
-        if let Some(outcome) = self.local_route(&identity, now).await {
-            return Ok(outcome);
-        }
-
-        let _waiter = self
-            .waiters
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| FrontlineRouteCoordinatorError::Saturated)?;
-        let flight = self.flight_for(identity.clone(), now).await?;
-        flight.wait().await
-    }
-
-    async fn local_route(
-        &self,
-        identity: &RouteIdentity,
-        now: Instant,
-    ) -> Option<FrontlineRouteOutcome> {
-        let state = self.state.read().await;
-        let lookup = state.cache().lookup(identity, now);
-        crate::resolver::record_cache_lookup(&self.observability, &lookup);
-        match lookup {
-            crate::CacheLookup::Hit(crate::CacheLookupHit::Positive(entry)) => {
-                match route_wake_decision(&entry.entry) {
-                    crate::RouteWakeDecision::Ready(backend) => {
-                        Some(FrontlineRouteOutcome::Ready(backend))
-                    }
-                    crate::RouteWakeDecision::Unavailable(unavailable) => {
-                        Some(FrontlineRouteOutcome::Unavailable(unavailable))
-                    }
-                    crate::RouteWakeDecision::Wait(wait) => {
-                        let _ = wait;
-                        None
-                    }
-                    crate::RouteWakeDecision::Wake { .. } => None,
-                }
-            }
-            crate::CacheLookup::Hit(crate::CacheLookupHit::Negative(entry)) => {
-                Some(FrontlineRouteOutcome::Miss(entry))
-            }
-            crate::CacheLookup::Expired | crate::CacheLookup::Absent => None,
-        }
-    }
-
-    async fn flight_for(
-        &self,
-        identity: RouteIdentity,
-        now: Instant,
-    ) -> Result<
-        Arc<RouteFlight<RouteClient::Error, Wake::Error>>,
-        FrontlineRouteCoordinatorError<RouteClient::Error, Wake::Error>,
-    > {
-        let mut flights = self.flights.lock().await;
-        if let Some(flight) = flights.get(&identity) {
-            return Ok(flight.clone());
-        }
-
-        if flights.len() >= MAX_ROUTE_FLIGHTS {
-            return Err(FrontlineRouteCoordinatorError::Saturated);
-        }
-        let flight = Arc::new(RouteFlight::new());
-        flights.insert(identity.clone(), flight.clone());
-        spawn_route_flight(
-            identity,
-            now,
-            flight.clone(),
-            self.commands.clone(),
-            self.flights.clone(),
-            self.route_deadline,
-        );
-        Ok(flight)
-    }
-}
-
-impl<RouteClientError, WakeClientError> RouteFlight<RouteClientError, WakeClientError>
-where
-    RouteClientError: Clone,
-    WakeClientError: Clone,
-{
-    fn new() -> Self {
-        Self {
-            result: tokio::sync::Mutex::new(None),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    async fn complete(&self, result: RouteResult<RouteClientError, WakeClientError>) {
-        *self.result.lock().await = Some(result);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) -> RouteResult<RouteClientError, WakeClientError> {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if let Some(result) = self.result.lock().await.clone() {
-                return result;
-            }
-            notified.await;
-        }
-    }
-}
-
-fn spawn_route_flight<RouteClientError, WakeClientError>(
-    identity: RouteIdentity,
-    now: Instant,
-    flight: Arc<RouteFlight<RouteClientError, WakeClientError>>,
-    commands: tokio::sync::mpsc::Sender<RouteActorCommand<RouteClientError, WakeClientError>>,
-    flights: RouteFlights<RouteClientError, WakeClientError>,
-    deadline: Duration,
-) where
-    RouteClientError: Clone + Send + 'static,
-    WakeClientError: Clone + Send + 'static,
-{
-    tokio::spawn(async move {
-        let work = async {
-            let mut refresh = false;
-            loop {
-                let result = route_via_actor(
-                    commands.clone(),
-                    identity.clone(),
-                    if refresh { Instant::now() } else { now },
-                    refresh,
-                )
-                .await;
-                match result {
-                    Ok(
-                        FrontlineRouteOutcome::Waking { .. }
-                        | FrontlineRouteOutcome::Waiting(_)
-                        | FrontlineRouteOutcome::GenerationConflict { .. },
-                    )
-                    | Err(FrontlineRouteCoordinatorError::InvalidatedDuringResolution) => {
-                        refresh = true;
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    other => break other,
-                }
-            }
-        };
-        let result = tokio::time::timeout(deadline, work)
-            .await
-            .unwrap_or(Err(FrontlineRouteCoordinatorError::RouteDeadline));
-        flight.complete(result).await;
-        flights.lock().await.remove(&identity);
-    });
-}
-
-async fn route_via_actor<RouteClientError, WakeClientError>(
-    commands: tokio::sync::mpsc::Sender<RouteActorCommand<RouteClientError, WakeClientError>>,
-    identity: RouteIdentity,
-    now: Instant,
-    refresh: bool,
-) -> RouteResult<RouteClientError, WakeClientError>
-where
-    RouteClientError: Send + 'static,
-    WakeClientError: Send + 'static,
-{
-    let (response, result) = tokio::sync::oneshot::channel();
-    if commands
-        .send(RouteActorCommand::Route {
-            identity,
-            now,
-            refresh,
-            response,
-        })
-        .await
-        .is_err()
-    {
-        return Err(FrontlineRouteCoordinatorError::RouteActorClosed);
-    }
-
-    result
-        .await
-        .unwrap_or(Err(FrontlineRouteCoordinatorError::RouteActorClosed))
-}
-
-// Event history is retained only while an operation could return an older
-// observation. A finite budget makes an overloaded stream fail closed instead
-// of allowing unbounded correlation state or silently forgetting invalidations.
-const MAX_OBSERVED_SUBSCRIPTIONS: usize = 4096;
-
-#[derive(Clone, Copy)]
-struct RouteObservation {
-    id: u64,
-    stream_epoch: u64,
-    sequence: u64,
-}
-
-#[derive(Default)]
-struct RouteObservations {
-    stream_epoch: u64,
-    /// Observations begun before this epoch crossed a session that dropped
-    /// events. An orderly rotation advances `stream_epoch` without raising it.
-    lossy_from: u64,
-    sequence: u64,
-    next_id: u64,
-    active: HashMap<u64, u64>,
-    subscriptions: HashMap<crate::SubscriptionId, u64>,
-}
-
-impl RouteObservations {
-    fn begin(&mut self) -> RouteObservation {
-        self.next_id += 1;
-        self.active.insert(self.next_id, self.sequence);
-        RouteObservation {
-            id: self.next_id,
-            stream_epoch: self.stream_epoch,
-            sequence: self.sequence,
-        }
-    }
-
-    /// The stream ended in order. Replies still in flight belong to a stream
-    /// this coordinator no longer tracks, and the IDs it issued are dead, but
-    /// the session delivered everything it had.
-    fn rotate(&mut self) {
-        self.stream_epoch += 1;
-        self.active.clear();
-        self.subscriptions.clear();
-    }
-
-    /// The session dropped events, so anything it still owes is unreliable.
-    fn reset(&mut self) {
-        self.rotate();
-        self.lossy_from = self.stream_epoch;
-    }
-
-    /// Whether an observation begun at `epoch` has since crossed a session that
-    /// dropped events.
-    fn crossed_lossy(&self, epoch: u64) -> bool {
-        epoch < self.lossy_from
-    }
-
-    // False means the bounded history cannot safely correlate another event.
-    fn record(&mut self, subscription_id: &crate::SubscriptionId) -> bool {
-        if self.active.is_empty() {
-            return true;
-        }
-        if self.subscriptions.len() == MAX_OBSERVED_SUBSCRIPTIONS
-            && !self.subscriptions.contains_key(subscription_id)
-        {
-            return false;
-        }
-        self.sequence += 1;
-        self.subscriptions
-            .insert(subscription_id.clone(), self.sequence);
-        true
-    }
-
-    fn finish(
-        &mut self,
-        observation: RouteObservation,
-        subscription_id: Option<&crate::SubscriptionId>,
-    ) -> bool {
-        let valid = observation.stream_epoch == self.stream_epoch
-            && !subscription_id.is_some_and(|id| {
-                self.subscriptions
-                    .get(id)
-                    .is_some_and(|sequence| *sequence > observation.sequence)
-            });
-        self.active.remove(&observation.id);
-        let oldest = self.active.values().copied().min().unwrap_or(self.sequence);
-        self.subscriptions.retain(|_, sequence| *sequence > oldest);
-        valid
-    }
-}
-
-enum PendingRoute<R, W> {
-    /// Re-registering a retained answer after its stream closed. No caller is
-    /// waiting, so a closed response channel must not be read as "abandoned".
-    Reregister {
-        identity: RouteIdentity,
-        request_id: crate::RouteRequestId,
-        observation: RouteObservation,
-        result: Result<SubscribeControlPlaneOutput, FrontlineRouteCoordinatorError<R, W>>,
-    },
-    Subscribe {
-        identity: RouteIdentity,
-        request_id: crate::RouteRequestId,
-        observation: RouteObservation,
-        response: tokio::sync::oneshot::Sender<RouteResult<R, W>>,
-        result: Result<SubscribeControlPlaneOutput, FrontlineRouteCoordinatorError<R, W>>,
-    },
-    Wake {
-        entry: Arc<crate::PositiveCacheEntry>,
-        request: WakeInstanceRequest,
-        observation: RouteObservation,
-        response: tokio::sync::oneshot::Sender<RouteResult<R, W>>,
-        result: Result<WakeInstanceResponse, FrontlineRouteCoordinatorError<R, W>>,
-    },
-}
-
-async fn route_actor<RouteClient, Wake>(
-    mut client: RouteClient,
-    mut wake_client: Wake,
-    wake_deadline: Duration,
-    observability: ObservabilityRecorder,
-    state: Arc<tokio::sync::RwLock<SubscriptionState>>,
-    mut rx: tokio::sync::mpsc::Receiver<RouteActorCommand<RouteClient::Error, Wake::Error>>,
-) where
-    RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Send + 'static,
-    Wake: WakeClient + Send + 'static,
-    Wake::Error: Send + 'static,
-{
-    let mut maintenance = tokio::time::interval(ROUTE_ACTOR_MAINTENANCE_INTERVAL);
-    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut unsubscribes = tokio::task::JoinSet::new();
-    let mut tracker = WakeTracker::new();
-    let mut observations = RouteObservations::default();
-    let mut next_request = 0u64;
-    let mut reregister: std::collections::VecDeque<RouteIdentity> =
-        std::collections::VecDeque::new();
-    loop {
-        drain_events(
-            &mut client,
-            &state,
-            &mut observations,
-            &mut unsubscribes,
-            &observability,
-            &mut reregister,
-        )
-        .await;
-        // The read fast path shares this lock, so only take it for writing when
-        // something is actually due.
-        let now = Instant::now();
-        let evicted = if state.read().await.cache().has_expired(now) {
-            state
-                .write()
-                .await
-                .cache_mut()
-                .expire_limited(now, MAX_ROUTE_FLIGHTS.saturating_sub(unsubscribes.len()))
-                .subscriptions_to_unsubscribe
-        } else {
-            Vec::new()
-        };
-        defer_unsubscribes(
-            evicted,
-            &mut client,
-            &state,
-            &mut observations,
-            &mut unsubscribes,
-        )
-        .await;
-
-        // Retained answers keep serving while this runs, so re-registration is
-        // background work: it yields the flight budget to live requests.
-        while tasks.len() < MAX_REREGISTRATION_FLIGHTS {
-            let Some(identity) = reregister.pop_front() else {
-                break;
-            };
-            if !state
-                .read()
-                .await
-                .cache()
-                .needs_reregistration(&identity, Instant::now())
-            {
-                continue;
-            }
-            next_request += 1;
-            let request_id =
-                crate::RouteRequestId::new(format!("req:{next_request}")).expect("request ID");
-            let future = client.subscribe_route(request_id.clone(), identity.clone());
-            let observation = observations.begin();
-            spawn_subscribe(&mut tasks, future, move |result| PendingRoute::Reregister {
-                identity,
-                request_id,
-                observation,
-                result,
-            });
-        }
-
-        tokio::select! {
-            biased;
-            _ = maintenance.tick() => {},
-            Some(completed) = tasks.join_next(), if !tasks.is_empty() => {
-                let Ok(completed) = completed else {
-                    state.write().await.cache_mut().clear();
-                    return;
-                };
-                // The reader can enqueue an event immediately after delivering
-                // a reply. Consume that event before installing the observation.
-                drain_events(
-                    &mut client, &state, &mut observations, &mut unsubscribes, &observability,
-                    &mut reregister,
-                ).await;
-                match completed {
-                    PendingRoute::Reregister { identity, request_id, observation, result } => {
-                        let subscription_id = result.as_ref().ok().and_then(resolved_subscription_id).cloned();
-                        let same_stream = observation.stream_epoch == observations.stream_epoch;
-                        let crossed_lossy = observations.crossed_lossy(observation.stream_epoch);
-                        let valid = observations.finish(observation, subscription_id.as_ref());
-                        let validation = result.as_ref().ok().map(|message| {
-                            crate::resolver::validate_subscribe_response::<RouteClient::Error>(&request_id, &identity, message)
-                        });
-                        // A reply that crossed another rotation belongs to a
-                        // stream this cache no longer tracks. Reclaim it the
-                        // same way a crossed Subscribe reply is reclaimed.
-                        if !valid || validation.as_ref().is_some_and(Result::is_err) {
-                            reclaim_crossed_reply(
-                                subscription_id, same_stream, crossed_lossy, &mut client, &state,
-                                &mut observations, &mut unsubscribes,
-                            ).await;
-                            continue;
-                        }
-                        let Ok(message) = result else { continue };
-                        let mut removed = Vec::new();
-                        append_unsubscribes(
-                            state.write().await.apply_resolved_response(identity, message, Instant::now()),
-                            &mut removed,
-                        );
-                        defer_unsubscribes(
-                            removed, &mut client, &state, &mut observations, &mut unsubscribes,
-                        ).await;
-                    }
-                    PendingRoute::Subscribe { identity, request_id, observation, response, result } => {
-                        observability.record_metric(MetricObservation::new(
-                            RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
-                            vec![Operation::SubscribeRoute.metric_label(),
-                                if result.is_ok() { Outcome::Success } else { Outcome::Error }.metric_label()],
-                            1.0,
-                        ));
-                        let subscription_id = result.as_ref().ok().and_then(resolved_subscription_id).cloned();
-                        let same_stream = observation.stream_epoch == observations.stream_epoch;
-                        let crossed_lossy = observations.crossed_lossy(observation.stream_epoch);
-                        let valid = observations.finish(observation, subscription_id.as_ref());
-                        let validation = result.as_ref().ok().map(|message| {
-                            crate::resolver::validate_subscribe_response(&request_id, &identity, message)
-                        });
-                        if !valid || response.is_closed() || validation.as_ref().is_some_and(Result::is_err) {
-                            reclaim_crossed_reply(
-                                subscription_id, same_stream, crossed_lossy, &mut client, &state,
-                                &mut observations, &mut unsubscribes,
-                            ).await;
-                            let error = match validation {
-                                Some(Err(error)) => FrontlineRouteCoordinatorError::Resolve(error),
-                                _ => FrontlineRouteCoordinatorError::InvalidatedDuringResolution,
-                            };
-                            let _ = response.send(Err(error));
-                            continue;
-                        }
-                        let message = match result {
-                            Ok(message) => message,
-                            Err(error) => { let _ = response.send(Err(error)); continue; }
-                        };
-                        let mut removed = Vec::new();
-                        append_unsubscribes(
-                            state.write().await.apply_resolved_response(identity.clone(), message, Instant::now()),
-                            &mut removed,
-                        );
-                        defer_unsubscribes(
-                            removed, &mut client, &state, &mut observations, &mut unsubscribes,
-                        ).await;
-                        match state.read().await.cache().lookup(&identity, Instant::now()) {
-                            crate::CacheLookup::Hit(crate::CacheLookupHit::Positive(entry)) => {
-                                dispatch_entry(entry, response, &mut observations, &mut tracker, &mut wake_client, wake_deadline, &mut tasks);
-                            }
-                            crate::CacheLookup::Hit(crate::CacheLookupHit::Negative(entry)) => {
-                                let _ = response.send(Ok(FrontlineRouteOutcome::Miss(entry)));
-                            }
-                            _ => { let _ = response.send(Err(FrontlineRouteCoordinatorError::InvalidatedDuringResolution)); }
-                        }
-                    }
-                    PendingRoute::Wake { entry, request, observation, response, result } => {
-                        tracker.complete(&request.instance_id, request.expected_generation);
-                        if !observations.finish(observation, entry.subscription_id.as_ref()) {
-                            let _ = response.send(Err(FrontlineRouteCoordinatorError::InvalidatedDuringResolution));
-                            continue;
-                        }
-                        let result = match result {
-                            Ok(reply) => {
-                                let disposition = validate_wake_response(&entry.entry, reply);
-                                observability.record_metric(MetricObservation::new(
-                                    RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
-                                    vec![Operation::WakeInstance.metric_label(), wake_response_outcome(&disposition).metric_label()], 1.0,
-                                ));
-                                if let WakeResponseDisposition::Ready(backend) = &disposition {
-                                    let now = Instant::now();
-                                    let ready = ready_route_entry(&entry.entry, backend.clone());
-                                    state.write().await.apply_ready_wake(&entry, ready, now);
-                                }
-                                Ok(wake_outcome(disposition))
-                            }
-                            Err(error) => Err(error),
-                        };
-                        let _ = response.send(result);
-                    }
-                }
-            }
-            command = rx.recv() => {
-                let Some(RouteActorCommand::Route {identity, now, refresh, response}) = command else { break; };
-                if response.is_closed() { continue; }
-                if tasks.len() >= MAX_ROUTE_FLIGHTS {
-                    let _ = response.send(Err(FrontlineRouteCoordinatorError::Saturated));
-                    continue;
-                }
-                let cached = if refresh {
-                    let removed = {
-                        let mut state = state.write().await;
-                        state.cache_mut().invalidate_request(&identity).into_iter().collect()
-                    };
-                    defer_unsubscribes(
-                        removed, &mut client, &state, &mut observations, &mut unsubscribes,
-                    ).await;
-                    crate::CacheLookup::Absent
-                } else { state.read().await.cache().lookup(&identity, now) };
-                match cached {
-                    crate::CacheLookup::Hit(crate::CacheLookupHit::Positive(entry)) => {
-                        dispatch_entry(entry, response, &mut observations, &mut tracker, &mut wake_client, wake_deadline, &mut tasks);
-                    }
-                    crate::CacheLookup::Hit(crate::CacheLookupHit::Negative(entry)) => {
-                        let _ = response.send(Ok(FrontlineRouteOutcome::Miss(entry)));
-                    }
-                    _ => {
-                        next_request += 1;
-                        let request_id = crate::RouteRequestId::new(format!("req:{next_request}")).expect("request ID");
-                        let future = client.subscribe_route(request_id.clone(), identity.clone());
-                        let observation = observations.begin();
-                        spawn_subscribe(&mut tasks, future, move |result| {
-                            PendingRoute::Subscribe {identity, request_id, observation, response, result}
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn resolved_subscription_id(
-    message: &SubscribeControlPlaneOutput,
-) -> Option<&crate::SubscriptionId> {
-    match message {
-        SubscribeControlPlaneOutput::RouteResolved {
-            subscription_id, ..
-        } => Some(subscription_id),
-        _ => None,
-    }
-}
-
-/// Both the demand path and re-registration issue the same call under the same
-/// deadline; only the completion they produce differs.
-fn spawn_subscribe<RouteClientError, WakeClientError, Finish>(
-    tasks: &mut tokio::task::JoinSet<PendingRoute<RouteClientError, WakeClientError>>,
-    future: crate::RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, RouteClientError>,
-    finish: Finish,
-) where
-    RouteClientError: Send + 'static,
-    WakeClientError: Send + 'static,
-    Finish: FnOnce(
-            Result<
-                SubscribeControlPlaneOutput,
-                FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>,
-            >,
-        ) -> PendingRoute<RouteClientError, WakeClientError>
-        + Send
-        + 'static,
-{
-    tasks.spawn(async move {
-        let result = match tokio::time::timeout(SUBSCRIBE_DEADLINE, future).await {
-            Ok(result) => result.map_err(|error| {
-                FrontlineRouteCoordinatorError::Resolve(FrontlineRouteResolverError::Subscribe(
-                    error,
-                ))
-            }),
-            Err(_) => Err(FrontlineRouteCoordinatorError::SubscribeDeadline),
-        };
-        finish(result)
-    });
-}
-
-/// Reclaim a reply this coordinator refuses to install. On the stream that
-/// issued it, drop the subscription. Past an orderly rotation, discard it: its
-/// ID died with its stream, so unsubscribing could target a reused ID on the
-/// replacement stream, and the ended session left nothing undelivered. Past a
-/// session that dropped events, ownership is ambiguous, because `ensure` may
-/// have reconnected while the reply was in flight, so reset and give up cached
-/// authority with it.
-async fn reclaim_crossed_reply<Client: RouteSubscriptionClient>(
-    subscription_id: Option<crate::SubscriptionId>,
-    same_stream: bool,
-    crossed_lossy: bool,
-    client: &mut Client,
-    state: &tokio::sync::RwLock<SubscriptionState>,
-    observations: &mut RouteObservations,
-    unsubscribes: &mut tokio::task::JoinSet<bool>,
-) where
-    Client::Error: 'static,
-{
-    if same_stream {
-        defer_unsubscribes(
-            subscription_id.into_iter().collect(),
-            client,
-            state,
-            observations,
-            unsubscribes,
-        )
-        .await;
-    } else if crossed_lossy && subscription_id.is_some() {
-        reset_route_session(client, state, observations, unsubscribes).await;
-    }
-}
-
-async fn reset_route_session<Client: RouteSubscriptionClient>(
-    client: &mut Client,
-    state: &tokio::sync::RwLock<SubscriptionState>,
-    observations: &mut RouteObservations,
-    unsubscribes: &mut tokio::task::JoinSet<bool>,
-) where
-    Client::Error: 'static,
-{
-    // Reached only where events were demonstrably lost: an overflowed
-    // correlation budget, a failed transport, or cleanup that could not be
-    // delivered. A dropped invalidation may name anything, so cached authority
-    // goes with the session. An orderly close loses nothing and rotates instead.
-    observations.reset();
-    state.write().await.cache_mut().clear();
-    *unsubscribes = tokio::task::JoinSet::new();
-    let reset = client.reset_subscription();
-    unsubscribes.spawn(async move {
-        matches!(
-            tokio::time::timeout(SUBSCRIBE_DEADLINE, reset).await,
-            Ok(Ok(()))
-        )
-    });
-}
-
-async fn defer_unsubscribes<Client: RouteSubscriptionClient>(
-    ids: Vec<crate::SubscriptionId>,
-    client: &mut Client,
-    state: &tokio::sync::RwLock<SubscriptionState>,
-    observations: &mut RouteObservations,
-    unsubscribes: &mut tokio::task::JoinSet<bool>,
-) where
-    Client::Error: 'static,
-{
-    let mut failed = false;
-    while let Some(result) = unsubscribes.try_join_next() {
-        failed |= !matches!(result, Ok(true));
-    }
-    if failed || ids.len() + unsubscribes.len() > MAX_ROUTE_FLIGHTS {
-        reset_route_session(client, state, observations, unsubscribes).await;
-        return;
-    }
-    for id in ids {
-        let unsubscribe = client.unsubscribe(id);
-        unsubscribes.spawn(async move {
-            matches!(
-                tokio::time::timeout(SUBSCRIBE_DEADLINE, unsubscribe).await,
-                Ok(Ok(()))
-            )
-        });
-    }
-}
-
-async fn drain_events<Client: RouteSubscriptionClient>(
-    client: &mut Client,
-    state: &tokio::sync::RwLock<SubscriptionState>,
-    observations: &mut RouteObservations,
-    unsubscribes: &mut tokio::task::JoinSet<bool>,
-    observability: &ObservabilityRecorder,
-    rotated: &mut std::collections::VecDeque<RouteIdentity>,
-) where
-    Client::Error: 'static,
-{
-    let mut removed = Vec::new();
-    let mut overflow = false;
-    {
-        let events = client.drain_subscription_events().await;
-        let mut state = state.write().await;
-        match events {
-            Ok(events) => {
-                for event in events {
-                    record_subscription_event(observability, &event);
-                    match event {
-                        crate::RouteSubscriptionEvent::StreamEnded => {
-                            observations.rotate();
-                            rotated.extend(state.cache_mut().rotate_session());
-                        }
-                        crate::RouteSubscriptionEvent::StreamClosed => {
-                            observations.reset();
-                            state.cache_mut().clear();
-                        }
-                        crate::RouteSubscriptionEvent::Update(message) => {
-                            match message.as_ref() {
-                                SubscribeControlPlaneOutput::RouteUpdated {
-                                    subscription_id,
-                                    ..
-                                }
-                                | SubscribeControlPlaneOutput::RouteInvalidated {
-                                    subscription_id,
-                                    ..
-                                } if !observations.record(subscription_id) => {
-                                    overflow = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                            append_unsubscribes(
-                                state.apply_control_plane_message(*message, Instant::now()),
-                                &mut removed,
-                            );
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                observations.reset();
-                state.cache_mut().clear();
-            }
-        }
-    }
-    if overflow {
-        reset_route_session(client, state, observations, unsubscribes).await;
-    } else {
-        defer_unsubscribes(removed, client, state, observations, unsubscribes).await;
-    }
-}
-
-fn append_unsubscribes(
-    outcome: crate::ApplyControlPlaneMessageOutcome,
-    ids: &mut Vec<crate::SubscriptionId>,
-) {
-    match outcome {
-        crate::ApplyControlPlaneMessageOutcome::Resolved(result)
-        | crate::ApplyControlPlaneMessageOutcome::Miss(result)
-        | crate::ApplyControlPlaneMessageOutcome::Updated(ApplyUpdateOutcome::Replaced(result)) => {
-            ids.extend(result.subscriptions_to_unsubscribe)
-        }
-        _ => {}
-    }
-}
-fn record_subscription_event(
-    observability: &ObservabilityRecorder,
-    event: &crate::RouteSubscriptionEvent,
-) {
-    match event {
-        crate::RouteSubscriptionEvent::Update(message) => {
-            crate::resolver::record_subscribe_message(observability, message)
-        }
-        crate::RouteSubscriptionEvent::StreamEnded
-        | crate::RouteSubscriptionEvent::StreamClosed => {
-            crate::resolver::record_subscribe_stream_closed(observability)
-        }
-    }
-}
-fn dispatch_entry<R: Send + 'static, Wake: WakeClient>(
-    entry: Arc<crate::PositiveCacheEntry>,
-    response: tokio::sync::oneshot::Sender<RouteResult<R, Wake::Error>>,
-    observations: &mut RouteObservations,
-    tracker: &mut WakeTracker,
-    wake: &mut Wake,
-    deadline: Duration,
-    tasks: &mut tokio::task::JoinSet<PendingRoute<R, Wake::Error>>,
-) where
-    Wake::Error: 'static,
-{
-    if entry.entry.instance_state == InstanceState::Waking {
-        let _ = response.send(Ok(FrontlineRouteOutcome::Waiting(WakeWait {
-            instance_id: entry.entry.instance_id.clone(),
-            generation: entry.entry.instance_generation,
-            reason: crate::WakeWaitReason::AlreadyWaking,
-        })));
-        return;
-    }
-    let outcome = match route_wake_decision(&entry.entry) {
-        crate::RouteWakeDecision::Ready(backend) => FrontlineRouteOutcome::Ready(backend),
-        crate::RouteWakeDecision::Wait(wait) => FrontlineRouteOutcome::Waiting(wait),
-        crate::RouteWakeDecision::Unavailable(unavailable) => {
-            FrontlineRouteOutcome::Unavailable(unavailable)
-        }
-        crate::RouteWakeDecision::Wake { request, .. } => match tracker.admit(request) {
-            WakeAdmission::Wait(wait) => FrontlineRouteOutcome::Waiting(wait),
-            WakeAdmission::Start(request) => {
-                let future = wake.wake_instance(request.clone());
-                let observation = observations.begin();
-                tasks.spawn(async move {
-                    let result = match tokio::time::timeout(deadline, future).await {
-                        Ok(result) => result.map_err(FrontlineRouteCoordinatorError::Wake),
-                        Err(_) => Err(FrontlineRouteCoordinatorError::WakeDeadline(
-                            request.clone(),
-                        )),
-                    };
-                    PendingRoute::Wake {
-                        entry,
-                        request,
-                        observation,
-                        response,
-                        result,
-                    }
-                });
-                return;
-            }
-        },
-    };
-    let _ = response.send(Ok(outcome));
-}
-fn wake_outcome(disposition: WakeResponseDisposition) -> FrontlineRouteOutcome {
-    match disposition {
-        WakeResponseDisposition::Ready(backend) => FrontlineRouteOutcome::Ready(backend),
-        WakeResponseDisposition::WakeStarted {
-            instance_id,
-            generation,
-        }
-        | WakeResponseDisposition::StillWaking {
-            instance_id,
-            generation,
-        } => FrontlineRouteOutcome::Waking {
-            instance_id,
-            generation,
-        },
-        WakeResponseDisposition::Failed {
-            instance_id,
-            generation,
-            reason,
-        } => FrontlineRouteOutcome::WakeFailed {
-            instance_id,
-            generation,
-            reason,
-        },
-        WakeResponseDisposition::Unavailable {
-            instance_id,
-            generation,
-            reason,
-        } => FrontlineRouteOutcome::WakeUnavailable {
-            instance_id,
-            generation,
-            reason,
-        },
-        WakeResponseDisposition::GenerationConflict {
-            instance_id,
-            expected_generation,
-            actual_generation,
-        } => FrontlineRouteOutcome::GenerationConflict {
-            instance_id,
-            expected_generation,
-            actual_generation,
-        },
-        WakeResponseDisposition::Rejected(stale) => {
-            FrontlineRouteOutcome::RejectedWakeObservation(stale)
-        }
-    }
-}
-
-// Legacy synchronous helpers are confined to focused unit tests. Production
-// HTTP, TLS and SNI all use the shared coordinator above.
-#[cfg(test)]
-impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake>
+impl<RouteClient, Wake> fmt::Debug for SharedFrontlineRouteCoordinator<RouteClient, Wake>
 where
     RouteClient: RouteSubscriptionClient,
     Wake: WakeClient,
 {
-    pub async fn route(
-        &mut self,
-        identity: RouteIdentity,
-        now: Instant,
-    ) -> Result<
-        FrontlineRouteOutcome,
-        FrontlineRouteCoordinatorError<RouteClient::Error, Wake::Error>,
-    > {
-        let resolution = self
-            .resolver
-            .resolve(identity, now)
-            .await
-            .map_err(FrontlineRouteCoordinatorError::Resolve)?;
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedFrontlineRouteCoordinator")
+            .finish_non_exhaustive()
+    }
+}
 
-        let cache_entry = match resolution {
-            FrontlineRouteResolution::Resolved(entry) => entry,
-            FrontlineRouteResolution::Miss(entry) => return Ok(FrontlineRouteOutcome::Miss(entry)),
+/// The cache clock. It follows Tokio's clock, which tests can pause.
+fn clock() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// What the snapshot says about one request.
+enum Lookup {
+    Answer(FrontlineRouteOutcome),
+    /// The route's instance is not running. `version` identifies the rule set
+    /// this was read from.
+    Pending {
+        instance: WakeKey,
+        wake: bool,
+        version: u64,
+    },
+    Absent,
+}
+
+impl<RouteClient, Wake> SharedFrontlineRouteCoordinator<RouteClient, Wake>
+where
+    RouteClient: RouteSubscriptionClient,
+    Wake: WakeClient,
+    Wake::Error: Clone + Send + Sync + 'static,
+{
+    /// Routes a canonical identity, such as the SNI name of a TLS connection.
+    pub async fn route(&self, identity: RouteIdentity, now: Instant) -> RouteResult<Wake::Error> {
+        let path = match &identity {
+            RouteIdentity::Http { path, .. } => path.as_ref().map_or("/", |path| path.as_str()),
+            RouteIdentity::Sni { .. } => "",
         };
+        self.route_canonical(identity.kind(), identity.host().as_str(), path, now)
+            .await
+    }
 
-        match route_wake_decision(&cache_entry.entry) {
-            crate::RouteWakeDecision::Ready(backend) => Ok(FrontlineRouteOutcome::Ready(backend)),
-            crate::RouteWakeDecision::Wait(wait) => Ok(FrontlineRouteOutcome::Waiting(wait)),
-            crate::RouteWakeDecision::Unavailable(unavailable) => {
-                Ok(FrontlineRouteOutcome::Unavailable(unavailable))
+    /// Routes an HTTP request by its Host value and path. A host over 253
+    /// bytes or a path over 4,096 bytes is refused without a lookup.
+    pub async fn route_http(
+        &self,
+        host: &str,
+        path: Option<&str>,
+        now: Instant,
+    ) -> RouteResult<Wake::Error> {
+        let host =
+            canonical_request_host(host).map_err(FrontlineRouteCoordinatorError::Identity)?;
+        let path =
+            canonical_request_path(path).map_err(FrontlineRouteCoordinatorError::Identity)?;
+        self.route_canonical(RouteKind::Http, &host, path, now)
+            .await
+    }
+
+    /// Lookups the cache answered and lookups that needed the control plane.
+    pub fn lookup_counters(&self) -> &RouteLookupCounters {
+        &self.shared.state.counters
+    }
+
+    async fn route_canonical(
+        &self,
+        kind: RouteKind,
+        host: &str,
+        path: &str,
+        now: Instant,
+    ) -> RouteResult<Wake::Error> {
+        if self.shared.actor.0.is_finished() {
+            return Err(FrontlineRouteCoordinatorError::RouteActorClosed);
+        }
+        let first = self.lookup(kind, host, path, now);
+        match &first {
+            Lookup::Absent => self.shared.state.counters.miss(),
+            _ => self.shared.state.counters.hit(),
+        }
+        if let Lookup::Answer(outcome) = first {
+            return Ok(outcome);
+        }
+        self.wait_for_route(kind, host, path, first).await
+    }
+
+    fn lookup(&self, kind: RouteKind, host: &str, path: &str, now: Instant) -> Lookup {
+        let snapshot = self.shared.state.snapshot.load();
+        let Some(entry) = snapshot.get(kind, host) else {
+            return Lookup::Absent;
+        };
+        if entry.is_expired(now) {
+            return Lookup::Absent;
+        }
+        entry.mark_used();
+        let Some(rule) = entry.rules.select(path) else {
+            return Lookup::Answer(FrontlineRouteOutcome::Miss);
+        };
+        match route_disposition(&rule.entry) {
+            RouteDisposition::Ready(backend) => {
+                Lookup::Answer(FrontlineRouteOutcome::Ready(backend))
             }
-            crate::RouteWakeDecision::Wake { request, .. } => {
-                match self.wake_tracker.admit(request) {
-                    WakeAdmission::Wait(wait) => Ok(FrontlineRouteOutcome::Waiting(wait)),
-                    WakeAdmission::Start(request) => {
-                        let response = match tokio::time::timeout(
-                            self.wake_deadline,
-                            self.wake_client.wake_instance(request.clone()),
-                        )
-                        .await
-                        {
-                            Err(_elapsed) => {
-                                self.record_wake_instance_call(Outcome::Error);
-                                self.wake_tracker
-                                    .complete(&request.instance_id, request.expected_generation);
-                                return Err(FrontlineRouteCoordinatorError::WakeDeadline(request));
-                            }
-                            Ok(result) => match result {
-                                Ok(response) => response,
-                                Err(error) => {
-                                    self.record_wake_instance_call(Outcome::Error);
-                                    self.wake_tracker.complete(
-                                        &request.instance_id,
-                                        request.expected_generation,
-                                    );
-                                    return Err(FrontlineRouteCoordinatorError::Wake(error));
-                                }
-                            },
-                        };
+            RouteDisposition::Unavailable(unavailable) => {
+                Lookup::Answer(FrontlineRouteOutcome::Unavailable(unavailable))
+            }
+            RouteDisposition::Pending {
+                instance_id,
+                generation,
+                wake,
+            } => Lookup::Pending {
+                instance: WakeKey {
+                    instance_id,
+                    generation,
+                },
+                wake,
+                version: entry.version,
+            },
+        }
+    }
 
-                        let disposition = validate_wake_response(&cache_entry.entry, response);
-                        self.record_wake_instance_call(wake_response_outcome(&disposition));
-                        self.handle_wake_response(cache_entry, disposition, now)
-                            .await
+    /// The path for a request the snapshot cannot answer yet: resolve the
+    /// host, then wait for its instance.
+    async fn wait_for_route(
+        &self,
+        kind: RouteKind,
+        host: &str,
+        path: &str,
+        mut seen: Lookup,
+    ) -> RouteResult<Wake::Error> {
+        let _waiter = self
+            .shared
+            .waiters
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| FrontlineRouteCoordinatorError::Saturated)?;
+        let subscribed_host = route_host(host).map_err(FrontlineRouteCoordinatorError::Identity)?;
+        let key = HostKey::new(kind, host);
+        let deadline = tokio::time::Instant::now() + self.shared.route_deadline;
+        let mut resolves = 0;
+        loop {
+            match seen {
+                Lookup::Answer(outcome) => return Ok(outcome),
+                Lookup::Absent => {
+                    if resolves == MAX_RESOLVE_ATTEMPTS {
+                        return Err(FrontlineRouteCoordinatorError::Resolve {
+                            code: SubscribeErrorCode::Unavailable,
+                            message: "the host's rule set did not stay cached".to_owned(),
+                        });
                     }
+                    resolves += 1;
+                    self.resolve(&key, &subscribed_host, None).await?;
+                }
+                Lookup::Pending {
+                    instance,
+                    wake,
+                    version,
+                } => {
+                    resolves = 0;
+                    let mut parked = self.shared.state.parking.park(&instance);
+                    // The rule set may have changed between the lookup and
+                    // parking; only an unchanged one is worth waiting on.
+                    let unchanged = matches!(
+                        self.lookup(kind, host, path, clock()),
+                        Lookup::Pending { version: current, .. } if current == version
+                    );
+                    if unchanged {
+                        if wake {
+                            self.command(Command::Wake {
+                                instance,
+                                host: key.clone(),
+                            })
+                            .await?;
+                        }
+                        tokio::select! {
+                            failure = parked.changed() => {
+                                if let Some(failure) = failure {
+                                    return Err(failure);
+                                }
+                            }
+                            _ = tokio::time::sleep(PARKED_REFRESH_INTERVAL) => {
+                                // The push may be late or lost. A failed
+                                // refresh leaves the cached rule set in place,
+                                // and the request keeps waiting on it.
+                                let _ = self.resolve(&key, &subscribed_host, Some(version)).await;
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                return Err(FrontlineRouteCoordinatorError::RouteDeadline);
+                            }
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FrontlineRouteCoordinatorError::RouteDeadline);
+            }
+            seen = self.lookup(kind, host, path, clock());
+        }
+    }
+
+    /// Joins or starts the flight for a host. With `stale_version`, the
+    /// flight runs only while the cache still holds that version.
+    async fn resolve(
+        &self,
+        key: &HostKey,
+        host: &RouteHost,
+        stale_version: Option<u64>,
+    ) -> Result<(), FrontlineRouteCoordinatorError<Wake::Error>> {
+        let (reply, result) = oneshot::channel();
+        self.command(Command::Resolve {
+            key: key.clone(),
+            host: host.clone(),
+            stale_version,
+            reply,
+        })
+        .await?;
+        result
+            .await
+            .unwrap_or(Err(FrontlineRouteCoordinatorError::RouteActorClosed))
+    }
+
+    async fn command(
+        &self,
+        command: Command<Wake::Error>,
+    ) -> Result<(), FrontlineRouteCoordinatorError<Wake::Error>> {
+        self.shared
+            .commands
+            .send(command)
+            .await
+            .map_err(|_| FrontlineRouteCoordinatorError::RouteActorClosed)
+    }
+}
+
+/// One instance generation that requests wait on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WakeKey {
+    instance_id: InstanceId,
+    generation: Generation,
+}
+
+impl WakeKey {
+    fn of(rule: &RouteRule) -> Self {
+        Self {
+            instance_id: rule.entry.instance_id.clone(),
+            generation: rule.entry.instance_generation,
+        }
+    }
+}
+
+/// Requests parked per instance generation. The actor signals a slot when a
+/// rule set naming that generation changes or its wake call fails.
+struct Parking<W> {
+    slots: Mutex<HashMap<WakeKey, Arc<ParkSlot<W>>>>,
+}
+
+struct ParkSlot<W> {
+    signal: watch::Sender<ParkSignal<W>>,
+    waiters: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct ParkSignal<W> {
+    version: u64,
+    /// The signal version at which the wake call failed, and its error.
+    failure: Option<(u64, FrontlineRouteCoordinatorError<W>)>,
+}
+
+struct Parked<'a, W> {
+    parking: &'a Parking<W>,
+    key: WakeKey,
+    slot: Arc<ParkSlot<W>>,
+    signal: watch::Receiver<ParkSignal<W>>,
+    parked_at: u64,
+}
+
+impl<W> Default for Parking<W> {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<W: Clone> Parking<W> {
+    fn park(&self, key: &WakeKey) -> Parked<'_, W> {
+        let mut slots = self.slots.lock().expect("route parking");
+        let slot = slots
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(ParkSlot {
+                    signal: watch::channel(ParkSignal {
+                        version: 0,
+                        failure: None,
+                    })
+                    .0,
+                    waiters: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+        slot.waiters.fetch_add(1, Ordering::Relaxed);
+        let mut signal = slot.signal.subscribe();
+        let parked_at = signal.borrow_and_update().version;
+        Parked {
+            parking: self,
+            key: key.clone(),
+            slot,
+            signal,
+            parked_at,
+        }
+    }
+
+    fn signal(&self, key: &WakeKey) {
+        if let Some(slot) = self.slots.lock().expect("route parking").get(key) {
+            slot.signal.send_modify(|signal| signal.version += 1);
+        }
+    }
+
+    fn signal_all(&self) {
+        for slot in self.slots.lock().expect("route parking").values() {
+            slot.signal.send_modify(|signal| signal.version += 1);
+        }
+    }
+
+    fn fail(&self, key: &WakeKey, error: FrontlineRouteCoordinatorError<W>) {
+        if let Some(slot) = self.slots.lock().expect("route parking").get(key) {
+            slot.signal.send_modify(|signal| {
+                signal.version += 1;
+                signal.failure = Some((signal.version, error));
+            });
+        }
+    }
+}
+
+impl<W: Clone> Parked<'_, W> {
+    /// Waits for the next signal. Returns the wake failure, if one arrived
+    /// after this request parked.
+    async fn changed(&mut self) -> Option<FrontlineRouteCoordinatorError<W>> {
+        if self.signal.changed().await.is_err() {
+            return None;
+        }
+        let signal = self.signal.borrow_and_update();
+        match &signal.failure {
+            Some((at, error)) if *at > self.parked_at => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl<W> Drop for Parked<'_, W> {
+    fn drop(&mut self) {
+        let mut slots = self.parking.slots.lock().expect("route parking");
+        if self.slot.waiters.fetch_sub(1, Ordering::Relaxed) == 1 {
+            slots.remove(&self.key);
+        }
+    }
+}
+
+enum Command<W> {
+    Resolve {
+        key: HostKey,
+        host: RouteHost,
+        stale_version: Option<u64>,
+        reply: FlightReply<W>,
+    },
+    Wake {
+        instance: WakeKey,
+        host: HostKey,
+    },
+}
+
+enum Session {
+    /// No stream. The next connect starts at `connect_at`.
+    Idle {
+        connect_at: tokio::time::Instant,
+    },
+    Connecting(tokio::task::JoinHandle<Option<RouteStream>>),
+    Open(RouteStream),
+}
+
+enum SessionEvent {
+    ConnectDue,
+    Connected(Option<RouteStream>),
+    Stream(Option<RouteStreamEvent>),
+}
+
+/// One host being resolved.
+struct Flight<W> {
+    key: HostKey,
+    host: RouteHost,
+    deadline: tokio::time::Instant,
+    /// Requests waiting for the answer. A flight with none keeps a cached rule
+    /// set current in the background.
+    waiters: Vec<FlightReply<W>>,
+    background: bool,
+    /// Times the control plane reported its subscription limit.
+    exhausted: usize,
+}
+
+struct WakeCall {
+    started: Instant,
+    in_flight: bool,
+    /// Hosts whose requests asked for this wake.
+    hosts: HashSet<HostKey>,
+}
+
+/// What a step decided, applied after the snapshot it depends on is
+/// published.
+struct Effects<W> {
+    replies: Vec<(FlightReply<W>, FlightResult<W>)>,
+    signals: Vec<WakeKey>,
+    signal_all: bool,
+    failures: Vec<(WakeKey, FrontlineRouteCoordinatorError<W>)>,
+}
+
+impl<W> Default for Effects<W> {
+    fn default() -> Self {
+        Self {
+            replies: Vec::new(),
+            signals: Vec::new(),
+            signal_all: false,
+            failures: Vec::new(),
+        }
+    }
+}
+
+struct Actor<Client, Wake: WakeClient> {
+    client: Client,
+    wake_client: Wake,
+    state: Arc<State<Wake::Error>>,
+    commands: mpsc::Receiver<Command<Wake::Error>>,
+    table: RouteTable,
+    session: Session,
+    next_subscription: SubscriptionId,
+    pending: HashMap<SubscriptionId, Flight<Wake::Error>>,
+    resolving: HashMap<HostKey, SubscriptionId>,
+    /// Carried-over rule sets waiting for a subscription on the current
+    /// stream.
+    registrations: VecDeque<HostKey>,
+    /// Requests for the stream, in order, until its channel has room.
+    outbox: VecDeque<RouteStreamRequest>,
+    wakes: HashMap<WakeKey, WakeCall>,
+    wake_calls: tokio::task::JoinSet<(WakeKey, WakeResult<Wake::Error>)>,
+    effects: Effects<Wake::Error>,
+    wake_deadline: Duration,
+    reconnect_backoff: Duration,
+    observability: ObservabilityRecorder,
+}
+
+enum Step<W> {
+    Session(SessionEvent),
+    WakeFinished(WakeKey, WakeResult<W>),
+    Command(Command<W>),
+    Tick,
+    Closed,
+}
+
+impl<Client, Wake> Actor<Client, Wake>
+where
+    Client: RouteSubscriptionClient + Send + 'static,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send + Sync + 'static,
+{
+    async fn run(mut self) {
+        let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            self.connect_when_due();
+            self.register_carried_hosts();
+            self.flush_outbox();
+            self.publish();
+            let step = tokio::select! {
+                event = session_event(&mut self.session) => Step::Session(event),
+                Some(finished) = self.wake_calls.join_next(), if !self.wake_calls.is_empty() => {
+                    match finished {
+                        Ok((key, result)) => Step::WakeFinished(key, result),
+                        Err(_) => Step::Closed,
+                    }
+                }
+                command = self.commands.recv() => command.map_or(Step::Closed, Step::Command),
+                _ = tick.tick() => Step::Tick,
+            };
+            match step {
+                // The top of the loop connects.
+                Step::Session(SessionEvent::ConnectDue) => {}
+                Step::Session(SessionEvent::Connected(Some(stream))) => {
+                    self.record_call(Operation::SubscribeStream, Outcome::Success);
+                    self.on_connected(stream)
+                }
+                Step::Session(SessionEvent::Connected(None)) => {
+                    self.record_call(Operation::SubscribeStream, Outcome::Error);
+                    // Nothing was lost: no stream existed to lose it.
+                    self.session = Session::Idle {
+                        connect_at: tokio::time::Instant::now() + self.reconnect_backoff,
+                    };
+                }
+                Step::Session(SessionEvent::Stream(event)) => {
+                    self.on_stream_event(event);
+                    // Replies that already arrived share one snapshot.
+                    for _ in 1..REPLY_BATCH {
+                        let Session::Open(stream) = &mut self.session else {
+                            break;
+                        };
+                        match stream.events.try_recv() {
+                            Ok(event) => self.on_stream_event(Some(event)),
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                self.on_stream_event(None)
+                            }
+                        }
+                    }
+                }
+                Step::WakeFinished(key, result) => self.on_wake_finished(key, result),
+                Step::Command(Command::Resolve {
+                    key,
+                    host,
+                    stale_version,
+                    reply,
+                }) => self.on_resolve(key, host, stale_version, reply),
+                Step::Command(Command::Wake { instance, host }) => self.on_wake(instance, host),
+                Step::Tick => self.maintain(),
+                Step::Closed => {
+                    // Request tasks stop serving once the actor is gone.
+                    let _ = self.table.clear();
+                    self.publish();
+                    return;
                 }
             }
         }
     }
 
-    fn record_wake_instance_call(&self, outcome: Outcome) {
+    fn on_stream_event(&mut self, event: Option<RouteStreamEvent>) {
+        match event {
+            Some(RouteStreamEvent::Reply(reply)) => self.on_reply(reply),
+            Some(RouteStreamEvent::Ended) => self.on_stream_end(true),
+            Some(RouteStreamEvent::Failed) | None => self.on_stream_end(false),
+        }
+    }
+
+    /// Publishes the table when it changed, then releases what waited on it.
+    fn publish(&mut self) {
+        if let Some(snapshot) = self.table.publish() {
+            self.state.snapshot.store(snapshot);
+        }
+        let effects = std::mem::take(&mut self.effects);
+        for (reply, result) in effects.replies {
+            let _ = reply.send(result);
+        }
+        if effects.signal_all {
+            self.state.parking.signal_all();
+        }
+        for key in effects.signals {
+            self.state.parking.signal(&key);
+        }
+        for (key, error) in effects.failures {
+            self.state.parking.fail(&key, error);
+        }
+    }
+
+    fn connect_when_due(&mut self) {
+        let Session::Idle { connect_at } = &self.session else {
+            return;
+        };
+        if tokio::time::Instant::now() < *connect_at {
+            return;
+        }
+        let connect = self.client.connect();
+        self.session = Session::Connecting(tokio::spawn(async move {
+            tokio::time::timeout(CONNECT_DEADLINE, connect)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }));
+    }
+
+    fn on_connected(&mut self, stream: RouteStream) {
+        self.session = Session::Open(stream);
+        // Flights that outlived the last stream ask again on this one.
+        let mut flights: Vec<_> = self.pending.iter().collect();
+        flights.sort_by_key(|(id, _)| **id);
+        for (id, flight) in flights {
+            self.outbox.push_back(RouteStreamRequest::Subscribe {
+                id: *id,
+                kind: flight.key.kind,
+                host: flight.host.clone(),
+            });
+        }
+    }
+
+    /// `in_order` means the control plane closed the stream after delivering
+    /// everything it had sent: cached rule sets stay and are registered on the
+    /// next stream. Any other end may have lost a change, so the cache is
+    /// emptied before another request reads it.
+    fn on_stream_end(&mut self, in_order: bool) {
+        let backoff = if in_order {
+            Duration::ZERO
+        } else {
+            self.reconnect_backoff
+        };
+        self.session = Session::Idle {
+            connect_at: tokio::time::Instant::now() + backoff,
+        };
+        self.outbox.clear();
+        self.registrations.clear();
+        if in_order {
+            let (kept, displaced) = self.table.end_session();
+            self.registrations.extend(kept);
+            self.release(displaced);
+        } else {
+            let displaced = self.table.clear();
+            self.release(displaced);
+            self.effects.signal_all = true;
+        }
+        // A background flight belongs to the stream that carried it. A
+        // flight with waiters asks again on the next stream.
+        let background: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, flight)| flight.background)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in background {
+            if let Some(flight) = self.pending.remove(&id) {
+                self.resolving.remove(&flight.key);
+                if in_order {
+                    self.registrations.push_back(flight.key);
+                }
+            }
+        }
+        // An orderly end is routine. A failed one cost the whole cache.
+        let outcome = if in_order {
+            Outcome::Closed
+        } else {
+            Outcome::Error
+        };
+        self.record_stream_event(outcome, Vec::new());
+    }
+
+    fn on_reply(&mut self, reply: RouteStreamReply) {
+        match reply {
+            RouteStreamReply::Rules {
+                id,
+                rules,
+                cache_policy,
+            } => {
+                let Some(key) = self
+                    .pending
+                    .get(&id)
+                    .map(|flight| flight.key.clone())
+                    .or_else(|| self.table.host_of(id).cloned())
+                else {
+                    // A subscription this proxy already released.
+                    return;
+                };
+                if !rules
+                    .iter()
+                    .all(|rule| rule.identity.applies_to(key.kind, &key.host))
+                {
+                    // A rule for another host cannot be trusted or placed.
+                    self.fail_flight(id, SubscribeErrorCode::Unavailable, "invalid rule set");
+                    self.on_stream_end(false);
+                    return;
+                }
+                let pushed = !self.pending.contains_key(&id);
+                if pushed && rules.is_empty() {
+                    // The host's last binding was removed, and the control
+                    // plane dropped the subscription. The next request asks
+                    // again, so a binding committed right after it is served
+                    // at once.
+                    let displaced = self.table.remove_subscription(id);
+                    self.release(displaced);
+                    self.record_stream_event(Outcome::Invalidated, Vec::new());
+                    return;
+                }
+                let expires_at = clock() + cache_policy.ttl();
+                let displaced =
+                    self.table
+                        .install(key, HostRules::ranked(rules), expires_at, Some(id));
+                self.release(displaced);
+                if let Some(flight) = self.pending.remove(&id) {
+                    self.resolving.remove(&flight.key);
+                    self.record_call(Operation::SubscribeRoute, Outcome::Success);
+                    for waiter in flight.waiters {
+                        self.effects.replies.push((waiter, Ok(())));
+                    }
+                }
+                if pushed {
+                    self.record_stream_event(Outcome::Updated, Vec::new());
+                }
+            }
+            RouteStreamReply::Error { id, code, message } => {
+                if self.pending.contains_key(&id) {
+                    self.on_flight_error(id, code, message);
+                } else if self.table.host_of(id).is_some() {
+                    // The control plane ended the subscription that kept this host
+                    // current.
+                    let displaced = self.table.remove_subscription(id);
+                    self.release(displaced);
+                    self.record_stream_event(
+                        Outcome::Invalidated,
+                        vec![LogField::error_reason(message)],
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_flight_error(&mut self, id: SubscriptionId, code: SubscribeErrorCode, message: String) {
+        let Some(flight) = self.pending.get_mut(&id) else {
+            return;
+        };
+        if code == SubscribeErrorCode::ResourceExhausted && flight.exhausted < 2 {
+            // The control plane holds as many subscriptions as it allows this
+            // stream. Release the oldest rule sets and ask again; the release
+            // precedes the retry on the stream.
+            flight.exhausted += 1;
+            let room = 4 * flight.exhausted;
+            let retry = RouteStreamRequest::Subscribe {
+                id,
+                kind: flight.key.kind,
+                host: flight.host.clone(),
+            };
+            // Holding one rule set fewer than the control plane refused at
+            // leaves room for the lookup that brings in the next host.
+            let held = self.table.positive_len();
+            let displaced = self.table.evict_oldest(room);
+            self.table.limit_capacity(held.saturating_sub(1));
+            self.release(displaced);
+            self.outbox.push_back(retry);
+            self.record_call(Operation::SubscribeRoute, Outcome::Rejected);
+            return;
+        }
+        self.fail_flight(id, code, &message);
+    }
+
+    fn fail_flight(&mut self, id: SubscriptionId, code: SubscribeErrorCode, message: &str) {
+        let Some(flight) = self.pending.remove(&id) else {
+            return;
+        };
+        self.resolving.remove(&flight.key);
+        self.record_call(Operation::SubscribeRoute, Outcome::Error);
+        if flight.waiters.is_empty() && code != SubscribeErrorCode::Unavailable {
+            // The control plane refuses this host, so its cached rule set
+            // has nothing left to keep it current.
+            let displaced = self.table.remove(&flight.key);
+            self.release(displaced);
+        }
+        for waiter in flight.waiters {
+            self.effects.replies.push((
+                waiter,
+                Err(FrontlineRouteCoordinatorError::Resolve {
+                    code,
+                    message: message.to_owned(),
+                }),
+            ));
+        }
+    }
+
+    fn on_resolve(
+        &mut self,
+        key: HostKey,
+        host: RouteHost,
+        stale_version: Option<u64>,
+        reply: FlightReply<Wake::Error>,
+    ) {
+        let current = self
+            .table
+            .get(&key)
+            .filter(|entry| !entry.is_expired(clock()))
+            .map(|entry| entry.version);
+        if current.is_some() && current != stale_version {
+            self.effects.replies.push((reply, Ok(())));
+            return;
+        }
+        if let Some(flight) = self
+            .resolving
+            .get(&key)
+            .and_then(|id| self.pending.get_mut(id))
+        {
+            flight.background = false;
+            flight.waiters.push(reply);
+            return;
+        }
+        if self.pending.len() >= MAX_ROUTE_FLIGHTS {
+            self.effects
+                .replies
+                .push((reply, Err(FrontlineRouteCoordinatorError::Saturated)));
+            return;
+        }
+        self.start_flight(key, host, vec![reply]);
+    }
+
+    fn start_flight(
+        &mut self,
+        key: HostKey,
+        host: RouteHost,
+        waiters: Vec<FlightReply<Wake::Error>>,
+    ) {
+        self.next_subscription += 1;
+        let id = self.next_subscription;
+        if matches!(self.session, Session::Open(_)) {
+            self.outbox.push_back(RouteStreamRequest::Subscribe {
+                id,
+                kind: key.kind,
+                host: host.clone(),
+            });
+        }
+        self.resolving.insert(key.clone(), id);
+        self.pending.insert(
+            id,
+            Flight {
+                key,
+                host,
+                deadline: tokio::time::Instant::now() + SUBSCRIBE_DEADLINE,
+                background: waiters.is_empty(),
+                waiters,
+                exhausted: 0,
+            },
+        );
+    }
+
+    /// Starts a flight that keeps a cached host current, within the
+    /// background budget.
+    fn refresh(&mut self, key: HostKey) -> bool {
+        if self.resolving.contains_key(&key) {
+            return true;
+        }
+        let background = self
+            .pending
+            .values()
+            .filter(|flight| flight.background)
+            .count();
+        if background >= MAX_BACKGROUND_FLIGHTS || self.pending.len() >= MAX_ROUTE_FLIGHTS {
+            return false;
+        }
+        let Ok(host) = RouteHost::exact(&*key.host) else {
+            return true;
+        };
+        self.start_flight(key, host, Vec::new());
+        true
+    }
+
+    fn register_carried_hosts(&mut self) {
+        if !matches!(self.session, Session::Open(_)) {
+            return;
+        }
+        while let Some(key) = self.registrations.pop_front() {
+            if !self.table.awaits_registration(&key, clock()) {
+                continue;
+            }
+            if !self.refresh(key.clone()) {
+                self.registrations.push_front(key);
+                return;
+            }
+        }
+    }
+
+    fn on_wake(&mut self, instance: WakeKey, host: HostKey) {
+        let now = clock();
+        if let Some(call) = self.wakes.get_mut(&instance) {
+            if call.in_flight || now < call.started + WAKE_RETRY_INTERVAL {
+                call.hosts.insert(host);
+                return;
+            }
+        }
+        if self.wake_calls.len() >= MAX_WAKE_CALLS {
+            self.effects
+                .failures
+                .push((instance, FrontlineRouteCoordinatorError::Saturated));
+            return;
+        }
+        let request = WakeInstanceRequest {
+            instance_id: instance.instance_id.clone(),
+            expected_generation: instance.generation,
+        };
+        let call = self.wake_client.wake_instance(request.clone());
+        let deadline = self.wake_deadline;
+        let key = instance.clone();
+        self.wake_calls.spawn(async move {
+            let result = match tokio::time::timeout(deadline, call).await {
+                Ok(result) => result.map_err(FrontlineRouteCoordinatorError::Wake),
+                Err(_) => Err(FrontlineRouteCoordinatorError::WakeDeadline(request)),
+            };
+            (key, result)
+        });
+        self.wakes.insert(
+            instance,
+            WakeCall {
+                started: now,
+                in_flight: true,
+                hosts: HashSet::from([host]),
+            },
+        );
+    }
+
+    fn on_wake_finished(&mut self, instance: WakeKey, result: WakeResult<Wake::Error>) {
+        let hosts = match self.wakes.get_mut(&instance) {
+            Some(call) => {
+                call.in_flight = false;
+                std::mem::take(&mut call.hosts)
+            }
+            None => HashSet::new(),
+        };
+        match result {
+            Ok(WakeInstanceResponse::StillWaking { .. }) => {
+                self.record_call(Operation::WakeInstance, Outcome::Started);
+            }
+            Ok(response) => {
+                // Running, deleted or at another generation: the cached rule
+                // set is behind, so each waiting host asks for its own again.
+                self.record_call(
+                    Operation::WakeInstance,
+                    match response {
+                        WakeInstanceResponse::AlreadyRunning { .. } => Outcome::AlreadyRunning,
+                        _ => Outcome::Rejected,
+                    },
+                );
+                for host in hosts {
+                    self.refresh(host);
+                }
+            }
+            Err(error) => {
+                self.record_call(Operation::WakeInstance, Outcome::Error);
+                self.effects.failures.push((instance, error));
+            }
+        }
+    }
+
+    fn maintain(&mut self) {
+        let displaced = self.table.expire(clock(), EXPIRY_BATCH);
+        self.release(displaced);
+
+        let now = tokio::time::Instant::now();
+        let mut ended = Vec::new();
+        for (id, flight) in &mut self.pending {
+            flight.waiters.retain(|waiter| !waiter.is_closed());
+            let abandoned = !flight.background && flight.waiters.is_empty();
+            if abandoned || now >= flight.deadline {
+                ended.push(*id);
+            }
+        }
+        for id in ended {
+            let Some(flight) = self.pending.remove(&id) else {
+                continue;
+            };
+            self.resolving.remove(&flight.key);
+            if matches!(self.session, Session::Open(_)) {
+                self.outbox
+                    .push_back(RouteStreamRequest::Unsubscribe { id });
+            }
+            if !flight.waiters.is_empty() {
+                self.record_call(Operation::SubscribeRoute, Outcome::Timeout);
+            }
+            for waiter in flight.waiters {
+                self.effects.replies.push((
+                    waiter,
+                    Err(FrontlineRouteCoordinatorError::SubscribeDeadline),
+                ));
+            }
+        }
+
+        let wall = clock();
+        self.wakes
+            .retain(|_, call| call.in_flight || wall < call.started + WAKE_RETRY_INTERVAL);
+    }
+
+    /// Releases what a table change displaced: the control plane drops the
+    /// subscriptions, and requests parked on the instances look again.
+    fn release(&mut self, displaced: Displaced) {
+        for entry in &displaced.entries {
+            self.signal_instances(entry);
+        }
+        if matches!(self.session, Session::Open(_)) {
+            for id in displaced.unsubscribe {
+                self.outbox
+                    .push_back(RouteStreamRequest::Unsubscribe { id });
+                self.record_call(Operation::Unsubscribe, Outcome::Success);
+            }
+        }
+    }
+
+    fn signal_instances(&mut self, entry: &HostEntry) {
+        self.effects
+            .signals
+            .extend(entry.rules.rules().iter().map(WakeKey::of));
+    }
+
+    fn flush_outbox(&mut self) {
+        let Session::Open(stream) = &self.session else {
+            return;
+        };
+        while let Some(request) = self.outbox.pop_front() {
+            match stream.requests.try_send(request) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(request)) => {
+                    self.outbox.push_front(request);
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(request)) => {
+                    // The reader reports how the stream ended.
+                    self.outbox.push_front(request);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn record_call(&self, operation: Operation, outcome: Outcome) {
         self.observability.record_metric(MetricObservation::new(
             RUNTIME_CONTROL_PLANE_CALLS_TOTAL,
-            vec![
-                Operation::WakeInstance.metric_label(),
-                outcome.metric_label(),
-            ],
+            vec![operation.metric_label(), outcome.metric_label()],
             1.0,
         ));
     }
 
-    async fn handle_wake_response(
-        &mut self,
-        cache_entry: Arc<crate::PositiveCacheEntry>,
-        disposition: WakeResponseDisposition,
-        now: Instant,
-    ) -> Result<
-        FrontlineRouteOutcome,
-        FrontlineRouteCoordinatorError<RouteClient::Error, Wake::Error>,
-    > {
-        let observed_instance_id = cache_entry.entry.instance_id.clone();
-        let observed_generation = cache_entry.entry.instance_generation;
-        self.wake_tracker
-            .complete(&observed_instance_id, observed_generation);
-
-        match disposition {
-            WakeResponseDisposition::WakeStarted {
-                instance_id,
-                generation,
-            }
-            | WakeResponseDisposition::StillWaking {
-                instance_id,
-                generation,
-            } => Ok(FrontlineRouteOutcome::Waking {
-                instance_id,
-                generation,
-            }),
-            WakeResponseDisposition::Ready(backend) => {
-                self.wake_tracker
-                    .complete(&observed_instance_id, observed_generation);
-                self.apply_ready_wake(cache_entry, backend.clone(), now)
-                    .await?;
-                Ok(FrontlineRouteOutcome::Ready(backend))
-            }
-            WakeResponseDisposition::Failed {
-                instance_id,
-                generation,
-                reason,
-            } => {
-                self.wake_tracker
-                    .complete(&observed_instance_id, observed_generation);
-                Ok(FrontlineRouteOutcome::WakeFailed {
-                    instance_id,
-                    generation,
-                    reason,
-                })
-            }
-            WakeResponseDisposition::Unavailable {
-                instance_id,
-                generation,
-                reason,
-            } => {
-                self.wake_tracker
-                    .complete(&observed_instance_id, observed_generation);
-                Ok(FrontlineRouteOutcome::WakeUnavailable {
-                    instance_id,
-                    generation,
-                    reason,
-                })
-            }
-            WakeResponseDisposition::GenerationConflict {
-                instance_id,
-                expected_generation,
-                actual_generation,
-            } => {
-                self.wake_tracker
-                    .complete(&observed_instance_id, observed_generation);
-                Ok(FrontlineRouteOutcome::GenerationConflict {
-                    instance_id,
-                    expected_generation,
-                    actual_generation,
-                })
-            }
-            WakeResponseDisposition::Rejected(stale) => {
-                self.wake_tracker
-                    .complete(&observed_instance_id, observed_generation);
-                Ok(FrontlineRouteOutcome::RejectedWakeObservation(stale))
-            }
-        }
-    }
-
-    async fn apply_ready_wake(
-        &mut self,
-        cache_entry: Arc<crate::PositiveCacheEntry>,
-        backend: ReadyBackend,
-        now: Instant,
-    ) -> Result<(), FrontlineRouteCoordinatorError<RouteClient::Error, Wake::Error>> {
-        let ready = ready_route_entry(&cache_entry.entry, backend);
-        match self
-            .resolver
-            .state_mut()
-            .apply_ready_wake(&cache_entry, ready, now)
-        {
-            ApplyUpdateOutcome::Replaced(_) => Ok(()),
-            outcome => Err(FrontlineRouteCoordinatorError::RejectedCacheUpdate(outcome)),
+    fn record_stream_event(&self, outcome: Outcome, fields: Vec<LogField>) {
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+        if outcome != Outcome::Updated {
+            self.observability
+                .record_log(LifecycleLogEvent::new(EVENT_SUBSCRIBE_STREAM, fields));
         }
     }
 }
 
-fn ready_route_entry(observed: &RouteEntry, backend: ReadyBackend) -> RouteEntry {
-    RouteEntry {
-        route_binding_id: observed.route_binding_id.clone(),
-        instance_id: observed.instance_id.clone(),
-        instance_state: InstanceState::Running,
-        instance_generation: backend.instance_generation,
-        backend: Some(backend.backend),
-        backend_generation: backend.backend_generation,
+async fn session_event(session: &mut Session) -> SessionEvent {
+    match session {
+        Session::Idle { connect_at } => {
+            tokio::time::sleep_until(*connect_at).await;
+            SessionEvent::ConnectDue
+        }
+        Session::Connecting(connect) => SessionEvent::Connected(connect.await.ok().flatten()),
+        Session::Open(stream) => SessionEvent::Stream(stream.events.recv().await),
     }
 }
 
-fn wake_response_outcome(disposition: &WakeResponseDisposition) -> Outcome {
-    match disposition {
-        WakeResponseDisposition::Ready(_) => Outcome::Success,
-        WakeResponseDisposition::WakeStarted { .. } => Outcome::Started,
-        WakeResponseDisposition::StillWaking { .. } => Outcome::AlreadyWaking,
-        WakeResponseDisposition::Failed { .. }
-        | WakeResponseDisposition::Unavailable { .. }
-        | WakeResponseDisposition::GenerationConflict { .. } => Outcome::Rejected,
-        WakeResponseDisposition::Rejected(_) => Outcome::Error,
-    }
-}
-
-impl<RouteClient, Wake> PartialEq for FrontlineRouteCoordinator<RouteClient, Wake>
-where
-    RouteClient: PartialEq,
-    Wake: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.resolver == other.resolver
-            && self.wake_tracker == other.wake_tracker
-            && self.wake_client == other.wake_client
-    }
-}
-
-impl<RouteClient, Wake> Eq for FrontlineRouteCoordinator<RouteClient, Wake>
-where
-    RouteClient: Eq,
-    Wake: Eq,
-{
-}
-
-impl<RouteClientError, WakeClientError> fmt::Display
-    for FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>
-where
-    RouteClientError: fmt::Display,
-    WakeClientError: fmt::Display,
-{
+impl<W: fmt::Display> fmt::Display for FrontlineRouteCoordinatorError<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Resolve(error) => write!(f, "route resolution failed: {error}"),
+            Self::Identity(error) => write!(f, "{error}"),
+            Self::Resolve { code, message } => {
+                write!(f, "route lookup failed ({code:?}): {message}")
+            }
+            Self::SubscribeDeadline => f.write_str("route lookup timed out"),
             Self::Wake(error) => write!(f, "wake request failed: {error}"),
             Self::WakeDeadline(request) => write!(
                 f,
@@ -1376,27 +1407,16 @@ where
                 request.instance_id.as_str(),
                 request.expected_generation.get()
             ),
-            Self::RouteActorClosed => f.write_str("frontline route actor is closed"),
-            Self::Saturated => f.write_str("frontline route admission is saturated"),
-            Self::SubscribeDeadline => f.write_str("route subscription timed out"),
             Self::RouteDeadline => f.write_str("route readiness timed out"),
-            Self::InvalidatedDuringResolution => {
-                f.write_str("route changed during resolution; retry")
-            }
-            Self::RejectedCacheUpdate(outcome) => {
-                write!(f, "ready wake cache update was rejected: {outcome:?}")
-            }
+            Self::Saturated => f.write_str("frontline route admission is saturated"),
+            Self::RouteActorClosed => f.write_str("frontline route actor is closed"),
         }
     }
 }
 
-impl<RouteClientError, WakeClientError> std::error::Error
-    for FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>
-where
-    RouteClientError: fmt::Debug + fmt::Display,
-    WakeClientError: fmt::Debug + fmt::Display,
-{
-}
+impl<W: fmt::Debug + fmt::Display> std::error::Error for FrontlineRouteCoordinatorError<W> {}
 
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;

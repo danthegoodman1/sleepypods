@@ -2,8 +2,8 @@ use std::{error::Error, process, time::Duration};
 
 use frontline::{
     serve_frontline, FrontlineEnvConfig, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    FrontlineRouteResolver, FrontlineTlsAdapter, GrpcProxyControlPlaneClient,
-    GrpcProxyHttp01Resolver, TlsCertificateStore, WakeTracker,
+    FrontlineTlsAdapter, GrpcProxyControlPlaneClient, GrpcProxyHttp01Resolver, RouteLookupCounters,
+    TlsCertificateStore,
 };
 use proxy_core::{
     observability::{
@@ -95,19 +95,13 @@ async fn run_with_shutdown(
     let (tls_certificates, certificate_worker) =
         TlsCertificateStore::with_observability(certificate_client.clone(), observability.clone());
     let certificate_worker = certificate_worker.with_watch(certificate_client)?;
-    let resolver = FrontlineRouteResolver::with_observability(
-        env.route_cache_capacity(),
-        route_client,
-        observability.clone(),
-    );
-    let coordinator = FrontlineRouteCoordinator::with_observability(
-        resolver,
-        WakeTracker::new(),
-        wake_client,
-        observability.clone(),
-    )
-    .with_wake_deadline(env.wake_instance_timeout())
-    .with_route_deadline(env.route_timeout());
+    let route_lookups = RouteLookupCounters::default();
+    let coordinator =
+        FrontlineRouteCoordinator::new(env.route_cache_capacity(), route_client, wake_client)
+            .with_observability(observability.clone())
+            .with_lookup_counters(route_lookups.clone())
+            .with_wake_deadline(env.wake_instance_timeout())
+            .with_route_deadline(env.route_timeout());
     let drain = DrainTracker::with_observability(env.drain_grace_timeout(), observability.clone());
     let active_streams = RuntimeActiveStreamsCollector::default();
     active_streams.attach(drain.clone());
@@ -143,9 +137,11 @@ async fn run_with_shutdown(
                             move |sink| {
                                 let active_streams = active_streams.clone();
                                 let certificate_metrics = certificate_metrics.clone();
+                                let route_lookups = route_lookups.clone();
                                 async move {
                                     active_streams.collect(sink.clone());
                                     certificate_metrics.collect_metrics(&sink);
+                                    route_lookups.collect(&sink);
                                 }
                             },
                         )
@@ -174,8 +170,8 @@ async fn run_with_shutdown(
 }
 
 // The filtered stderr sink keeps lifecycle and error events visible while
-// dropping metric samples and the per-request route-cache lookup event, so
-// stderr observability performs no formatted writes on the forward path.
+// dropping metric samples, so stderr observability performs no formatted
+// writes on the forward path.
 fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
     if !metrics_enabled {
         let _ = ObservabilityRecorder::install_global(std::sync::Arc::new(

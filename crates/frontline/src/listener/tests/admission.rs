@@ -24,19 +24,15 @@ async fn count(limiter: &proxy_core::AdmissionLimiter, expected: usize) {
 async fn tls_and_sni_setup_share_global_admission_with_http_and_recover() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::CREATED, READY_RESPONSE).await;
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-admission"),
-            http_identity("app.example.com", "/secure"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/secure"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let resources = ProxyResourceConfig::default()
         .with_limits(2, 1, 1, 1)
@@ -50,8 +46,7 @@ async fn tls_and_sni_setup_share_global_admission_with_http_and_recover() {
     let admission = ProxyAdmission::new(resources);
     let shared = SharedFrontlineHttpRuntime::from_runtime(
         runtime_with_state(
-            state,
-            FakeRouteClient::default(),
+            route_client.clone(),
             DrainTracker::new(Duration::from_secs(1)),
         ),
         admission.clone(),
@@ -176,24 +171,19 @@ async fn sni_write_override_bounds_only_pending_writes_and_preserves_quiet_sessi
         )
         .unwrap();
     let admission = ProxyAdmission::new(resources);
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-sni-limit"),
-            sni_identity("db.example.com"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("tcp://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        sni_identity("db.example.com"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("tcp://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let shared = SharedFrontlineHttpRuntime::from_runtime(
         runtime_with_state(
-            state,
-            FakeRouteClient::default(),
+            route_client.clone(),
             DrainTracker::new(Duration::from_secs(1)),
         ),
         admission.clone(),

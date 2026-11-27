@@ -23,9 +23,9 @@ use crate::{
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
-        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet, RouteResolution,
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
+        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet,
     },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -172,10 +172,10 @@ pub trait ControlPlaneStore: Send + Sync {
         request: ListRouteBindingsForInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>>;
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>>;
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>>;
 
     fn compare_and_swap_instance_state<'a>(
         &'a self,
@@ -604,12 +604,12 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
-            store.resolve_route(request.clone())
+            store.resolve_host_rules(request.clone())
         })
     }
 
@@ -1123,10 +1123,10 @@ mod tests {
             not_implemented()
         }
 
-        fn resolve_route<'a>(
+        fn resolve_host_rules<'a>(
             &'a self,
-            _request: ResolveRouteRequest,
-        ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+            _request: ResolveHostRulesRequest,
+        ) -> StoreFuture<'a, StoreResult<HostRules>> {
             not_implemented()
         }
 

@@ -5,6 +5,7 @@ mod certificate_watch;
 mod certificates;
 mod proxy;
 mod route_events;
+mod route_subscriptions;
 pub mod server;
 mod sidecar;
 mod template;
