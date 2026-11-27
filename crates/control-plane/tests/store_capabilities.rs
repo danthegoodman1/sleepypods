@@ -147,12 +147,6 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
         self.fail("get_instance", format!("{request:?}"))
     }
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        self.fail("delete_instance", format!("{request:?}"))
-    }
     fn create_workload_class_version<'a>(
         &'a self,
         request: CreateWorkloadClassVersionRequest,
@@ -183,29 +177,11 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         self.fail("delete_route_binding", format!("{request:?}"))
     }
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
-        self.fail("list_route_bindings_for_instance", format!("{request:?}"))
-    }
     fn resolve_host_rules<'a>(
         &'a self,
         request: ResolveHostRulesRequest,
     ) -> StoreFuture<'a, StoreResult<HostRules>> {
         self.fail("resolve_host_rules", format!("{request:?}"))
-    }
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        self.fail("compare_and_swap_instance_state", format!("{request:?}"))
-    }
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        self.fail("record_materialization", format!("{request:?}"))
     }
     fn load_ready_materialization<'a>(
         &'a self,
@@ -225,23 +201,11 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         self.fail("load_materialization", format!("{request:?}"))
     }
-    fn complete_wake<'a>(
-        &'a self,
-        request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        self.fail("complete_wake", format!("{request:?}"))
-    }
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
     ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
         self.fail("begin_sleep", format!("{request:?}"))
-    }
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        self.fail("finalize_sleep", format!("{request:?}"))
     }
     fn load_materialization_operational_metrics(
         &self,
@@ -307,12 +271,6 @@ impl ControlPlaneStore for CapabilityProbe {
         request: ForceReleaseExclusivityKeyRequest,
     ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
         self.fail("force_release_exclusivity_key", format!("{request:?}"))
-    }
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        request: RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
-        self.fail("lookup_route_dependencies", format!("{request:?}"))
     }
     fn put_http01_challenge<'a>(
         &'a self,
@@ -486,11 +444,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     );
     check!(2, get_instance, GetInstanceRequest::new(instance.clone()));
     check!(
-        1,
-        delete_instance,
-        DeleteInstanceRequest::new(instance.clone())
-    );
-    check!(
         2,
         create_workload_class_version,
         CreateWorkloadClassVersionRequest::new(class.clone())
@@ -517,11 +470,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     );
     check!(
         2,
-        list_route_bindings_for_instance,
-        ListRouteBindingsForInstanceRequest::new(instance.clone())
-    );
-    check!(
-        2,
         resolve_host_rules,
         ResolveHostRulesRequest::new(
             control_plane::RouteKind::Http,
@@ -529,17 +477,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             target.clone()
         )
     );
-    check!(
-        2,
-        compare_and_swap_instance_state,
-        CompareAndSwapInstanceStateRequest::new(
-            instance.clone(),
-            generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested
-        )
-    );
-    check!(1, record_materialization, record);
     check!(
         2,
         load_ready_materialization,
@@ -555,7 +492,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
         load_materialization,
         LoadMaterializationRequest::new(materialization.clone())
     );
-    check!(2, complete_wake, complete.clone());
     check!(
         2,
         begin_sleep,
@@ -563,7 +499,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             .with_drain_grace_timeout(Duration::from_millis(321))
             .with_minimum_ready_age(Duration::from_secs(190))
     );
-    check!(2, finalize_sleep, finalize.clone());
     assert!(store
         .load_materialization_operational_metrics()
         .await
@@ -649,11 +584,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             "operator",
             "fenced old process"
         )
-    );
-    check!(
-        2,
-        lookup_route_dependencies,
-        RouteDependencyLookup::new(route)
     );
     check!(
         1,

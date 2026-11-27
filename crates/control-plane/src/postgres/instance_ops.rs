@@ -4,9 +4,8 @@ use tokio_postgres::IsolationLevel;
 use crate::{
     ids::Generation,
     instance::{
-        validate_instance_state_transition, CompareAndSwapInstanceStateRequest,
-        CreateInstanceRequest, CreateInstanceResult, DeleteInstanceRequest, GetInstanceRequest,
-        InstanceRecord, InstanceRoute, InstanceState,
+        CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord,
+        InstanceRoute, InstanceState,
     },
     route::RouteBindingRecord,
     store::{StoreError, StoreResult},
@@ -199,101 +198,6 @@ pub(crate) async fn get_instance(
     let client = store.client().await?;
 
     load_instance(&client, request.instance_id.as_str()).await
-}
-
-pub(crate) async fn delete_instance(
-    store: &PostgresStore,
-    request: DeleteInstanceRequest,
-) -> StoreResult<bool> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let instance_id = request.instance_id.as_str();
-    let current = sql::query_opt(
-        &transaction,
-        "
-            SELECT state
-            FROM instances
-            WHERE instance_id = $1
-            FOR UPDATE
-            ",
-        &[&instance_id],
-    )
-    .await?;
-    let Some(row) = current else {
-        transaction.commit().await.map_err(map_postgres_error)?;
-        return Ok(false);
-    };
-    let state: String = row.get("state");
-    if state != instance_state_to_db(InstanceState::Deleting) {
-        return Err(StoreError::invalid_argument(
-            "instance delete requires state deleting",
-        ));
-    }
-
-    if sql::query_one(&transaction, "SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&instance_id]).await?.get::<_,bool>(0) {
-        return Err(StoreError::invalid_argument("instance deletion requires completed materialization cleanup"));
-    }
-    let deleted = sql::execute(
-        &transaction,
-        "DELETE FROM instances WHERE instance_id = $1 AND state = 'deleting'",
-        &[&instance_id],
-    )
-    .await?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-
-    Ok(deleted > 0)
-}
-
-pub(crate) async fn compare_and_swap_instance_state(
-    store: &PostgresStore,
-    request: CompareAndSwapInstanceStateRequest,
-) -> StoreResult<InstanceRecord> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let instance_id = request.instance_id.as_str();
-    let current = sql::query_opt(
-        &transaction,
-        "
-            SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
-            FROM instances
-            WHERE instance_id = $1
-            FOR UPDATE
-            ",
-        &[&instance_id],
-    )
-    .await?;
-
-    let Some(row) = current else {
-        return Err(StoreError::NotFound {
-            resource: "instance",
-        });
-    };
-    let current = instance_from_row(&row)?;
-
-    if current.generation != request.expected_generation {
-        return Err(StoreError::GenerationConflict {
-            expected: request.expected_generation,
-            actual: current.generation,
-        });
-    }
-
-    validate_instance_state_transition(current.state, request.next_state, &request.reason)
-        .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
-
-    let next_generation = generation_to_i64(request.expected_generation.next())?;
-    let next_state = instance_state_to_db(request.next_state);
-    let row = sql::query_one(&transaction, "
-            UPDATE instances
-            SET state = $2,
-                generation = $3
-            WHERE instance_id = $1
-            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
-            ",
-            &[&instance_id, &next_state, &next_generation],).await?;
-    let updated = instance_from_row(&row)?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-
-    Ok(updated)
 }
 
 pub(crate) async fn load_instance(

@@ -66,7 +66,7 @@ use control_plane::{
     InstanceId, InstanceRecord, InstanceState as DomainInstanceState, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
-    RenderedObjectRef, StateTransitionReason, StaticBearerTokens,
+    RenderedObjectRef, StaticBearerTokens,
 };
 use http_body_util::{BodyExt, Full};
 use prost::Message;
@@ -223,9 +223,8 @@ async fn report_idle_running_instance_transitions_to_draining() {
     assert_eq!(instance.generation, Generation::new(8));
     let transitions = store.transition_requests();
     assert_eq!(transitions.len(), 1);
-    assert_eq!(transitions[0].expected_generation, Generation::new(7));
-    assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
-    assert_eq!(transitions[0].reason, StateTransitionReason::IdleReported);
+    assert_eq!(transitions[0].1, Generation::new(7));
+    assert_eq!(transitions[0].2, DomainInstanceState::Draining);
     assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
     let materialization = store
         .materialization()
@@ -275,8 +274,8 @@ async fn report_idle_uses_exact_persisted_projection_independent_of_cas_revision
     assert_eq!(store.instance().generation, Generation::new(9));
     let transitions = store.transition_requests();
     assert_eq!(transitions.len(), 1);
-    assert_eq!(transitions[0].expected_generation, Generation::new(8));
-    assert_eq!(transitions[0].next_state, DomainInstanceState::Draining);
+    assert_eq!(transitions[0].1, Generation::new(8));
+    assert_eq!(transitions[0].2, DomainInstanceState::Draining);
     assert_eq!(client.deleted_objects(), Vec::<RenderedObjectRef>::new());
 }
 

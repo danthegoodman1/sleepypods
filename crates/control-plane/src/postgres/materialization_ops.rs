@@ -32,20 +32,6 @@ use super::{
     sql,
 };
 
-pub(crate) async fn record_materialization(
-    store: &PostgresStore,
-    mut request: RecordMaterializationRequest,
-) -> StoreResult<MaterializationRecord> {
-    normalize_exclusivity_keys(&mut request.exclusivity_keys);
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    ensure_instance_generation(&transaction, &request).await?;
-    let record = upsert_materialization(&transaction, &request).await?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-
-    Ok(record)
-}
-
 pub(crate) async fn load_ready_materialization(
     store: &PostgresStore,
     request: LoadReadyMaterializationRequest,
@@ -98,18 +84,6 @@ pub(crate) async fn load_materialization(
             &[&materialization_id],).await?;
 
     row.as_ref().map(materialization_from_row).transpose()
-}
-
-pub(crate) async fn complete_wake(
-    store: &PostgresStore,
-    mut request: CompleteWakeRequest,
-) -> StoreResult<CompleteWakeResult> {
-    normalize_exclusivity_keys(&mut request.exclusivity_keys);
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let result = complete_wake_in_transaction(&transaction, request).await?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-    Ok(result)
 }
 
 fn normalize_exclusivity_keys(keys: &mut Vec<crate::workload::RenderedExclusivityKey>) {
@@ -228,17 +202,6 @@ pub(crate) async fn begin_sleep(
         instance,
         materialization,
     })
-}
-
-pub(crate) async fn finalize_sleep(
-    store: &PostgresStore,
-    request: FinalizeSleepRequest,
-) -> StoreResult<FinalizeSleepResult> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let result = finalize_sleep_in_transaction(&transaction, request).await?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-    Ok(result)
 }
 
 pub(crate) async fn load_materialization_operational_metrics(
@@ -1290,38 +1253,6 @@ async fn reject_active_materialization_generation_mismatch(
         expected: expected_instance_generation,
         actual: active.instance_generation,
     })
-}
-
-async fn ensure_instance_generation(
-    client: &impl GenericClient,
-    request: &RecordMaterializationRequest,
-) -> StoreResult<()> {
-    let instance_id = request.instance_id.as_str();
-    let row = sql::query_opt(
-        client,
-        "SELECT generation FROM instances WHERE instance_id = $1 FOR UPDATE",
-        &[&instance_id],
-    )
-    .await?;
-    let Some(row) = row else {
-        return Err(StoreError::NotFound {
-            resource: "instance",
-        });
-    };
-    let actual: i64 = row.get("generation");
-    let expected = generation_to_i64(request.instance_generation)?;
-
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(StoreError::GenerationConflict {
-            expected: request.instance_generation,
-            actual: Generation::new(
-                u64::try_from(actual)
-                    .map_err(|_| StoreError::internal("stored instance generation was negative"))?,
-            ),
-        })
-    }
 }
 
 async fn backend_generation_rewind_error(

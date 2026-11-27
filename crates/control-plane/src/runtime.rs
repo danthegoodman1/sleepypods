@@ -1000,8 +1000,7 @@ pub(crate) mod tests {
             PutHttp01ChallengeRequest,
         },
         instance::{
-            CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-            DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
+            CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord,
         },
         manifest::KubernetesObject,
         materialization::{
@@ -1014,8 +1013,7 @@ pub(crate) mod tests {
         materializer::{KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer},
         route::{
             CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-            HostRules, ResolveHostRulesRequest, RouteBindingRecord, RouteDependencyLookup,
-            RouteDependencySet,
+            HostRules, ResolveHostRulesRequest, RouteBindingRecord,
         },
         store::{StoreError, StoreFuture, StoreResult},
         workload::{
@@ -1825,22 +1823,16 @@ pub(crate) mod tests {
             finalize_instance_deletions,
             create_instance,
             get_instance,
-            delete_instance,
             create_workload_class_version,
             load_workload_class_version,
             create_route_binding,
             get_route_binding,
             delete_route_binding,
-            list_route_bindings_for_instance,
             resolve_host_rules,
-            compare_and_swap_instance_state,
-            record_materialization,
             load_ready_materialization,
             load_active_materialization,
             load_materialization,
-            complete_wake,
             begin_sleep,
-            finalize_sleep,
             claim_next_materialization_reconciliation,
             renew_materialization_reconciliation_lease,
             release_materialization_reconciliation_lease,
@@ -1849,7 +1841,6 @@ pub(crate) mod tests {
             delete_materialization_reconciliation,
             force_delete_materialization,
             force_release_exclusivity_key,
-            lookup_route_dependencies,
             put_http01_challenge,
             resolve_http01_challenge,
             delete_http01_challenge
@@ -1907,7 +1898,6 @@ pub(crate) mod tests {
             accept_wake,
             request_instance_deletion,
             finalize_instance_deletions,
-            list_route_bindings_for_instance,
             load_materialization,
             load_materialization_operational_metrics,
             claim_next_materialization_reconciliation,
@@ -1931,13 +1921,6 @@ pub(crate) mod tests {
             &'a self,
             _request: GetInstanceRequest,
         ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-            not_implemented()
-        }
-
-        fn delete_instance<'a>(
-            &'a self,
-            _request: DeleteInstanceRequest,
-        ) -> StoreFuture<'a, StoreResult<bool>> {
             not_implemented()
         }
 
@@ -1983,20 +1966,6 @@ pub(crate) mod tests {
             not_implemented()
         }
 
-        fn compare_and_swap_instance_state<'a>(
-            &'a self,
-            _request: CompareAndSwapInstanceStateRequest,
-        ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-            not_implemented()
-        }
-
-        fn record_materialization<'a>(
-            &'a self,
-            _request: RecordMaterializationRequest,
-        ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-            not_implemented()
-        }
-
         fn load_ready_materialization<'a>(
             &'a self,
             _request: LoadReadyMaterializationRequest,
@@ -2011,31 +1980,10 @@ pub(crate) mod tests {
             not_implemented()
         }
 
-        fn complete_wake<'a>(
-            &'a self,
-            _request: CompleteWakeRequest,
-        ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-            not_implemented()
-        }
-
         fn begin_sleep<'a>(
             &'a self,
             _request: crate::BeginSleepRequest,
         ) -> StoreFuture<'a, StoreResult<crate::BeginSleepResult>> {
-            not_implemented()
-        }
-
-        fn finalize_sleep<'a>(
-            &'a self,
-            _request: crate::FinalizeSleepRequest,
-        ) -> StoreFuture<'a, StoreResult<crate::FinalizeSleepResult>> {
-            not_implemented()
-        }
-
-        fn lookup_route_dependencies<'a>(
-            &'a self,
-            _request: RouteDependencyLookup,
-        ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
             not_implemented()
         }
 

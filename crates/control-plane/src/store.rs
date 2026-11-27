@@ -6,25 +6,21 @@ use crate::{
         DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
         PutHttp01ChallengeRequest,
     },
-    instance::{
-        CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
-    },
+    instance::{CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord},
     materialization::{
         BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
-        CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+        CompleteWakeReconciliationRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
-        FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
-        ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
-        LoadActiveMaterializationRequest, LoadMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
-        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        FinalizeSleepResult, ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+        ForceReleaseExclusivityKeyResult, LoadActiveMaterializationRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest,
+        MaterializationOperationalMetrics, MaterializationRecord,
+        ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
-        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet,
+        ResolveHostRulesRequest, RouteBindingRecord,
     },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -142,11 +138,6 @@ pub trait ControlPlaneStore: Send + Sync {
         request: GetInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>>;
 
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
-
     fn create_workload_class_version<'a>(
         &'a self,
         request: CreateWorkloadClassVersionRequest,
@@ -172,25 +163,10 @@ pub trait ControlPlaneStore: Send + Sync {
         request: DeleteRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<bool>>;
 
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>>;
-
     fn resolve_host_rules<'a>(
         &'a self,
         request: ResolveHostRulesRequest,
     ) -> StoreFuture<'a, StoreResult<HostRules>>;
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>>;
-
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>>;
 
     fn load_ready_materialization<'a>(
         &'a self,
@@ -207,20 +183,10 @@ pub trait ControlPlaneStore: Send + Sync {
         request: LoadMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>>;
 
-    fn complete_wake<'a>(
-        &'a self,
-        request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>>;
-
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
     ) -> StoreFuture<'a, StoreResult<BeginSleepResult>>;
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>>;
 
     fn load_materialization_operational_metrics(
         &self,
@@ -265,11 +231,6 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: ForceReleaseExclusivityKeyRequest,
     ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>>;
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        request: RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>>;
 
     fn put_http01_challenge<'a>(
         &'a self,
@@ -531,14 +492,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        // An instance ID alone does not fence a newly created incarnation after a lost response.
-        self.inner.delete_instance(request)
-    }
-
     fn create_workload_class_version<'a>(
         &'a self,
         request: CreateWorkloadClassVersionRequest,
@@ -582,15 +535,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         self.inner.delete_route_binding(request)
     }
 
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.list_route_bindings_for_instance(request.clone())
-        })
-    }
-
     fn resolve_host_rules<'a>(
         &'a self,
         request: ResolveHostRulesRequest,
@@ -598,23 +542,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.resolve_host_rules(request.clone())
         })
-    }
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.compare_and_swap_instance_state(request.clone())
-        })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        // A same-generation upsert can overwrite newer projection state and clear its lease.
-        self.inner.record_materialization(request)
     }
 
     fn load_ready_materialization<'a>(
@@ -644,30 +571,12 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn complete_wake<'a>(
-        &'a self,
-        request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.complete_wake(request.clone())
-        })
-    }
-
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
     ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
             store.begin_sleep(request.clone())
-        })
-    }
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.finalize_sleep(request.clone())
         })
     }
 
@@ -748,15 +657,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
         // A released key may be acquired by a different owner before a retry.
         self.inner.force_release_exclusivity_key(request)
-    }
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        request: RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.lookup_route_dependencies(request.clone())
-        })
     }
 
     fn put_http01_challenge<'a>(
@@ -983,7 +883,6 @@ mod tests {
             accept_wake,
             request_instance_deletion,
             finalize_instance_deletions,
-            list_route_bindings_for_instance,
             load_materialization,
             load_materialization_operational_metrics,
             claim_next_materialization_reconciliation,
@@ -1020,13 +919,6 @@ mod tests {
                     None => Ok(None),
                 }
             })
-        }
-
-        fn delete_instance<'a>(
-            &'a self,
-            _request: DeleteInstanceRequest,
-        ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
         }
 
         fn create_workload_class_version<'a>(
@@ -1071,20 +963,6 @@ mod tests {
             not_implemented()
         }
 
-        fn compare_and_swap_instance_state<'a>(
-            &'a self,
-            _request: CompareAndSwapInstanceStateRequest,
-        ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-            not_implemented()
-        }
-
-        fn record_materialization<'a>(
-            &'a self,
-            _request: RecordMaterializationRequest,
-        ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-            not_implemented()
-        }
-
         fn load_ready_materialization<'a>(
             &'a self,
             _request: LoadReadyMaterializationRequest,
@@ -1099,31 +977,10 @@ mod tests {
             not_implemented()
         }
 
-        fn complete_wake<'a>(
-            &'a self,
-            _request: CompleteWakeRequest,
-        ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-            not_implemented()
-        }
-
         fn begin_sleep<'a>(
             &'a self,
             _request: BeginSleepRequest,
         ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
-            not_implemented()
-        }
-
-        fn finalize_sleep<'a>(
-            &'a self,
-            _request: FinalizeSleepRequest,
-        ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-            not_implemented()
-        }
-
-        fn lookup_route_dependencies<'a>(
-            &'a self,
-            _request: RouteDependencyLookup,
-        ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
             not_implemented()
         }
 

@@ -138,15 +138,6 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (delete_instance $(, $rest:ident)* $(,)?) => {
-    fn delete_instance<'a>(
-        &'a self,
-        _request: control_plane::DeleteInstanceRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<bool>> {
-        panic!("unexpected test store capability: delete_instance")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
     (create_workload_class_version $(, $rest:ident)* $(,)?) => {
     fn create_workload_class_version<'a>(
         &'a self,
@@ -192,39 +183,12 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (list_route_bindings_for_instance $(, $rest:ident)* $(,)?) => {
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        _request: control_plane::ListRouteBindingsForInstanceRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<Vec<control_plane::RouteBindingRecord>>> {
-        panic!("unexpected test store capability: list_route_bindings_for_instance")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
     (resolve_host_rules $(, $rest:ident)* $(,)?) => {
     fn resolve_host_rules<'a>(
         &'a self,
         _request: control_plane::ResolveHostRulesRequest,
     ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::HostRules>> {
         panic!("unexpected test store capability: resolve_host_rules")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (compare_and_swap_instance_state $(, $rest:ident)* $(,)?) => {
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        _request: control_plane::CompareAndSwapInstanceStateRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::InstanceRecord>> {
-        panic!("unexpected test store capability: compare_and_swap_instance_state")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (record_materialization $(, $rest:ident)* $(,)?) => {
-    fn record_materialization<'a>(
-        &'a self,
-        _request: control_plane::RecordMaterializationRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::MaterializationRecord>> {
-        panic!("unexpected test store capability: record_materialization")
     }
         unexpected_store_methods!($($rest),*);
     };
@@ -255,30 +219,12 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (complete_wake $(, $rest:ident)* $(,)?) => {
-    fn complete_wake<'a>(
-        &'a self,
-        _request: control_plane::CompleteWakeRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::CompleteWakeResult>> {
-        panic!("unexpected test store capability: complete_wake")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
     (begin_sleep $(, $rest:ident)* $(,)?) => {
     fn begin_sleep<'a>(
         &'a self,
         _request: control_plane::BeginSleepRequest,
     ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::BeginSleepResult>> {
         panic!("unexpected test store capability: begin_sleep")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (finalize_sleep $(, $rest:ident)* $(,)?) => {
-    fn finalize_sleep<'a>(
-        &'a self,
-        _request: control_plane::FinalizeSleepRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::FinalizeSleepResult>> {
-        panic!("unexpected test store capability: finalize_sleep")
     }
         unexpected_store_methods!($($rest),*);
     };
@@ -359,15 +305,6 @@ macro_rules! unexpected_store_methods {
         _request: control_plane::ForceReleaseExclusivityKeyRequest,
     ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<control_plane::ForceReleaseExclusivityKeyResult>> {
         panic!("unexpected test store capability: force_release_exclusivity_key")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (lookup_route_dependencies $(, $rest:ident)* $(,)?) => {
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        _request: control_plane::RouteDependencyLookup,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<Option<control_plane::RouteDependencySet>>> {
-        panic!("unexpected test store capability: lookup_route_dependencies")
     }
         unexpected_store_methods!($($rest),*);
     };

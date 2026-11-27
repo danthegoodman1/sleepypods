@@ -50,22 +50,17 @@ impl ControlPlaneStore for LostResponseStore {
         create_workload_class_version,
         load_workload_class_version,
         get_route_binding,
-        list_route_bindings_for_instance,
         resolve_host_rules,
-        compare_and_swap_instance_state,
         load_ready_materialization,
         load_active_materialization,
         load_materialization,
-        complete_wake,
         begin_sleep,
-        finalize_sleep,
         load_materialization_operational_metrics,
         renew_materialization_reconciliation_lease,
         release_materialization_reconciliation_lease,
         complete_wake_reconciliation,
         finalize_sleep_reconciliation,
         delete_materialization_reconciliation,
-        lookup_route_dependencies,
         resolve_http01_challenge
     );
     fn record_materialization_failure(
@@ -95,15 +90,6 @@ impl ControlPlaneStore for LostResponseStore {
             self.lost(result).await
         })
     }
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self.inner.delete_instance(request).await?;
-            self.lost(result).await
-        })
-    }
     fn create_route_binding<'a>(
         &'a self,
         request: CreateRouteBindingRequest,
@@ -119,15 +105,6 @@ impl ControlPlaneStore for LostResponseStore {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async move {
             let result = self.inner.delete_route_binding(request).await?;
-            self.lost(result).await
-        })
-    }
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        Box::pin(async move {
-            let result = self.inner.record_materialization(request).await?;
             self.lost(result).await
         })
     }
@@ -249,9 +226,10 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         .instance;
     let target = MaterializationTarget::new("retry-cluster", "apps")?;
 
-    // Force operations are ID/key scoped. A second writer installs a new projection
-    // or key owner after commit, before the old caller observes response loss.
-    for operation in ["force-delete", "force-release", "record"] {
+    // Force operations are ID or key scoped. A second writer installs a new
+    // projection or key owner after commit, before the old caller observes
+    // response loss; an automatic replay would act on that replacement.
+    for operation in ["force-delete", "force-release"] {
         let instance = pg
             .create_instance(create_instance_request(
                 operation,
@@ -260,48 +238,43 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
             ))
             .await?
             .instance;
-        let mut request = RecordMaterializationRequest::new(
-            instance.id.clone(),
-            instance.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        );
-        request.exclusivity_keys = vec![RenderedExclusivityKey {
+        let key = vec![RenderedExclusivityKey {
             name: "storage".into(),
             value: operation.into(),
         }];
-        let initial = pg.record_materialization(request.clone()).await?;
-        let mut replacement = request.clone();
-        replacement.backend_generation = BackendGeneration::new(2);
-        replacement.rendered_objects = vec![RenderedObjectRef {
+        let initial = accept_projection(pg, &instance, &target, vec![], key.clone()).await?;
+        let replacement_refs = vec![RenderedObjectRef {
             api_version: "v1".into(),
             kind: "Service".into(),
             namespace: "apps".into(),
             name: format!("{operation}-replacement"),
         }];
+        let replacement_owner = if operation == "force-delete" {
+            instance.id.clone()
+        } else {
+            pg.create_instance(create_instance_request(
+                &format!("{operation}-replacement"),
+                class.reference.clone(),
+                vec![],
+            ))
+            .await?
+            .instance
+            .id
+        };
         let next = pg.clone();
-        let replacement_id = initial.id.clone();
         let replacement_target = target.clone();
+        let (owner, refs, keys) = (replacement_owner.clone(), replacement_refs, key.clone());
         let (store, fault) = lossy(pg, move || {
             let db = next.clone();
-            let request = replacement.clone();
-            let id = replacement_id.clone();
             let target = replacement_target.clone();
+            let (owner, refs, keys) = (owner.clone(), refs.clone(), keys.clone());
             Box::pin(async move {
-                db.record_materialization(request).await?;
-                // Every earlier Pending row in this target is already leased.
-                let claimed = db
-                    .claim_next_materialization_reconciliation(
-                        ClaimNextMaterializationRequest::new(
-                            MaterializationState::Pending,
-                            target,
-                            "replacement-owner",
-                            Duration::from_secs(60),
-                        ),
-                    )
-                    .await?;
-                assert_eq!(claimed.map(|claimed| claimed.id), Some(id));
+                let current = db
+                    .get_instance(GetInstanceRequest::new(owner))
+                    .await?
+                    .expect("the replacement owner exists");
+                let replacement = accept_projection(&db, &current, &target, refs, keys).await?;
+                claim_row(&db, &replacement, "replacement-owner").await?;
                 Ok(())
             })
         });
@@ -328,27 +301,22 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
                     .await,
                 &fault,
             ),
-            "record" => {
-                // Same backend generation makes replay able to overwrite state;
-                // a monotonic backend counter alone is not an exact write fence.
-                request.backend_generation = BackendGeneration::new(2);
-                assert_one_shot(store.record_materialization(request).await, &fault);
-            }
             _ => unreachable!(),
         }
         let current = pg
-            .load_materialization(LoadMaterializationRequest::new(initial.id))
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                replacement_owner,
+                target.clone(),
+            ))
             .await?
-            .unwrap();
+            .expect("the replacement projection survives response loss");
         assert_eq!(current.state, MaterializationState::Pending);
-        assert_eq!(current.backend_generation, BackendGeneration::new(2));
         assert_eq!(
             current.rendered_objects[0].name,
             format!("{operation}-replacement")
         );
         assert_eq!(
-            current.exclusivity_keys.len(),
-            1,
+            current.exclusivity_keys, key,
             "replacement ownership survives response loss"
         );
         assert_eq!(
@@ -442,49 +410,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         );
     }
 
-    // A legacy ID-only delete must not delete a fresh incarnation, even if that
-    // new incarnation has independently entered Deleting as well.
-    let old = pg
-        .create_instance(create_instance_request(
-            "delete-reused",
-            class.reference.clone(),
-            vec![],
-        ))
-        .await?
-        .instance;
-    pg.request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
-        instance_id: old.id.clone(),
-        expected_generation: old.generation,
-    })
-    .await?;
-    let replacement = create_instance_request("delete-reused", class.reference.clone(), vec![]);
-    let next = pg.clone();
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let request = replacement.clone();
-        Box::pin(async move {
-            let created = db.create_instance(request).await?.instance;
-            db.request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
-                instance_id: created.id,
-                expected_generation: created.generation,
-            })
-            .await?;
-            Ok(())
-        })
-    });
-    assert_one_shot(
-        store
-            .delete_instance(DeleteInstanceRequest::new(old.id.clone()))
-            .await,
-        &fault,
-    );
-    let current = pg
-        .get_instance(GetInstanceRequest::new(old.id))
-        .await?
-        .unwrap();
-    assert!(current.generation > old.generation);
-    assert_eq!(current.state, InstanceState::Deleting);
-
     // A repeated create makes a deleted resource again, so the wrapper sends a
     // create once: a delete that lands after a lost response stays in effect.
     let create = create_instance_request("create-lost", class.reference.clone(), vec![]);
@@ -503,7 +428,7 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
                 expected_generation: current.generation,
             })
             .await?;
-            db.delete_instance(DeleteInstanceRequest::new(id)).await?;
+            db.finalize_instance_deletions(1024).await?;
             Ok(())
         })
     });
@@ -561,25 +486,8 @@ async fn exact_fence_retries(
         ))
         .await?
         .instance;
-    let pending = pg
-        .record_materialization(RecordMaterializationRequest::new(
-            instance.id,
-            instance.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        ))
-        .await?;
-    let claimed = pg
-        .claim_next_materialization_reconciliation(ClaimNextMaterializationRequest::new(
-            MaterializationState::Pending,
-            target.clone(),
-            "fenced-owner",
-            Duration::from_secs(60),
-        ))
-        .await?
-        .unwrap();
-    assert_eq!(claimed.id, pending.id);
+    let pending = accept_projection(pg, &instance, target, vec![], vec![]).await?;
+    let claimed = claim_row(pg, &pending, "fenced-owner").await?;
     let attempt = claimed.reconciliation_lease.as_ref().unwrap().attempt;
     let (store, fault) = lossy(pg, || Box::pin(async { Ok(()) }));
     assert!(

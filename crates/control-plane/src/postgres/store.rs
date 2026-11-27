@@ -4,25 +4,21 @@ use crate::{
         DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
         PutHttp01ChallengeRequest,
     },
-    instance::{
-        CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
-        DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
-    },
+    instance::{CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord},
     materialization::{
         BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
-        CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+        CompleteWakeReconciliationRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
-        FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
-        ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
-        LoadActiveMaterializationRequest, LoadMaterializationRequest,
-        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
-        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        FinalizeSleepResult, ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+        ForceReleaseExclusivityKeyResult, LoadActiveMaterializationRequest,
+        LoadMaterializationRequest, LoadReadyMaterializationRequest,
+        MaterializationOperationalMetrics, MaterializationRecord,
+        ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
-        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet,
+        ResolveHostRulesRequest, RouteBindingRecord,
     },
     store::{ControlPlaneStore, StoreFuture, StoreResult},
     workload::{
@@ -166,13 +162,6 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(async move { instance_ops::get_instance(self, request).await })
     }
 
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move { instance_ops::delete_instance(self, request).await })
-    }
-
     fn create_workload_class_version<'a>(
         &'a self,
         request: CreateWorkloadClassVersionRequest,
@@ -208,32 +197,11 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(async move { route_ops::delete_route_binding(self, request).await })
     }
 
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
-        Box::pin(async move { route_ops::list_route_bindings_for_instance(self, request).await })
-    }
-
     fn resolve_host_rules<'a>(
         &'a self,
         request: ResolveHostRulesRequest,
     ) -> StoreFuture<'a, StoreResult<HostRules>> {
         Box::pin(async move { route_ops::resolve_host_rules(self, request).await })
-    }
-
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move { instance_ops::compare_and_swap_instance_state(self, request).await })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        request: RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<MaterializationRecord>> {
-        Box::pin(async move { materialization_ops::record_materialization(self, request).await })
     }
 
     fn load_ready_materialization<'a>(
@@ -261,25 +229,11 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(async move { materialization_ops::load_materialization(self, request).await })
     }
 
-    fn complete_wake<'a>(
-        &'a self,
-        request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        Box::pin(async move { materialization_ops::complete_wake(self, request).await })
-    }
-
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
     ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
         Box::pin(async move { materialization_ops::begin_sleep(self, request).await })
-    }
-
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        Box::pin(async move { materialization_ops::finalize_sleep(self, request).await })
     }
 
     fn load_materialization_operational_metrics(
@@ -360,13 +314,6 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(
             async move { materialization_ops::force_release_exclusivity_key(self, request).await },
         )
-    }
-
-    fn lookup_route_dependencies<'a>(
-        &'a self,
-        request: RouteDependencyLookup,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteDependencySet>>> {
-        Box::pin(async move { route_ops::lookup_route_dependencies(self, request).await })
     }
 
     fn put_http01_challenge<'a>(

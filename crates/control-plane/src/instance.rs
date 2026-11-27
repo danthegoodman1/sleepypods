@@ -57,19 +57,6 @@ pub struct RequestInstanceDeletion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeleteInstanceRequest {
-    pub instance_id: InstanceId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompareAndSwapInstanceStateRequest {
-    pub instance_id: InstanceId,
-    pub expected_generation: Generation,
-    pub next_state: InstanceState,
-    pub reason: StateTransitionReason,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateTransitionReason {
     OperatorRequested,
     WakeRequested,
@@ -274,28 +261,6 @@ impl From<SleepPolicyError> for CreateInstanceValidationError {
 impl GetInstanceRequest {
     pub fn new(instance_id: InstanceId) -> Self {
         Self { instance_id }
-    }
-}
-
-impl DeleteInstanceRequest {
-    pub fn new(instance_id: InstanceId) -> Self {
-        Self { instance_id }
-    }
-}
-
-impl CompareAndSwapInstanceStateRequest {
-    pub fn new(
-        instance_id: InstanceId,
-        expected_generation: Generation,
-        next_state: InstanceState,
-        reason: StateTransitionReason,
-    ) -> Self {
-        Self {
-            instance_id,
-            expected_generation,
-            next_state,
-            reason,
-        }
     }
 }
 

@@ -30,8 +30,10 @@ pub struct TestStore {
     route_change_signal: Arc<Notify>,
     fail_ready_materialization_lookup: bool,
     get_error: Mutex<Option<&'static str>>,
-    transition_requests: Mutex<Vec<CompareAndSwapInstanceStateRequest>>,
-    delete_requests: Mutex<Vec<DeleteInstanceRequest>>,
+    /// Each instance transition: the instance, its expected generation and its new state.
+    transition_requests: Mutex<Vec<(InstanceId, Generation, DomainInstanceState)>>,
+    /// Instances whose deletion was finalized.
+    delete_requests: Mutex<Vec<InstanceId>>,
     http01: Mutex<BTreeMap<(String, String), Http01ChallengeRecord>>,
     reconciliation_claim_owners: Mutex<Vec<String>>,
     sleep_requests: Mutex<Vec<BeginSleepRequest>>,
@@ -232,10 +234,10 @@ impl TestStore {
     pub fn materializations(&self) -> Vec<MaterializationRecord> {
         self.materializations.lock().unwrap().clone()
     }
-    pub fn transition_requests(&self) -> Vec<CompareAndSwapInstanceStateRequest> {
+    pub fn transition_requests(&self) -> Vec<(InstanceId, Generation, DomainInstanceState)> {
         self.transition_requests.lock().unwrap().clone()
     }
-    pub fn delete_requests(&self) -> Vec<DeleteInstanceRequest> {
+    pub fn delete_requests(&self) -> Vec<InstanceId> {
         self.delete_requests.lock().unwrap().clone()
     }
     pub fn reconciliation_claim_owners(&self) -> Vec<String> {
@@ -267,15 +269,11 @@ impl TestStore {
             &reason,
         )
         .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
-        self.transition_requests
-            .lock()
-            .unwrap()
-            .push(CompareAndSwapInstanceStateRequest {
-                instance_id,
-                expected_generation,
-                next_state,
-                reason,
-            });
+        self.transition_requests.lock().unwrap().push((
+            instance_id,
+            expected_generation,
+            next_state,
+        ));
         instance.state = next_state;
         instance.generation = expected_generation.next();
         self.record_instance_change(instance.id.as_str());
@@ -311,6 +309,86 @@ impl TestStore {
         }
         self.record_instance_change(record.instance_id.as_str());
         Some(record.clone())
+    }
+}
+
+impl TestStore {
+    fn complete(&self, request: CompleteWakeRequest) -> StoreResult<CompleteWakeResult> {
+        let instance = self.transition_instance(
+            request.instance_id.clone(),
+            request.expected_waking_generation,
+            DomainInstanceState::Running,
+            StateTransitionReason::MaterializationReady,
+        )?;
+        let projection_generation = self
+            .materializations
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| {
+                record.instance_id == request.instance_id && record.target == request.target
+            })
+            .map_or(instance.generation, |record| record.projection_generation);
+        let materialization = fake_materialization_record(RecordMaterializationRequest {
+            pod_backend: request.pod_backend,
+            instance_id: request.instance_id,
+            instance_generation: instance.generation,
+            projection_generation,
+            target: request.target,
+            state: MaterializationState::Ready,
+            backend: Some(request.backend),
+            backend_generation: request.backend_generation,
+            rendered_objects: request.rendered_objects,
+            exclusivity_keys: request.exclusivity_keys,
+        });
+        self.seed_materialization(materialization.clone());
+        Ok(CompleteWakeResult {
+            instance,
+            materialization,
+        })
+    }
+
+    fn finish_sleep(&self, request: FinalizeSleepRequest) -> StoreResult<FinalizeSleepResult> {
+        let instance = self.transition_instance(
+            request.instance_id.clone(),
+            request.expected_draining_generation,
+            DomainInstanceState::Cold,
+            StateTransitionReason::DrainCompleted,
+        )?;
+        let materialization = self.mark_materialization(
+            request.instance_id,
+            request.target,
+            MaterializationState::Deleted,
+            Some(instance.generation),
+            Some(Vec::new()),
+        );
+        Ok(FinalizeSleepResult {
+            instance,
+            materialization,
+        })
+    }
+
+    /// Removes a Deleting instance whose cleanup has finished.
+    fn finalize_deletion(&self, instance_id: InstanceId) -> bool {
+        let mut instances = self.instances.lock().unwrap();
+        let mut records = self.materializations.lock().unwrap();
+        let finished = instances.get(instance_id.as_str()).is_some_and(|instance| {
+            instance.state == DomainInstanceState::Deleting
+                && records.iter().all(|record| {
+                    record.instance_id != instance_id
+                        || record.state == MaterializationState::Deleted
+                })
+        });
+        if finished {
+            instances.remove(instance_id.as_str());
+            records.retain(|record| record.instance_id != instance_id);
+            self.route_bindings
+                .lock()
+                .unwrap()
+                .retain(|_, record| record.instance_id != instance_id);
+            self.delete_requests.lock().unwrap().push(instance_id);
+        }
+        finished
     }
 }
 
@@ -375,7 +453,6 @@ impl ControlPlaneStore for TestStore {
         snapshot_tls_bindings,
         maintain_runtime_records,
         load_materialization_operational_metrics,
-        lookup_route_dependencies
     );
     fn load_route_changes(
         &self,
@@ -555,22 +632,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        request: control_plane::ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<control_plane::RouteBindingRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .values()
-                .filter(|route_binding| route_binding.instance_id == request.instance_id)
-                .cloned()
-                .collect())
-        })
-    }
-
     fn put_http01_challenge<'a>(
         &'a self,
         request: control_plane::PutHttp01ChallengeRequest,
@@ -625,25 +686,6 @@ impl ControlPlaneStore for TestStore {
                     request.key().token().to_owned(),
                 ))
                 .is_some())
-        })
-    }
-
-    fn record_materialization<'a>(
-        &'a self,
-        request: control_plane::RecordMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::MaterializationRecord>> {
-        Box::pin(async move {
-            let record = fake_materialization_record(request);
-            let mut materializations = self
-                .materializations
-                .lock()
-                .expect("fake store lock is available");
-            materializations.retain(|existing| {
-                !(existing.instance_id == record.instance_id && existing.target == record.target)
-            });
-            materializations.push(record.clone());
-
-            Ok(record)
         })
     }
 
@@ -786,31 +828,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn finalize_sleep<'a>(
-        &'a self,
-        request: FinalizeSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        Box::pin(async move {
-            let updated = self.transition_instance(
-                request.instance_id.clone(),
-                request.expected_draining_generation,
-                DomainInstanceState::Cold,
-                StateTransitionReason::DrainCompleted,
-            )?;
-            let materialization = self.mark_materialization(
-                request.instance_id,
-                request.target,
-                MaterializationState::Deleted,
-                Some(updated.generation),
-                Some(Vec::new()),
-            );
-
-            Ok(FinalizeSleepResult {
-                instance: updated,
-                materialization,
-            })
-        })
-    }
     fn load_materialization_work_status(
         &self,
         id: control_plane::ids::MaterializationId,
@@ -878,20 +895,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn compare_and_swap_instance_state<'a>(
-        &'a self,
-        request: CompareAndSwapInstanceStateRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move {
-            self.transition_instance(
-                request.instance_id,
-                request.expected_generation,
-                request.next_state,
-                request.reason,
-            )
-        })
-    }
-
     fn request_instance_deletion<'a>(
         &'a self,
         request: control_plane::instance::RequestInstanceDeletion,
@@ -953,48 +956,10 @@ impl ControlPlaneStore for TestStore {
                     .map(|instance| instance.id.clone())
                     .collect()
             };
-            let mut count = 0;
-            for instance_id in candidates {
-                count += usize::from(
-                    self.delete_instance(DeleteInstanceRequest::new(instance_id))
-                        .await?,
-                );
-            }
-            Ok(count)
-        })
-    }
-
-    fn delete_instance<'a>(
-        &'a self,
-        request: DeleteInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            self.delete_requests.lock().unwrap().push(request.clone());
-            let mut instances = self.instances.lock().unwrap();
-            let Some(instance) = instances.get(request.instance_id.as_str()) else {
-                return Ok(false);
-            };
-            if instance.state != DomainInstanceState::Deleting {
-                return Err(StoreError::invalid_argument(
-                    "hard delete requires deleting state",
-                ));
-            }
-            let mut records = self.materializations.lock().unwrap();
-            if records.iter().any(|record| {
-                record.instance_id == request.instance_id
-                    && record.state != MaterializationState::Deleted
-            }) {
-                return Err(StoreError::invalid_argument(
-                    "hard delete requires completed cleanup",
-                ));
-            }
-            instances.remove(request.instance_id.as_str());
-            records.retain(|record| record.instance_id != request.instance_id);
-            self.route_bindings
-                .lock()
-                .unwrap()
-                .retain(|_, record| record.instance_id != request.instance_id);
-            Ok(true)
+            Ok(candidates
+                .into_iter()
+                .filter(|instance_id| self.finalize_deletion(instance_id.clone()))
+                .count())
         })
     }
 
@@ -1094,59 +1059,18 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn complete_wake<'a>(
-        &'a self,
-        request: CompleteWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        Box::pin(async move {
-            let instance = self.transition_instance(
-                request.instance_id.clone(),
-                request.expected_waking_generation,
-                DomainInstanceState::Running,
-                StateTransitionReason::MaterializationReady,
-            )?;
-            let projection_generation = self
-                .materializations
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|record| {
-                    record.instance_id == request.instance_id && record.target == request.target
-                })
-                .map_or(instance.generation, |record| record.projection_generation);
-            let mut materialization = fake_materialization_record(RecordMaterializationRequest {
-                pod_backend: None,
-                instance_id: request.instance_id,
-                instance_generation: instance.generation,
-                projection_generation,
-                target: request.target,
-                state: MaterializationState::Ready,
-                backend: Some(request.backend),
-                backend_generation: request.backend_generation,
-                rendered_objects: request.rendered_objects,
-                exclusivity_keys: request.exclusivity_keys,
-            });
-            materialization.projection_generation = projection_generation;
-            self.seed_materialization(materialization.clone());
-            Ok(CompleteWakeResult {
-                instance,
-                materialization,
-            })
-        })
-    }
-
     fn complete_wake_reconciliation<'a>(
         &'a self,
         request: CompleteWakeReconciliationRequest,
     ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        self.complete_wake(request.complete)
+        Box::pin(async move { self.complete(request.complete) })
     }
 
     fn finalize_sleep_reconciliation<'a>(
         &'a self,
         request: FinalizeSleepReconciliationRequest,
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        self.finalize_sleep(request.finalize)
+        Box::pin(async move { self.finish_sleep(request.finalize) })
     }
 
     fn delete_materialization_reconciliation<'a>(
@@ -1277,6 +1201,21 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
 /// The same observable transport-facing lifecycle checks run against this fixture
 /// and PostgreSQL. SQL concurrency, retention and fencing have separate DB gates.
 pub async fn lifecycle_conformance(store: &dyn ControlPlaneStore) -> StoreResult<()> {
+    async fn claim(
+        store: &dyn ControlPlaneStore,
+        state: MaterializationState,
+        target: &MaterializationTarget,
+    ) -> StoreResult<MaterializationRecord> {
+        Ok(store
+            .claim_next_materialization_reconciliation(ClaimNextMaterializationRequest::new(
+                state,
+                target.clone(),
+                "conformance",
+                Duration::from_secs(60),
+            ))
+            .await?
+            .expect("a row is due"))
+    }
     let class = workload_class();
     store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
@@ -1304,24 +1243,34 @@ pub async fn lifecycle_conformance(store: &dyn ControlPlaneStore) -> StoreResult
         .await?;
     assert_eq!(waking.state, InstanceState::Waking);
     assert_eq!(waking.generation, created.generation.next());
-    assert!(matches!(
-        store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                created.id.clone(),
-                created.generation,
-                InstanceState::Waking,
-                StateTransitionReason::WakeRequested
-            ))
-            .await,
-        Err(StoreError::GenerationConflict { .. })
-    ));
+    assert!(
+        matches!(
+            store
+                .begin_sleep(BeginSleepRequest::new(
+                    created.id.clone(),
+                    created.generation,
+                    target.clone(),
+                ))
+                .await,
+            Err(StoreError::GenerationConflict { .. })
+        ),
+        "a stale generation conflicts"
+    );
+    let claimed = claim(store, MaterializationState::Pending, &target).await?;
+    let mut complete = CompleteWakeRequest::new(
+        created.id.clone(),
+        waking.generation,
+        target.clone(),
+        BackendEndpoint::new("http://shared.example:8080").unwrap(),
+        claimed.backend_generation,
+    );
+    complete.rendered_objects = claimed.rendered_objects.clone();
     let ready = store
-        .complete_wake(CompleteWakeRequest::new(
-            created.id.clone(),
-            waking.generation,
-            target.clone(),
-            BackendEndpoint::new("http://shared.example:8080").unwrap(),
-            BackendGeneration::new(2),
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "conformance",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            complete,
         ))
         .await?;
     assert_eq!(ready.instance.state, InstanceState::Running);
@@ -1367,11 +1316,13 @@ pub async fn lifecycle_conformance(store: &dyn ControlPlaneStore) -> StoreResult
             .projection_generation,
         pending.projection_generation
     );
+    let claimed = claim(store, MaterializationState::Deleting, &target).await?;
     let cold = store
-        .finalize_sleep(FinalizeSleepRequest::new(
-            created.id.clone(),
-            draining.instance.generation,
-            target,
+        .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
+            claimed.id.clone(),
+            "conformance",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            FinalizeSleepRequest::new(created.id.clone(), draining.instance.generation, target),
         ))
         .await?;
     assert_eq!(cold.instance.state, InstanceState::Cold);

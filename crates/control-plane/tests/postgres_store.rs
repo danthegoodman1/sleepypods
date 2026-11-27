@@ -16,10 +16,9 @@ use control_plane::materialization::{
 };
 use control_plane::{
     render_manifests, BackendEndpoint, BackendGeneration, BeginSleepRequest,
-    ClaimNextMaterializationRequest, CompareAndSwapInstanceStateRequest,
-    CompleteWakeReconciliationRequest, CompleteWakeRequest, ContainerPortTemplate,
-    ContainerTemplate, ControlPlaneStore, CreateInstanceRequest, CreateRouteBindingRequest,
-    CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
+    ClaimNextMaterializationRequest, CompleteWakeReconciliationRequest, CompleteWakeRequest,
+    ContainerPortTemplate, ContainerTemplate, ControlPlaneStore, CreateInstanceRequest,
+    CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteMaterializationReconciliationRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     FinalizeSleepReconciliationRequest, FinalizeSleepRequest, ForceReleaseExclusivityKeyRequest,
     Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey,
@@ -28,11 +27,11 @@ use control_plane::{
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
-    ResolveHostRulesRequest, RouteBindingId, RouteDependencyLookup, RouteEntry, RouteHost,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
-    StoreError, TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion,
-    WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    ResolveHostRulesRequest, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, StoreError, TemplateText,
+    TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef,
+    WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -55,6 +54,144 @@ async fn claim_next(
             lease_ttl,
         ))
         .await
+}
+
+/// A wake of the Cold or Failed `instance` into `target`, whose projection
+/// holds `refs` and `keys`.
+fn accept_request(
+    instance: &control_plane::InstanceRecord,
+    target: &MaterializationTarget,
+    refs: Vec<RenderedObjectRef>,
+    keys: Vec<RenderedExclusivityKey>,
+) -> control_plane::materialization::AcceptWakeRequest {
+    let mut pending = RecordMaterializationRequest::new(
+        instance.id.clone(),
+        instance.generation.next(),
+        target.clone(),
+        MaterializationState::Pending,
+        BackendGeneration::new(1),
+    );
+    pending.rendered_objects = refs;
+    pending.exclusivity_keys = keys;
+    control_plane::materialization::AcceptWakeRequest {
+        expected_generation: instance.generation,
+        pending,
+    }
+}
+
+/// Accepts a wake of the Cold or Failed `instance` into `target`. The
+/// instance becomes Waking with a Pending row that holds `refs` and `keys`.
+async fn accept_projection(
+    store: &(impl ControlPlaneStore + ?Sized),
+    instance: &control_plane::InstanceRecord,
+    target: &MaterializationTarget,
+    refs: Vec<RenderedObjectRef>,
+    keys: Vec<RenderedExclusivityKey>,
+) -> Result<control_plane::MaterializationRecord, StoreError> {
+    store
+        .accept_wake(accept_request(instance, target, refs, keys))
+        .await?;
+    Ok(store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("an accepted wake has a Pending row"))
+}
+
+/// Claims `row` for `owner`. A claim takes its target's longest-waiting due
+/// row, so rows ahead of `row` are claimed and released, which moves them
+/// behind it.
+async fn claim_row(
+    store: &(impl ControlPlaneStore + ?Sized),
+    row: &control_plane::MaterializationRecord,
+    owner: &str,
+) -> Result<control_plane::MaterializationRecord, StoreError> {
+    for _ in 0..64 {
+        let claimed = claim_next(
+            store,
+            row.state,
+            &row.target,
+            owner,
+            Duration::from_secs(60),
+        )
+        .await?
+        .ok_or_else(|| StoreError::internal("the row is not due"))?;
+        if claimed.id == row.id {
+            return Ok(claimed);
+        }
+        store
+            .release_materialization_reconciliation_lease(
+                ReleaseMaterializationReconciliationLeaseRequest::new(
+                    claimed.id.clone(),
+                    owner,
+                    claimed.reconciliation_lease.as_ref().unwrap().attempt,
+                    claimed.instance_generation,
+                ),
+            )
+            .await?;
+    }
+    Err(StoreError::internal("the row never came due"))
+}
+
+/// Completes the wake of `pending` at `backend` as a driver does: it claims
+/// the row and completes it under that lease.
+async fn complete_wake_of(
+    store: &(impl ControlPlaneStore + ?Sized),
+    pending: &control_plane::MaterializationRecord,
+    backend: &str,
+) -> Result<control_plane::CompleteWakeResult, StoreError> {
+    let claimed = claim_row(store, pending, "driver").await?;
+    store
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            complete_for_reconciled_pending(&claimed, backend),
+        ))
+        .await
+}
+
+/// Finishes the drain of `draining`, whose projection is `deleting`, as a
+/// driver does: it claims the row and finalizes the sleep under that lease.
+async fn finish_sleep_of(
+    store: &(impl ControlPlaneStore + ?Sized),
+    deleting: &control_plane::MaterializationRecord,
+    draining: &control_plane::InstanceRecord,
+) -> Result<control_plane::FinalizeSleepResult, StoreError> {
+    let claimed = claim_row(store, deleting, "driver").await?;
+    store
+        .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            FinalizeSleepRequest::new(
+                draining.id.clone(),
+                draining.generation,
+                claimed.target.clone(),
+            ),
+        ))
+        .await
+}
+
+/// Wakes the Cold instance `instance_id` into `target` and completes the wake,
+/// with `refs` and `keys` in its projection.
+async fn wake_to_running(
+    store: &(impl ControlPlaneStore + ?Sized),
+    instance_id: InstanceId,
+    target: &MaterializationTarget,
+    refs: Vec<RenderedObjectRef>,
+    keys: Vec<RenderedExclusivityKey>,
+) -> Result<control_plane::CompleteWakeResult, StoreError> {
+    let instance = store
+        .get_instance(GetInstanceRequest::new(instance_id))
+        .await?
+        .ok_or(StoreError::NotFound {
+            resource: "instance",
+        })?;
+    let pending = accept_projection(store, &instance, target, refs, keys).await?;
+    complete_wake_of(store, &pending, "http://10.0.0.1:8080").await
 }
 
 #[tokio::test]
@@ -377,17 +514,18 @@ async fn run_conformance(
         );
     }
     assert_eq!(store.create_instance(create.clone()).await?, created);
-    assert_eq!(
-        store
-            .list_route_bindings_for_instance(
-                control_plane::ListRouteBindingsForInstanceRequest::new(
-                    created.instance.id.clone()
-                )
+    for host in ["extra.example.com", "other.example.com"] {
+        assert_eq!(
+            resolve_route(
+                store,
+                http_identity(host, Some("/api")),
+                MaterializationTarget::new("cluster-a", "default").unwrap(),
             )
             .await?,
-        created.route_bindings,
-        "a refused create binds none of its routes"
-    );
+            None,
+            "a refused create binds none of its routes"
+        );
+    }
 
     let duplicate_route = store
         .create_instance(create_instance_request(
@@ -425,6 +563,8 @@ async fn run_conformance(
     exercise_materialization_reconciliation_leases(store, config, class.reference.clone()).await?;
     exercise_lease_clock_ownership(store, config, class.reference.clone()).await?;
 
+    // Finalizing removes a Deleting instance whose cleanup has finished, and
+    // nothing else.
     let delete_target = store
         .create_instance(create_instance_request(
             "instance-delete",
@@ -433,39 +573,24 @@ async fn run_conformance(
         ))
         .await?;
     assert_eq!(delete_target.instance.generation, Generation::new(0));
-    let direct_delete = store
-        .delete_instance(DeleteInstanceRequest::new(
-            delete_target.instance.id.clone(),
-        ))
-        .await
-        .expect_err("hard delete requires deleting state");
-    assert!(matches!(direct_delete, StoreError::InvalidArgument { .. }));
-    let deleting_target = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            delete_target.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
-        .await?;
-    assert_eq!(deleting_target.state, InstanceState::Deleting);
-    assert_eq!(deleting_target.generation, Generation::new(1));
+    store.finalize_instance_deletions(1024).await?;
+    assert!(store
+        .get_instance(GetInstanceRequest::new(delete_target.instance.id.clone()))
+        .await?
+        .is_some());
     assert!(
         store
-            .delete_instance(DeleteInstanceRequest::new(
-                delete_target.instance.id.clone()
-            ))
+            .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+                instance_id: delete_target.instance.id.clone(),
+                expected_generation: Generation::new(0),
+            })
             .await?
     );
+    store.finalize_instance_deletions(1024).await?;
     assert!(store
         .get_instance(GetInstanceRequest::new(delete_target.instance.id.clone()))
         .await?
         .is_none());
-    assert!(
-        !store
-            .delete_instance(DeleteInstanceRequest::new(delete_target.instance.id))
-            .await?
-    );
 
     let delete_wake_race = store
         .create_instance(create_instance_request(
@@ -474,24 +599,29 @@ async fn run_conformance(
             vec![],
         ))
         .await?;
-    let deleting = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            delete_wake_race.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
+    store
+        .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+            instance_id: delete_wake_race.instance.id.clone(),
+            expected_generation: Generation::new(0),
+        })
         .await?;
+    let deleting = store
+        .get_instance(GetInstanceRequest::new(
+            delete_wake_race.instance.id.clone(),
+        ))
+        .await?
+        .expect("a deleting instance remains until its deletion finishes");
+    assert_eq!(deleting.state, InstanceState::Deleting);
     assert_eq!(deleting.generation, Generation::new(1));
     let wake_after_delete = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            delete_wake_race.instance.id,
-            Generation::new(1),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
+        .accept_wake(accept_request(
+            &deleting,
+            &MaterializationTarget::new("cluster-a", "default").unwrap(),
+            vec![],
+            vec![],
         ))
         .await
-        .expect_err("wake after delete CAS is rejected");
+        .expect_err("a wake after a delete is rejected");
     assert!(matches!(
         wake_after_delete,
         StoreError::InvalidArgument { .. }
@@ -524,23 +654,28 @@ async fn run_conformance(
     .await?;
     assert_eq!(miss, None);
 
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            InstanceId::new("instance-a").expect("valid instance ID"),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
+    let target = MaterializationTarget::new("cluster-a", "default").expect("valid target");
+    let mut wake = accept_request(
+        &created.instance,
+        &target,
+        vec![RenderedObjectRef {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: "default".to_owned(),
+            name: "instance-a".to_owned(),
+        }],
+        vec![],
+    );
+    wake.pending.backend_generation = BackendGeneration::new(2);
+    let waking = store.accept_wake(wake).await?;
     assert_eq!(waking.generation, Generation::new(1));
     assert_eq!(waking.state, InstanceState::Waking);
 
     let stale = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            InstanceId::new("instance-a").expect("valid instance ID"),
+        .begin_sleep(BeginSleepRequest::new(
+            waking.id.clone(),
             Generation::new(0),
-            InstanceState::Failed,
-            StateTransitionReason::FailureReported("stale writer".to_owned()),
+            target.clone(),
         ))
         .await
         .expect_err("stale generation is rejected");
@@ -552,60 +687,32 @@ async fn run_conformance(
         other => panic!("expected generation conflict, got {other}"),
     }
 
-    let target = MaterializationTarget::new("cluster-a", "default").expect("valid target");
-    let pending = RecordMaterializationRequest::new(
-        InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(1),
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    let pending_record = store.record_materialization(pending).await?;
+    let pending_record = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            waking.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("the accepted wake has a Pending row");
     assert_eq!(pending_record.state, MaterializationState::Pending);
-
-    let running = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            InstanceId::new("instance-a").expect("valid instance ID"),
-            Generation::new(1),
-            InstanceState::Running,
-            StateTransitionReason::MaterializationReady,
+    let claimed = claim_row(store, &pending_record, "driver").await?;
+    let completed = store
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            complete_for_reconciled_pending(&claimed, "http://10.0.0.10:8080"),
         ))
         .await?;
+    let running = completed.instance;
     assert_eq!(running.generation, Generation::new(2));
     assert_eq!(running.state, InstanceState::Running);
-
-    let mut ready = RecordMaterializationRequest::new(
-        InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(2),
-        target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(2),
-    );
-    ready.backend = Some(BackendEndpoint::new("http://10.0.0.10:8080").expect("valid backend"));
-    ready.rendered_objects = vec![RenderedObjectRef {
-        api_version: "apps/v1".to_owned(),
-        kind: "Deployment".to_owned(),
-        namespace: "default".to_owned(),
-        name: "instance-a".to_owned(),
-    }];
-    let ready_record = store.record_materialization(ready).await?;
+    let ready_record = completed.materialization;
     assert_eq!(ready_record.state, MaterializationState::Ready);
     assert_eq!(ready_record.backend_generation, BackendGeneration::new(2));
     assert_eq!(
         ready_record.backend.as_ref().map(BackendEndpoint::uri),
         Some("http://10.0.0.10:8080")
-    );
-
-    let dependencies = store
-        .lookup_route_dependencies(RouteDependencyLookup::new(
-            route_entry.route_binding_id.clone(),
-        ))
-        .await?
-        .expect("route dependencies load");
-    assert_eq!(dependencies.instance_id.as_str(), "instance-a");
-    assert_eq!(
-        dependencies.materialization_generation,
-        Some(BackendGeneration::new(2))
     );
 
     let resolved_with_backend = resolve_route(
@@ -628,26 +735,18 @@ async fn run_conformance(
         None => panic!("route should resolve after materialization"),
     }
 
-    let mut rewind = RecordMaterializationRequest::new(
-        InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(2),
-        target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(1),
-    );
-    rewind.backend = Some(BackendEndpoint::new("http://10.0.0.9:8080").expect("valid backend"));
-    let rewind_error = store
-        .record_materialization(rewind)
-        .await
-        .expect_err("lower backend generations must be rejected");
-    match rewind_error {
-        StoreError::InvalidArgument { message } => {
-            assert!(message.contains("backend generation rewind"));
-        }
-        other => panic!("expected backend rewind invalid argument, got {other}"),
-    }
+    // A second completion under the consumed lease changes nothing.
+    let repeated = store
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            complete_for_reconciled_pending(&claimed, "http://10.0.0.9:8080"),
+        ))
+        .await;
+    assert!(repeated.is_err(), "a consumed lease completes nothing");
 
-    let resolved_after_rewind_rejection = resolve_route(
+    let resolved_after_repeat = resolve_route(
         store,
         RouteIdentity::Http {
             host: RouteHost::exact("app.example.com").expect("valid host"),
@@ -656,7 +755,7 @@ async fn run_conformance(
         MaterializationTarget::new("cluster-a", "default").unwrap(),
     )
     .await?;
-    match resolved_after_rewind_rejection {
+    match resolved_after_repeat {
         Some(entry) => {
             assert_eq!(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
@@ -668,21 +767,19 @@ async fn run_conformance(
     }
 
     let draining = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            InstanceId::new("instance-a").expect("valid instance ID"),
+        .begin_sleep(BeginSleepRequest::new(
+            running.id.clone(),
             Generation::new(2),
-            InstanceState::Draining,
-            StateTransitionReason::SleepRequested,
+            target.clone(),
         ))
         .await?;
-    assert_eq!(draining.generation, Generation::new(3));
+    assert_eq!(draining.instance.generation, Generation::new(3));
 
     let stale_sidecar_report = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            InstanceId::new("instance-a").expect("valid instance ID"),
+        .begin_sleep(BeginSleepRequest::new(
+            running.id.clone(),
             Generation::new(2),
-            InstanceState::Draining,
-            StateTransitionReason::IdleReported,
+            target.clone(),
         ))
         .await
         .expect_err("stale sidecar idle reports are rejected");
@@ -712,37 +809,33 @@ async fn run_conformance(
         None => panic!("route binding should still resolve"),
     }
 
-    let dependencies_after_generation_advance = store
-        .lookup_route_dependencies(RouteDependencyLookup::new(
-            route_entry.route_binding_id.clone(),
+    // A completion from the earlier incarnation cannot land on the drain.
+    let stale_completion = store
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            complete_for_reconciled_pending(&claimed, "http://10.0.0.11:8080"),
         ))
-        .await?
-        .expect("route dependencies still load");
-    assert_eq!(
-        dependencies_after_generation_advance.materialization_generation,
-        None
+        .await;
+    assert!(
+        stale_completion.is_err(),
+        "a stale incarnation's completion is rejected"
     );
 
-    let mut stale_materialization = RecordMaterializationRequest::new(
-        InstanceId::new("instance-a").expect("valid instance ID"),
-        Generation::new(2),
-        target,
-        MaterializationState::Ready,
-        BackendGeneration::new(3),
+    // The next wake's backend generation lands above every earlier one, even
+    // when the request names a lower floor.
+    let deleting = draining
+        .materialization
+        .expect("the drain marks the projection deleting");
+    let cold = finish_sleep_of(store, &deleting, &draining.instance).await?;
+    assert_eq!(cold.instance.state, InstanceState::Cold);
+    let rewoken = accept_projection(store, &cold.instance, &target, vec![], vec![]).await?;
+    assert!(
+        rewoken.backend_generation > BackendGeneration::new(2),
+        "backend generation rewound to {:?}",
+        rewoken.backend_generation
     );
-    stale_materialization.backend =
-        Some(BackendEndpoint::new("http://10.0.0.11:8080").expect("valid backend"));
-    let stale_materialization_error = store
-        .record_materialization(stale_materialization)
-        .await
-        .expect_err("stale instance generation materialization is rejected");
-    match stale_materialization_error {
-        StoreError::GenerationConflict { expected, actual } => {
-            assert_eq!(expected, Generation::new(2));
-            assert_eq!(actual, Generation::new(3));
-        }
-        other => panic!("expected stale materialization generation conflict, got {other}"),
-    }
 
     exercise_http01(store).await?;
 
@@ -853,47 +946,32 @@ async fn exercise_instance_lifecycle(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
 ) -> Result<(), StoreError> {
-    let invalid_target =
-        create_lifecycle_instance(store, workload_class.clone(), "instance-lifecycle-invalid")
-            .await?;
-    assert_eq!(invalid_target.instance.generation, Generation::new(0));
+    let target = |name: &str| MaterializationTarget::new(name, "apps").expect("valid target");
 
-    let invalid = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            invalid_target.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Running,
-            StateTransitionReason::MaterializationReady,
-        ))
-        .await
-        .expect_err("cold instances cannot become running directly");
-    assert!(matches!(invalid, StoreError::InvalidArgument { .. }));
-    let after_invalid = store
-        .get_instance(GetInstanceRequest::new(invalid_target.instance.id.clone()))
-        .await?
-        .expect("invalid transition target still exists");
-    assert_eq!(after_invalid.state, InstanceState::Cold);
-    assert_eq!(after_invalid.generation, Generation::new(0));
-
-    let concurrent_target = create_lifecycle_instance(
+    // Two wakes race for one Cold instance: one projection is accepted, and
+    // the wake for another target is refused.
+    let concurrent = create_lifecycle_instance(
         store,
         workload_class.clone(),
         "instance-lifecycle-concurrent",
     )
     .await?;
-    let wake_a = CompareAndSwapInstanceStateRequest::new(
-        concurrent_target.instance.id.clone(),
-        Generation::new(0),
-        InstanceState::Waking,
-        StateTransitionReason::WakeRequested,
-    );
-    let wake_b = wake_a.clone();
     let (first, second) = tokio::join!(
-        store.compare_and_swap_instance_state(wake_a),
-        store.compare_and_swap_instance_state(wake_b)
+        store.accept_wake(accept_request(
+            &concurrent.instance,
+            &target("lifecycle-concurrent-a"),
+            vec![],
+            vec![],
+        )),
+        store.accept_wake(accept_request(
+            &concurrent.instance,
+            &target("lifecycle-concurrent-b"),
+            vec![],
+            vec![],
+        ))
     );
     let mut successes = 0;
-    let mut conflicts = 0;
+    let mut refusals = 0;
     for result in [first, second] {
         match result {
             Ok(record) => {
@@ -901,38 +979,33 @@ async fn exercise_instance_lifecycle(
                 assert_eq!(record.state, InstanceState::Waking);
                 assert_eq!(record.generation, Generation::new(1));
             }
-            Err(StoreError::GenerationConflict { expected, actual }) => {
-                conflicts += 1;
-                assert_eq!(expected, Generation::new(0));
-                assert_eq!(actual, Generation::new(1));
-            }
-            Err(other) => panic!("expected wake success or generation conflict, got {other}"),
+            Err(StoreError::InvalidArgument { .. }) => refusals += 1,
+            Err(other) => panic!("expected one accepted wake and one refusal, got {other}"),
         }
     }
-    assert_eq!(successes, 1);
-    assert_eq!(conflicts, 1);
+    assert_eq!((successes, refusals), (1, 1));
 
+    // A Waking instance cannot begin a sleep; a deletion supersedes the wake.
     let sleep_while_waking = create_lifecycle_instance(
         store,
         workload_class.clone(),
         "instance-lifecycle-sleep-waking",
     )
     .await?;
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            sleep_while_waking.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    assert_eq!(waking.generation, Generation::new(1));
+    let waking_target = target("lifecycle-sleep-waking");
+    accept_projection(
+        store,
+        &sleep_while_waking.instance,
+        &waking_target,
+        vec![],
+        vec![],
+    )
+    .await?;
     let sleep_during_wake = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+        .begin_sleep(BeginSleepRequest::new(
             sleep_while_waking.instance.id.clone(),
             Generation::new(1),
-            InstanceState::Draining,
-            StateTransitionReason::SleepRequested,
+            waking_target,
         ))
         .await
         .expect_err("sleep while waking is deterministically rejected");
@@ -948,99 +1021,155 @@ async fn exercise_instance_lifecycle(
         .expect("sleep while waking target still exists");
     assert_eq!(still_waking.state, InstanceState::Waking);
     assert_eq!(still_waking.generation, Generation::new(1));
+    assert!(
+        store
+            .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+                instance_id: sleep_while_waking.instance.id.clone(),
+                expected_generation: Generation::new(1),
+            })
+            .await?
+    );
     let deleting_from_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            sleep_while_waking.instance.id,
-            Generation::new(1),
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
-        .await?;
+        .get_instance(GetInstanceRequest::new(sleep_while_waking.instance.id))
+        .await?
+        .expect("a deleting instance remains until cleanup finishes");
     assert_eq!(deleting_from_waking.state, InstanceState::Deleting);
     assert_eq!(deleting_from_waking.generation, Generation::new(2));
 
+    // Running drains to Draining and finishes Cold.
     let drain_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
         "instance-lifecycle-drain-complete",
     )
     .await?;
-    let running = wake_to_running(store, drain_target.instance.id.clone()).await?;
-    assert_eq!(running.generation, Generation::new(2));
+    let running = wake_to_running(
+        store,
+        drain_target.instance.id.clone(),
+        &target("lifecycle-drain-complete"),
+        vec![],
+        vec![],
+    )
+    .await?;
+    assert_eq!(running.instance.generation, Generation::new(2));
     let draining = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+        .begin_sleep(BeginSleepRequest::new(
             drain_target.instance.id.clone(),
             Generation::new(2),
-            InstanceState::Draining,
-            StateTransitionReason::IdleReported,
+            running.materialization.target.clone(),
         ))
         .await?;
-    assert_eq!(draining.generation, Generation::new(3));
-    let cold = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            drain_target.instance.id,
-            Generation::new(3),
-            InstanceState::Cold,
-            StateTransitionReason::DrainCompleted,
-        ))
-        .await?;
-    assert_eq!(cold.state, InstanceState::Cold);
-    assert_eq!(cold.generation, Generation::new(4));
+    assert_eq!(draining.instance.generation, Generation::new(3));
+    let cold = finish_sleep_of(
+        store,
+        draining.materialization.as_ref().unwrap(),
+        &draining.instance,
+    )
+    .await?;
+    assert_eq!(cold.instance.state, InstanceState::Cold);
+    assert_eq!(cold.instance.generation, Generation::new(4));
 
+    // A deletion supersedes a drain.
     let delete_draining_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
         "instance-lifecycle-delete-draining",
     )
     .await?;
-    wake_to_running(store, delete_draining_target.instance.id.clone()).await?;
+    let running = wake_to_running(
+        store,
+        delete_draining_target.instance.id.clone(),
+        &target("lifecycle-delete-draining"),
+        vec![],
+        vec![],
+    )
+    .await?;
     let draining = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
+        .begin_sleep(BeginSleepRequest::new(
             delete_draining_target.instance.id.clone(),
             Generation::new(2),
-            InstanceState::Draining,
-            StateTransitionReason::SleepRequested,
+            running.materialization.target.clone(),
         ))
         .await?;
-    assert_eq!(draining.generation, Generation::new(3));
+    assert_eq!(draining.instance.generation, Generation::new(3));
+    store
+        .request_instance_deletion(control_plane::instance::RequestInstanceDeletion {
+            instance_id: delete_draining_target.instance.id.clone(),
+            expected_generation: Generation::new(3),
+        })
+        .await?;
     let deleting_from_draining = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            delete_draining_target.instance.id,
-            Generation::new(3),
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
-        .await?;
+        .get_instance(GetInstanceRequest::new(delete_draining_target.instance.id))
+        .await?
+        .expect("a deleting instance remains until cleanup finishes");
     assert_eq!(deleting_from_draining.state, InstanceState::Deleting);
     assert_eq!(deleting_from_draining.generation, Generation::new(4));
 
+    // A wake that fails permanently leaves a Failed instance, which wakes
+    // again once its cleanup has finished.
     let failed_target =
         create_lifecycle_instance(store, workload_class, "instance-lifecycle-failed-retry").await?;
-    store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            failed_target.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
+    let retry_target = target("lifecycle-failed-retry");
+    let pending = accept_projection(
+        store,
+        &failed_target.instance,
+        &retry_target,
+        vec![],
+        vec![],
+    )
+    .await?;
+    let claimed = claim_row(store, &pending, "driver").await?;
+    assert!(
+        store
+            .record_materialization_failure(
+                control_plane::runtime_work::RecordMaterializationFailure {
+                    expected_state: MaterializationState::Pending,
+                    materialization_id: claimed.id.clone(),
+                    owner: "driver".to_owned(),
+                    attempt: claimed.reconciliation_lease.as_ref().unwrap().attempt,
+                    generation: claimed.instance_generation,
+                    permanent: true,
+                    message: "readiness timeout".to_owned(),
+                }
+            )
+            .await?
+    );
     let failed = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            failed_target.instance.id.clone(),
-            Generation::new(1),
-            InstanceState::Failed,
-            StateTransitionReason::FailureReported("readiness timeout".to_owned()),
-        ))
-        .await?;
+        .get_instance(GetInstanceRequest::new(failed_target.instance.id.clone()))
+        .await?
+        .expect("the failed instance remains");
     assert_eq!(failed.state, InstanceState::Failed);
     assert_eq!(failed.generation, Generation::new(2));
-    let retry = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            failed_target.instance.id,
-            Generation::new(2),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
+    assert!(
+        matches!(
+            store
+                .accept_wake(accept_request(&failed, &retry_target, vec![], vec![]))
+                .await,
+            Err(StoreError::Unavailable { .. })
+        ),
+        "a wake waits for the failed wake's cleanup"
+    );
+    let cleanup = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            failed.id.clone(),
+            retry_target.clone(),
         ))
+        .await?
+        .expect("the failed wake leaves cleanup");
+    let claimed = claim_row(store, &cleanup, "driver").await?;
+    store
+        .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            MaterializationState::Deleting,
+            claimed.instance_id.clone(),
+            claimed.instance_generation,
+            claimed.target.clone(),
+        ))
+        .await?;
+    let retry = store
+        .accept_wake(accept_request(&failed, &retry_target, vec![], vec![]))
         .await?;
     assert_eq!(retry.state, InstanceState::Waking);
     assert_eq!(retry.generation, Generation::new(3));
@@ -1066,23 +1195,7 @@ async fn exercise_lease_clock_ownership(
             vec![],
         ))
         .await?;
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            created.instance.id.clone(),
-            created.instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let pending = store
-        .record_materialization(RecordMaterializationRequest::new(
-            waking.id.clone(),
-            waking.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        ))
-        .await?;
+    let pending = accept_projection(store, &created.instance, &target, vec![], vec![]).await?;
 
     // Remaining lifetime measured entirely inside the database: both operands
     // come from the clock that wrote the expiry.
@@ -1223,26 +1336,16 @@ async fn exercise_rendered_object_ref_collision_rejection(
         "instance-collision-service-owner",
     )
     .await?;
-    let owner_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
     let service_target =
         MaterializationTarget::new("cluster-collision", "apps").expect("valid target");
-    let mut owner_materialization = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        owner_waking.generation,
-        service_target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    owner_materialization.rendered_objects =
-        vec![object_ref("v1", "Service", "apps", "shared-service")];
-    store.record_materialization(owner_materialization).await?;
+    accept_projection(
+        store,
+        &owner.instance,
+        &service_target,
+        vec![object_ref("v1", "Service", "apps", "shared-service")],
+        vec![],
+    )
+    .await?;
 
     let contender = create_lifecycle_instance(
         store,
@@ -1250,25 +1353,13 @@ async fn exercise_rendered_object_ref_collision_rejection(
         "instance-collision-service-contender",
     )
     .await?;
-    let contender_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut contender_materialization = RecordMaterializationRequest::new(
-        contender.instance.id.clone(),
-        contender_waking.generation,
-        service_target,
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    contender_materialization.rendered_objects =
-        vec![object_ref("v1", "Service", "apps", "shared-service")];
     let service_collision = store
-        .record_materialization(contender_materialization)
+        .accept_wake(accept_request(
+            &contender.instance,
+            &service_target,
+            vec![object_ref("v1", "Service", "apps", "shared-service")],
+            vec![],
+        ))
         .await
         .expect_err("namespaced rendered object ref collision is rejected");
     assert_collision_error(
@@ -1280,56 +1371,32 @@ async fn exercise_rendered_object_ref_collision_rejection(
         store
             .get_instance(GetInstanceRequest::new(contender.instance.id.clone()))
             .await?
-            .expect("contender instance remains")
-            .state,
-        InstanceState::Waking
+            .expect("contender instance remains"),
+        contender.instance,
+        "a refused wake changes nothing"
     );
 
     let pv_owner =
         create_lifecycle_instance(store, workload_class.clone(), "instance-collision-pv-owner")
             .await?;
-    let pv_owner_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            pv_owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut pv_owner_materialization = RecordMaterializationRequest::new(
-        pv_owner.instance.id.clone(),
-        pv_owner_waking.generation,
-        MaterializationTarget::new("cluster-collision", "pv-owner").expect("valid target"),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    pv_owner_materialization.rendered_objects =
-        vec![object_ref("v1", "PersistentVolume", "", "shared-pv")];
-    store
-        .record_materialization(pv_owner_materialization)
-        .await?;
+    accept_projection(
+        store,
+        &pv_owner.instance,
+        &MaterializationTarget::new("cluster-collision", "pv-owner").expect("valid target"),
+        vec![object_ref("v1", "PersistentVolume", "", "shared-pv")],
+        vec![],
+    )
+    .await?;
 
     let pv_contender =
         create_lifecycle_instance(store, workload_class, "instance-collision-pv-contender").await?;
-    let pv_contender_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            pv_contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut pv_contender_materialization = RecordMaterializationRequest::new(
-        pv_contender.instance.id.clone(),
-        pv_contender_waking.generation,
-        MaterializationTarget::new("cluster-collision", "pv-contender").expect("valid target"),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    pv_contender_materialization.rendered_objects =
-        vec![object_ref("v1", "PersistentVolume", "", "shared-pv")];
     let pv_collision = store
-        .record_materialization(pv_contender_materialization)
+        .accept_wake(accept_request(
+            &pv_contender.instance,
+            &MaterializationTarget::new("cluster-collision", "pv-contender").expect("valid target"),
+            vec![object_ref("v1", "PersistentVolume", "", "shared-pv")],
+            vec![],
+        ))
         .await
         .expect_err("cluster-scoped PV rendered object ref collision is rejected");
     assert_collision_error(
@@ -1360,6 +1427,11 @@ async fn exercise_exclusivity_keys(
     assert_eq!(loaded.exclusivity_keys, workload_class.exclusivity_keys);
 
     let target = MaterializationTarget::new("cluster-exclusive", "apps").expect("valid target");
+    let keys = |instance: &control_plane::InstanceRecord| {
+        workload_class
+            .render_exclusivity_keys(&instance.values)
+            .map_err(|error| StoreError::internal(error.to_string()))
+    };
     let owner = create_exclusive_instance(
         store,
         &workload_class.reference,
@@ -1368,30 +1440,19 @@ async fn exercise_exclusivity_keys(
         "license-owner",
     )
     .await?;
-    let owner_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut owner_materialization = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        owner_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    owner_materialization.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&owner_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
     let expected_owner_keys = vec![
         control_plane::RenderedExclusivityKey::new("disk", "disk-a"),
         control_plane::RenderedExclusivityKey::new("license", "license-owner"),
     ];
-    assert_eq!(owner_materialization.exclusivity_keys, expected_owner_keys);
-    let owner_record = store.record_materialization(owner_materialization).await?;
+    assert_eq!(keys(&owner.instance)?, expected_owner_keys);
+    let owner_record = accept_projection(
+        store,
+        &owner.instance,
+        &target,
+        vec![],
+        keys(&owner.instance)?,
+    )
+    .await?;
     assert_eq!(owner_record.exclusivity_keys, expected_owner_keys);
     let operational_metrics = store.load_materialization_operational_metrics().await?;
     let pending_metrics = operational_metrics
@@ -1408,24 +1469,28 @@ async fn exercise_exclusivity_keys(
         .expect("pending held-key metrics are grouped by state");
     assert!(pending_key_metrics.exclusivity_keys_held >= 2);
 
-    let stale_record = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        Generation::new(0),
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(2),
-    );
-    let stale_error = store
-        .record_materialization(stale_record)
+    // A wake request for another target cannot move the held keys.
+    let elsewhere = store
+        .accept_wake(accept_request(
+            &owner.instance,
+            &MaterializationTarget::new("cluster-exclusive", "elsewhere").expect("valid target"),
+            vec![],
+            keys(&owner.instance)?,
+        ))
         .await
-        .expect_err("stale instance generation cannot update held keys");
-    assert!(matches!(
-        stale_error,
-        StoreError::GenerationConflict {
-            expected,
-            actual
-        } if expected == Generation::new(0) && actual == owner_waking.generation
-    ));
+        .expect_err("an accepted wake keeps its target");
+    assert!(matches!(elsewhere, StoreError::InvalidArgument { .. }));
+    assert_eq!(
+        store
+            .load_active_materialization(LoadActiveMaterializationRequest::new(
+                owner.instance.id.clone(),
+                target.clone(),
+            ))
+            .await?
+            .expect("the owner keeps its projection")
+            .exclusivity_keys,
+        expected_owner_keys
+    );
 
     let contender = create_exclusive_instance(
         store,
@@ -1435,26 +1500,14 @@ async fn exercise_exclusivity_keys(
         "license-contender",
     )
     .await?;
-    let contender_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut contender_materialization = RecordMaterializationRequest::new(
-        contender.instance.id.clone(),
-        contender_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
+    let contender_wake = accept_request(
+        &contender.instance,
+        &target,
+        vec![],
+        keys(&contender.instance)?,
     );
-    contender_materialization.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&contender_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
     let conflict = store
-        .record_materialization(contender_materialization.clone())
+        .accept_wake(contender_wake.clone())
         .await
         .expect_err("same rendered key is rejected while active materialization holds it");
     assert_exclusivity_conflict(conflict, "disk", Some("instance-exclusive-owner"));
@@ -1475,26 +1528,13 @@ async fn exercise_exclusivity_keys(
         "license-restart",
     )
     .await?;
-    let restart_waking = restarted_store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            restart_contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut restart_materialization = RecordMaterializationRequest::new(
-        restart_contender.instance.id,
-        restart_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    restart_materialization.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&restart_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
     let restart_conflict = restarted_store
-        .record_materialization(restart_materialization)
+        .accept_wake(accept_request(
+            &restart_contender.instance,
+            &target,
+            vec![],
+            keys(&restart_contender.instance)?,
+        ))
         .await
         .expect_err("recreated store still sees active held key");
     assert_exclusivity_conflict(restart_conflict, "disk", Some("instance-exclusive-owner"));
@@ -1507,27 +1547,14 @@ async fn exercise_exclusivity_keys(
         "license-different",
     )
     .await?;
-    let different_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            different.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut different_materialization = RecordMaterializationRequest::new(
-        different.instance.id,
-        different_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    different_materialization.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&different_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
-    let different_record = store
-        .record_materialization(different_materialization)
-        .await?;
+    let different_record = accept_projection(
+        store,
+        &different.instance,
+        &target,
+        vec![],
+        keys(&different.instance)?,
+    )
+    .await?;
     assert_eq!(
         different_record.exclusivity_keys,
         vec![
@@ -1536,15 +1563,7 @@ async fn exercise_exclusivity_keys(
         ]
     );
 
-    let mut complete = CompleteWakeRequest::new(
-        owner.instance.id.clone(),
-        owner_waking.generation,
-        target.clone(),
-        BackendEndpoint::new("http://10.0.0.50:8080").expect("valid backend"),
-        BackendGeneration::new(2),
-    );
-    complete.exclusivity_keys = expected_owner_keys.clone();
-    let completed = store.complete_wake(complete).await?;
+    let completed = complete_wake_of(store, &owner_record, "http://10.0.0.50:8080").await?;
     assert_eq!(
         completed.materialization.exclusivity_keys,
         expected_owner_keys
@@ -1572,27 +1591,18 @@ async fn exercise_exclusivity_keys(
         ))
         .await?;
     assert_eq!(begin.instance.state, InstanceState::Draining);
-    assert_eq!(
-        begin
-            .materialization
-            .as_ref()
-            .expect("materialization is marked deleting")
-            .exclusivity_keys,
-        expected_owner_keys
-    );
+    let deleting = begin
+        .materialization
+        .clone()
+        .expect("materialization is marked deleting");
+    assert_eq!(deleting.exclusivity_keys, expected_owner_keys);
     let deleting_conflict = store
-        .record_materialization(contender_materialization.clone())
+        .accept_wake(contender_wake.clone())
         .await
         .expect_err("deleting materialization keeps the key held until finalize");
     assert_exclusivity_conflict(deleting_conflict, "disk", Some("instance-exclusive-owner"));
 
-    let finalized = store
-        .finalize_sleep(FinalizeSleepRequest::new(
-            owner.instance.id,
-            begin.instance.generation,
-            target.clone(),
-        ))
-        .await?;
+    let finalized = finish_sleep_of(store, &deleting, &begin.instance).await?;
     assert_eq!(finalized.instance.state, InstanceState::Cold);
     assert_eq!(
         finalized
@@ -1610,10 +1620,8 @@ async fn exercise_exclusivity_keys(
         .await?
         .is_none());
 
-    let acquired_after_release = store
-        .record_materialization(contender_materialization)
-        .await?;
-    assert_eq!(acquired_after_release.instance_id, contender.instance.id);
+    let acquired_after_release = store.accept_wake(contender_wake).await?;
+    assert_eq!(acquired_after_release.id, contender.instance.id);
 
     Ok(())
 }
@@ -1628,6 +1636,11 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
 
     let target =
         MaterializationTarget::new("cluster-exclusive-release", "apps").expect("valid target");
+    let keys = |instance: &control_plane::InstanceRecord| {
+        workload_class
+            .render_exclusivity_keys(&instance.values)
+            .map_err(|error| StoreError::internal(error.to_string()))
+    };
     let owner = create_exclusive_instance(
         store,
         &workload_class.reference,
@@ -1636,42 +1649,86 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
         "license-release",
     )
     .await?;
-    let owner_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
     let expected_owner_keys = vec![
         control_plane::RenderedExclusivityKey::new("disk", "disk-release"),
         control_plane::RenderedExclusivityKey::new("license", "license-release"),
     ];
-    let mut pending = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        owner_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    pending.rendered_objects = vec![object_ref("v1", "PersistentVolume", "", "pv-release")];
-    pending.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&owner_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
-    assert_eq!(pending.exclusivity_keys, expected_owner_keys);
-    store.record_materialization(pending).await?;
+    assert_eq!(keys(&owner.instance)?, expected_owner_keys);
+    let pending = accept_projection(
+        store,
+        &owner.instance,
+        &target,
+        vec![object_ref("v1", "PersistentVolume", "", "pv-release")],
+        keys(&owner.instance)?,
+    )
+    .await?;
 
-    let mut release = RecordMaterializationRequest::new(
-        owner.instance.id.clone(),
-        owner_waking.generation,
-        target.clone(),
-        MaterializationState::Deleted,
-        BackendGeneration::new(1),
+    // A wake that fails before it applies anything ends: its instance is
+    // Failed, and its cleanup keeps the keys until it proves the objects absent.
+    let claimed = claim_row(store, &pending, "driver").await?;
+    assert!(
+        store
+            .record_materialization_failure(
+                control_plane::runtime_work::RecordMaterializationFailure {
+                    expected_state: MaterializationState::Pending,
+                    materialization_id: claimed.id.clone(),
+                    owner: "driver".to_owned(),
+                    attempt: claimed.reconciliation_lease.as_ref().unwrap().attempt,
+                    generation: claimed.instance_generation,
+                    permanent: true,
+                    message: "materialization failed before apply".to_owned(),
+                }
+            )
+            .await?
     );
-    release.rendered_objects = Vec::new();
-    release.exclusivity_keys = Vec::new();
-    let released = store.record_materialization(release).await?;
+    let failed = store
+        .get_instance(GetInstanceRequest::new(owner.instance.id.clone()))
+        .await?
+        .expect("the failed instance remains");
+    assert_eq!(failed.state, InstanceState::Failed);
+    assert_eq!(failed.generation, owner.instance.generation.next().next());
+
+    let contender = create_exclusive_instance(
+        store,
+        &workload_class.reference,
+        "instance-exclusive-release-contender",
+        "disk-release",
+        "license-contender",
+    )
+    .await?;
+    let contender_wake = accept_request(
+        &contender.instance,
+        &target,
+        vec![],
+        keys(&contender.instance)?,
+    );
+    let held = store
+        .accept_wake(contender_wake.clone())
+        .await
+        .expect_err("cleanup keeps the failed wake's keys");
+    assert_exclusivity_conflict(held, "disk", Some("instance-exclusive-release-owner"));
+
+    let cleanup = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            owner.instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("the failed wake leaves cleanup");
+    assert_eq!(cleanup.state, MaterializationState::Deleting);
+    let cleanup_claim = claim_row(store, &cleanup, "driver").await?;
+    let released = store
+        .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
+            cleanup_claim.id.clone(),
+            "driver",
+            cleanup_claim.reconciliation_lease.as_ref().unwrap().attempt,
+            MaterializationState::Deleting,
+            cleanup_claim.instance_id.clone(),
+            cleanup_claim.instance_generation,
+            cleanup_claim.target.clone(),
+        ))
+        .await?
+        .expect("cleanup marks the row deleted");
     assert_eq!(released.state, MaterializationState::Deleted);
     assert!(released.rendered_objects.is_empty());
     assert!(released.exclusivity_keys.is_empty());
@@ -1683,49 +1740,10 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
         .await?
         .is_none());
 
-    let failed = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            owner.instance.id,
-            owner_waking.generation,
-            InstanceState::Failed,
-            StateTransitionReason::FailureReported(
-                "materialization failed before apply".to_owned(),
-            ),
-        ))
-        .await?;
-    assert_eq!(failed.generation, owner_waking.generation.next());
+    let acquired = store.accept_wake(contender_wake).await?;
+    assert_eq!(acquired.id, contender.instance.id);
 
-    let contender = create_exclusive_instance(
-        store,
-        &workload_class.reference,
-        "instance-exclusive-release-contender",
-        "disk-release",
-        "license-contender",
-    )
-    .await?;
-    let contender_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            contender.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut contender_materialization = RecordMaterializationRequest::new(
-        contender.instance.id.clone(),
-        contender_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    contender_materialization.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&contender_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
-    let acquired = store
-        .record_materialization(contender_materialization)
-        .await?;
-    assert_eq!(acquired.instance_id, contender.instance.id);
-
+    // A cleanup attempt that lost its lease cannot release the keys.
     let stale_owner = create_exclusive_instance(
         store,
         &workload_class.reference,
@@ -1734,61 +1752,63 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
         "license-stale-release",
     )
     .await?;
-    let stale_owner_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            stale_owner.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
+    let stale_pending = accept_projection(
+        store,
+        &stale_owner.instance,
+        &target,
+        vec![],
+        keys(&stale_owner.instance)?,
+    )
+    .await?;
+    let wake_claim = claim_row(store, &stale_pending, "driver").await?;
+    let wake_attempt = wake_claim.reconciliation_lease.as_ref().unwrap().attempt;
+    store
+        .record_materialization_failure(control_plane::runtime_work::RecordMaterializationFailure {
+            expected_state: MaterializationState::Pending,
+            materialization_id: wake_claim.id.clone(),
+            owner: "driver".to_owned(),
+            attempt: wake_attempt,
+            generation: wake_claim.instance_generation,
+            permanent: true,
+            message: "materialization failed before apply".to_owned(),
+        })
         .await?;
-    let mut stale_pending = RecordMaterializationRequest::new(
-        stale_owner.instance.id.clone(),
-        stale_owner_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    stale_pending.exclusivity_keys = workload_class
-        .render_exclusivity_keys(&stale_owner_waking.values)
-        .map_err(|error| StoreError::internal(error.to_string()))?;
-    store.record_materialization(stale_pending).await?;
-    let stale_failed = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            stale_owner.instance.id.clone(),
-            stale_owner_waking.generation,
-            InstanceState::Failed,
-            StateTransitionReason::FailureReported(
-                "materialization failed before apply".to_owned(),
-            ),
-        ))
-        .await?;
-    let stale_release = RecordMaterializationRequest::new(
-        stale_owner.instance.id.clone(),
-        stale_owner_waking.generation,
-        target.clone(),
-        MaterializationState::Deleted,
-        BackendGeneration::new(1),
-    );
     let stale_release_error = store
-        .record_materialization(stale_release)
+        .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
+            wake_claim.id.clone(),
+            "driver",
+            wake_attempt,
+            MaterializationState::Deleting,
+            wake_claim.instance_id.clone(),
+            wake_claim.instance_generation,
+            wake_claim.target.clone(),
+        ))
         .await
-        .expect_err("stale generation cannot release pending held keys");
+        .expect_err("a consumed lease cannot release pending held keys");
     assert!(matches!(
         stale_release_error,
-        StoreError::GenerationConflict {
-            expected,
-            actual
-        } if expected == stale_owner_waking.generation && actual == stale_failed.generation
+        StoreError::LeaseConflict { .. }
     ));
-    let accepted_release = RecordMaterializationRequest::new(
-        stale_owner.instance.id,
-        stale_failed.generation,
-        target,
-        MaterializationState::Deleted,
-        BackendGeneration::new(1),
-    );
-    store.record_materialization(accepted_release).await?;
+    let stale_cleanup = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            stale_owner.instance.id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("the stale owner's cleanup remains");
+    assert_eq!(stale_cleanup.exclusivity_keys.len(), 2);
+    let cleanup_claim = claim_row(store, &stale_cleanup, "driver").await?;
+    store
+        .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
+            cleanup_claim.id.clone(),
+            "driver",
+            cleanup_claim.reconciliation_lease.as_ref().unwrap().attempt,
+            MaterializationState::Deleting,
+            cleanup_claim.instance_id,
+            cleanup_claim.instance_generation,
+            target,
+        ))
+        .await?;
 
     Ok(())
 }
@@ -1807,29 +1827,19 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            created.instance.id.clone(),
-            created.instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut pending = RecordMaterializationRequest::new(
-        waking.id.clone(),
-        waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    pending.rendered_objects = vec![RenderedObjectRef {
-        api_version: "apps/v1".to_owned(),
-        kind: "Deployment".to_owned(),
-        namespace: "apps".to_owned(),
-        name: "instance-reconcile-pending".to_owned(),
-    }];
-    pending.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "reconcile-disk")];
-    let pending_record = store.record_materialization(pending).await?;
+    let pending_record = accept_projection(
+        store,
+        &created.instance,
+        &target,
+        vec![RenderedObjectRef {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: "apps".to_owned(),
+            name: "instance-reconcile-pending".to_owned(),
+        }],
+        vec![RenderedExclusivityKey::new("disk", "reconcile-disk")],
+    )
+    .await?;
     let loaded_pending = store
         .load_materialization(LoadMaterializationRequest::new(pending_record.id.clone()))
         .await?
@@ -1962,30 +1972,18 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let expired_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            expired_instance.instance.id.clone(),
-            expired_instance.instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
     // This row keeps an expired lease, so it stays due; its own target keeps
     // it out of the later scenarios' claims.
     let expired_target =
         MaterializationTarget::new("cluster-reconcile-expired", "apps").expect("valid target");
-    let mut expired_pending_request = RecordMaterializationRequest::new(
-        expired_waking.id.clone(),
-        expired_waking.generation,
-        expired_target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    expired_pending_request.exclusivity_keys =
-        vec![RenderedExclusivityKey::new("disk", "expired-pending-disk")];
-    let expired_pending = store
-        .record_materialization(expired_pending_request)
-        .await?;
+    let expired_pending = accept_projection(
+        store,
+        &expired_instance.instance,
+        &expired_target,
+        vec![],
+        vec![RenderedExclusivityKey::new("disk", "expired-pending-disk")],
+    )
+    .await?;
     claim_next(
         store,
         MaterializationState::Pending,
@@ -2052,54 +2050,21 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let race_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            race_instance.instance.id.clone(),
-            race_instance.instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let mut stale_race_request = RecordMaterializationRequest::new(
-        race_waking.id.clone(),
-        race_waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    stale_race_request.exclusivity_keys =
-        vec![RenderedExclusivityKey::new("disk", "race-old-disk")];
-    let stale_race = store.record_materialization(stale_race_request).await?;
-    claim_next(
+    let stale_race = accept_projection(
         store,
-        MaterializationState::Pending,
+        &race_instance.instance,
         &target,
-        "race-owner",
-        Duration::from_secs(60),
+        vec![],
+        vec![RenderedExclusivityKey::new("disk", "race-disk")],
     )
-    .await?
-    .expect("race fixture lease claim succeeds");
-    let race_running = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            race_waking.id.clone(),
-            race_waking.generation,
-            InstanceState::Running,
-            StateTransitionReason::MaterializationReady,
-        ))
-        .await?;
-    let mut newer_race_request = RecordMaterializationRequest::new(
-        race_waking.id.clone(),
-        race_running.generation,
-        target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(2),
-    );
-    newer_race_request.backend =
-        Some(BackendEndpoint::new("http://10.0.0.43:8080").expect("valid backend"));
-    newer_race_request.exclusivity_keys =
-        vec![RenderedExclusivityKey::new("disk", "race-new-disk")];
-    let newer_race = store.record_materialization(newer_race_request).await?;
-    assert_eq!(newer_race.id, stale_race.id);
+    .await?;
+    claim_row(store, &stale_race, "race-owner").await?;
+    // The race owner stops renewing; another driver takes over and completes
+    // the wake.
+    raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&stale_race.id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
+    let newer_race = complete_wake_of(store, &stale_race, "http://10.0.0.43:8080").await?;
+    assert_eq!(newer_race.materialization.id, stale_race.id);
+    let race_running = newer_race.instance;
     let stale_race_delete = store
         .delete_materialization_reconciliation(DeleteMaterializationReconciliationRequest::new(
             stale_race.id.clone(),
@@ -2112,7 +2077,10 @@ async fn exercise_materialization_reconciliation_leases(
         ))
         .await
         .expect_err("stale cleanup cannot delete newer same-id materialization");
-    assert!(matches!(stale_race_delete, StoreError::NotFound { .. }));
+    assert!(matches!(
+        stale_race_delete,
+        StoreError::NotFound { .. } | StoreError::LeaseConflict { .. }
+    ));
     let race_loaded = store
         .load_materialization(LoadMaterializationRequest::new(stale_race.id.clone()))
         .await?
@@ -2124,7 +2092,7 @@ async fn exercise_materialization_reconciliation_leases(
             .exclusivity_keys
             .first()
             .map(|key| key.value.as_str()),
-        Some("race-new-disk")
+        Some("race-disk")
     );
 
     let delete_instance = store
@@ -2134,22 +2102,20 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let running = wake_to_running(store, delete_instance.instance.id.clone()).await?;
-    let mut ready = RecordMaterializationRequest::new(
-        running.id.clone(),
-        running.generation,
-        target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(5),
-    );
-    ready.rendered_objects = vec![RenderedObjectRef {
-        api_version: "apps/v1".to_owned(),
-        kind: "Deployment".to_owned(),
-        namespace: "apps".to_owned(),
-        name: "instance-reconcile-delete".to_owned(),
-    }];
-    ready.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "delete-disk")];
-    store.record_materialization(ready).await?;
+    let running = wake_to_running(
+        store,
+        delete_instance.instance.id.clone(),
+        &target,
+        vec![RenderedObjectRef {
+            api_version: "apps/v1".to_owned(),
+            kind: "Deployment".to_owned(),
+            namespace: "apps".to_owned(),
+            name: "instance-reconcile-delete".to_owned(),
+        }],
+        vec![RenderedExclusivityKey::new("disk", "delete-disk")],
+    )
+    .await?
+    .instance;
     let drain_grace_timeout = Duration::from_secs(60 * 60);
     let begin = store
         .begin_sleep(
@@ -2177,7 +2143,7 @@ async fn exercise_materialization_reconciliation_leases(
         "manual claim must not bypass drain grace"
     );
     raw.execute("UPDATE materializations SET drain_not_before_unix_millis = 0, next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&deleting_id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
-    claim_next(
+    let delete_attempt = claim_next(
         store,
         MaterializationState::Deleting,
         &target,
@@ -2185,12 +2151,15 @@ async fn exercise_materialization_reconciliation_leases(
         Duration::from_secs(30),
     )
     .await?
-    .expect("delete lease claim succeeds after grace");
+    .expect("delete lease claim succeeds after grace")
+    .reconciliation_lease
+    .unwrap()
+    .attempt;
     let stale_finalize = store
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-b",
-            1,
+            delete_attempt,
             FinalizeSleepRequest::new(
                 begin.instance.id.clone(),
                 begin.instance.generation,
@@ -2204,7 +2173,7 @@ async fn exercise_materialization_reconciliation_leases(
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             deleting_id.clone(),
             "delete-owner-a",
-            1,
+            delete_attempt,
             FinalizeSleepRequest::new(
                 begin.instance.id,
                 begin.instance.generation,
@@ -2240,18 +2209,15 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let expired_delete_running =
-        wake_to_running(store, expired_delete_instance.instance.id.clone()).await?;
-    let mut expired_ready = RecordMaterializationRequest::new(
-        expired_delete_running.id.clone(),
-        expired_delete_running.generation,
-        target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(8),
-    );
-    expired_ready.exclusivity_keys =
-        vec![RenderedExclusivityKey::new("disk", "expired-delete-disk")];
-    store.record_materialization(expired_ready).await?;
+    let expired_delete_running = wake_to_running(
+        store,
+        expired_delete_instance.instance.id.clone(),
+        &target,
+        vec![],
+        vec![RenderedExclusivityKey::new("disk", "expired-delete-disk")],
+    )
+    .await?
+    .instance;
     let expired_begin = store
         .begin_sleep(BeginSleepRequest::new(
             expired_delete_running.id.clone(),
@@ -2262,7 +2228,7 @@ async fn exercise_materialization_reconciliation_leases(
     let expired_deleting = expired_begin
         .materialization
         .expect("expired deleting materialization exists");
-    claim_next(
+    let expired_attempt = claim_next(
         store,
         MaterializationState::Deleting,
         &target,
@@ -2270,13 +2236,16 @@ async fn exercise_materialization_reconciliation_leases(
         Duration::from_secs(30),
     )
     .await?
-    .expect("expired delete lease fixture claim succeeds relative to request clock");
+    .expect("expired delete lease fixture claim succeeds relative to request clock")
+    .reconciliation_lease
+    .unwrap()
+    .attempt;
     raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 1 WHERE materialization_id = $1", &[&expired_deleting.id.as_str()]).await.map_err(|e| StoreError::internal(e.to_string()))?;
     let expired_finalize = store
         .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
             expired_deleting.id.clone(),
             "expired-delete-owner",
-            1,
+            expired_attempt,
             FinalizeSleepRequest::new(
                 expired_begin.instance.id,
                 expired_begin.instance.generation,
@@ -2312,25 +2281,16 @@ async fn exercise_materialization_reconciliation_leases(
             vec![],
         ))
         .await?;
-    let force_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            force_instance.instance.id.clone(),
-            force_instance.instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
     let force_target =
         MaterializationTarget::new("cluster-force-release", "apps").expect("valid target");
-    let mut force_pending = RecordMaterializationRequest::new(
-        force_waking.id,
-        force_waking.generation,
-        force_target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(1),
-    );
-    force_pending.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "force-disk")];
-    store.record_materialization(force_pending).await?;
+    accept_projection(
+        store,
+        &force_instance.instance,
+        &force_target,
+        vec![],
+        vec![RenderedExclusivityKey::new("disk", "force-disk")],
+    )
+    .await?;
     let force_result = store
         .force_release_exclusivity_key(ForceReleaseExclusivityKeyRequest::new(
             force_target,
@@ -2387,28 +2347,6 @@ fn complete_for_reconciled_pending(
     complete
 }
 
-async fn wake_to_running(
-    store: &PostgresStore,
-    instance_id: InstanceId,
-) -> Result<control_plane::InstanceRecord, StoreError> {
-    store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            instance_id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            instance_id,
-            Generation::new(1),
-            InstanceState::Running,
-            StateTransitionReason::MaterializationReady,
-        ))
-        .await
-}
-
 async fn exercise_complete_wake(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
@@ -2422,29 +2360,7 @@ async fn exercise_complete_wake(
         .await?;
     let instance_id = success.instance.id.clone();
     let route_binding_id = success.route_bindings[0].id.clone();
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            instance_id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    assert_eq!(waking.state, InstanceState::Waking);
-    assert_eq!(waking.generation, Generation::new(1));
-
     let target = MaterializationTarget::new("cluster-complete", "apps").expect("valid target");
-    let pending = RecordMaterializationRequest::new(
-        instance_id.clone(),
-        waking.generation,
-        target.clone(),
-        MaterializationState::Pending,
-        BackendGeneration::new(6),
-    );
-    let pending_record = store.record_materialization(pending).await?;
-    assert_eq!(pending_record.instance_generation, Generation::new(1));
-    assert_eq!(pending_record.backend_generation, BackendGeneration::new(6));
-
     let rendered_objects = vec![
         RenderedObjectRef {
             api_version: "apps/v1".to_owned(),
@@ -2459,15 +2375,22 @@ async fn exercise_complete_wake(
             name: "instance-complete-wake-success".to_owned(),
         },
     ];
-    let mut complete = CompleteWakeRequest::new(
-        instance_id.clone(),
-        waking.generation,
-        target.clone(),
-        BackendEndpoint::new("http://10.0.0.20:8080").expect("valid backend"),
-        BackendGeneration::new(7),
-    );
-    complete.rendered_objects = rendered_objects.clone();
-    let completed = store.complete_wake(complete).await?;
+    let mut wake = accept_request(&success.instance, &target, rendered_objects.clone(), vec![]);
+    wake.pending.backend_generation = BackendGeneration::new(6);
+    let waking = store.accept_wake(wake).await?;
+    assert_eq!(waking.state, InstanceState::Waking);
+    assert_eq!(waking.generation, Generation::new(1));
+    let pending_record = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            instance_id.clone(),
+            target.clone(),
+        ))
+        .await?
+        .expect("the accepted wake has a Pending row");
+    assert_eq!(pending_record.instance_generation, Generation::new(1));
+    assert_eq!(pending_record.backend_generation, BackendGeneration::new(6));
+
+    let completed = complete_wake_of(store, &pending_record, "http://10.0.0.20:8080").await?;
     assert_eq!(completed.instance.id, instance_id);
     assert_eq!(completed.instance.state, InstanceState::Running);
     assert_eq!(completed.instance.generation, Generation::new(2));
@@ -2480,7 +2403,7 @@ async fn exercise_complete_wake(
     assert_eq!(completed.materialization.state, MaterializationState::Ready);
     assert_eq!(
         completed.materialization.backend_generation,
-        BackendGeneration::new(7)
+        BackendGeneration::new(6)
     );
     assert_eq!(
         completed
@@ -2522,28 +2445,6 @@ async fn exercise_complete_wake(
             .is_none(),
         "wrong target must not load ready materialization"
     );
-    let non_ready_target =
-        MaterializationTarget::new("cluster-complete", "pending").expect("valid target");
-    store
-        .record_materialization(RecordMaterializationRequest::new(
-            completed.instance.id.clone(),
-            completed.instance.generation,
-            non_ready_target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        ))
-        .await?;
-    assert!(
-        store
-            .load_ready_materialization(LoadReadyMaterializationRequest::new(
-                completed.instance.id.clone(),
-                completed.instance.generation,
-                non_ready_target,
-            ))
-            .await?
-            .is_none(),
-        "non-ready materialization must not load"
-    );
 
     match resolve_route(
         store,
@@ -2561,18 +2462,10 @@ async fn exercise_complete_wake(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
                 Some("http://10.0.0.20:8080")
             );
-            assert_eq!(entry.backend_generation, Some(BackendGeneration::new(7)));
+            assert_eq!(entry.backend_generation, Some(BackendGeneration::new(6)));
         }
-        None => panic!("route should resolve after complete_wake"),
+        None => panic!("route should resolve after the wake completes"),
     }
-    let dependencies = store
-        .lookup_route_dependencies(RouteDependencyLookup::new(route_binding_id))
-        .await?
-        .expect("route dependencies load after complete_wake");
-    assert_eq!(
-        dependencies.materialization_generation,
-        Some(BackendGeneration::new(7))
-    );
 
     let sleep_started = store
         .begin_sleep(BeginSleepRequest::new(
@@ -2585,6 +2478,7 @@ async fn exercise_complete_wake(
     assert_eq!(sleep_started.instance.generation, Generation::new(3));
     let deleting_materialization = sleep_started
         .materialization
+        .clone()
         .expect("active materialization is marked deleting");
     assert_eq!(
         deleting_materialization.state,
@@ -2595,6 +2489,17 @@ async fn exercise_complete_wake(
         "a draining projection keeps its backend for a revive"
     );
     assert_eq!(deleting_materialization.rendered_objects, rendered_objects);
+    assert!(
+        store
+            .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                completed.instance.id.clone(),
+                completed.instance.generation,
+                target.clone(),
+            ))
+            .await?
+            .is_none(),
+        "a draining materialization is not Ready"
+    );
     let active = store
         .load_active_materialization(LoadActiveMaterializationRequest::new(
             completed.instance.id.clone(),
@@ -2604,13 +2509,8 @@ async fn exercise_complete_wake(
         .expect("deleting materialization remains active until cleanup finalizes");
     assert_eq!(active.state, MaterializationState::Deleting);
 
-    let sleep_finalized = store
-        .finalize_sleep(FinalizeSleepRequest::new(
-            completed.instance.id.clone(),
-            sleep_started.instance.generation,
-            target.clone(),
-        ))
-        .await?;
+    let sleep_finalized =
+        finish_sleep_of(store, &deleting_materialization, &sleep_started.instance).await?;
     assert_eq!(sleep_finalized.instance.state, InstanceState::Cold);
     assert_eq!(sleep_finalized.instance.generation, Generation::new(4));
     let deleted_materialization = sleep_finalized
@@ -2634,253 +2534,68 @@ async fn exercise_complete_wake(
         "deleted materialization is no longer active"
     );
 
-    let stale_sleep = create_lifecycle_instance(
-        store,
-        workload_class.clone(),
-        "instance-begin-sleep-stale-materialization",
-    )
-    .await?;
-    let stale_sleep_id = stale_sleep.instance.id.clone();
-    let stale_sleep_waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            stale_sleep_id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let stale_sleep_target =
-        MaterializationTarget::new("cluster-complete", "stale-sleep").expect("valid target");
-    let stale_sleep_materialization = store
-        .record_materialization(RecordMaterializationRequest::new(
-            stale_sleep_id.clone(),
-            stale_sleep_waking.generation,
-            stale_sleep_target.clone(),
-            MaterializationState::Ready,
-            BackendGeneration::new(1),
-        ))
-        .await?;
-    assert_eq!(
-        stale_sleep_materialization.instance_generation,
-        Generation::new(1)
-    );
-    let stale_sleep_running = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            stale_sleep_id.clone(),
-            stale_sleep_waking.generation,
-            InstanceState::Running,
-            StateTransitionReason::MaterializationReady,
-        ))
-        .await?;
-    assert_eq!(stale_sleep_running.generation, Generation::new(2));
-    let stale_sleep_error = store
-        .begin_sleep(BeginSleepRequest::new(
-            stale_sleep_id.clone(),
-            stale_sleep_running.generation,
-            stale_sleep_target.clone(),
-        ))
-        .await
-        .expect_err("begin_sleep rejects stale active materialization generation");
-    match stale_sleep_error {
-        StoreError::GenerationConflict { expected, actual } => {
-            assert_eq!(expected, Generation::new(2));
-            assert_eq!(actual, Generation::new(1));
-        }
-        other => panic!("expected stale materialization generation conflict, got {other}"),
-    }
-    let active_after_rejected_sleep = store
-        .load_active_materialization(LoadActiveMaterializationRequest::new(
-            stale_sleep_id,
-            stale_sleep_target,
-        ))
-        .await?
-        .expect("stale materialization remains active after rejected sleep");
-    assert_eq!(
-        active_after_rejected_sleep.state,
-        MaterializationState::Ready
-    );
-    assert_eq!(
-        active_after_rejected_sleep.instance_generation,
-        Generation::new(1)
-    );
-
+    // A completion names the incarnation it woke; an earlier one is refused
+    // and changes nothing.
     let stale = create_lifecycle_instance(
         store,
         workload_class.clone(),
         "instance-complete-wake-stale",
     )
     .await?;
-    let stale_id = stale.instance.id.clone();
-    store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            stale_id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
     let stale_target =
         MaterializationTarget::new("cluster-complete", "stale").expect("valid target");
+    let stale_pending =
+        accept_projection(store, &stale.instance, &stale_target, vec![], vec![]).await?;
+    let claimed = claim_row(store, &stale_pending, "driver").await?;
+    let mut stale_complete = complete_for_reconciled_pending(&claimed, "http://10.0.0.30:8080");
+    stale_complete.expected_waking_generation = Generation::new(0);
     let stale_error = store
-        .complete_wake(CompleteWakeRequest::new(
-            stale_id.clone(),
-            Generation::new(0),
-            stale_target.clone(),
-            BackendEndpoint::new("http://10.0.0.30:8080").expect("valid backend"),
-            BackendGeneration::new(5),
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            claimed.id.clone(),
+            "driver",
+            claimed.reconciliation_lease.as_ref().unwrap().attempt,
+            stale_complete,
         ))
         .await
-        .expect_err("stale complete_wake generation is rejected");
-    match stale_error {
-        StoreError::GenerationConflict { expected, actual } => {
-            assert_eq!(expected, Generation::new(0));
-            assert_eq!(actual, Generation::new(1));
-        }
-        other => panic!("expected stale complete_wake generation conflict, got {other}"),
-    }
+        .expect_err("a completion for an earlier incarnation is rejected");
+    assert!(matches!(
+        stale_error,
+        StoreError::NotFound { .. } | StoreError::GenerationConflict { .. }
+    ));
     let stale_after = store
-        .get_instance(GetInstanceRequest::new(stale_id.clone()))
+        .get_instance(GetInstanceRequest::new(stale.instance.id.clone()))
         .await?
-        .expect("stale complete_wake target still exists");
+        .expect("stale completion target still exists");
     assert_eq!(stale_after.state, InstanceState::Waking);
     assert_eq!(stale_after.generation, Generation::new(1));
-    let stale_probe = RecordMaterializationRequest::new(
-        stale_id,
-        Generation::new(1),
-        stale_target,
-        MaterializationState::Pending,
-        BackendGeneration::new(4),
-    );
-    let stale_probe_record = store.record_materialization(stale_probe).await?;
-    assert_eq!(
-        stale_probe_record.backend_generation,
-        BackendGeneration::new(4)
-    );
 
+    // A Cold instance has no wake to complete.
     let cold =
-        create_lifecycle_instance(store, workload_class.clone(), "instance-complete-wake-cold")
-            .await?;
-    let cold_id = cold.instance.id.clone();
+        create_lifecycle_instance(store, workload_class, "instance-complete-wake-cold").await?;
     let cold_target = MaterializationTarget::new("cluster-complete", "cold").expect("valid target");
     let cold_error = store
-        .complete_wake(CompleteWakeRequest::new(
-            cold_id.clone(),
-            Generation::new(0),
-            cold_target.clone(),
-            BackendEndpoint::new("http://10.0.0.31:8080").expect("valid backend"),
-            BackendGeneration::new(3),
+        .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
+            control_plane::materialization_id(&cold.instance.id, &cold_target)
+                .expect("valid materialization ID"),
+            "driver",
+            1,
+            CompleteWakeRequest::new(
+                cold.instance.id.clone(),
+                Generation::new(0),
+                cold_target,
+                BackendEndpoint::new("http://10.0.0.31:8080").expect("valid backend"),
+                BackendGeneration::new(3),
+            ),
         ))
         .await
         .expect_err("cold instances cannot complete wake");
-    assert!(matches!(cold_error, StoreError::InvalidArgument { .. }));
+    assert!(matches!(cold_error, StoreError::NotFound { .. }));
     let cold_after = store
-        .get_instance(GetInstanceRequest::new(cold_id.clone()))
+        .get_instance(GetInstanceRequest::new(cold.instance.id.clone()))
         .await?
-        .expect("cold complete_wake target still exists");
+        .expect("cold completion target still exists");
     assert_eq!(cold_after.state, InstanceState::Cold);
     assert_eq!(cold_after.generation, Generation::new(0));
-    let cold_probe = RecordMaterializationRequest::new(
-        cold_id,
-        Generation::new(0),
-        cold_target,
-        MaterializationState::Pending,
-        BackendGeneration::new(2),
-    );
-    let cold_probe_record = store.record_materialization(cold_probe).await?;
-    assert_eq!(
-        cold_probe_record.backend_generation,
-        BackendGeneration::new(2)
-    );
-
-    let rewind = store
-        .create_instance(create_instance_request(
-            "instance-complete-wake-rewind",
-            workload_class,
-            vec![http_identity("complete-wake-rewind.example.com", None)],
-        ))
-        .await?;
-    let rewind_id = rewind.instance.id.clone();
-    let rewind_route_binding_id = rewind.route_bindings[0].id.clone();
-    store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            rewind_id.clone(),
-            Generation::new(0),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    let rewind_target =
-        MaterializationTarget::new("cluster-complete", "rewind").expect("valid target");
-    let mut old_ready = RecordMaterializationRequest::new(
-        rewind_id.clone(),
-        Generation::new(1),
-        rewind_target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(9),
-    );
-    old_ready.backend = Some(BackendEndpoint::new("http://10.0.0.40:8080").expect("valid backend"));
-    old_ready.rendered_objects = vec![RenderedObjectRef {
-        api_version: "apps/v1".to_owned(),
-        kind: "Deployment".to_owned(),
-        namespace: "rewind".to_owned(),
-        name: "old-ready".to_owned(),
-    }];
-    store.record_materialization(old_ready).await?;
-    let rewind_error = store
-        .complete_wake(CompleteWakeRequest::new(
-            rewind_id.clone(),
-            Generation::new(1),
-            rewind_target.clone(),
-            BackendEndpoint::new("http://10.0.0.41:8080").expect("valid backend"),
-            BackendGeneration::new(8),
-        ))
-        .await
-        .expect_err("complete_wake rejects backend generation rewinds");
-    match rewind_error {
-        StoreError::InvalidArgument { message } => {
-            assert!(message.contains("backend generation rewind"));
-        }
-        other => panic!("expected backend rewind invalid argument, got {other}"),
-    }
-    let rewind_after = store
-        .get_instance(GetInstanceRequest::new(rewind_id.clone()))
-        .await?
-        .expect("rewind complete_wake target still exists");
-    assert_eq!(rewind_after.state, InstanceState::Waking);
-    assert_eq!(rewind_after.generation, Generation::new(1));
-    match resolve_route(
-        store,
-        http_identity("complete-wake-rewind.example.com", None),
-        MaterializationTarget::new("cluster-complete", "rewind").unwrap(),
-    )
-    .await?
-    {
-        Some(entry) => {
-            assert_eq!(entry.route_binding_id, rewind_route_binding_id);
-            assert_eq!(entry.instance_state, InstanceState::Waking);
-            assert_eq!(entry.instance_generation, Generation::new(1));
-            assert_eq!(
-                entry.backend.as_ref().map(BackendEndpoint::uri),
-                Some("http://10.0.0.40:8080")
-            );
-            assert_eq!(entry.backend_generation, Some(BackendGeneration::new(9)));
-        }
-        None => {
-            panic!("route should still resolve to the unchanged old materialization")
-        }
-    }
-    let lower_backend_generation = RecordMaterializationRequest::new(
-        rewind_id,
-        Generation::new(1),
-        rewind_target,
-        MaterializationState::Ready,
-        BackendGeneration::new(8),
-    );
-    let lower_error = store
-        .record_materialization(lower_backend_generation)
-        .await
-        .expect_err("old materialization backend generation remains newer");
-    assert!(matches!(lower_error, StoreError::InvalidArgument { .. }));
 
     Ok(())
 }
@@ -3692,24 +3407,37 @@ async fn phase5_reservation_concurrency(
     config: &PostgresStoreConfig,
     class: &WorkloadClassVersion,
 ) -> TestResult {
+    let target = MaterializationTarget::new("phase5", "apps")?;
     let mut requests = Vec::new();
-    for index in 0..26 {
+    for index in 0..28 {
         let id = format!("phase5-reservation-{index}");
         let instance = create_lifecycle_instance(store, class.reference.clone(), &id)
             .await?
             .instance;
-        let mut request = RecordMaterializationRequest::new(
-            instance.id,
-            instance.generation,
-            MaterializationTarget::new("phase5", "apps")?,
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        );
-        request.rendered_objects = vec![object_ref("v1", "Service", "apps", &id)];
-        request.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", &id)];
-        requests.push(request);
+        requests.push(accept_request(
+            &instance,
+            &target,
+            vec![object_ref("v1", "Service", "apps", &id)],
+            vec![RenderedExclusivityKey::new("disk", &id)],
+        ));
     }
-    let held = store.record_materialization(requests[0].clone()).await?;
+    let accept = |request: control_plane::materialization::AcceptWakeRequest| {
+        let store = store.clone();
+        async move {
+            let id = request.pending.instance_id.clone();
+            store.accept_wake(request).await?;
+            Ok::<_, StoreError>(
+                store
+                    .load_active_materialization(LoadActiveMaterializationRequest::new(
+                        id,
+                        MaterializationTarget::new("phase5", "apps").unwrap(),
+                    ))
+                    .await?
+                    .expect("an accepted wake has a Pending row"),
+            )
+        }
+    };
+    let held = accept(requests[0].clone()).await?;
     let mut raw = raw_client(config).await?;
     let transaction = raw.transaction().await?;
     transaction.execute("UPDATE materializations SET failure_count = failure_count WHERE materialization_id = $1", &[&held.id.as_str()]).await?;
@@ -3730,7 +3458,7 @@ async fn phase5_reservation_concurrency(
     for request in &requests[1..24] {
         let store = store.clone();
         let request = request.clone();
-        tasks.spawn(async move { store.record_materialization(request).await });
+        tasks.spawn(async move { store.accept_wake(request).await });
     }
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(result) = tasks.join_next().await {
@@ -3743,37 +3471,34 @@ async fn phase5_reservation_concurrency(
     // Two transactions racing to acquire one key must produce one owner.
     let mut left = requests[24].clone();
     let mut right = requests[25].clone();
-    left.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "shared-race")];
-    right.exclusivity_keys = left.exclusivity_keys.clone();
-    let (left, right) = tokio::join!(
-        store.record_materialization(left),
-        store.record_materialization(right)
-    );
+    left.pending.exclusivity_keys = vec![RenderedExclusivityKey::new("disk", "shared-race")];
+    right.pending.exclusivity_keys = left.pending.exclusivity_keys.clone();
+    let (left, right) = tokio::join!(store.accept_wake(left), store.accept_wake(right));
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
     assert!(matches!(
         left.as_ref().err().or(right.as_ref().err()),
         Some(StoreError::ExclusivityConflict { .. })
     ));
     // An object has one Kubernetes API-group identity across API versions.
-    let mut other_version = requests[25].clone();
-    other_version.exclusivity_keys.clear();
-    other_version.rendered_objects = vec![object_ref(
-        "apps/v1",
-        "Deployment",
-        "apps",
-        "shared-version",
-    )];
-    let mut owner = requests[24].clone();
-    owner.exclusivity_keys.clear();
-    owner.rendered_objects = vec![object_ref(
+    let mut owner = requests[26].clone();
+    owner.pending.exclusivity_keys.clear();
+    owner.pending.rendered_objects = vec![object_ref(
         "apps/v1beta1",
         "Deployment",
         "apps",
         "shared-version",
     )];
-    store.record_materialization(owner).await?;
+    let mut other_version = requests[27].clone();
+    other_version.pending.exclusivity_keys.clear();
+    other_version.pending.rendered_objects = vec![object_ref(
+        "apps/v1",
+        "Deployment",
+        "apps",
+        "shared-version",
+    )];
+    store.accept_wake(owner).await?;
     assert!(matches!(
-        store.record_materialization(other_version).await,
+        store.accept_wake(other_version).await,
         Err(StoreError::InvalidArgument { .. })
     ));
     // Renewal and release preserve state age; retry queue placement is separate.
@@ -3894,21 +3619,25 @@ async fn phase5_route_scale_snapshot_and_target(
     }
     local_matching_equals_postgres_for_random_binding_sets(store, &raw, instance.id.as_str())
         .await?;
-    let running = wake_to_running(store, instance.id.clone()).await?;
-    for (cluster, generation, uri) in [
-        ("target", 1, "http://127.0.0.1:8081"),
-        ("other", 99, "http://127.0.0.1:8082"),
-    ] {
-        let mut materialization = RecordMaterializationRequest::new(
-            instance.id.clone(),
-            running.generation,
-            MaterializationTarget::new(cluster, "apps")?,
-            MaterializationState::Ready,
-            BackendGeneration::new(generation),
-        );
-        materialization.backend = Some(BackendEndpoint::new(uri)?);
-        store.record_materialization(materialization).await?;
-    }
+    // The instance runs in one target; a lookup for another target sees no backend.
+    let pending = accept_projection(
+        store,
+        &instance,
+        &MaterializationTarget::new("target", "apps")?,
+        vec![],
+        vec![],
+    )
+    .await?;
+    complete_wake_of(store, &pending, "http://127.0.0.1:8081").await?;
+    assert!(matches!(
+        resolve_route(
+            store,
+            http_identity("app.customer.example.net", None),
+            MaterializationTarget::new("other", "apps").unwrap(),
+        )
+        .await?,
+        Some(entry) if entry.backend.is_none()
+    ));
     let lookup = || {
         resolve_route(
             store,
@@ -4400,12 +4129,13 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
             "lost response replay is idempotent"
         );
         if state != "zero" {
+            store.finalize_instance_deletions(1024).await?;
             assert!(
                 store
-                    .delete_instance(DeleteInstanceRequest::new(instance.id.clone()))
-                    .await
-                    .is_err(),
-                "hard delete cannot release unresolved cleanup"
+                    .get_instance(GetInstanceRequest::new(instance.id.clone()))
+                    .await?
+                    .is_some(),
+                "a deletion finalizes only once its cleanup has finished"
             );
         }
         drive_until(target.clone(), instance.id.clone(), None).await;
@@ -4497,53 +4227,7 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
         "delete atomically cancels the deferred wake"
     );
 
-    // All targets become deleting, but a driver may prove cleanup only for its own target.
-    let other_target = MaterializationTarget::new("cluster-b", "apps")?;
-    let second = RecordMaterializationRequest::new(
-        rewoken.id.clone(),
-        rewoken.generation,
-        other_target.clone(),
-        MaterializationState::Ready,
-        BackendGeneration::new(rewoken.generation.get()),
-    );
-    store.record_materialization(second).await?;
-    store
-        .request_instance_deletion(RequestInstanceDeletion {
-            instance_id: rewoken.id.clone(),
-            expected_generation: rewoken.generation,
-        })
-        .await?;
-    {
-        let local = fresh_driver(target.clone());
-        transport_support::reconcile_until(local, || async {
-            store
-                .load_active_materialization(LoadActiveMaterializationRequest::new(
-                    rewoken.id.clone(),
-                    target.clone(),
-                ))
-                .await
-                .is_ok_and(|active| active.is_none())
-        })
-        .await;
-    }
-    drive_for(target.clone(), Duration::from_millis(200)).await;
-    assert!(
-        store
-            .get_instance(GetInstanceRequest::new(rewoken.id.clone()))
-            .await?
-            .is_some(),
-        "local absence cannot finalize another cluster"
-    );
-    let other = store
-        .load_active_materialization(LoadActiveMaterializationRequest::new(
-            rewoken.id.clone(),
-            other_target.clone(),
-        ))
-        .await?
-        .unwrap();
-    assert_eq!(other.state, MaterializationState::Deleting);
-    drive_until(other_target, rewoken.id.clone(), None).await;
-    eprintln!("phase6a durable acceptance, fresh-driver recovery, stable projection, grace, target-scoped cleanup, and ID-reuse fencing passed");
+    eprintln!("phase6a durable acceptance, fresh-driver recovery, stable projection, grace and ID-reuse fencing passed");
     Ok(())
 }
 
@@ -4584,25 +4268,15 @@ async fn postgres_attempt_and_incarnation_fencing() -> TestResult {
             ))
             .await?
             .instance;
-        let waking = store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                cold.id.clone(),
-                cold.generation,
-                InstanceState::Waking,
-                StateTransitionReason::WakeRequested,
-            ))
-            .await?;
         let target = MaterializationTarget::new("fence-cluster", "apps")?;
-        let mut request = RecordMaterializationRequest::new(
-            waking.id,
-            waking.generation,
-            target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        );
-        request.rendered_objects = vec![object_ref("v1", "Service", "apps", "fence-service")];
-        request.exclusivity_keys = vec![RenderedExclusivityKey::new("singleton", "fence")];
-        let pending = store.record_materialization(request).await?;
+        let pending = accept_projection(
+            store.as_ref(),
+            &cold,
+            &target,
+            vec![object_ref("v1", "Service", "apps", "fence-service")],
+            vec![RenderedExclusivityKey::new("singleton", "fence")],
+        )
+        .await?;
         let claim = || {
             claim_next(
                 store.as_ref(),
@@ -4708,24 +4382,14 @@ async fn postgres_attempt_and_incarnation_fencing() -> TestResult {
             ))
             .await?
             .instance;
-        let recreated_waking = store
-            .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-                recreated.id,
-                recreated.generation,
-                InstanceState::Waking,
-                StateTransitionReason::WakeRequested,
-            ))
-            .await?;
-        let mut new_request = RecordMaterializationRequest::new(
-            recreated_waking.id,
-            recreated_waking.generation,
-            pending.target.clone(),
-            MaterializationState::Pending,
-            BackendGeneration::new(1),
-        );
-        new_request.rendered_objects = pending.rendered_objects.clone();
-        new_request.exclusivity_keys = pending.exclusivity_keys.clone();
-        let recreated_pending = store.record_materialization(new_request).await?;
+        let recreated_pending = accept_projection(
+            store.as_ref(),
+            &recreated,
+            &pending.target,
+            pending.rendered_objects.clone(),
+            pending.exclusivity_keys.clone(),
+        )
+        .await?;
         assert_eq!(
             recreated_pending.id, pending.id,
             "materialization names are deterministic across ID reuse"

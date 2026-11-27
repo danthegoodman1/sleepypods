@@ -47,23 +47,7 @@ async fn ready(
         ))
         .await?
         .instance;
-    let waking = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            instance.id,
-            instance.generation,
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await?;
-    Ok(store
-        .complete_wake(CompleteWakeRequest::new(
-            waking.id,
-            waking.generation,
-            target.clone(),
-            BackendEndpoint::new("http://127.0.0.1:8080")?,
-            BackendGeneration::new(1),
-        ))
-        .await?)
+    Ok(wake_to_running(store, instance.id, target, vec![], vec![]).await?)
 }
 
 async fn check_activation_floor(
@@ -109,21 +93,14 @@ async fn check_activation_floor(
         "a fresh store/process must not restart the activation clock"
     );
 
-    // Another operation on an already-Ready record cannot restart its age.
-    let mut same_ready = RecordMaterializationRequest::new(
-        ready.instance.id.clone(),
-        ready.instance.generation,
-        target.clone(),
-        MaterializationState::Ready,
-        ready.materialization.backend_generation,
+    // An admin enqueue of a Ready row is not lifecycle work and moves nothing.
+    assert!(
+        !store
+            .enqueue_materialization(ready.materialization.id.clone())
+            .await?,
+        "a Ready row is not lifecycle work"
     );
-    same_ready.projection_generation = ready.materialization.projection_generation;
-    same_ready.backend = ready.materialization.backend.clone();
-    store.record_materialization(same_ready).await?;
-    assert!(matches!(store.begin_sleep(request.clone()).await,
-        Err(StoreError::SleepDeferred { retry_after }) if retry_after > Duration::from_secs(180)));
-
-    assert_eq!(raw.query_one("SELECT state_entered_at_unix_millis FROM materializations WHERE materialization_id = $1", &[&ready.materialization.id.as_str()]).await?.get::<_, i64>(0), first_ready_at, "same-state work and reconnect do not move the persisted deadline");
+    assert_eq!(raw.query_one("SELECT state_entered_at_unix_millis FROM materializations WHERE materialization_id = $1", &[&ready.materialization.id.as_str()]).await?.get::<_, i64>(0), first_ready_at, "deferrals, an enqueue and a reconnect do not move the persisted deadline");
     let bad_generation = BeginSleepRequest::new(
         ready.instance.id.clone(),
         Generation::new(0),

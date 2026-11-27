@@ -28,7 +28,7 @@ use crate::{
         KubernetesClientFuture, KubernetesClientResult,
     },
     projection::{LiveObjectIdentity, LiveObjectMetadata, ProjectionObjectInspection},
-    route::{ListRouteBindingsForInstanceRequest, RouteBindingRecord},
+    route::RouteBindingRecord,
     runtime_work::{MaterializationWorkStatus, RecordMaterializationFailure},
     store::StoreFuture,
     workload::{WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueSchema},
@@ -316,35 +316,22 @@ impl ControlPlaneStore for FakeStore {
         accept_wake,
         request_instance_deletion,
         create_instance,
-        delete_instance,
         create_workload_class_version,
         create_route_binding,
         get_route_binding,
         delete_route_binding,
         resolve_host_rules,
-        compare_and_swap_instance_state,
-        record_materialization,
         load_ready_materialization,
         load_active_materialization,
         load_materialization,
-        complete_wake,
         begin_sleep,
-        finalize_sleep,
         load_materialization_operational_metrics,
         force_delete_materialization,
         force_release_exclusivity_key,
-        lookup_route_dependencies,
         put_http01_challenge,
         resolve_http01_challenge,
         delete_http01_challenge
     );
-
-    fn list_route_bindings_for_instance<'a>(
-        &'a self,
-        _request: ListRouteBindingsForInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
 
     fn finalize_instance_deletions(&self, _limit: usize) -> StoreFuture<'_, StoreResult<usize>> {
         Box::pin(async { Ok(0) })
