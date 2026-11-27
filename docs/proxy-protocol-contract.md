@@ -258,12 +258,11 @@ termination and SNI passthrough listeners.
 Admission has no wait queue. An excess accepted socket closes before any
 connection work starts: it sends FIN, then discards up to 64 KiB the client has
 already sent, such as a ClientHello, so the client and any relay in front of the
-proxy read end of stream rather than a reset. Excess HTTP requests return 503
-with Retry-After: 1. Hyper also
-limits h2 streams before service dispatch. Pooled HTTP upstream saturation returns
-503 until an active socket closes or idle eviction frees a slot. WS/TCP/SNI
-upstream sockets follow their admitted active sessions and are separate from the
-HTTP pool cap.
+proxy, such as `kubectl port-forward`, read end of stream. Excess HTTP requests
+return 503 with Retry-After: 1. Hyper also limits h2 streams before service
+dispatch. Pooled HTTP upstream saturation returns 503 until an active socket
+closes or idle eviction frees a slot. WS/TCP/SNI upstream sockets follow their
+admitted active sessions and are separate from the HTTP pool cap.
 
 Both the upload body and produced response buffers retain request admission and
 drain activity until their queued bytes are delivered or canceled, even for a
