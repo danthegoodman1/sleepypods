@@ -1,4 +1,0 @@
-{
-  "crates/control-plane/tests/kind_e2e_routing.rs": "e71c27847db35289801b356679e2af8e3e8fcf273526fa49d9a5539394526506",
-  "crates/control-plane/tests/api_transport.rs": "a4643d71bd37e2025472fa4b9f00b3d341ce40a742c8012b93cd1270fb9ec80b"
-}

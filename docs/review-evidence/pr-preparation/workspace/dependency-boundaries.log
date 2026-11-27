@@ -1,3 +1,0 @@
-PASS frontline: 111 unique normal dependencies; boundary intact
-PASS sidecar: 102 unique normal dependencies; boundary intact
-PASS control-plane: 174 unique normal dependencies; boundary intact

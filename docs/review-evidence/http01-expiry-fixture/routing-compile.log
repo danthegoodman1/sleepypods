@@ -1,9 +1,0 @@
-   Compiling control-plane v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/control-plane)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.18s
-     Running tests/kind_e2e_routing.rs (target/debug/deps/kind_e2e_routing-f0dfb15a114a2ef1)
-
-running 1 test
-test routing_and_http01_through_deployed_platform ... ignored, requires scripts/test-kind-e2e-routing.sh or an equivalent kind deployment
-
-test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
-

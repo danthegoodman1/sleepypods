@@ -1,8 +1,0 @@
-{
-  "command": [
-    "python3",
-    "scripts/test-full-wake-sleep-inventory.py"
-  ],
-  "exit_code": 0,
-  "elapsed_seconds": 6.1335185000207275
-}

@@ -1,7 +1,0 @@
-connect_ms=0.305
-write_ms=0.337
-first_byte_ms=0.482
-headers_ms=0.493 head="HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close"
-framed_complete_ms=0.501
-read_error_ms=1002.524 kind=WouldBlock captured_bytes=60 framed_complete=true
-read_to_end_result=Err(Os { code: 35, kind: WouldBlock, message: "Resource temporarily unavailable" }) elapsed_ms=1002.560 bytes=60

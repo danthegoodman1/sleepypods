@@ -1,4 +1,0 @@
-NAME                                      READY   STATUS    RESTARTS      AGE   IP             NODE                                          NOMINATED NODE   READINESS GATES
-sleepypods-control-plane-8876455c-7wfc5   1/1     Running   1 (80s ago)   81s   10.244.0.111   sleepypods-review-remediation-control-plane   <none>           <none>
-sleepypods-frontline-647745f4f-6rbpz      1/1     Running   0             81s   10.244.0.112   sleepypods-review-remediation-control-plane   <none>           <none>
-sleepypods-postgres-67d4f4499-bf5vw       1/1     Running   0             83s   10.244.0.110   sleepypods-review-remediation-control-plane   <none>           <none>

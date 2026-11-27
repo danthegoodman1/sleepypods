@@ -1,9 +1,0 @@
---- a/crates/control-plane/tests/postgres_store.rs
-+++ b/crates/control-plane/tests/postgres_store.rs
-@@ -4736,3 +4736,6 @@
- 
- #[path = "postgres_store/activation_idle.rs"]
- mod activation_idle;
-+
-+#[path = "postgres_store/cleanup_boundary.rs"]
-+mod cleanup_boundary;

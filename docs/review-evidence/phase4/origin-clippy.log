@@ -1,4 +1,0 @@
-   Compiling control-plane v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/control-plane)
-    Checking sleepypods-types v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sleepypods-types)
-    Checking frontline v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/frontline)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.84s

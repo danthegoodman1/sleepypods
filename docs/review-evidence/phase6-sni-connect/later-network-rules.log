@@ -1,7 +1,0 @@
-/usr/sbin/conntrack
-conntrack v1.4.7 (conntrack-tools): 0 flow entries have been shown.
--A KUBE-SEP-ZUBD6PJVNHQJK2RV -s 10.244.0.151/32 -m comment --comment "sleepypods-e2e-sni-before-capture/e2e-tls-sni-exact-24c750bd:app" -j KUBE-MARK-MASQ
--A KUBE-SEP-ZUBD6PJVNHQJK2RV -p tcp -m comment --comment "sleepypods-e2e-sni-before-capture/e2e-tls-sni-exact-24c750bd:app" -m tcp -j DNAT --to-destination 10.244.0.151:15000
--A KUBE-SERVICES -d 10.96.201.29/32 -p tcp -m comment --comment "sleepypods-e2e-sni-before-capture/e2e-tls-sni-exact-24c750bd:app cluster IP" -m tcp --dport 8080 -j KUBE-SVC-FIHQEEBSHU2AXSG5
--A KUBE-SVC-FIHQEEBSHU2AXSG5 ! -s 10.244.0.0/16 -d 10.96.201.29/32 -p tcp -m comment --comment "sleepypods-e2e-sni-before-capture/e2e-tls-sni-exact-24c750bd:app cluster IP" -m tcp --dport 8080 -j KUBE-MARK-MASQ
--A KUBE-SVC-FIHQEEBSHU2AXSG5 -m comment --comment "sleepypods-e2e-sni-before-capture/e2e-tls-sni-exact-24c750bd:app -> 10.244.0.151:15000" -j KUBE-SEP-ZUBD6PJVNHQJK2RV

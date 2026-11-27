@@ -1,4 +1,0 @@
-   Compiling sleepypods-api v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sleepypods-api)
-    Checking sleepypods-observability v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sleepypods-observability)
-    Checking control-plane v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/control-plane)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.86s

@@ -1,9 +1,0 @@
-   Compiling frontline v0.1.0 (/private/tmp/sleepypods-cleanup-boundary-ro13u8e8/crates/frontline)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.73s
-     Running unittests src/lib.rs (/Users/dangoodman/code/sleepy-pods/target/debug/deps/frontline-2c3652ef47b26b6e)
-
-running 1 test
-test listener::tests::actual_serve_boundary_rejects_oversized_programmatic_activation_budget ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 206 filtered out; finished in 0.00s
-

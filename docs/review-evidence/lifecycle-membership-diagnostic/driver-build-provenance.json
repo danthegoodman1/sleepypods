@@ -1,8 +1,0 @@
-{
-  "source": "driver-as-run.rs",
-  "compiler_log": "scratch-build.log",
-  "compiled_path": "target/debug/deps/kind_e2e_lifecycle_races-34e0266a77682d40",
-  "retained_executable": ".generated/implementation-evidence/membership-diagnostic-driver",
-  "executable_sha256": "828ae0f8b3866188175f34510950773ae08806511fab1f5b482266a21bf05cdf",
-  "fixture_sha256": "1b7dedf62b7178c43790448eef7f1f3f5b48e3fab33fcb751ba2f3eb64ffc647"
-}
