@@ -83,12 +83,6 @@ pub(crate) fn store_error_to_status(error: StoreError) -> Status {
             Status::failed_precondition(message)
         }
         StoreError::LeaseConflict { message } => Status::aborted(message),
-        StoreError::IdempotencyResourceDeleted { resource } => {
-            Status::failed_precondition(format!("idempotent replay refers to a deleted {resource}"))
-        }
-        StoreError::IdempotencyConflict => {
-            Status::already_exists("idempotency key was already used for a different request")
-        }
         StoreError::Unavailable { message } => {
             log_store_error("unavailable", message);
             Status::unavailable("control-plane store is unavailable")

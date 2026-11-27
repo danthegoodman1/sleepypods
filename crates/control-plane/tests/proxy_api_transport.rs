@@ -1058,7 +1058,6 @@ async fn operator_route_binding_reassignment_invalidates_old_route_before_resubs
     operator
         .create_route_binding(tonic::Request::new(
             control_plane::api::pb::CreateRouteBindingRequest {
-                idempotency_key: "create-reassigned-route".to_owned(),
                 route_binding_id: "route-reassign-new".to_owned(),
                 instance_id: "instance-reassign-new".to_owned(),
                 identity: Some(proto_http_identity(
@@ -1126,7 +1125,6 @@ async fn operator_exact_http_host_create_invalidates_cached_wildcard_subscriptio
     operator
         .create_route_binding(tonic::Request::new(
             control_plane::api::pb::CreateRouteBindingRequest {
-                idempotency_key: "create-http-shadow-host".to_owned(),
                 route_binding_id: "route-exact-http".to_owned(),
                 instance_id: "instance-exact-http".to_owned(),
                 identity: Some(proto_http_identity(
@@ -1193,7 +1191,6 @@ async fn operator_longer_http_path_create_invalidates_cached_shorter_path_subscr
     operator
         .create_route_binding(tonic::Request::new(
             control_plane::api::pb::CreateRouteBindingRequest {
-                idempotency_key: "create-http-shadow-path".to_owned(),
                 route_binding_id: "route-long-path".to_owned(),
                 instance_id: "instance-long-path".to_owned(),
                 identity: Some(proto_http_identity(
@@ -1256,7 +1253,6 @@ async fn operator_exact_sni_create_invalidates_cached_wildcard_sni_subscription(
     operator
         .create_route_binding(tonic::Request::new(
             control_plane::api::pb::CreateRouteBindingRequest {
-                idempotency_key: "create-sni-shadow-host".to_owned(),
                 route_binding_id: "route-exact-sni".to_owned(),
                 instance_id: "instance-exact-sni".to_owned(),
                 identity: Some(proto_sni_identity(RouteHostKind::Exact, "db.example.com")),

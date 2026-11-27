@@ -402,7 +402,6 @@ Create an instance, with its routes if it has any:
 
 ```text
 CreateInstance({
-  idempotency_key: "instance-tenant-a-20260624",
   instance_id: "tenant-a",
   workload_class: {class_id: "web", version: 1},
   values: {"tenant": "tenant-a"},
@@ -414,6 +413,16 @@ CreateInstance({
 
 The instance and its `routes` commit in one transaction, so the instance is
 reachable as soon as the call returns.
+
+Create calls are safe to repeat. A `CreateInstance` whose class version, values
+and routes equal the stored instance's returns that instance in its current
+state, and a `CreateRouteBinding` that names the same instance and identity
+returns the stored binding. Any other request for an existing ID returns
+`AlreadyExists` and changes nothing. The comparison reads current state: once a
+route is added to or removed from an instance, the request that created it
+differs from it. After a delete completes, the same request creates the
+resource again, and a recreated instance starts above every generation its
+predecessor used, so a caller or sidecar holding an old generation is rejected.
 
 ### Create-Time Validation
 
@@ -553,7 +562,6 @@ Add a route or custom domain:
 
 ```text
 CreateRouteBinding({
-  idempotency_key: "route-tenant-a-app",
   route_binding_id: "route-tenant-a-app",
   instance_id: "tenant-a",
   protocol: PROTOCOL_ROUTE_HTTP,
@@ -770,9 +778,8 @@ public tonic/Hyper cannot reset an already queued final DATA frame individually,
 so other streams on that connection are also cancelled. Ordinary active
 subscriptions use their explicit lifetime, not the unary delivery deadline.
 
-Maintenance runs every five seconds in bounded batches for HTTP-01 expiry,
-opt-in idempotency expiry and event retention. Permanent idempotency tombstones
-and instance generation watermarks are preserved.
+Maintenance runs every five seconds in bounded batches for HTTP-01 expiry and
+event retention. Instance generation watermarks are preserved.
 
 ## Lifecycle Expectations
 
@@ -828,10 +835,10 @@ marks it `Failed` with an advanced revision. An explicit wake retry can then
 choose the configured target. Legacy failed projections are queued for cleanup
 before any new incarnation can replace their recorded inventory.
 
-Per-ID generation watermarks are permanent and independent of optional
-idempotency-key expiry. An ID deleted before watermarks existed is permanently
+Per-ID generation watermarks are permanent. An ID deleted before watermarks
+existed is permanently
 retired when deletion history is available; create a new ID. If historical
-idempotency/deletion records were manually erased before this migration, the
+deletion records were manually erased before this migration, the
 old incarnation is unknowable: use new instance IDs for those historical
 resources and quiesce incompatible clients during upgrade. Never restore a
 database without its generation watermarks while allowing old clients or

@@ -52,7 +52,6 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-auth-missing".to_owned(),
             instance_id: "grpc-web-kind-auth-missing".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
@@ -68,7 +67,6 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-auth-invalid".to_owned(),
             instance_id: "grpc-web-kind-auth-invalid".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
@@ -118,7 +116,6 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-create-instance".to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),

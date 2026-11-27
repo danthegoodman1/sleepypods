@@ -234,7 +234,6 @@ async fn concurrent_wake_calls_converge(
         "lifecycle-concurrent-route",
         "concurrent.lifecycle.sleepypods.test",
         "concurrent",
-        "concurrent",
     )
     .await?;
     let created =
@@ -340,7 +339,6 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
         "lifecycle-sleep-waking-route",
         "sleep-waking.lifecycle.sleepypods.test",
         "sleep-waking",
-        "sleep-waking",
     )
     .await?;
     let wake_addr = config.frontline_addr;
@@ -428,7 +426,6 @@ async fn delete_while_waking_cleans_pending_objects(
         "lifecycle-delete-waking-route",
         "delete-waking.lifecycle.sleepypods.test",
         "delete-waking",
-        "delete-waking",
     )
     .await?;
     let wake_addr = config.frontline_addr;
@@ -491,7 +488,6 @@ async fn delete_while_draining_cleans_deleting_materialization(
         "lifecycle-delete-draining",
         "lifecycle-delete-draining-route",
         "delete-draining.lifecycle.sleepypods.test",
-        "delete-draining",
         "delete-draining",
     )
     .await?;
@@ -706,7 +702,6 @@ async fn failed_wake_retry_rejects_stale_generation(
         "lifecycle-failed-retry-route",
         "failed-retry.lifecycle.sleepypods.test",
         "failed-retry",
-        "failed-retry",
     )
     .await?;
     wait_for_frontline_status(
@@ -792,7 +787,6 @@ async fn stale_sidecar_report_is_rejected(
         "lifecycle-stale-sidecar",
         "lifecycle-stale-sidecar-route",
         "stale-sidecar.lifecycle.sleepypods.test",
-        "stale-sidecar",
         "stale-sidecar",
     )
     .await?;
@@ -901,7 +895,6 @@ async fn idle_report_requires_current_single_member(
         instance_id,
         "lifecycle-membership-route",
         "membership.lifecycle.sleepypods.test",
-        "membership",
         "membership",
     )
     .await?;
@@ -1073,28 +1066,13 @@ async fn route_reassignment_invalidates_active_subscription(
     _kube: Client,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "lifecycle-reassign-old",
-        "old",
-        "reassign-old",
-    )
-    .await?;
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "lifecycle-reassign-new",
-        "new",
-        "reassign-new",
-    )
-    .await?;
+    create_instance(operator, NORMAL_CLASS_ID, "lifecycle-reassign-old", "old").await?;
+    create_instance(operator, NORMAL_CLASS_ID, "lifecycle-reassign-new", "new").await?;
     create_route(
         operator,
         "lifecycle-reassign-old-route",
         "lifecycle-reassign-old",
         "reassign.lifecycle.sleepypods.test",
-        "reassign-old",
     )
     .await?;
     let aliases = [
@@ -1112,7 +1090,7 @@ async fn route_reassignment_invalidates_active_subscription(
         ),
     ];
     for (route_id, instance_id, host, _) in aliases {
-        create_route(operator, route_id, instance_id, host, route_id).await?;
+        create_route(operator, route_id, instance_id, host).await?;
     }
     // Prewarm through durable acceptance and read-only state observation. Never
     // resolve this frontend host until both backends can already serve traffic.
@@ -1203,7 +1181,6 @@ async fn route_reassignment_invalidates_active_subscription(
             "lifecycle-reassign-new-route",
             "lifecycle-reassign-new",
             "reassign.lifecycle.sleepypods.test",
-            "reassign-new",
         )
         .await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -1335,10 +1312,9 @@ async fn create_instance_and_route(
     route_id: &str,
     host: &str,
     target: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
-    create_instance(operator, class_id, instance_id, target, idempotency_suffix).await?;
-    create_route(operator, route_id, instance_id, host, idempotency_suffix).await
+    create_instance(operator, class_id, instance_id, target).await?;
+    create_route(operator, route_id, instance_id, host).await
 }
 
 async fn create_instance(
@@ -1346,11 +1322,9 @@ async fn create_instance(
     class_id: &str,
     instance_id: &str,
     target: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-lifecycle-{idempotency_suffix}-instance"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: class_id.to_owned(),
@@ -1368,11 +1342,9 @@ async fn create_route(
     route_id: &str,
     instance_id: &str,
     host: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-lifecycle-{idempotency_suffix}-route"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),

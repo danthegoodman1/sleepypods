@@ -244,14 +244,12 @@ fn owned_metadata(materialization: &MaterializationRecord) -> LiveObjectMetadata
 #[test]
 fn generated_api_contains_expected_v1_resource_shape() {
     let request = CreateInstanceRequest {
-        idempotency_key: "create-instance-1".to_owned(),
         instance_id: "instance-1".to_owned(),
         workload_class: None,
         values: [("tenant".to_owned(), "acme".to_owned())].into(),
         routes: Vec::new(),
     };
     let route_binding = CreateRouteBindingRequest {
-        idempotency_key: "create-route-1".to_owned(),
         route_binding_id: "route-1".to_owned(),
         instance_id: request.instance_id.clone(),
         identity: None,
@@ -316,7 +314,6 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 
     let created = service
         .create_instance(tonic::Request::new(CreateInstanceRequest {
-            idempotency_key: "create-instance-1".to_owned(),
             instance_id: "instance-1".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-1".to_owned(),
@@ -385,7 +382,6 @@ async fn create_instance_creates_its_routes_with_the_instance() {
     let service = store_operator_api(store.clone());
     let request = |instance_id: &str, routes: Vec<InstanceRoute>| {
         tonic::Request::new(CreateInstanceRequest {
-            idempotency_key: format!("create-{instance_id}"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-1".to_owned(),
@@ -449,7 +445,6 @@ async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
 
     let error = service
         .create_instance(tonic::Request::new(CreateInstanceRequest {
-            idempotency_key: "create-invalid-instance".to_owned(),
             instance_id: "Tenant_One".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-1".to_owned(),
@@ -1259,7 +1254,6 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
     let created_route = service
         .create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
-            idempotency_key: "create-route-1".to_owned(),
             route_binding_id: "route-1".to_owned(),
             instance_id: "instance-1".to_owned(),
             identity: Some(http_identity("App.Example.COM.", Some("/api"))),
@@ -1845,7 +1839,6 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
     let response = store_operator_grpc_service(store_with_class("class-transport", 3))
         .oneshot(grpc_create_instance_request(
             CreateInstanceRequest {
-                idempotency_key: "create-instance-transport".to_owned(),
                 instance_id: "instance-transport".to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: "class-transport".to_owned(),
@@ -1970,7 +1963,6 @@ async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
     let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
         .oneshot(grpc_create_route_binding_request(
             CreateRouteBindingRequest {
-                idempotency_key: "create-route-transport".to_owned(),
                 route_binding_id: "route-transport".to_owned(),
                 instance_id: "instance-transport".to_owned(),
                 identity: Some(sni_identity("DB.Example.COM.")),
@@ -2064,7 +2056,6 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "grpc-web-create-instance".to_owned(),
             instance_id: "instance-grpc-web".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-grpc-web".to_owned(),
@@ -2096,7 +2087,6 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateRouteBinding",
         CreateRouteBindingRequest {
-            idempotency_key: "grpc-web-create-route".to_owned(),
             route_binding_id: "route-grpc-web".to_owned(),
             instance_id: "instance-grpc-web".to_owned(),
             identity: Some(http_identity("App.Example.COM.", Some("/app"))),
@@ -2225,7 +2215,6 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "native-create-instance".to_owned(),
             instance_id: "instance-native".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-native".to_owned(),
@@ -2257,7 +2246,6 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateRouteBinding",
         CreateRouteBindingRequest {
-            idempotency_key: "native-create-route".to_owned(),
             route_binding_id: "route-native".to_owned(),
             instance_id: "instance-native".to_owned(),
             identity: Some(http_identity("Native.Example.COM.", Some("/app"))),
@@ -2403,7 +2391,6 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
         .oneshot(grpc_web_operator_request(
             "CreateInstance",
             CreateInstanceRequest {
-                idempotency_key: "metadata-create-instance".to_owned(),
                 instance_id: "metadata-instance".to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: "metadata-class".to_owned(),
@@ -2482,7 +2469,6 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
         .oneshot(grpc_web_operator_request(
             "CreateInstance",
             CreateInstanceRequest {
-                idempotency_key: "grpc-web-auth-valid".to_owned(),
                 instance_id: "grpc-web-auth-valid".to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: "class-auth".to_owned(),
@@ -2501,7 +2487,6 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
     let mut missing_request = grpc_web_operator_request(
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "grpc-web-auth-missing".to_owned(),
             instance_id: "grpc-web-auth-missing".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: "class-auth".to_owned(),
@@ -2533,7 +2518,6 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
             grpc_web_operator_request(
                 "CreateInstance",
                 CreateInstanceRequest {
-                    idempotency_key: "grpc-web-auth-wrong".to_owned(),
                     instance_id: "grpc-web-auth-wrong".to_owned(),
                     workload_class: Some(WorkloadClassVersionRef {
                         class_id: "class-auth".to_owned(),

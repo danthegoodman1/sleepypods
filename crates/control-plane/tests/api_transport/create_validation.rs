@@ -137,7 +137,6 @@ async fn create_instance(
     values: &[(&str, &str)],
 ) -> Result<(), Status> {
     api.create_instance(tonic::Request::new(CreateInstanceRequest {
-        idempotency_key: format!("create-{instance_id}"),
         instance_id: instance_id.to_owned(),
         workload_class: Some(WorkloadClassVersionRef {
             class_id: class_id.to_owned(),
@@ -418,7 +417,6 @@ async fn route_creation_rejects_hosts_no_request_can_carry() {
     let (_, api) = service();
     let create = |host: &'static str| {
         api.create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
-            idempotency_key: format!("route-{host}"),
             route_binding_id: format!("route-{host}"),
             instance_id: "tenant-a".to_owned(),
             identity: Some(http_identity(host, None)),

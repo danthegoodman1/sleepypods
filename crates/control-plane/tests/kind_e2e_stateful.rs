@@ -926,20 +926,19 @@ async fn create_operator_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_stateful_operator_resources(operator, config, "kind-e2e-stateful", 15_000).await
+    create_stateful_operator_resources(operator, config, 15_000).await
 }
 
 async fn create_projection_drift_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_stateful_operator_resources(operator, config, "kind-e2e-projection-drift", 900_000).await
+    create_stateful_operator_resources(operator, config, 900_000).await
 }
 
 async fn create_stateful_operator_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
-    idempotency_scope: &str,
     idle_timeout_ms: u64,
 ) -> TestResult<()> {
     operator
@@ -960,7 +959,6 @@ async fn create_stateful_operator_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("{idempotency_scope}-create-instance"),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
@@ -973,7 +971,6 @@ async fn create_stateful_operator_resources(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("{idempotency_scope}-create-route"),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -1017,7 +1014,6 @@ async fn create_exclusivity_resources(
 
     create_exclusive_instance_and_route(
         operator,
-        "owner",
         EXCLUSIVE_OWNER_INSTANCE_ID,
         EXCLUSIVE_OWNER_ROUTE_ID,
         EXCLUSIVE_OWNER_HOST,
@@ -1027,7 +1023,6 @@ async fn create_exclusivity_resources(
     .await?;
     create_exclusive_instance_and_route(
         operator,
-        "blocked",
         EXCLUSIVE_BLOCKED_INSTANCE_ID,
         EXCLUSIVE_BLOCKED_ROUTE_ID,
         EXCLUSIVE_BLOCKED_HOST,
@@ -1037,7 +1032,6 @@ async fn create_exclusivity_resources(
     .await?;
     create_exclusive_instance_and_route(
         operator,
-        "other",
         EXCLUSIVE_OTHER_INSTANCE_ID,
         EXCLUSIVE_OTHER_ROUTE_ID,
         EXCLUSIVE_OTHER_HOST,
@@ -1051,7 +1045,6 @@ async fn create_exclusivity_resources(
 
 async fn create_exclusive_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    suffix: &str,
     instance_id: &str,
     route_id: &str,
     route_host: &str,
@@ -1060,7 +1053,6 @@ async fn create_exclusive_instance_and_route(
 ) -> TestResult<()> {
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-exclusivity-create-{suffix}"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: EXCLUSIVE_CLASS_ID.to_owned(),
@@ -1076,7 +1068,6 @@ async fn create_exclusive_instance_and_route(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-exclusivity-route-{suffix}"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(RouteIdentity {

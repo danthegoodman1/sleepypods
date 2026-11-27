@@ -84,7 +84,6 @@ impl fmt::Display for EmptyStringError {
 
 impl Error for EmptyStringError {}
 
-string_newtype!(IdempotencyKey);
 string_newtype!(WorkloadClassId);
 string_newtype!(RouteBindingId);
 string_newtype!(MaterializationId);
@@ -218,13 +217,13 @@ impl fmt::Display for BackendGeneration {
 
 #[cfg(test)]
 mod tests {
-    use super::{Generation, IdempotencyKey, InstanceId};
+    use super::{Generation, InstanceId, RouteBindingId};
 
     #[test]
-    fn idempotency_key_rejects_blank_values() {
-        let error = IdempotencyKey::new("  ").expect_err("blank keys are invalid");
+    fn string_ids_reject_blank_values() {
+        let error = RouteBindingId::new("  ").expect_err("blank IDs are invalid");
 
-        assert_eq!(error.field(), "IdempotencyKey");
+        assert_eq!(error.field(), "RouteBindingId");
     }
 
     #[test]

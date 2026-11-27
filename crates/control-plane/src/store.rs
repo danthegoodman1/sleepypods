@@ -327,10 +327,6 @@ pub enum StoreError {
         owner_instance_id: Option<String>,
         owner_generation: Option<crate::ids::Generation>,
     },
-    IdempotencyConflict,
-    IdempotencyResourceDeleted {
-        resource: &'static str,
-    },
     LeaseConflict {
         message: String,
     },
@@ -528,7 +524,7 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         &'a self,
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        // The idempotency retention window can expire during a retry; the wrapper cannot prove replay identity.
+        // Sent once: after a lost response and a delete, a retry would create the instance again.
         self.inner.create_instance(request)
     }
 
@@ -571,7 +567,7 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         &'a self,
         request: CreateRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
-        // Idempotency records can expire before replay; do not recreate a deleted binding automatically.
+        // Sent once: after a lost response and a delete, a retry would create the binding again.
         self.inner.create_route_binding(request)
     }
 
@@ -876,12 +872,6 @@ impl fmt::Display for StoreError {
             Self::LeaseConflict { message } => {
                 write!(f, "reconciliation ownership conflict: {message}")
             }
-            Self::IdempotencyResourceDeleted { resource } => {
-                write!(f, "idempotent replay refers to a deleted {resource}")
-            }
-            Self::IdempotencyConflict => {
-                f.write_str("idempotency key was already used for a different request")
-            }
             Self::Unavailable { message } => write!(f, "store unavailable: {message}"),
             Self::Internal { message } => write!(f, "internal store error: {message}"),
         }
@@ -913,13 +903,9 @@ mod tests {
     }
 
     #[test]
-    fn lease_conflicts_and_deleted_replays_are_not_retryable() {
+    fn lease_conflicts_are_not_retryable() {
         assert!(!StoreError::LeaseConflict {
             message: "ownership lost".to_owned()
-        }
-        .is_retryable());
-        assert!(!StoreError::IdempotencyResourceDeleted {
-            resource: "instance"
         }
         .is_retryable());
         assert!(StoreError::unavailable("connection interrupted").is_retryable());

@@ -162,7 +162,6 @@ async fn exercise(pg: PostgresStore, raw: &tokio_postgres::Client) -> TestResult
     let cold = store
         .create_instance(create_instance_request(
             "cleanup-boundary",
-            "cleanup-boundary",
             class.reference,
             vec![],
         ))
