@@ -327,7 +327,7 @@ where
                     let id = match finished.expect("a job is running") {
                         Ok((id, ())) => id,
                         Err(error) => {
-                            self.record_outcome("reconcile", Outcome::Error, Some(&error.to_string()));
+                            self.record_failed_attempt(&error.to_string());
                             error.id()
                         }
                     };
@@ -439,7 +439,7 @@ where
             }
             Err(MaterializationReconcileError::Cancelled) => {}
             Err(error) => {
-                self.record_outcome("reconcile", Outcome::Error, Some(&error.to_string()));
+                self.record_failed_attempt(&error.to_string());
                 let failure = crate::runtime_work::RecordMaterializationFailure {
                     expected_state: claimed.state,
                     materialization_id: claimed.id.clone(),
@@ -867,27 +867,32 @@ where
     }
 
     fn record_outcome(&self, operation: &'static str, outcome: Outcome, error: Option<&str>) {
+        let mut fields = vec![
+            LogField::new("operation", operation),
+            LogField::new("outcome", outcome.as_str()),
+        ];
+        fields.extend(error.map(LogField::error_reason));
         self.observability.record_log(LifecycleLogEvent::new(
             EVENT_MATERIALIZATION_RECONCILIATION,
-            vec![
-                LogField::new("operation", operation),
-                LogField::new("outcome", outcome.as_str()),
-            ],
+            fields,
         ));
-        if let Some(error) = error {
-            self.observability.record_metric(MetricObservation::new(
-                RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
-                vec![
-                    Operation::Materialize.metric_label(),
-                    Outcome::Error.metric_label(),
-                ],
-                1.0,
-            ));
-            self.observability.record_log(LifecycleLogEvent::new(
-                EVENT_MATERIALIZATION_FAILURE,
-                vec![LogField::error_reason(error)],
-            ));
-        }
+    }
+
+    /// Counts an attempt that ended without finishing its work.
+    fn record_failed_attempt(&self, error: &str) {
+        self.record_outcome("reconcile", Outcome::Error, Some(error));
+        self.observability.record_metric(MetricObservation::new(
+            RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+            vec![
+                Operation::Materialize.metric_label(),
+                Outcome::Error.metric_label(),
+            ],
+            1.0,
+        ));
+        self.observability.record_log(LifecycleLogEvent::new(
+            EVENT_MATERIALIZATION_FAILURE,
+            vec![LogField::error_reason(error)],
+        ));
     }
 
     fn record_reconciler_run(&self, outcome: Outcome, duration: Duration) {

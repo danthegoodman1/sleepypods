@@ -165,8 +165,10 @@ Build dashboards from the exact names above:
   `outcome`; alert on high latency and any sustained `error` or `timeout`.
 - Materialization failures: rate of
   `sleepypods_runtime_materialization_failures_total` by `operation,outcome`;
-  page on nonzero sustained failures. A wake or sleep that completes records
-  none, including a sleep that waits for its Pod to stop.
+  page on nonzero sustained failures. The counter counts attempts that ended
+  without finishing their work. A wake or sleep that completes records none,
+  including a sleep that waits for its Pod to stop and work that rides out a
+  store outage inside its lease.
 - Reconciler health: rate of `sleepypods_reconciler_runs_total` by `outcome`,
   p95/p99 over `sleepypods_reconciler_run_duration_seconds`, and
   `sleepypods_reconciler_claims_total` by `state`. Alert when runs stop or

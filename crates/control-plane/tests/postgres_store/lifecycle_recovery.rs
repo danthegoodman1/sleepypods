@@ -1019,6 +1019,341 @@ async fn postgres_completions_and_deletion_share_one_lock_order() -> TestResult 
     .await
 }
 
+/// A TCP relay in front of Postgres. Cutting it resets every session and
+/// every new connection, as a database outage does; restoring it lets new
+/// connections through.
+struct Relay {
+    address: std::net::SocketAddr,
+    cut: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Bytes whose next appearance in a request cuts the relay. That request
+    /// is held, so it is in flight on its session when the reset arrives.
+    trigger: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The single TCP server a test database URL names.
+fn database_server(base: &str) -> TestResult<String> {
+    let config: tokio_postgres::Config = base.parse()?;
+    let [tokio_postgres::config::Host::Tcp(host)] = config.get_hosts() else {
+        return Err("the test database URL must name one TCP host".into());
+    };
+    let server = format!(
+        "{host}:{}",
+        config.get_ports().first().copied().unwrap_or(5432)
+    );
+    if !base.contains(&server) {
+        return Err(format!("the test database URL must spell out {server}").into());
+    }
+    Ok(server)
+}
+
+impl Relay {
+    async fn start(base: &str) -> TestResult<Self> {
+        let upstream = tokio::net::lookup_host(database_server(base)?)
+            .await?
+            .next()
+            .ok_or("the test database host does not resolve")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let cut = Arc::new(tokio::sync::watch::channel(false).0);
+        let trigger = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let (relay_cut, relay_trigger) = (cut.clone(), trigger.clone());
+        let task = tokio::spawn(async move {
+            while let Ok((inbound, _)) = listener.accept().await {
+                if *relay_cut.borrow() {
+                    let _ = inbound.set_zero_linger();
+                    continue;
+                }
+                let (cut, trigger) = (relay_cut.clone(), relay_trigger.clone());
+                tokio::spawn(async move {
+                    if let Ok(outbound) = tokio::net::TcpStream::connect(upstream).await {
+                        relay_session(inbound, outbound, &cut, &trigger).await;
+                    }
+                });
+            }
+        });
+        Ok(Self {
+            address,
+            cut,
+            trigger,
+            task,
+        })
+    }
+
+    /// The connection URL `base` names, with this relay as its server.
+    fn url(&self, base: &str) -> TestResult<String> {
+        Ok(base.replacen(&database_server(base)?, &self.address.to_string(), 1))
+    }
+
+    /// Cuts the relay at the next request that carries `bytes`.
+    fn cut_at(&self, bytes: &[u8]) {
+        *self.trigger.lock().unwrap() = Some(bytes.to_vec());
+    }
+
+    async fn wait_until_cut(&self) {
+        let _ = self.cut.subscribe().wait_for(|cut| *cut).await;
+    }
+
+    fn restore(&self) {
+        self.cut.send_replace(false);
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Copies one session in both directions until either side closes or the
+/// relay is cut, and then resets both connections.
+async fn relay_session(
+    mut inbound: tokio::net::TcpStream,
+    mut outbound: tokio::net::TcpStream,
+    cut: &tokio::sync::watch::Sender<bool>,
+    trigger: &std::sync::Mutex<Option<Vec<u8>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut watched = cut.subscribe();
+    {
+        let (mut client_read, mut client_write) = inbound.split();
+        let (mut server_read, mut server_write) = outbound.split();
+        let requests = async {
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                let read = client_read.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                let request = &buffer[..read];
+                let fires = {
+                    let mut armed = trigger.lock().unwrap();
+                    let fires = armed.as_ref().is_some_and(|bytes| {
+                        request.windows(bytes.len()).any(|window| window == bytes)
+                    });
+                    if fires {
+                        *armed = None;
+                    }
+                    fires
+                };
+                if fires {
+                    cut.send_replace(true);
+                    std::future::pending::<()>().await;
+                }
+                server_write.write_all(request).await?;
+            }
+        };
+        tokio::select! {
+            _ = requests => {}
+            _ = tokio::io::copy(&mut server_read, &mut client_write) => {}
+            _ = watched.wait_for(|cut| *cut) => {}
+        }
+    }
+    let _ = inbound.set_zero_linger();
+    let _ = outbound.set_zero_linger();
+}
+
+/// Pods that become ready, and stop, at a fixed time.
+#[derive(Clone)]
+struct PodsSettleAt(LifecycleKubernetes, tokio::time::Instant);
+
+impl KubernetesMaterializerClient for PodsSettleAt {
+    fn apply_object<'a>(
+        &'a self,
+        object: &'a KubernetesObject,
+        precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.0.apply_object(object, precondition)
+    }
+    fn delete_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+        precondition: &'a control_plane::projection::LiveObjectIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.0.delete_object(object, precondition)
+    }
+    fn wait_for_readiness<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
+        Box::pin(async move {
+            tokio::time::sleep_until(self.1).await;
+            self.0.wait_for_readiness(objects).await
+        })
+    }
+    fn inspect_object<'a>(
+        &'a self,
+        object: &'a RenderedObjectRef,
+    ) -> KubernetesClientFuture<
+        'a,
+        KubernetesClientResult<control_plane::projection::ProjectionObjectInspection>,
+    > {
+        self.0.inspect_object(object)
+    }
+    fn ensure_no_descendants<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+        instance_id: &'a str,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        if tokio::time::Instant::now() < self.1 {
+            return Box::pin(async {
+                Err(control_plane::KubernetesClientError::transient(
+                    "Pods are stopping",
+                ))
+            });
+        }
+        self.0.ensure_no_descendants(objects, instance_id)
+    }
+    fn verify_retained_bindings<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        self.0.verify_retained_bindings(objects)
+    }
+}
+
+/// The reconciler rides out a 30 s database outage that resets its sessions
+/// mid-wake and mid-sleep: it keeps running, both instances reach their
+/// state once the database returns, and no failure is recorded. The wake's
+/// Pod becomes ready, and the sleep's Pod stops, inside the outage.
+#[tokio::test]
+async fn postgres_reconciler_rides_out_a_thirty_second_outage() -> TestResult {
+    use sleepypods_observability::{
+        metrics::{
+            CONTROL_PLANE_STORE_AVAILABLE, RECONCILER_CLAIMS_TOTAL,
+            RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
+        },
+        recorder::{InMemoryObservability, ObservabilityEvent},
+    };
+    const OUTAGE: Duration = Duration::from_secs(30);
+    with_store(|store, raw| async move {
+        let base = std::env::var("SLEEPYPODS_POSTGRES_URL")?;
+        let class = class(&store, "outage-class").await?;
+        let target = target("outage");
+        let awake = running(&store, &class, &target, "outage-sleep").await?;
+        store
+            .begin_sleep(
+                BeginSleepRequest::new(
+                    awake.instance.id.clone(),
+                    awake.instance.generation,
+                    target.clone(),
+                )
+                .with_drain_grace_timeout(Duration::ZERO),
+            )
+            .await?;
+        let waking = accepted(&store, &class, &target, "outage-wake").await?;
+        let schema: String = raw
+            .query_one("SELECT current_schema()::text", &[])
+            .await?
+            .get(0);
+
+        let relay = Relay::start(&base).await?;
+        let relayed = PostgresStoreConfig::new(connection_url_with_search_path(
+            &relay.url(&base)?,
+            &schema,
+        ))?;
+        let relayed: Arc<dyn ControlPlaneStore> =
+            Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(
+                PostgresStore::connect(&relayed).await?,
+            )));
+        let sink = InMemoryObservability::default();
+        let kube = LifecycleKubernetes::default();
+        let driver = control_plane::MaterializationReconciler::new(
+            relayed,
+            KubernetesMaterializer::new(PodsSettleAt(
+                kube.clone(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )),
+            target.clone(),
+            control_plane::MaterializationReconcilerConfig {
+                owner: "outage-driver".into(),
+                ..Default::default()
+            },
+            sink.recorder(),
+        );
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let running = tokio::spawn(driver.run_until_shutdown(stopped));
+
+        // The driver holds both rows, and the wake has created and scaled up
+        // its workload: the Service, the Deployment and its activation.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let held: i64 = raw
+                    .query_one(
+                        "SELECT count(*) FROM materializations WHERE reconcile_owner = 'outage-driver'",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                if held == 2 && kube.applies.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+                    return Ok::<_, tokio_postgres::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the driver did not claim the wake and the sleep")??;
+        // The outage starts while the wake's completion is in flight.
+        relay.cut_at(waking.instance_id.as_str().as_bytes());
+        tokio::time::timeout(Duration::from_secs(15), relay.wait_until_cut())
+            .await
+            .map_err(|_| "the wake never sent its completion")?;
+        tokio::time::sleep(OUTAGE).await;
+        assert!(!running.is_finished(), "the reconciler stopped in the outage");
+        relay.restore();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let woke = instance(&store, &waking.instance_id).await?.state;
+                let slept = instance(&store, &awake.instance.id).await?.state;
+                if (woke, slept) == (InstanceState::Running, InstanceState::Cold) {
+                    return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the wake and the sleep did not finish after the outage")??;
+        assert!(!running.is_finished(), "the reconciler stopped after the outage");
+        let metric = |name: &str| {
+            sink.events()
+                .iter()
+                .filter_map(|event| match event {
+                    ObservabilityEvent::Metric(metric) if metric.name() == name => {
+                        Some(metric.value())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            metric(RECONCILER_CLAIMS_TOTAL.name()).len(),
+            2,
+            "each first attempt survived the outage"
+        );
+        assert!(
+            metric(RUNTIME_MATERIALIZATION_FAILURES_TOTAL.name()).is_empty(),
+            "the outage ended an attempt"
+        );
+        assert!(
+            metric(CONTROL_PLANE_STORE_AVAILABLE.name()).contains(&0.0),
+            "the outage went unreported"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while metric(CONTROL_PLANE_STORE_AVAILABLE.name()).last() != Some(&1.0) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the store never reported available again")?;
+
+        shutdown.send_replace(true);
+        running.await??;
+        Ok(())
+    })
+    .await
+}
+
 /// Deleting a Running instance tears it down at once: drain grace belongs to
 /// sleep. A deletion accepted during a drain keeps that drain's deadline.
 #[tokio::test]
