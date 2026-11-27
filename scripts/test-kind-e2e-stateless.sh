@@ -369,20 +369,38 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" port-forward \
   svc/sleepypods-frontline "${frontline_port}:8080" "${frontline_metrics_port}:19090" >"${frontline_pf_log}" 2>&1 &
 frontline_pf=$!
 
-echo "==> Running stateless kind E2E driver"
-KUBECONFIG="${kubeconfig}" \
-  SLEEPYPODS_KIND_E2E_STATELESS=1 \
-  SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
-  SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
-  SLEEPYPODS_E2E_WORKLOAD_ENDPOINT="http://127.0.0.1:${workload_port}" \
-  SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
-  SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR="127.0.0.1:${frontline_metrics_port}" \
-  SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
-  SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
-  SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
-  SLEEPYPODS_E2E_PROXY_TOKEN="${proxy_token}" \
-  SLEEPYPODS_E2E_SIDECAR_TOKEN="${sidecar_token}" \
-  SLEEPYPODS_E2E_INVALID_TOKEN="${invalid_token}" \
-  cargo test -p control-plane --test kind_e2e_stateless -- --ignored --nocapture
+# Runs the driver's tests matching the filter. The lifecycle test and the
+# wake-latency measurement run one after the other, so the measurement sees an
+# otherwise idle platform.
+run_driver() {
+  local filter="$1"
+  local wake_latency="$2"
+
+  KUBECONFIG="${kubeconfig}" \
+    SLEEPYPODS_KIND_E2E_STATELESS=1 \
+    SLEEPYPODS_KIND_E2E_WAKE_LATENCY="${wake_latency}" \
+    SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
+    SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
+    SLEEPYPODS_E2E_WORKLOAD_ENDPOINT="http://127.0.0.1:${workload_port}" \
+    SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
+    SLEEPYPODS_E2E_FRONTLINE_METRICS_ADDR="127.0.0.1:${frontline_metrics_port}" \
+    SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
+    SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
+    SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
+    SLEEPYPODS_E2E_PROXY_TOKEN="${proxy_token}" \
+    SLEEPYPODS_E2E_SIDECAR_TOKEN="${sidecar_token}" \
+    SLEEPYPODS_E2E_INVALID_TOKEN="${invalid_token}" \
+    cargo test -p control-plane --test kind_e2e_stateless "${filter}" -- --ignored --nocapture
+}
+
+# SLEEPYPODS_KIND_E2E_WAKE_LATENCY_ONLY=1 skips the lifecycle test, which
+# waits out the activation floor.
+if [[ "${SLEEPYPODS_KIND_E2E_WAKE_LATENCY_ONLY:-0}" != "1" ]]; then
+  echo "==> Running stateless kind E2E driver"
+  run_driver stateless_http_lifecycle_through_deployed_platform 0
+fi
+
+echo "==> Measuring stateless wake latency"
+run_driver stateless_wake_latency_through_deployed_platform 1
 
 echo "stateless full-platform kind E2E completed"

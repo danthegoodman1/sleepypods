@@ -7,14 +7,16 @@ use std::{
 };
 
 use control_plane::{
-    render_manifests, rendered_object_ref, ContainerPortTemplate, ContainerTemplate, Generation,
-    InstanceId, InstanceRecord, InstanceState, InstanceValues, KubeMaterializerClient,
-    KubeMaterializerClientConfig, KubernetesMaterializer, KubernetesMaterializerClient,
-    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSourceTemplate, RenderManifestRequest, RenderedManifest, RenderedObjectRef,
-    ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, VolumeTemplate, WorkloadClassId, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadTemplate,
+    projection::{ProjectionPlan, ProjectionReconciler},
+    render_manifests, rendered_object_ref, BackendGeneration, ContainerPortTemplate,
+    ContainerTemplate, Generation, InstanceId, InstanceRecord, InstanceState, InstanceValues,
+    KubeMaterializerClient, KubeMaterializerClientConfig, KubernetesMaterializer,
+    KubernetesMaterializerClient, ManifestTemplate, MaterializationId, MaterializationRecord,
+    MaterializationState, MaterializationTarget, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RenderManifestRequest,
+    RenderedManifest, RenderedObjectRef, ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate,
+    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassId,
+    WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
 };
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
@@ -70,13 +72,12 @@ async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResu
     let pv_seed = pv_name(namespace);
     let marker = marker_value(namespace);
     let config = KubeMaterializerClientConfig {
-        pvc_bound_timeout: Duration::from_secs(60),
         readiness_timeout: Duration::from_secs(90),
-        poll_interval: POLL_INTERVAL,
         ..KubeMaterializerClientConfig::default()
     };
     let kube_client = KubeMaterializerClient::with_config(client.clone(), config)?;
     let materializer = KubernetesMaterializer::new(kube_client);
+    let projection = ProjectionReconciler::new(&materializer);
     let manifest = kind_manifest(namespace, &pv_seed)?;
     let refs = rendered_refs(&manifest);
     let name = |kind: &str| {
@@ -89,29 +90,45 @@ async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResu
     let pv_name = name("PersistentVolume");
     let pvc_name = name("PersistentVolumeClaim");
     let workload_name = name("StatefulSet");
+    let record = MaterializationRecord {
+        pod_backend: None,
+        id: MaterializationId::new(format!("kind-materializer:kind:{namespace}"))?,
+        instance_id: InstanceId::new("kind-materializer")?,
+        instance_generation: Generation::new(1),
+        projection_generation: Generation::new(1),
+        target: MaterializationTarget::new("kind", namespace)?,
+        state: MaterializationState::Pending,
+        backend: None,
+        backend_generation: BackendGeneration::new(1),
+        rendered_objects: refs.clone(),
+        exclusivity_keys: Vec::new(),
+        reconciliation_lease: None,
+    };
+    let plan = ProjectionPlan::from_manifest(&record, &manifest)?;
 
     let lifecycle_result: TestResult<()> = async {
-        let applied_refs = materializer.apply_manifest(&manifest).await?;
+        // The workload is created without waiting for the claim; its Pod is
+        // ready only once the claim is Bound and mounted.
+        projection.apply(&plan).await?;
+        let backend = projection.wait_for_readiness(&plan).await?;
         verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name, &pvc_name).await?;
-        let backend = materializer
-            .client()
-            .wait_for_readiness(&applied_refs)
-            .await?;
-        verify_backend_uri(backend.uri(), namespace, &workload_name)?;
+        verify_backend_uri(client.clone(), backend.uri(), namespace, &workload_name).await?;
 
         write_marker(client.clone(), namespace, &pvc_name, &marker).await?;
 
-        // Keep the old Pod visible after foreground workload deletion and prove
-        // absence inspection remains blocked until that member is actually gone.
+        // Hold the old Pod after foreground workload deletion and prove cleanup
+        // keeps waiting until that member is actually gone.
         let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
         let pod = pods.list(&ListParams::default().labels("sleepypods.io/instance-id=kind-materializer")).await?.items.into_iter().next().ok_or("ready workload has no Pod")?;
         let pod_name = pod.metadata.name.as_deref().ok_or("Pod name missing")?;
         let uid = pod.metadata.uid.as_deref().ok_or("Pod UID missing")?;
         pods.patch(pod_name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"metadata":{"uid":uid,"resourceVersion":pod.metadata.resource_version,"finalizers":["sleepypods.io/phase6bd-test-hold"]}}))).await?;
-        materializer.delete_rendered_objects(&refs).await?;
-        let blocked = materializer.client().ensure_no_descendants(&refs, "kind-materializer").await;
+        let cleanup = projection.delete_owned(&plan);
+        tokio::pin!(cleanup);
+        let held = tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await;
         pods.patch(pod_name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"metadata":{"uid":uid,"finalizers":null}}))).await?;
-        assert!(blocked.is_err(), "terminating old member must hold cleanup ownership");
+        assert!(held.is_err(), "terminating old member must hold cleanup ownership");
+        cleanup.await?;
         wait_for_rendered_objects_deleted(
             client.clone(),
             namespace,
@@ -121,23 +138,17 @@ async fn run_materializer_lifecycle(client: Client, namespace: &str) -> TestResu
         )
         .await?;
 
-        let rematerialized_manifest = kind_manifest(namespace, &pv_seed)?;
-        let applied_refs = materializer
-            .apply_manifest(&rematerialized_manifest)
-            .await?;
+        projection.apply(&plan).await?;
+        let backend = projection.wait_for_readiness(&plan).await?;
         verify_pv_and_bound_pvc_exist(client.clone(), namespace, &pv_name, &pvc_name).await?;
-        let backend = materializer
-            .client()
-            .wait_for_readiness(&applied_refs)
-            .await?;
-        verify_backend_uri(backend.uri(), namespace, &workload_name)?;
+        verify_backend_uri(client.clone(), backend.uri(), namespace, &workload_name).await?;
 
         verify_marker_present(client.clone(), namespace, &pvc_name, &marker).await?;
         Ok(())
     }
     .await;
 
-    let delete_result = materializer.delete_rendered_objects(&refs).await;
+    let delete_result = projection.delete_owned(&plan).await;
     let deletion_wait_result =
         wait_for_rendered_objects_deleted(client, namespace, &pv_name, &pvc_name, &workload_name)
             .await;
@@ -161,8 +172,21 @@ async fn verify_single_node_cluster(client: Client) -> TestResult<()> {
     Ok(())
 }
 
-fn verify_backend_uri(uri: &str, namespace: &str, workload_name: &str) -> TestResult<()> {
-    let expected = format!("http://{workload_name}.{namespace}.svc.cluster.local:8080");
+/// The backend is the Service's ClusterIP and port.
+async fn verify_backend_uri(
+    client: Client,
+    uri: &str,
+    namespace: &str,
+    workload_name: &str,
+) -> TestResult<()> {
+    let services: Api<Service> = Api::namespaced(client, namespace);
+    let cluster_ip = services
+        .get(workload_name)
+        .await?
+        .spec
+        .and_then(|spec| spec.cluster_ip)
+        .ok_or("Service has no ClusterIP")?;
+    let expected = format!("http://{cluster_ip}:8080");
     if uri != expected {
         return Err(format!("expected backend URI {expected}, got {uri}").into());
     }

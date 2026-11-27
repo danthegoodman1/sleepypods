@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
 use crate::{
     ids::{Generation, InstanceId, MaterializationId},
@@ -17,6 +17,14 @@ pub const ANNOTATION_RENDERED_HASH: &str = "sleepypods.io/rendered-hash";
 
 const MAX_DETAIL_LEN: usize = 160;
 const MAX_FINALIZERS: usize = 5;
+/// Rounds of inspect-then-apply one attempt makes when a mutation reports that
+/// the object must be inspected again.
+pub(crate) const APPLY_ROUNDS: u32 = 4;
+/// How long one cleanup attempt waits for deleted objects and their Pods to
+/// disappear. A Pod has its termination grace period to stop.
+pub const ABSENCE_WAIT: Duration = Duration::from_secs(60);
+const ABSENCE_POLL_MIN: Duration = Duration::from_millis(100);
+const ABSENCE_POLL_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionPlan {
@@ -497,26 +505,43 @@ where
         }
     }
 
+    /// Brings every rendered object to its desired state. Each round inspects
+    /// the live objects, then creates the missing ones and patches the rest on
+    /// condition that they are unchanged. A mutation whose outcome is unknown,
+    /// or whose precondition went stale, starts another round.
     pub async fn apply(&self, plan: &ProjectionPlan) -> Result<(), ProjectionError> {
-        let observations = self.inspect(plan).await?;
-        self.reject_unowned(&observations)?;
-        self.apply_with_observations(plan, &observations).await
-    }
-
-    async fn apply_with_observations(
-        &self,
-        plan: &ProjectionPlan,
-        observations: &[ProjectionObservation],
-    ) -> Result<(), ProjectionError> {
         let manifest = plan.manifest().ok_or(ProjectionError::MissingManifest)?;
-        self.materializer
-            .apply_manifest_with_preconditions(manifest, observations)
-            .await
-            .map_err(|source| ProjectionError::Apply {
-                observations: apply_rejected_observations(plan, &source),
-                source: Box::new(source),
-            })?;
-        Ok(())
+        let mut round = 0;
+        loop {
+            round += 1;
+            let observations = self.inspect(plan).await?;
+            self.reject_unowned(&observations)?;
+            // A terminating leftover keeps its name until it is gone.
+            if observations
+                .iter()
+                .any(|observation| observation.state == ProjectionObservationState::DeletingOwned)
+            {
+                return Err(ProjectionError::Incomplete { observations });
+            }
+            match self
+                .materializer
+                .apply_manifest(manifest, &observations)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(MaterializerError::Apply { source, .. })
+                    if round < APPLY_ROUNDS && !source.is_permanent() =>
+                {
+                    tokio::time::sleep(ABSENCE_POLL_MIN * round).await;
+                }
+                Err(source) => {
+                    return Err(ProjectionError::Apply {
+                        observations: apply_rejected_observations(plan, &source),
+                        source: Box::new(source),
+                    });
+                }
+            }
+        }
     }
 
     pub async fn wait_for_readiness(
@@ -536,12 +561,83 @@ where
             })
     }
 
+    /// Deletes every recorded object this projection owns and returns once
+    /// they and their Pods are gone. Each round inspects the live objects and
+    /// deletes, on condition that it is unchanged, any that is still present.
+    /// A terminating object or Pod is progress: the attempt waits for it up to
+    /// `ABSENCE_WAIT`.
     pub async fn delete_owned(&self, plan: &ProjectionPlan) -> Result<(), ProjectionError> {
-        let before = self.inspect(plan).await?;
-        self.reject_unowned(&before)?;
+        let object_refs = plan.object_refs();
+        let deadline = tokio::time::Instant::now() + ABSENCE_WAIT;
+        let mut poll = ABSENCE_POLL_MIN;
+        loop {
+            let observed = self.inspect(plan).await?;
+            self.reject_unowned(&observed)?;
+            if observed
+                .iter()
+                .all(|observation| observation.state == ProjectionObservationState::Missing)
+            {
+                match self
+                    .materializer
+                    .client()
+                    .ensure_no_descendants(&object_refs, plan.instance_id().as_str())
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    // Pods are still stopping, or the read failed for a
+                    // reason that passes.
+                    Err(source) if source.is_retryable() => {}
+                    Err(source) => {
+                        return Err(ProjectionError::Inspect {
+                            object_ref: Box::new(readiness_observation_ref(plan)),
+                            observations: vec![ProjectionObservation::delete_blocked(
+                                readiness_observation_ref(plan),
+                                "descendants_remain_or_inspection_failed",
+                                &[],
+                            )],
+                            source,
+                        });
+                    }
+                }
+            } else {
+                self.delete_present(plan, &observed).await?;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProjectionError::CleanupBlocked {
+                    observations: observed
+                        .into_iter()
+                        .filter_map(delete_blocked_observation)
+                        .collect(),
+                });
+            }
+            tokio::time::sleep(poll).await;
+            poll = (poll * 2).min(ABSENCE_POLL_MAX);
+        }
+    }
+
+    /// Issues a conditional delete for each owned object that is present and
+    /// not yet terminating.
+    async fn delete_present(
+        &self,
+        plan: &ProjectionPlan,
+        observed: &[ProjectionObservation],
+    ) -> Result<(), ProjectionError> {
+        let object_refs = plan.object_refs();
+        let present = |object_ref: &RenderedObjectRef| {
+            observed.iter().find(|observation| {
+                observation.object_ref == *object_ref
+                    && observation.state == ProjectionObservationState::PresentOwned
+            })
+        };
+        if !object_refs
+            .iter()
+            .any(|object_ref| present(object_ref).is_some())
+        {
+            return Ok(());
+        }
         // PVC deletion itself can trigger destructive PV reclamation. Validate
         // every live volume before issuing any teardown request.
-        let unsafe_volumes = before
+        let unsafe_volumes = observed
             .iter()
             .filter(|observation| {
                 observation.object_ref.kind == "PersistentVolume"
@@ -561,8 +657,6 @@ where
                 observations: unsafe_volumes,
             });
         }
-
-        let object_refs = plan.object_refs();
         self.materializer
             .client()
             .verify_retained_bindings(&object_refs)
@@ -577,61 +671,36 @@ where
                 source,
             })?;
         for object_ref in delete_order(&object_refs) {
-            let Some(observation) = before
-                .iter()
-                .find(|observation| observation.object_ref == *object_ref)
-            else {
+            let Some(observation) = present(object_ref) else {
                 continue;
             };
-            if observation.state == ProjectionObservationState::PresentOwned {
-                self.materializer
-                    .delete_rendered_object_conditionally(
-                        object_ref,
-                        observation
-                            .identity
-                            .as_ref()
-                            .expect("owned inspection has identity"),
-                    )
-                    .await
-                    .map_err(|source| ProjectionError::Delete {
+            match self
+                .materializer
+                .delete_rendered_object_conditionally(
+                    object_ref,
+                    observation
+                        .identity
+                        .as_ref()
+                        .expect("owned inspection has identity"),
+                )
+                .await
+            {
+                Ok(()) => {}
+                // The next round inspects the object and decides again.
+                Err(MaterializerError::Delete { source, .. }) if !source.is_permanent() => {}
+                Err(source) => {
+                    return Err(ProjectionError::Delete {
                         observations: vec![ProjectionObservation::delete_blocked(
                             object_ref.clone(),
                             "delete_request_failed",
                             &[],
                         )],
                         source: Box::new(source),
-                    })?;
+                    });
+                }
             }
         }
-
-        let after = self.inspect(plan).await?;
-        self.reject_unowned(&after)?;
-        if after
-            .iter()
-            .all(|observation| observation.state == ProjectionObservationState::Missing)
-        {
-            self.materializer
-                .client()
-                .ensure_no_descendants(&object_refs, plan.instance_id().as_str())
-                .await
-                .map_err(|source| ProjectionError::Inspect {
-                    object_ref: Box::new(readiness_observation_ref(plan)),
-                    observations: vec![ProjectionObservation::delete_blocked(
-                        readiness_observation_ref(plan),
-                        "descendants_remain_or_inspection_failed",
-                        &[],
-                    )],
-                    source,
-                })?;
-            return Ok(());
-        }
-
-        Err(ProjectionError::CleanupBlocked {
-            observations: after
-                .into_iter()
-                .filter_map(delete_blocked_observation)
-                .collect(),
-        })
+        Ok(())
     }
 }
 
@@ -908,17 +977,6 @@ fn apply_rejected_observations(
             object.as_ref().clone(),
             "apply_rejected",
         )],
-        MaterializerError::PvcBoundWait {
-            namespace, name, ..
-        } => vec![ProjectionObservation::apply_rejected(
-            RenderedObjectRef {
-                api_version: "v1".to_owned(),
-                kind: "PersistentVolumeClaim".to_owned(),
-                namespace: namespace.clone(),
-                name: name.clone(),
-            },
-            "pvc_bound_wait_failed",
-        )],
         MaterializerError::InvalidManifest { .. } => vec![ProjectionObservation::apply_rejected(
             fallback_observation_ref(plan),
             "invalid_manifest",
@@ -1057,7 +1115,10 @@ fn bound_finalizers(mut finalizers: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     use crate::{
         ids::{BackendGeneration, WorkloadClassId},
@@ -1205,23 +1266,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_apply_rejects_unowned_live_refs_before_apply() {
-        let materialization = materialization_record();
-        let plan =
-            ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
-        let client =
-            FakeProjectionClient::new(ProjectionObjectInspection::Present(LiveObjectMetadata {
-                persistent_volume_reclaim_policy: Some("Retain".into()),
-                identity: crate::projection::LiveObjectIdentity {
-                    uid: "test-uid".into(),
-                    resource_version: "1".into(),
-                },
+    async fn apply_creates_missing_objects_and_scales_the_workload_up() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        ProjectionReconciler::new(&materializer)
+            .apply(&plan)
+            .await
+            .expect("projection applies");
+
+        let [service, workload] = &plan.object_refs()[..] else {
+            panic!("the plan renders a Service and a Deployment");
+        };
+        assert_eq!(
+            cluster.calls(),
+            vec![
+                Call::Create(service.clone()),
+                Call::Create(workload.clone()),
+                Call::Patch(workload.clone()),
+            ]
+        );
+        let observations = ProjectionReconciler::new(&materializer)
+            .inspect(&plan)
+            .await
+            .expect("inspection succeeds");
+        assert!(observations
+            .iter()
+            .all(|observation| observation.state == ProjectionObservationState::PresentOwned));
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_unowned_live_refs_before_any_mutation() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert(
+            &plan.object_refs()[0],
+            LiveObjectMetadata {
+                persistent_volume_reclaim_policy: None,
+                identity: identity("foreign"),
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
                 deleting: false,
                 finalizers: Vec::new(),
-            }));
-        let materializer = KubernetesMaterializer::new(client.clone());
+            },
+        );
+        let materializer = KubernetesMaterializer::new(cluster.clone());
 
         let error = ProjectionReconciler::new(&materializer)
             .apply(&plan)
@@ -1229,22 +1319,271 @@ mod tests {
             .expect_err("unowned live refs block projection apply");
 
         assert!(matches!(error, ProjectionError::OwnershipConflict { .. }));
-        assert!(client.applied_objects().is_empty());
+        assert!(cluster.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_inspects_again_after_a_stale_mutation() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        // The create's response was lost after the API server stored the object.
+        cluster.lose_next_create_response();
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        ProjectionReconciler::new(&materializer)
+            .apply(&plan)
+            .await
+            .expect("the next round finds the object and continues");
+
+        let [service, workload] = &plan.object_refs()[..] else {
+            panic!("the plan renders a Service and a Deployment");
+        };
+        assert_eq!(
+            cluster.calls(),
+            vec![
+                Call::Create(service.clone()),
+                Call::Patch(service.clone()),
+                Call::Create(workload.clone()),
+                Call::Patch(workload.clone()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_gives_up_after_its_rounds_of_stale_mutations() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        for _ in 0..APPLY_ROUNDS {
+            cluster.fail_next_apply(KubernetesClientError::stale("request timed out"));
+        }
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .apply(&plan)
+            .await
+            .expect_err("every round failed");
+
+        assert!(matches!(error, ProjectionError::Apply { .. }));
+        assert_eq!(cluster.calls().len(), APPLY_ROUNDS as usize);
+    }
+
+    #[tokio::test]
+    async fn apply_stops_at_a_permanent_mutation_failure() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.fail_next_apply(KubernetesClientError::new("invalid object"));
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .apply(&plan)
+            .await
+            .expect_err("a permanent failure ends the apply");
+
+        assert!(matches!(error, ProjectionError::Apply { .. }));
+        assert_eq!(
+            cluster.calls(),
+            vec![Call::Create(plan.object_refs()[0].clone())]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_waits_for_a_terminating_leftover_without_mutating() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.hold_with_finalizer(&plan.object_refs()[1]);
+        cluster.mark_deleting(&plan.object_refs()[1]);
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .apply(&plan)
+            .await
+            .expect_err("a terminating object keeps its name");
+
+        assert!(matches!(error, ProjectionError::Incomplete { .. }));
+        assert!(cluster.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_owned_waits_for_terminating_objects_and_pods() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.terminate_after_inspections(3);
+        cluster.find_pods_for_checks(2);
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+        let started = tokio::time::Instant::now();
+
+        ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect("termination is progress, not failure");
+
+        let [service, workload] = &plan.object_refs()[..] else {
+            panic!("the plan renders a Service and a Deployment");
+        };
+        assert_eq!(
+            cluster.calls(),
+            vec![
+                Call::Delete(service.clone()),
+                Call::Delete(workload.clone())
+            ],
+            "each object is deleted once and then awaited"
+        );
+        assert!(started.elapsed() < ABSENCE_WAIT);
+        assert!(cluster.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_owned_deletes_again_after_a_stale_delete() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.fail_next_delete(KubernetesClientError::stale("request timed out"));
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect("the next round deletes what is still present");
+
+        let [service, workload] = &plan.object_refs()[..] else {
+            panic!("the plan renders a Service and a Deployment");
+        };
+        assert_eq!(
+            cluster.calls(),
+            vec![
+                Call::Delete(service.clone()),
+                Call::Delete(workload.clone()),
+                Call::Delete(service.clone()),
+            ]
+        );
+        assert!(cluster.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_owned_reports_a_finalizer_that_outlasts_the_absence_wait() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        let workload = plan.object_refs()[1].clone();
+        cluster.hold_with_finalizer(&workload);
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+        let started = tokio::time::Instant::now();
+
+        let error = ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect_err("a held object blocks cleanup");
+
+        let ProjectionError::CleanupBlocked { observations } = error else {
+            panic!("expected cleanup to be blocked");
+        };
+        assert!(started.elapsed() >= ABSENCE_WAIT);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].object_ref, workload);
+        assert_eq!(
+            observations[0].reason.as_deref(),
+            Some("finalizers_blocking")
+        );
+        assert_eq!(
+            cluster
+                .calls()
+                .iter()
+                .filter(|call| **call == Call::Delete(workload.clone()))
+                .count(),
+            1,
+            "a terminating object is awaited, never deleted twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_owned_refuses_an_unowned_object_without_deleting() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.insert(
+            &plan.object_refs()[0],
+            LiveObjectMetadata {
+                persistent_volume_reclaim_policy: None,
+                identity: identity("foreign"),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                deleting: false,
+                finalizers: Vec::new(),
+            },
+        );
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect_err("another owner's object is never deleted");
+
+        assert!(matches!(error, ProjectionError::OwnershipConflict { .. }));
+        assert!(cluster.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_owned_requires_retain_before_any_delete() {
+        let mut materialization = materialization_record();
+        let volume = RenderedObjectRef {
+            api_version: "v1".to_owned(),
+            kind: "PersistentVolume".to_owned(),
+            namespace: String::new(),
+            name: "pv".to_owned(),
+        };
+        materialization.rendered_objects.insert(0, volume.clone());
+        let plan = ProjectionPlan::from_recorded_refs(&materialization);
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&self::plan());
+        let mut live = cluster.live(&plan.object_refs()[1]).expect("owned Service");
+        live.persistent_volume_reclaim_policy = Some("Delete".to_owned());
+        cluster.insert(&volume, live);
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect_err("a volume the cluster would reclaim blocks cleanup");
+
+        let ProjectionError::CleanupBlocked { observations } = error else {
+            panic!("expected cleanup to be blocked");
+        };
+        assert_eq!(observations[0].object_ref, volume);
+        assert_eq!(
+            observations[0].reason.as_deref(),
+            Some("managed_volume_requires_retain_before_cleanup")
+        );
+        assert!(cluster.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_owned_stops_at_a_permanent_delete_failure() {
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.fail_next_delete(KubernetesClientError::new("forbidden"));
+        let materializer = KubernetesMaterializer::new(cluster.clone());
+
+        let error = ProjectionReconciler::new(&materializer)
+            .delete_owned(&plan)
+            .await
+            .expect_err("a permanent failure ends the attempt");
+
+        assert!(matches!(error, ProjectionError::Delete { .. }));
+        assert_eq!(cluster.calls().len(), 1);
     }
 
     #[tokio::test]
     async fn projection_inspect_with_readiness_appends_ready_observation() {
-        let materialization = materialization_record();
-        let plan =
-            ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
-        let live = LiveObjectMetadata::from_rendered_object(
-            &plan.manifest().expect("manifest").objects[0].object,
-        );
+        let plan = plan();
         let backend =
             BackendEndpoint::new("http://svc.apps.svc.cluster.local:80").expect("backend endpoint");
-        let client = FakeProjectionClient::new(ProjectionObjectInspection::Present(live))
-            .with_readiness(ProjectionReadinessInspection::Ready(backend.clone()));
-        let materializer = KubernetesMaterializer::new(client);
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.set_readiness(ProjectionReadinessInspection::Ready(backend.clone()));
+        let materializer = KubernetesMaterializer::new(cluster);
 
         let metadata_only = ProjectionReconciler::new(&materializer)
             .inspect(&plan)
@@ -1269,17 +1608,13 @@ mod tests {
 
     #[tokio::test]
     async fn projection_inspect_with_readiness_appends_bounded_unready_observation() {
-        let materialization = materialization_record();
-        let plan =
-            ProjectionPlan::from_manifest(&materialization, &manifest()).expect("projection plan");
-        let live = LiveObjectMetadata::from_rendered_object(
-            &plan.manifest().expect("manifest").objects[0].object,
-        );
-        let client = FakeProjectionClient::new(ProjectionObjectInspection::Present(live))
-            .with_readiness(ProjectionReadinessInspection::Unready {
-                reason: "x".repeat(MAX_DETAIL_LEN + 32),
-            });
-        let materializer = KubernetesMaterializer::new(client);
+        let plan = plan();
+        let cluster = FakeCluster::default();
+        cluster.insert_owned(&plan);
+        cluster.set_readiness(ProjectionReadinessInspection::Unready {
+            reason: "x".repeat(MAX_DETAIL_LEN + 32),
+        });
+        let materializer = KubernetesMaterializer::new(cluster);
 
         let observations = ProjectionReconciler::new(&materializer)
             .inspect_with_readiness(&plan)
@@ -1295,64 +1630,182 @@ mod tests {
         assert_eq!(observation.backend_uri, None);
     }
 
-    #[derive(Clone)]
-    struct FakeProjectionClient {
-        inspection: ProjectionObjectInspection,
-        readiness: ProjectionReadinessInspection,
-        applied_objects: Arc<Mutex<Vec<RenderedObjectRef>>>,
+    /// A cluster in memory. A create stores the rendered object's stamps under
+    /// a fresh UID, a conditional patch needs the stored identity, and a
+    /// delete marks the object terminating: it disappears after the configured
+    /// number of further inspections unless a finalizer holds it.
+    #[derive(Clone, Default)]
+    struct FakeCluster {
+        state: Arc<Mutex<ClusterState>>,
     }
 
-    impl FakeProjectionClient {
-        fn new(inspection: ProjectionObjectInspection) -> Self {
-            Self {
-                inspection,
-                readiness: ProjectionReadinessInspection::NotObserved,
-                applied_objects: Arc::new(Mutex::new(Vec::new())),
+    #[derive(Default)]
+    struct ClusterState {
+        live: BTreeMap<RefKey, LiveObjectMetadata>,
+        terminating: BTreeMap<RefKey, usize>,
+        termination_inspections: usize,
+        pod_checks: usize,
+        calls: Vec<Call>,
+        apply_failures: VecDeque<KubernetesClientError>,
+        delete_failures: VecDeque<KubernetesClientError>,
+        lose_create_response: bool,
+        readiness: ProjectionReadinessInspection,
+        created: u64,
+    }
+
+    type RefKey = (String, String, String, String);
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Call {
+        Create(RenderedObjectRef),
+        Patch(RenderedObjectRef),
+        Delete(RenderedObjectRef),
+    }
+
+    impl FakeCluster {
+        fn state(&self) -> std::sync::MutexGuard<'_, ClusterState> {
+            self.state.lock().expect("fake cluster lock is available")
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.state().calls.clone()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.state().live.is_empty()
+        }
+
+        fn live(&self, object: &RenderedObjectRef) -> Option<LiveObjectMetadata> {
+            self.state().live.get(&ref_key(object)).cloned()
+        }
+
+        fn insert(&self, object: &RenderedObjectRef, live: LiveObjectMetadata) {
+            self.state().live.insert(ref_key(object), live);
+        }
+
+        /// Stores every object of the plan's manifest as this projection's own.
+        fn insert_owned(&self, plan: &ProjectionPlan) {
+            for rendered in &plan.manifest().expect("stamped manifest").objects {
+                self.insert(
+                    &rendered_object_ref(&rendered.object),
+                    LiveObjectMetadata::from_rendered_object(&rendered.object),
+                );
             }
         }
 
-        fn with_readiness(mut self, readiness: ProjectionReadinessInspection) -> Self {
-            self.readiness = readiness;
-            self
+        fn hold_with_finalizer(&self, object: &RenderedObjectRef) {
+            self.state()
+                .live
+                .get_mut(&ref_key(object))
+                .expect("live object")
+                .finalizers = vec!["example.com/hold".to_owned()];
         }
 
-        fn applied_objects(&self) -> Vec<RenderedObjectRef> {
-            self.applied_objects
-                .lock()
-                .expect("fake projection client lock is available")
-                .clone()
+        fn mark_deleting(&self, object: &RenderedObjectRef) {
+            self.state()
+                .live
+                .get_mut(&ref_key(object))
+                .expect("live object")
+                .deleting = true;
+        }
+
+        fn terminate_after_inspections(&self, inspections: usize) {
+            self.state().termination_inspections = inspections;
+        }
+
+        fn find_pods_for_checks(&self, checks: usize) {
+            self.state().pod_checks = checks;
+        }
+
+        fn fail_next_apply(&self, error: KubernetesClientError) {
+            self.state().apply_failures.push_back(error);
+        }
+
+        fn fail_next_delete(&self, error: KubernetesClientError) {
+            self.state().delete_failures.push_back(error);
+        }
+
+        fn lose_next_create_response(&self) {
+            self.state().lose_create_response = true;
+        }
+
+        fn set_readiness(&self, readiness: ProjectionReadinessInspection) {
+            self.state().readiness = readiness;
         }
     }
 
-    impl KubernetesMaterializerClient for FakeProjectionClient {
+    impl KubernetesMaterializerClient for FakeCluster {
         fn apply_object<'a>(
             &'a self,
             object: &'a KubernetesObject,
-            _precondition: Option<&'a crate::projection::LiveObjectIdentity>,
+            precondition: Option<&'a LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
-                self.applied_objects
-                    .lock()
-                    .expect("fake projection client lock is available")
-                    .push(rendered_object_ref(object));
+                let object_ref = rendered_object_ref(object);
+                let key = ref_key(&object_ref);
+                let mut state = self.state();
+                state.calls.push(match precondition {
+                    None => Call::Create(object_ref),
+                    Some(_) => Call::Patch(object_ref),
+                });
+                if let Some(error) = state.apply_failures.pop_front() {
+                    return Err(error);
+                }
+                let mut stored = LiveObjectMetadata::from_rendered_object(object);
+                match precondition {
+                    None => {
+                        if state.live.contains_key(&key) {
+                            return Err(KubernetesClientError::stale("already exists"));
+                        }
+                        state.created += 1;
+                        stored.identity = identity(&format!("created-{}", state.created));
+                        state.live.insert(key, stored);
+                        if std::mem::take(&mut state.lose_create_response) {
+                            return Err(KubernetesClientError::stale("response lost"));
+                        }
+                    }
+                    Some(expected) => {
+                        let live = state.live.get_mut(&key);
+                        let Some(live) = live.filter(|live| live.identity == *expected) else {
+                            return Err(KubernetesClientError::stale("conflict"));
+                        };
+                        stored.identity = LiveObjectIdentity {
+                            uid: expected.uid.clone(),
+                            resource_version: format!("{}-patched", expected.resource_version),
+                        };
+                        *live = stored;
+                    }
+                }
                 Ok(())
             })
         }
 
         fn delete_object<'a>(
             &'a self,
-            _object: &'a RenderedObjectRef,
-            _precondition: &'a crate::projection::LiveObjectIdentity,
+            object: &'a RenderedObjectRef,
+            precondition: &'a LiveObjectIdentity,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn wait_for_pvc_bound<'a>(
-            &'a self,
-            _namespace: &'a str,
-            _name: &'a str,
-        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                let key = ref_key(object);
+                let mut state = self.state();
+                state.calls.push(Call::Delete(object.clone()));
+                if let Some(error) = state.delete_failures.pop_front() {
+                    return Err(error);
+                }
+                let inspections = state.termination_inspections;
+                let Some(live) = state
+                    .live
+                    .get_mut(&key)
+                    .filter(|live| live.identity == *precondition)
+                else {
+                    return Err(KubernetesClientError::stale("conflict"));
+                };
+                live.deleting = true;
+                if live.finalizers.is_empty() {
+                    state.terminating.insert(key, inspections);
+                }
+                Ok(())
+            })
         }
 
         fn wait_for_readiness<'a>(
@@ -1368,10 +1821,25 @@ mod tests {
 
         fn inspect_object<'a>(
             &'a self,
-            _object: &'a RenderedObjectRef,
+            object: &'a RenderedObjectRef,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>>
         {
-            Box::pin(async move { Ok(self.inspection.clone()) })
+            Box::pin(async move {
+                let key = ref_key(object);
+                let mut state = self.state();
+                match state.terminating.get_mut(&key) {
+                    Some(0) => {
+                        state.terminating.remove(&key);
+                        state.live.remove(&key);
+                    }
+                    Some(remaining) => *remaining -= 1,
+                    None => {}
+                }
+                Ok(match state.live.get(&key) {
+                    Some(live) => ProjectionObjectInspection::Present(live.clone()),
+                    None => ProjectionObjectInspection::Missing,
+                })
+            })
         }
 
         fn inspect_readiness<'a>(
@@ -1379,7 +1847,7 @@ mod tests {
             _objects: &'a [RenderedObjectRef],
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>>
         {
-            Box::pin(async move { Ok(self.readiness.clone()) })
+            Box::pin(async move { Ok(self.state().readiness.clone()) })
         }
 
         fn ensure_no_descendants<'a>(
@@ -1387,18 +1855,36 @@ mod tests {
             _objects: &'a [RenderedObjectRef],
             _instance_id: &'a str,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                let mut state = self.state();
+                if state.pod_checks == 0 {
+                    return Ok(());
+                }
+                state.pod_checks -= 1;
+                Err(KubernetesClientError::transient(
+                    "projection Pods still exist, including terminating members",
+                ))
+            })
         }
 
         fn verify_retained_bindings<'a>(
             &'a self,
             _objects: &'a [RenderedObjectRef],
-        ) -> crate::materializer::KubernetesClientFuture<
-            'a,
-            crate::materializer::KubernetesClientResult<()>,
-        > {
+        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    fn identity(uid: &str) -> LiveObjectIdentity {
+        LiveObjectIdentity {
+            uid: uid.to_owned(),
+            resource_version: "1".to_owned(),
+        }
+    }
+
+    fn plan() -> ProjectionPlan {
+        ProjectionPlan::from_manifest(&materialization_record(), &manifest())
+            .expect("projection plan")
     }
 
     fn object_metadata(object: &KubernetesObject) -> &ObjectMeta {
@@ -1417,6 +1903,7 @@ mod tests {
         let manifest = manifest();
         let rendered_objects = rendered_object_refs(&manifest).expect("refs");
         MaterializationRecord {
+            pod_backend: None,
             id: MaterializationId::new("instance-a:cluster-a:apps")
                 .expect("valid materialization id"),
             instance_id: InstanceId::new("instance-a").expect("valid instance id"),

@@ -70,6 +70,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0012_route_host_rules.sql"),
     },
     Migration {
+        version: 13,
+        name: "lifecycle_recovery",
+        sql: include_str!("../../migrations/0013_lifecycle_recovery.sql"),
+    },
+    Migration {
         version: 14,
         name: "api_cleanup",
         sql: include_str!("../../migrations/0014_api_cleanup.sql"),

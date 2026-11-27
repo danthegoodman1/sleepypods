@@ -283,7 +283,7 @@ impl control_plane::KubernetesMaterializerClient for SchedulerKubernetes {
                 Some("transient") => Err(control_plane::KubernetesClientError::transient(
                     "temporarily unavailable",
                 )),
-                Some("uncertain") => Err(control_plane::KubernetesClientError::uncertain(
+                Some("stale") => Err(control_plane::KubernetesClientError::stale(
                     "request reply lost",
                 )),
                 _ => self.inner.apply_object(object, condition).await,
@@ -296,13 +296,6 @@ impl control_plane::KubernetesMaterializerClient for SchedulerKubernetes {
         condition: &'a control_plane::projection::LiveObjectIdentity,
     ) -> control_plane::KubernetesClientFuture<'a, control_plane::KubernetesClientResult<()>> {
         self.inner.delete_object(object, condition)
-    }
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> control_plane::KubernetesClientFuture<'a, control_plane::KubernetesClientResult<()>> {
-        self.inner.wait_for_pvc_bound(namespace, name)
     }
     fn wait_for_readiness<'a>(
         &'a self,
@@ -408,8 +401,8 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
             target,
             MaterializationReconcilerConfig {
                 interval: Duration::from_millis(20),
-                concurrency_limit: 2,
-                batch_size: 2,
+                wake_limit: 2,
+                cleanup_limit: 2,
                 ..Default::default()
             },
             sleepypods_observability::recorder::ObservabilityRecorder::noop(),
@@ -441,8 +434,23 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
             )
         }
     };
+    let instance_state = |id: InstanceId| {
+        let store = store.clone();
+        async move {
+            store
+                .get_instance(GetInstanceRequest::new(id))
+                .await
+                .ok()
+                .flatten()
+                .map(|instance| instance.state)
+        }
+    };
     let healthy = accept("healthy-delete".into(), target.clone()).await?;
-    driver(target.clone()).run_once().await;
+    transport_support::reconcile_until(driver(target.clone()), || {
+        let state = instance_state(healthy.instance_id.clone());
+        async move { state.await == Some(InstanceState::Running) }
+    })
+    .await;
     let ready = store
         .get_instance(GetInstanceRequest::new(healthy.instance_id.clone()))
         .await?
@@ -484,13 +492,6 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     shutdown.send_replace(true);
     running.await??;
     assert_eq!(
-        raw.query_one("SELECT count(*) FROM materialization_effects", &[])
-            .await?
-            .get::<_, i64>(0),
-        0,
-        "readiness cancellation is not quarantined"
-    );
-    assert_eq!(
         raw.query_one(
             "SELECT count(*) FROM materializations WHERE reconcile_owner IS NOT NULL",
             &[]
@@ -498,19 +499,39 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         .await?
         .get::<_, i64>(0),
         0,
-        "shutdown releases definite read-only attempts"
+        "shutdown releases every attempt it stops"
     );
 
-    for behavior in ["permanent", "transient", "uncertain"] {
+    // A permanent apply failure ends the wake. A failure that passes, and one
+    // whose outcome is unknown, are both retried after a backoff.
+    for (behavior, kind) in [
+        ("permanent", "permanent"),
+        ("transient", "transient"),
+        ("stale", "transient"),
+    ] {
         let id = format!("failure-{behavior}");
         client.behavior.lock().unwrap().insert(id.clone(), behavior);
         let isolated = MaterializationTarget::new(format!("failure-{behavior}"), "apps")?;
         let pending = accept(id.clone(), isolated.clone()).await?;
-        driver(isolated.clone()).run_once().await;
-        if behavior == "uncertain" {
-            // Model an ambiguous conditional update's stored observation for the API mapping gate.
-            raw.execute("UPDATE materialization_effects SET expected_uid = 'observed-uid', expected_resource_version = 'observed-rv' WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
-        }
+        // The failed wake's cleanup runs at once, with no operator and no
+        // rescheduling by the test.
+        transport_support::reconcile_until(driver(isolated.clone()), || async {
+            let Ok(Some(status)) = store
+                .load_materialization_work_status(pending.id.clone())
+                .await
+            else {
+                return false;
+            };
+            let state = store
+                .load_materialization(LoadMaterializationRequest::new(pending.id.clone()))
+                .await
+                .ok()
+                .flatten()
+                .map(|record| record.state);
+            status.failure_kind.as_deref() == Some(kind)
+                && (behavior != "permanent" || state == Some(MaterializationState::Deleted))
+        })
+        .await;
         let status = store
             .load_materialization_work_status(pending.id.clone())
             .await?
@@ -527,7 +548,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         .await?
         .into_inner();
         assert!(diagnostics.found && !diagnostics.attempted);
-        assert_eq!(diagnostics.failure_kind, behavior);
+        assert_eq!(diagnostics.failure_kind, kind);
         assert_eq!(diagnostics.failure_message, status.failure_message);
         assert_eq!(
             diagnostics.operation_deadline_unix_millis,
@@ -538,65 +559,22 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
             status.next_attempt_at_unix_millis
         );
         assert_eq!(diagnostics.failure_count, status.failure_count);
-        if let Some(effect) = &status.uncertain_effect {
-            let exposed = diagnostics.uncertain_effect.unwrap();
-            assert_eq!(exposed.owner, effect.owner);
-            assert_eq!(exposed.lease_attempt, effect.attempt);
-            assert_eq!(exposed.instance_generation, effect.generation.get());
-            assert_eq!(exposed.effect_id, effect.effect_id);
-            assert_eq!(exposed.object.unwrap().name, effect.object.name);
-            assert_eq!(exposed.expected_uid, "observed-uid");
-            assert_eq!(exposed.expected_resource_version, "observed-rv");
-        }
 
-        assert_eq!(status.failure_kind.as_deref(), Some(behavior));
-        assert_eq!(status.failure_count, 1);
-        assert!(
-            status.next_attempt_at_unix_millis
-                > SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64
-        );
-        assert_eq!(status.uncertain_effect.is_some(), behavior == "uncertain");
         if behavior == "permanent" {
-            assert_eq!(
-                store
-                    .get_instance(GetInstanceRequest::new(pending.instance_id.clone()))
-                    .await?
-                    .unwrap()
-                    .state,
-                InstanceState::Failed
-            );
-            let cleanup = store
-                .load_materialization(LoadMaterializationRequest::new(pending.id.clone()))
-                .await?
-                .unwrap();
-            assert_eq!(cleanup.state, MaterializationState::Deleting);
-            assert_eq!(
-                cleanup.rendered_objects, pending.rendered_objects,
-                "terminalization retains cleanup inventory"
-            );
-            client.behavior.lock().unwrap().remove(&id);
-            raw.execute("UPDATE materializations SET next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
-            driver(isolated.clone()).run_once().await;
-            let final_status = store
-                .load_materialization_work_status(pending.id.clone())
-                .await?
-                .unwrap();
             assert!(
-                final_status.wake_failure_message.contains("forbidden"),
-                "wake reason survives safe cleanup"
+                status.wake_failure_message.contains("forbidden"),
+                "wake reason survives cleanup"
             );
             assert_eq!(
-                store
-                    .load_materialization(LoadMaterializationRequest::new(pending.id.clone()))
-                    .await?
-                    .unwrap()
-                    .state,
-                MaterializationState::Deleted
+                status.failure_count, 0,
+                "the failed wake's cleanup starts with a fresh backoff"
             );
             let failed = store
                 .get_instance(GetInstanceRequest::new(pending.instance_id.clone()))
                 .await?
                 .unwrap();
+            assert_eq!(failed.state, InstanceState::Failed);
+            client.behavior.lock().unwrap().remove(&id);
             StoreBackedProxyApi::new(store.clone(), materializer.clone(), isolated)
                 .wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
                     instance_id: id,
@@ -604,18 +582,24 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
                     backend_generation: None,
                 }))
                 .await?;
-        } else if behavior == "transient" {
+            continue;
+        }
+        assert_eq!(status.failure_count, 1);
+        assert!(
+            status.next_attempt_at_unix_millis
+                > SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64
+        );
+        if behavior == "transient" {
             raw.execute("UPDATE materializations SET next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
-            let claimed = store
-                .claim_materialization_reconciliation(
-                    ClaimMaterializationReconciliationRequest::new(
-                        pending.id.clone(),
-                        "expired-failure",
-                        Duration::from_secs(30),
-                    ),
-                )
-                .await?
-                .unwrap();
+            let claimed = claim_next(
+                store.as_ref(),
+                MaterializationState::Pending,
+                &isolated,
+                "expired-failure",
+                Duration::from_secs(30),
+            )
+            .await?
+            .unwrap();
             let revision = store.load_route_change_revision().await?;
             raw.execute("UPDATE materializations SET reconcile_lease_expires_at_unix_millis = 0 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
             assert!(
@@ -639,10 +623,15 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
                 "lease-only updates and rejected publication emit no semantic event"
             );
         } else {
-            assert!(
-                !store.enqueue_materialization(pending.id.clone()).await?,
-                "normal admin scheduling cannot clear uncertainty"
-            );
+            // An unknown outcome leaves ordinary retryable work: the next
+            // attempt inspects the object and decides again.
+            client.behavior.lock().unwrap().remove(&id);
+            raw.execute("UPDATE materializations SET next_attempt_at_unix_millis = 0 WHERE materialization_id = $1", &[&pending.id.as_str()]).await?;
+            transport_support::reconcile_until(driver(isolated.clone()), || {
+                let state = instance_state(pending.instance_id.clone());
+                async move { state.await == Some(InstanceState::Running) }
+            })
+            .await;
         }
     }
     let deadline_target = MaterializationTarget::new("deadline-target", "apps")?;
@@ -664,9 +653,9 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     let cancelled_before = client
         .readiness_cancelled
         .load(std::sync::atomic::Ordering::SeqCst);
-    let deadline_driver = driver(deadline_target.clone());
+    let (deadline_shutdown, deadline_stopped) = tokio::sync::watch::channel(false);
     let mut deadline_jobs = tokio::task::JoinSet::new();
-    deadline_jobs.spawn(async move { deadline_driver.run_once().await });
+    deadline_jobs.spawn(driver(deadline_target.clone()).run_until_shutdown(deadline_stopped));
     tokio::time::timeout(Duration::from_secs(2), async {
         while client.waiting.load(std::sync::atomic::Ordering::SeqCst) == waiting_before {
             tokio::task::yield_now().await;
@@ -697,9 +686,16 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     })
     .await?;
     publication_lock.rollback().await?;
-    tokio::time::timeout(Duration::from_secs(3), deadline_jobs.join_next())
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while instance_state(deadline.instance_id.clone()).await != Some(InstanceState::Failed) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    deadline_shutdown.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(20), deadline_jobs.join_next())
         .await?
-        .expect("deadline job")?;
+        .expect("deadline driver")??;
     assert_eq!(
         client
             .readiness_cancelled
@@ -723,10 +719,6 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     .into_inner();
     assert_eq!(diagnostics.failure_kind, "deadline");
     assert!(!diagnostics.attempted);
-    assert!(
-        diagnostics.uncertain_effect.is_none(),
-        "deadline during readiness is a definite read-only cancellation"
-    );
     assert!(!diagnostics.wake_failure_message.is_empty());
     assert_eq!(
         store
@@ -863,8 +855,8 @@ async fn delete_supersedes_pending_case(
             } else {
                 Duration::from_secs(30)
             },
-            concurrency_limit: 2,
-            batch_size: 2,
+            wake_limit: 2,
+            cleanup_limit: 2,
         },
         sleepypods_observability::recorder::ObservabilityRecorder::noop(),
     );
@@ -894,12 +886,7 @@ async fn delete_supersedes_pending_case(
         // lease, cleaning up objects and sweeping a finalized instance all run
         // at the database's pace, and each case asserts the timing it actually
         // constrains where that timing happens.
-        let completion_budget = match behavior {
-            // The uncertain case observes that nothing finalizes, so a short
-            // window keeps a negative observation cheap.
-            "apply-hang" => Duration::from_secs(1),
-            _ => Duration::from_secs(30),
-        };
+        let completion_budget = Duration::from_secs(30);
         let delete_started = tokio::time::Instant::now();
         let completion_deadline = delete_started + completion_budget;
         let accept = async {
@@ -924,10 +911,13 @@ async fn delete_supersedes_pending_case(
             if definite_apply {
                 completion_deadline
             } else {
-                // Preserve the original short-read and uncertain-effect cases.
                 tokio::time::Instant::now() + completion_budget
             },
             async {
+                // The hung apply stays hung: its attempt loses the lease at the
+                // next heartbeat, and cleanup proceeds once that lease expires.
+                // Whatever the hung request does later is conditional or
+                // creates nothing that runs.
                 if behavior != "apply-hang" {
                     gate.add_permits(1);
                 }
@@ -949,7 +939,6 @@ async fn delete_supersedes_pending_case(
                         || current["failure_count"] != 0
                         || !current["failure_kind"].is_null()
                         || current["failure_requires_cleanup"] != false
-                        || current["effect_count"] != 0
                         || current["operation_deadline"] != accepted["operation_deadline"]
                     {
                         return Err(format!("invalid supersession handoff: {handoff}").into());
@@ -1001,76 +990,6 @@ async fn delete_supersedes_pending_case(
         eprintln!(
             "6L supersession {behavior}: before={before}; accepted={after_accept}; after={after}"
         );
-        if behavior == "apply-hang" {
-            let durable = store
-                .load_materialization_work_status(pending.id.clone())
-                .await?
-                .unwrap();
-            if durable.failure_count != 0 || durable.failure_kind.is_some() {
-                return Err("stale durable failure was published".into());
-            }
-            if finished.is_ok() {
-                return Err("uncertain dispatched work was finalized".into());
-            }
-            let status = StoreBackedOperatorApi::new(
-                store.clone(),
-                KubernetesMaterializer::new(client.clone()),
-                pending.target.clone(),
-            )
-            .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-                instance_id: pending.instance_id.as_str().into(),
-                status_only: true,
-            }))
-            .await?
-            .into_inner();
-            let effect = status
-                .uncertain_effect
-                .as_ref()
-                .ok_or("missing durable uncertain-effect diagnostics")?;
-            if status.failure_count != 0
-                || status.failure_kind != "uncertain"
-                || effect.lease_attempt != 1
-            {
-                return Err(format!(
-                    "stale failure was published or effect identity changed: {status:?}"
-                )
-                .into());
-            }
-            if store
-                .release_materialization_reconciliation_lease(
-                    ReleaseMaterializationReconciliationLeaseRequest::new(
-                        pending.id.clone(),
-                        format!("owner-{behavior}"),
-                        1,
-                        pending.instance_generation,
-                    ),
-                )
-                .await?
-            {
-                return Err("released uncertain dispatched attempt".into());
-            }
-            // The replacement below has to meet an expired lease, so that a
-            // refused claim proves the uncertain effect fences it rather than a
-            // live lease doing the work.
-            await_expired_lease(raw, pending.id.as_str(), SUPERSESSION_LEASE_TTL * 5).await?;
-            if store
-                .claim_materialization_reconciliation(
-                    ClaimMaterializationReconciliationRequest::new(
-                        pending.id.clone(),
-                        "replacement",
-                        Duration::from_secs(30),
-                    ),
-                )
-                .await?
-                .is_some()
-            {
-                return Err("claimed uncertain attempt after its lease expired".into());
-            }
-            if store.finalize_instance_deletions(10).await? != 0 {
-                return Err("finalized instance with uncertain effect".into());
-            }
-            return Ok(());
-        }
         match finished {
             Ok(result) => result?,
             Err(_) => {
@@ -1098,6 +1017,8 @@ async fn delete_supersedes_pending_case(
         let locks = raw.query_one("SELECT COALESCE(json_agg(x), '[]'::json)::text FROM (SELECT l.pid,l.locktype,l.mode,l.granted,l.relation::regclass::text AS relation,l.transactionid FROM pg_locks l JOIN pg_stat_activity a USING(pid) WHERE a.application_name='6l-supersession' AND a.pid<>pg_backend_pid() LIMIT 64) x", &[]).await.map(|row| row.get::<_,String>(0));
         eprintln!("6L diagnostic {behavior}: applies={} readiness={} activity={activity:?} locks={locks:?}", client.inner.applies.load(std::sync::atomic::Ordering::SeqCst), client.waiting.load(std::sync::atomic::Ordering::SeqCst));
     }
+    // Let a still-hung apply return so its job stops with the driver.
+    gate.add_permits(1);
     shutdown.send_replace(true);
     let drained = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(joined) = jobs.join_next().await {
@@ -1117,35 +1038,7 @@ async fn delete_supersedes_pending_case(
 }
 
 async fn supersession_snapshot(raw: &tokio_postgres::Client, id: &str) -> TestResult<String> {
-    Ok(raw.query_opt("SELECT json_build_object('state', m.state, 'instance_state', i.state, 'instance_generation', i.generation, 'materialization_generation', m.instance_generation, 'now', (extract(epoch from clock_timestamp()) * 1000)::bigint, 'operation_deadline', m.operation_deadline_unix_millis, 'owner', m.reconcile_owner, 'attempt', m.reconcile_attempt, 'lease_expires', m.reconcile_lease_expires_at_unix_millis, 'failure_kind', m.failure_kind, 'failure_count', m.failure_count, 'failure_requires_cleanup', m.failure_requires_cleanup, 'effect_count', (SELECT count(*) FROM materialization_effects e WHERE e.materialization_id=m.materialization_id))::text FROM materializations m JOIN instances i USING(instance_id) WHERE materialization_id=$1", &[&id]).await?.map(|row| row.get::<_, String>(0)).unwrap_or_else(|| "absent".into()))
-}
-
-/// Wait until the row's reconciliation lease sits in the database's past.
-async fn await_expired_lease(
-    raw: &tokio_postgres::Client,
-    id: &str,
-    budget: Duration,
-) -> TestResult {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        let row = raw
-            .query_opt(
-                "SELECT reconcile_lease_expires_at_unix_millis IS NULL \
-                    OR reconcile_lease_expires_at_unix_millis \
-                        <= (extract(epoch from clock_timestamp()) * 1000)::bigint \
-                 FROM materializations WHERE materialization_id = $1",
-                &[&id],
-            )
-            .await?
-            .ok_or_else(|| format!("materialization {id} vanished while its lease was held"))?;
-        if row.get::<_, bool>(0) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("lease on {id} still holds after {budget:?}").into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    Ok(raw.query_opt("SELECT json_build_object('state', m.state, 'instance_state', i.state, 'instance_generation', i.generation, 'materialization_generation', m.instance_generation, 'now', (extract(epoch from clock_timestamp()) * 1000)::bigint, 'operation_deadline', m.operation_deadline_unix_millis, 'owner', m.reconcile_owner, 'attempt', m.reconcile_attempt, 'lease_expires', m.reconcile_lease_expires_at_unix_millis, 'failure_kind', m.failure_kind, 'failure_count', m.failure_count, 'failure_requires_cleanup', m.failure_requires_cleanup)::text FROM materializations m JOIN instances i USING(instance_id) WHERE materialization_id=$1", &[&id]).await?.map(|row| row.get::<_, String>(0)).unwrap_or_else(|| "absent".into()))
 }
 
 async fn deletion_and_failure_use_one_lock_order(
@@ -1185,14 +1078,15 @@ async fn deletion_and_failure_use_one_lock_order(
         ))
         .await?
         .unwrap();
-    let claimed = store
-        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
-            pending.id.clone(),
-            "lock-order-owner",
-            Duration::from_secs(30),
-        ))
-        .await?
-        .unwrap();
+    let claimed = claim_next(
+        store.as_ref(),
+        MaterializationState::Pending,
+        &target,
+        "lock-order-owner",
+        Duration::from_secs(30),
+    )
+    .await?
+    .unwrap();
     let separator = if config.connection_url().contains('?') {
         '&'
     } else {
@@ -1382,17 +1276,21 @@ async fn failure_deadline_lock_boundary(
     }))
     .await?;
     let pending = store
-        .load_active_materialization(LoadActiveMaterializationRequest::new(cold.id, target))
-        .await?
-        .unwrap();
-    let claimed = store
-        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
-            pending.id.clone(),
-            "deadline-lock-owner",
-            Duration::from_secs(30),
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            cold.id,
+            target.clone(),
         ))
         .await?
         .unwrap();
+    let claimed = claim_next(
+        store.as_ref(),
+        MaterializationState::Pending,
+        &target,
+        "deadline-lock-owner",
+        Duration::from_secs(30),
+    )
+    .await?
+    .unwrap();
     let (raw, raw_conn) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let (mut blocker, blocker_conn) =
         tokio_postgres::connect(config.connection_url(), NoTls).await?;
@@ -1485,7 +1383,6 @@ async fn failure_deadline_lock_boundary(
         .unwrap();
     eprintln!("deadline lock boundary: queued_at={queued_at} original_deadline={original_deadline} released_at={released_at} persisted_kind={:?} persisted_message={:?}",status.failure_kind,status.failure_message);
     assert_eq!(status.failure_kind.as_deref(), Some("deadline"));
-    assert!(status.uncertain_effect.is_none());
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())

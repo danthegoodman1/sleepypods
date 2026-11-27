@@ -411,20 +411,42 @@ control_plane_pf="${port_forward_loop_pid}"
 start_port_forward_loop sleepypods-frontline "${frontline_port}" 8080 "${frontline_pf_log}"
 frontline_pf="${port_forward_loop_pid}"
 
-echo "==> Running stateful kind E2E driver"
-cargo_args=(test -p control-plane --test kind_e2e_stateful)
-if [[ -n "${SLEEPYPODS_KIND_E2E_TEST_FILTER:-}" ]]; then
-  cargo_args+=("${SLEEPYPODS_KIND_E2E_TEST_FILTER}")
-fi
-cargo_args+=(-- --ignored --nocapture)
+# Runs the driver's tests matching the filter; an empty filter runs every test
+# its environment enables. The wake-latency measurement runs on its own, so it
+# sees an otherwise idle platform.
+run_driver() {
+  local filter="$1"
+  local wake_latency="$2"
+  local cargo_args=(test -p control-plane --test kind_e2e_stateful)
 
-KUBECONFIG="${kubeconfig}" \
-  SLEEPYPODS_KIND_E2E_STATEFUL=1 \
-  SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
-  SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
-  SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
-  SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
-  SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
-  cargo "${cargo_args[@]}"
+  if [[ -n "${filter}" ]]; then
+    cargo_args+=("${filter}")
+  fi
+  cargo_args+=(-- --ignored --nocapture)
+
+  KUBECONFIG="${kubeconfig}" \
+    SLEEPYPODS_KIND_E2E_STATEFUL=1 \
+    SLEEPYPODS_KIND_E2E_WAKE_LATENCY="${wake_latency}" \
+    SLEEPYPODS_E2E_NAMESPACE="${namespace}" \
+    SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
+    SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
+    SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
+    SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
+    cargo "${cargo_args[@]}"
+}
+
+# A wrapper script names its own test through SLEEPYPODS_KIND_E2E_TEST_FILTER.
+# SLEEPYPODS_KIND_E2E_WAKE_LATENCY_ONLY=1 runs the measurement alone.
+if [[ -n "${SLEEPYPODS_KIND_E2E_TEST_FILTER:-}" ]]; then
+  echo "==> Running stateful kind E2E driver"
+  run_driver "${SLEEPYPODS_KIND_E2E_TEST_FILTER}" 0
+else
+  if [[ "${SLEEPYPODS_KIND_E2E_WAKE_LATENCY_ONLY:-0}" != "1" ]]; then
+    echo "==> Running stateful kind E2E driver"
+    run_driver "" 0
+  fi
+  echo "==> Measuring stateful wake latency"
+  run_driver stateful_wake_latency_through_deployed_platform 1
+fi
 
 echo "stateful full-platform kind E2E completed"

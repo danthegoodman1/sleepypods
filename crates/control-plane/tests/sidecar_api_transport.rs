@@ -346,13 +346,14 @@ async fn report_idle_never_infers_an_older_projection_from_revision_arithmetic()
 }
 
 #[tokio::test]
-async fn report_idle_untrusted_maximum_generation_does_not_overflow_drain_replay() {
+async fn report_idle_untrusted_maximum_generation_is_a_conflict_while_draining() {
     let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(
         "idle-overflow",
         DomainInstanceState::Draining,
         8,
     ));
+    store.seed_materialization(draining_materialization("idle-overflow", 7));
     let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
     let response = service
         .report_idle(tonic::Request::new(SidecarReportIdleRequest {
@@ -364,7 +365,7 @@ async fn report_idle_untrusted_maximum_generation_does_not_overflow_drain_replay
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(expect_generation_conflict(response).actual_generation, 8);
+    assert_eq!(expect_generation_conflict(response).actual_generation, 7);
     assert!(store.transition_requests().is_empty());
 }
 
@@ -484,13 +485,16 @@ async fn report_idle_nonzero_active_count_returns_failed_precondition_without_mu
 }
 
 #[tokio::test]
-async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
+async fn report_idle_from_the_draining_projection_is_already_draining() {
     let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+    // The instance has been revived once since the projection was rendered,
+    // so its generation is well past the one the sidecar holds.
     store.seed_instance(domain_instance(
         "instance-draining",
         DomainInstanceState::Draining,
-        8,
+        10,
     ));
+    store.seed_materialization(draining_materialization("instance-draining", 7));
     let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let response = service
@@ -506,10 +510,10 @@ async fn report_idle_duplicate_at_next_draining_generation_is_idempotent() {
 
     let already = expect_already_draining(response);
     assert_eq!(already.instance_id, "instance-draining");
-    assert_eq!(already.instance_generation, 8);
+    assert_eq!(already.instance_generation, 10);
     assert_eq!(store.transition_requests().len(), 0);
     assert_eq!(store.instance().state, DomainInstanceState::Draining);
-    assert_eq!(store.instance().generation, Generation::new(8));
+    assert_eq!(store.instance().generation, Generation::new(10));
 }
 
 #[tokio::test]
@@ -520,6 +524,7 @@ async fn report_idle_stale_generation_conflict_is_structured_response() {
         DomainInstanceState::Draining,
         8,
     ));
+    store.seed_materialization(draining_materialization("instance-conflict", 7));
     let service = sidecar_api(store.clone(), FakeKubernetesClient::default());
 
     let response = service
@@ -536,8 +541,45 @@ async fn report_idle_stale_generation_conflict_is_structured_response() {
     let conflict = expect_generation_conflict(response);
     assert_eq!(conflict.instance_id, "instance-conflict");
     assert_eq!(conflict.expected_generation, 6);
-    assert_eq!(conflict.actual_generation, 8);
+    assert_eq!(
+        conflict.actual_generation, 7,
+        "the conflict names the draining projection's generation"
+    );
     assert_eq!(store.transition_requests().len(), 0);
+}
+
+/// A report says which projection is idle. An instance with no projection to
+/// sleep answers with its state, whatever generation the report carries.
+#[tokio::test]
+async fn report_idle_without_a_projection_to_sleep_is_unavailable() {
+    for (state, reason) in [
+        (
+            DomainInstanceState::Cold,
+            SidecarReportIdleUnavailableReason::Cold,
+        ),
+        (
+            DomainInstanceState::Draining,
+            SidecarReportIdleUnavailableReason::Draining,
+        ),
+    ] {
+        let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
+        store.seed_instance(domain_instance("instance-settled", state, 9));
+        let response = sidecar_api(store.clone(), FakeKubernetesClient::default())
+            .report_idle(tonic::Request::new(SidecarReportIdleRequest {
+                pod_uid: "test-pod".to_owned(),
+                instance_id: "instance-settled".to_owned(),
+                expected_generation: 7,
+                active_count: 0,
+            }))
+            .await
+            .expect("unavailable state is a domain response")
+            .into_inner();
+
+        let unavailable = expect_unavailable(response);
+        assert_eq!(unavailable.instance_generation, 9);
+        assert_eq!(unavailable.reason, reason as i32);
+        assert_eq!(store.transition_requests().len(), 0);
+    }
 }
 
 #[tokio::test]
@@ -992,14 +1034,6 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         })
     }
 
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        _namespace: &'a str,
-        _name: &'a str,
-    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn wait_for_readiness<'a>(
         &'a self,
         _objects: &'a [RenderedObjectRef],
@@ -1059,6 +1093,7 @@ fn domain_instance(id: &str, state: DomainInstanceState, generation: u64) -> Ins
 
 fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationRecord {
     MaterializationRecord {
+        pod_backend: None,
         id: MaterializationId::new(format!("{}:cluster-a:apps", instance_id))
             .expect("materialization id is valid"),
         instance_id: InstanceId::new(instance_id).expect("instance id is valid"),
@@ -1071,6 +1106,14 @@ fn ready_materialization(instance_id: &str, generation: u64) -> MaterializationR
         rendered_objects: vec![object_ref("apps/v1", "Deployment", "apps", instance_id)],
         exclusivity_keys: vec![],
         reconciliation_lease: None,
+    }
+}
+
+/// The projection of a draining instance, rendered at `projection`.
+fn draining_materialization(instance_id: &str, projection: u64) -> MaterializationRecord {
+    MaterializationRecord {
+        state: MaterializationState::Deleting,
+        ..ready_materialization(instance_id, projection)
     }
 }
 

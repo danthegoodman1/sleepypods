@@ -19,6 +19,8 @@ struct AcceptanceStore {
     instance: InstanceRecord,
     accepted: Mutex<Vec<AcceptWakeRequest>>,
     reject: bool,
+    /// The projection a wake during drain grace returns to Ready.
+    revived: Option<MaterializationRecord>,
 }
 impl AcceptanceStore {
     fn new(state: InstanceState) -> Self {
@@ -32,6 +34,7 @@ impl AcceptanceStore {
             },
             accepted: Mutex::new(Vec::new()),
             reject: false,
+            revived: None,
         }
     }
 }
@@ -64,16 +67,12 @@ impl ControlPlaneStore for AcceptanceStore {
         resolve_host_rules,
         compare_and_swap_instance_state,
         record_materialization,
-        load_ready_materialization,
         load_materialization,
         complete_wake,
         begin_sleep,
         finalize_sleep,
-        list_materialization_reconciliation_candidates,
         load_materialization_operational_metrics,
-        claim_materialization_reconciliation,
-        begin_materialization_effect,
-        acknowledge_materialization_effect,
+        claim_next_materialization_reconciliation,
         renew_materialization_reconciliation_lease,
         release_materialization_reconciliation_lease,
         complete_wake_reconciliation,
@@ -114,12 +113,26 @@ impl ControlPlaneStore for AcceptanceStore {
                 return Err(StoreError::unavailable("injected atomic commit failure"));
             }
             let mut result = self.instance.clone();
-            if result.state != InstanceState::Draining {
+            if let Some(revived) = &self.revived {
+                result.state = InstanceState::Running;
+                result.generation = revived.instance_generation;
+            } else if result.state != InstanceState::Draining {
                 result.state = InstanceState::Waking;
                 result.generation = request.pending.instance_generation;
             }
             self.accepted.lock().unwrap().push(request);
             Ok(result)
+        })
+    }
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .revived
+                .clone()
+                .filter(|revived| revived.instance_generation == request.instance_generation))
         })
     }
 }
@@ -140,13 +153,6 @@ impl KubernetesMaterializerClient for NoKubernetes {
         _precondition: &'a crate::projection::LiveObjectIdentity,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         panic!("API must not delete")
-    }
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a str,
-    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        panic!("API must not wait for PVC")
     }
     fn wait_for_readiness<'a>(
         &'a self,
@@ -251,6 +257,46 @@ async fn wake_during_drain_only_persists_future_intent() {
         accepted[0].pending.projection_generation,
         Generation::new(11)
     );
+}
+
+#[tokio::test]
+async fn wake_during_drain_grace_answers_with_the_revived_projection() {
+    let mut store = AcceptanceStore::new(InstanceState::Draining);
+    let backend = BackendEndpoint::new("http://10.96.0.10:80").unwrap();
+    store.revived = Some(MaterializationRecord {
+        pod_backend: None,
+        id: crate::ids::MaterializationId::new("acceptance:cluster-a:apps").unwrap(),
+        instance_id: store.instance.id.clone(),
+        instance_generation: Generation::new(9),
+        projection_generation: Generation::new(7),
+        target: request().target,
+        state: MaterializationState::Ready,
+        backend: Some(backend.clone()),
+        backend_generation: BackendGeneration::new(8),
+        rendered_objects: Vec::new(),
+        exclusivity_keys: Vec::new(),
+        reconciliation_lease: None,
+    });
+
+    let result = wake_instance(
+        &store,
+        &KubernetesMaterializer::new(NoKubernetes),
+        request(),
+    )
+    .await
+    .unwrap();
+
+    let WakeInstanceResult::AlreadyRunning {
+        instance,
+        materialization,
+    } = result
+    else {
+        panic!("a revived instance is Running, got {result:?}");
+    };
+    assert_eq!(instance.state, InstanceState::Running);
+    assert_eq!(instance.generation, Generation::new(9));
+    assert_eq!(materialization.backend, Some(backend));
+    assert_eq!(materialization.projection_generation, Generation::new(7));
 }
 
 #[tokio::test]

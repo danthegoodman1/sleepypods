@@ -1,14 +1,7 @@
-use super::{
-    connection::PostgresStore,
-    error::map_postgres_error,
-    mapping::{generation_from_i64, generation_to_i64, rendered_objects_from_json},
-};
+use super::{connection::PostgresStore, error::map_postgres_error, mapping::generation_to_i64};
 use crate::{
     ids::MaterializationId,
-    runtime_work::{
-        DurableRouteChanges, MaterializationWorkStatus, RecordMaterializationFailure,
-        UncertainMaterializationEffect,
-    },
+    runtime_work::{DurableRouteChanges, MaterializationWorkStatus, RecordMaterializationFailure},
     store::{StoreError, StoreResult},
 };
 
@@ -159,22 +152,27 @@ pub(super) async fn status(
     id: MaterializationId,
 ) -> StoreResult<Option<MaterializationWorkStatus>> {
     let client = store.client().await?;
-    let Some(row) = client.query_opt("SELECT CASE WHEN m.state = 'ready' THEN GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint - m.state_entered_at_unix_millis) ELSE NULL END AS ready_age_millis, m.next_attempt_at_unix_millis, m.operation_deadline_unix_millis, CASE WHEN m.operation_deadline_unix_millis > 0 THEN GREATEST(0::bigint, m.operation_deadline_unix_millis - (extract(epoch from clock_timestamp()) * 1000)::bigint) ELSE NULL END AS operation_remaining_millis, m.failure_count, m.failure_kind, m.failure_message, m.wake_failure_message, e.instance_generation AS effect_generation, e.lease_owner, e.lease_attempt, e.effect_id, e.operation, e.object_ref, e.expected_uid, e.expected_resource_version, e.started_at_unix_millis FROM materializations m LEFT JOIN materialization_effects e USING(materialization_id) WHERE materialization_id = $1", &[&id.as_str()]).await.map_err(map_postgres_error)? else { return Ok(None) };
-    let effect = if let Some(generation) = row.get::<_, Option<i64>>("effect_generation") {
-        let object: serde_json::Value = row.get("object_ref");
-        Some(UncertainMaterializationEffect {
-            generation: generation_from_i64(generation)?,
-            owner: row.get("lease_owner"),
-            attempt: row.get::<_, i64>("lease_attempt") as u64,
-            effect_id: row.get::<_, i64>("effect_id") as u64,
-            operation: row.get("operation"),
-            object: rendered_objects_from_json(serde_json::json!([object]))?.remove(0),
-            expected_uid: row.get("expected_uid"),
-            expected_resource_version: row.get("expected_resource_version"),
-            started_at_unix_millis: row.get("started_at_unix_millis"),
-        })
-    } else {
-        None
+    let Some(row) = client
+        .query_opt(
+            "
+            SELECT CASE WHEN state = 'ready'
+                    THEN GREATEST(0::bigint, (extract(epoch from clock_timestamp()) * 1000)::bigint - state_entered_at_unix_millis)
+                    ELSE NULL END AS ready_age_millis,
+                next_attempt_at_unix_millis,
+                operation_deadline_unix_millis,
+                CASE WHEN operation_deadline_unix_millis > 0
+                    THEN GREATEST(0::bigint, operation_deadline_unix_millis - (extract(epoch from clock_timestamp()) * 1000)::bigint)
+                    ELSE NULL END AS operation_remaining_millis,
+                failure_count, failure_kind, failure_message, wake_failure_message
+            FROM materializations
+            WHERE materialization_id = $1
+            ",
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?
+    else {
+        return Ok(None);
     };
     Ok(Some(MaterializationWorkStatus {
         ready_age: row
@@ -189,10 +187,15 @@ pub(super) async fn status(
         failure_kind: row.get("failure_kind"),
         failure_message: row.get("failure_message"),
         wake_failure_message: row.get("wake_failure_message"),
-        uncertain_effect: effect,
     }))
 }
 
+/// Records one failed attempt and schedules the next after a capped backoff.
+///
+/// A wake that fails permanently, or outlives its operation deadline, ends:
+/// the instance becomes Failed and the materialization is queued for cleanup.
+/// Cleanup has one acceptable outcome, so it retries until it succeeds; only
+/// a failure the caller marks permanent (an ownership conflict) parks it.
 pub(super) async fn record_failure(
     store: &PostgresStore,
     request: RecordMaterializationFailure,
@@ -225,21 +228,12 @@ pub(super) async fn record_failure(
     {
         return Ok(false);
     }
-    let uncertain = tx
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM materialization_effects WHERE materialization_id = $1)",
-            &[&id],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .get::<_, bool>(0);
+    let waking = row.get::<_, &str>("state") == "pending";
     // The locking SELECT may have waited across the deadline. Use the same
     // fresh post-lock database time as the lease check, not a pre-wait expression.
-    let expired = row.get::<_, i64>("operation_deadline_unix_millis") <= now;
-    let terminal = !uncertain && (request.permanent || expired);
-    let kind = if uncertain {
-        "uncertain"
-    } else if expired {
+    let expired = waking && row.get::<_, i64>("operation_deadline_unix_millis") <= now;
+    let terminal = request.permanent || expired;
+    let kind = if expired {
         "deadline"
     } else if request.permanent {
         "permanent"
@@ -249,7 +243,7 @@ pub(super) async fn record_failure(
     let count = row.get::<_, i32>("failure_count").saturating_add(1);
     let delay = 1000_i64 * (1_i64 << count.min(5));
     let message = request.message.chars().take(512).collect::<String>();
-    let cleanup_required = terminal && row.get::<_, &str>("state") == "pending";
+    let cleanup_required = terminal && waking;
     if cleanup_required {
         tx.execute(
             "UPDATE materializations SET state = 'deleting' WHERE materialization_id = $1",
@@ -259,20 +253,29 @@ pub(super) async fn record_failure(
         .map_err(map_postgres_error)?;
         tx.execute("UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = $1 AND generation = $2 AND state = 'waking'", &[&row.get::<_, String>("instance_id"), &generation]).await.map_err(map_postgres_error)?;
     }
-    // Clearing owner makes retry after a committed/lost response an exact no-op.
+    // A failed wake's cleanup starts at once and with a fresh backoff. Clearing
+    // the owner makes a retry after a committed, lost response an exact no-op.
+    let (count, delay) = if cleanup_required {
+        (0, 0)
+    } else {
+        (count, delay)
+    };
     tx.execute("UPDATE materializations SET failure_count = $2, failure_kind = $3, failure_message = $4, failure_requires_cleanup = $6, wake_failure_message = CASE WHEN $6 THEN $4 ELSE wake_failure_message END, next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $5, reconcile_owner = NULL, reconcile_lease_expires_at_unix_millis = NULL WHERE materialization_id = $1", &[&id, &count, &kind, &message, &delay, &cleanup_required]).await.map_err(map_postgres_error)?;
     tx.commit().await.map_err(map_postgres_error)?;
+    if cleanup_required {
+        crate::runtime_work::signal_lifecycle_work();
+    }
     Ok(true)
 }
 
 pub(super) async fn enqueue(store: &PostgresStore, id: MaterializationId) -> StoreResult<bool> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    transaction.query_opt("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&id.as_str()]).await.map_err(map_postgres_error)?;
-    // An admin request schedules normal work. It cannot override grace, a live
-    // attempt or uncertainty. Failed wakes first clean their retained inventory.
-    let changed = transaction.execute("UPDATE materializations SET state = CASE WHEN state = 'failed' THEN 'deleting' ELSE state END, failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting', 'failed') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint) AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)", &[&id.as_str()]).await.map_err(map_postgres_error)?;
-    transaction.commit().await.map_err(map_postgres_error)?;
+    let client = store.client().await?;
+    // An admin request schedules normal work. It cannot override grace or a
+    // live attempt. Failed wakes first clean their retained inventory.
+    let changed = client.execute("UPDATE materializations SET state = CASE WHEN state = 'failed' THEN 'deleting' ELSE state END, failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting', 'failed') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint)", &[&id.as_str()]).await.map_err(map_postgres_error)?;
+    if changed == 1 {
+        crate::runtime_work::signal_lifecycle_work();
+    }
     Ok(changed == 1)
 }
 
