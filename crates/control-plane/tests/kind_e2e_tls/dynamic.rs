@@ -100,6 +100,14 @@ async fn instance(operator: &mut Operator, id: &str) -> TestResult<Instance> {
         .into_inner())
 }
 async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
+    // The protocol fixture serves HTTP/2 without TLS, so the class declares an
+    // h2c app port and HTTP/2 reaches the app on both hops.
+    let mut template = manifest_template(config, "http", None);
+    template
+        .sidecar
+        .as_mut()
+        .ok_or("manifest template has a sidecar")?
+        .app_protocol = pb::AppProtocol::H2c as i32;
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
             class_id: "dynamic-web".into(),
@@ -114,7 +122,7 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
                 )]),
                 allow_extra: false,
             }),
-            template: Some(manifest_template(config, "http", None)),
+            template: Some(template),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 1000,
                 idle_retry_backoff_ms: 500,
@@ -329,7 +337,7 @@ async fn dynamic_certificate_lifecycle_through_exact_replicas() -> TestResult<()
     }
     control_plane::install_rustls_crypto_provider();
     let mut config = E2eConfig::from_env()?;
-    // HTTP/2 is preserved upstream; use the existing H1/H2/WS backend fixture.
+    // The H1/H2/WS protocol fixture, behind an h2c app port.
     config.app_image = env::var("SLEEPYPODS_E2E_PROTOCOL_APP_IMAGE")?;
     let kube = Client::try_default().await?;
     let mut artifact = Artifact::new()?;
