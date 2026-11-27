@@ -29,8 +29,8 @@ use control_plane::api::{
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
-    rendered_object_ref, AuthConfig, BackendEndpoint, BackendGeneration, CallerRole,
-    ControlPlaneAuth, ControlPlaneStore, Generation, InstanceId, InstanceRecord,
+    AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
+    ControlPlaneStore, Generation, InstanceId, InstanceRecord,
     InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
@@ -1844,7 +1844,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            let object_ref = rendered_object_ref(object);
+            let object_ref = object.object_ref();
             self.live_objects
                 .lock()
                 .expect("fake kubernetes lock is available")

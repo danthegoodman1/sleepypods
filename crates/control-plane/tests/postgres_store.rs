@@ -4248,7 +4248,7 @@ impl control_plane::materializer::KubernetesMaterializerClient for LifecycleKube
             self.applies
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.objects.lock().unwrap().insert(
-                lifecycle_object_key(&control_plane::materializer::rendered_object_ref(object)),
+                lifecycle_object_key(&object.object_ref()),
                 control_plane::projection::LiveObjectMetadata::from_rendered_object(object),
             );
             Ok(())

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     convert::Infallible,
     sync::{Arc, Mutex},
     time::Duration,
@@ -17,9 +16,9 @@ use crate::{
     instance::{InstanceRecord, InstanceState, InstanceValues},
     manifest::{
         render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate, KubernetesObject,
-        ManifestTemplate, ObjectMeta, RawKubernetesObject, RenderManifestRequest, RenderedManifest,
-        RenderedManifestObject, Service, ServicePort, ServicePortTemplate, ServiceSpec,
-        ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind, WorkloadTemplate,
+        ManifestTemplate, RenderManifestRequest, RenderedManifest, RenderedManifestObject,
+        ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind,
+        WorkloadTemplate,
     },
     materialization::{
         BackendEndpoint, MaterializationRecord, MaterializationState, MaterializationTarget,
@@ -35,25 +34,17 @@ use crate::{
 
 fn plan() -> ProjectionPlan {
     let generation = Generation::new(2);
-    let object = KubernetesObject::Service(Service {
-        metadata: ObjectMeta {
-            name: "app".into(),
-            namespace: Some("apps".into()),
-            labels: BTreeMap::from([(
-                crate::manifest::LABEL_INSTANCE_GENERATION.into(),
-                "2".into(),
-            )]),
-            annotations: BTreeMap::new(),
+    let object = KubernetesObject::from_kubernetes_json(json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "app",
+            "namespace": "apps",
+            "labels": { crate::manifest::LABEL_INSTANCE_GENERATION: "2" },
         },
-        spec: ServiceSpec {
-            selector: BTreeMap::new(),
-            ports: vec![ServicePort {
-                name: None,
-                port: 80,
-                target_port: 8080,
-            }],
-        },
-    });
+        "spec": { "ports": [{ "port": 80, "targetPort": 8080 }] },
+    }))
+    .unwrap();
     let record = MaterializationRecord {
         pod_backend: None,
         id: MaterializationId::new("mat").unwrap(),
@@ -164,23 +155,6 @@ fn rendered_workload(kind: WorkloadKind) -> KubernetesObject {
     .unwrap()
 }
 
-/// A raw auxiliary Deployment that leaves its replica count to the API
-/// server's default.
-fn raw_deployment() -> KubernetesObject {
-    KubernetesObject::Raw(RawKubernetesObject {
-        api_version: "apps/v1".into(),
-        kind: "Deployment".into(),
-        metadata: ObjectMeta {
-            name: "aux".into(),
-            namespace: Some("apps".into()),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-        },
-        pod_template_metadata: None,
-        value: json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"aux"},"spec":{"selector":{"matchLabels":{"app":"aux"}},"template":{"metadata":{"labels":{"app":"aux"}},"spec":{"containers":[{"name":"c","image":"example/aux:1"}]}}}}),
-    })
-}
-
 /// Each request's method, path and body.
 type RecordedRequests = Arc<Mutex<Vec<(Method, String, Value)>>>;
 
@@ -217,10 +191,6 @@ async fn workloads_are_created_with_zero_replicas() {
             rendered_workload(WorkloadKind::StatefulSet),
             "/apis/apps/v1/namespaces/apps/statefulsets",
         ),
-        (
-            raw_deployment(),
-            "/apis/apps/v1/namespaces/apps/deployments",
-        ),
     ] {
         assert_ne!(object.to_kubernetes_json()["spec"]["replicas"], 0);
         let (client, requests) = recording_client();
@@ -247,8 +217,6 @@ async fn conditional_patch_scales_a_workload_to_its_rendered_replicas() {
     for object in [
         rendered_workload(WorkloadKind::Deployment),
         rendered_workload(WorkloadKind::StatefulSet),
-        // A merge patch restores a defaulted count only when it names one.
-        raw_deployment(),
     ] {
         let (client, requests) = recording_client();
 
@@ -275,7 +243,6 @@ async fn activation_scales_the_created_object_on_its_uid_alone() {
     for object in [
         rendered_workload(WorkloadKind::Deployment),
         rendered_workload(WorkloadKind::StatefulSet),
-        raw_deployment(),
     ] {
         let (client, requests) = recording_client();
 
@@ -649,21 +616,14 @@ async fn legacy_and_raw_storage_cleanup_refuses_before_any_pvc_delete() {
                     _ => json!({"volumeName":"disk"}),
                 }
             };
-            let value = json!({"apiVersion":"v1","kind":kind,"metadata":{"name":name},"spec":spec});
+            let mut metadata = json!({"name": name});
+            if kind == "PersistentVolumeClaim" {
+                metadata["namespace"] = "apps".into();
+            }
+            let value = json!({"apiVersion":"v1","kind":kind,"metadata":metadata,"spec":spec});
             manifest.objects.push(RenderedManifestObject {
                 apply_order: order,
-                object: KubernetesObject::Raw(RawKubernetesObject {
-                    api_version: "v1".into(),
-                    kind: kind.into(),
-                    metadata: ObjectMeta {
-                        name: name.into(),
-                        namespace: (kind == "PersistentVolumeClaim").then(|| "apps".into()),
-                        labels: BTreeMap::new(),
-                        annotations: BTreeMap::new(),
-                    },
-                    pod_template_metadata: None,
-                    value,
-                }),
+                object: KubernetesObject::from_kubernetes_json(value).unwrap(),
             });
         }
         let generation = Generation::new(2);

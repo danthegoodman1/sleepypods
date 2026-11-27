@@ -1,10 +1,6 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fmt,
-    future::Future,
-    pin::Pin,
-};
+use std::{collections::BTreeSet, error::Error, fmt, future::Future, pin::Pin};
+
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use crate::{
     auth::BearerToken,
@@ -19,7 +15,6 @@ use crate::{
 
 pub type KubernetesClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type KubernetesClientResult<T> = Result<T, KubernetesClientError>;
-type ObjectMetadataMaps<'a> = (&'a BTreeMap<String, String>, &'a BTreeMap<String, String>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdleMemberIdentity {
@@ -287,7 +282,7 @@ where
         object: &KubernetesObject,
         observations: &[crate::projection::ProjectionObservation],
     ) -> Result<(), MaterializerError> {
-        let object_ref = rendered_object_ref(object);
+        let object_ref = object.object_ref();
         let failed = |source| MaterializerError::Apply {
             object: Box::new(object_ref.clone()),
             source,
@@ -474,30 +469,6 @@ where
     }
 }
 
-pub fn rendered_object_ref(object: &KubernetesObject) -> RenderedObjectRef {
-    let (api_version, namespace) = match object {
-        KubernetesObject::Deployment(object) => ("apps/v1", object.metadata.namespace.clone()),
-        KubernetesObject::StatefulSet(object) => ("apps/v1", object.metadata.namespace.clone()),
-        KubernetesObject::Service(object) => ("v1", object.metadata.namespace.clone()),
-        KubernetesObject::Secret(object) => ("v1", object.metadata.namespace.clone()),
-        KubernetesObject::PersistentVolume(object) => ("v1", object.metadata.namespace.clone()),
-        KubernetesObject::PersistentVolumeClaim(object) => {
-            ("v1", object.metadata.namespace.clone())
-        }
-        KubernetesObject::Raw(object) => (
-            object.api_version.as_str(),
-            object.metadata.namespace.clone(),
-        ),
-    };
-
-    RenderedObjectRef {
-        api_version: api_version.to_owned(),
-        kind: object.kind().to_owned(),
-        namespace: namespace.unwrap_or_default(),
-        name: object.name().to_owned(),
-    }
-}
-
 pub fn rendered_object_refs(
     manifest: &RenderedManifest,
 ) -> Result<Vec<RenderedObjectRef>, MaterializerError> {
@@ -505,7 +476,7 @@ pub fn rendered_object_refs(
 
     let rendered_objects = ordered_objects(manifest)
         .into_iter()
-        .map(|object| rendered_object_ref(&object.object))
+        .map(|object| object.object.object_ref())
         .collect::<Vec<_>>();
     validate_rendered_object_refs(&rendered_objects)?;
 
@@ -689,21 +660,18 @@ fn validate_manifest_generations(manifest: &RenderedManifest) -> Result<(), Mate
     let expected_instance_generation = manifest.instance_generation.to_string();
 
     for rendered in &manifest.objects {
-        let (labels, _) = object_metadata(&rendered.object);
+        let object = &rendered.object;
         validate_generation_value(
-            &rendered.object,
+            object,
             "metadata",
-            LABEL_INSTANCE_GENERATION,
-            labels.get(LABEL_INSTANCE_GENERATION),
+            object.metadata(),
             &expected_instance_generation,
         )?;
-
-        if let Some((labels, _)) = pod_template_metadata(&rendered.object) {
+        if let Some(metadata) = object.pod_template_metadata() {
             validate_generation_value(
-                &rendered.object,
+                object,
                 "pod template metadata",
-                LABEL_INSTANCE_GENERATION,
-                labels.get(LABEL_INSTANCE_GENERATION),
+                metadata,
                 &expected_instance_generation,
             )?;
         }
@@ -715,64 +683,26 @@ fn validate_manifest_generations(manifest: &RenderedManifest) -> Result<(), Mate
 fn validate_generation_value(
     object: &KubernetesObject,
     context: &'static str,
-    key: &'static str,
-    actual: Option<&String>,
+    metadata: &ObjectMeta,
     expected: &str,
 ) -> Result<(), MaterializerError> {
+    let actual = metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_INSTANCE_GENERATION));
     if actual.is_some_and(|actual| actual == expected) {
         return Ok(());
     }
 
-    let object_ref = rendered_object_ref(object);
     Err(MaterializerError::InvalidManifest {
         message: format!(
-            "{} {}/{} {context} {key} must be {expected:?}, got {:?}",
-            object_ref.kind, object_ref.namespace, object_ref.name, actual
+            "{} {}/{} {context} {LABEL_INSTANCE_GENERATION} must be {expected:?}, got {:?}",
+            object.kind(),
+            object.namespace(),
+            object.name(),
+            actual
         ),
     })
-}
-
-fn object_metadata(object: &KubernetesObject) -> ObjectMetadataMaps<'_> {
-    match object {
-        KubernetesObject::Deployment(object) => {
-            (&object.metadata.labels, &object.metadata.annotations)
-        }
-        KubernetesObject::StatefulSet(object) => {
-            (&object.metadata.labels, &object.metadata.annotations)
-        }
-        KubernetesObject::Service(object) => {
-            (&object.metadata.labels, &object.metadata.annotations)
-        }
-        KubernetesObject::Secret(object) => (&object.metadata.labels, &object.metadata.annotations),
-        KubernetesObject::PersistentVolume(object) => {
-            (&object.metadata.labels, &object.metadata.annotations)
-        }
-        KubernetesObject::PersistentVolumeClaim(object) => {
-            (&object.metadata.labels, &object.metadata.annotations)
-        }
-        KubernetesObject::Raw(object) => (&object.metadata.labels, &object.metadata.annotations),
-    }
-}
-
-fn pod_template_metadata(object: &KubernetesObject) -> Option<ObjectMetadataMaps<'_>> {
-    match object {
-        KubernetesObject::Deployment(object) => Some((
-            &object.spec.template.metadata.labels,
-            &object.spec.template.metadata.annotations,
-        )),
-        KubernetesObject::StatefulSet(object) => Some((
-            &object.spec.template.metadata.labels,
-            &object.spec.template.metadata.annotations,
-        )),
-        KubernetesObject::Service(_)
-        | KubernetesObject::Secret(_)
-        | KubernetesObject::PersistentVolume(_)
-        | KubernetesObject::PersistentVolumeClaim(_) => None,
-        KubernetesObject::Raw(object) => object
-            .pod_template_metadata
-            .as_ref()
-            .map(|metadata| (&metadata.labels, &metadata.annotations)),
-    }
 }
 
 #[cfg(test)]
@@ -802,10 +732,10 @@ mod tests {
     };
 
     use super::{
-        delete_order, rendered_object_ref, rendered_object_refs, BackendEndpoint,
-        KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
-        KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError, RenderedObjectRef,
-        RetryPolicy, RetryingKubernetesMaterializerClient,
+        delete_order, rendered_object_refs, BackendEndpoint, KubernetesClientError,
+        KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
+        KubernetesMaterializerClient, MaterializerError, RenderedObjectRef, RetryPolicy,
+        RetryingKubernetesMaterializerClient,
     };
 
     /// Records every call. A created object becomes live under a UID derived
@@ -859,24 +789,28 @@ mod tests {
         let metadata = manifest
             .objects
             .iter()
-            .find_map(|rendered| match &rendered.object {
-                KubernetesObject::Service(service) => Some(service.metadata.clone()),
-                _ => None,
-            })
-            .map(|mut metadata| {
-                metadata.name = "sidecar-token".into();
-                metadata
-            })
+            .find(|rendered| rendered.object.kind() == "Service")
+            .map(
+                |rendered| k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                    name: Some("sidecar-token".into()),
+                    ..rendered.object.metadata().clone()
+                },
+            )
             .expect("service object");
         manifest
             .objects
             .push(crate::manifest::RenderedManifestObject {
                 apply_order: crate::manifest::ApplyOrder::Secret,
-                object: KubernetesObject::Secret(crate::manifest::Secret {
+                object: k8s_openapi::api::core::v1::Secret {
                     metadata,
-                    type_: "Opaque".into(),
-                    string_data: BTreeMap::from([("token".into(), "sidecar-test-token".into())]),
-                }),
+                    type_: Some("Opaque".into()),
+                    string_data: Some(BTreeMap::from([(
+                        "token".into(),
+                        "sidecar-test-token".into(),
+                    )])),
+                    ..Default::default()
+                }
+                .into(),
             });
         let client = FakeKubernetesClient::default();
 
@@ -1258,7 +1192,7 @@ mod tests {
         let created = client.created();
         assert_eq!(created.len(), 2);
         for object in created {
-            let labels = object_labels(&object);
+            let labels = object.metadata().labels.as_ref().expect("labels");
             assert_eq!(labels["sleepypods.io/instance-id"], "instance-a");
             assert_eq!(labels["sleepypods.io/instance-generation"], "7");
         }
@@ -1272,15 +1206,18 @@ mod tests {
         let deployment = manifest
             .objects
             .iter_mut()
-            .find_map(|object| match &mut object.object {
-                KubernetesObject::Deployment(deployment) => Some(deployment),
-                _ => None,
-            })
+            .find(|object| object.object.kind() == "Deployment")
             .expect("deployment object");
-        deployment.metadata.labels.insert(
-            "sleepypods.io/instance-generation".to_owned(),
-            "6".to_owned(),
-        );
+        deployment
+            .object
+            .metadata_mut()
+            .labels
+            .as_mut()
+            .expect("labels")
+            .insert(
+                "sleepypods.io/instance-generation".to_owned(),
+                "6".to_owned(),
+            );
 
         let error = materializer
             .apply_manifest(&manifest, &[])
@@ -1305,12 +1242,9 @@ mod tests {
         let service = manifest
             .objects
             .iter_mut()
-            .find_map(|object| match &mut object.object {
-                KubernetesObject::Service(service) => Some(service),
-                _ => None,
-            })
+            .find(|object| object.object.kind() == "Service")
             .expect("service object");
-        service.metadata.name = "Invalid_Service_Name".to_owned();
+        service.object.metadata_mut().name = Some("Invalid_Service_Name".to_owned());
 
         let error = materializer
             .apply_manifest(&manifest, &[])
@@ -1335,12 +1269,9 @@ mod tests {
         let pv = manifest
             .objects
             .iter_mut()
-            .find_map(|object| match &mut object.object {
-                KubernetesObject::PersistentVolume(pv) => Some(pv),
-                _ => None,
-            })
+            .find(|object| object.object.kind() == "PersistentVolume")
             .expect("persistent volume object");
-        pv.metadata.namespace = Some("data".to_owned());
+        pv.object.metadata_mut().namespace = Some("data".to_owned());
 
         let error = materializer
             .apply_manifest(&manifest, &[])
@@ -1387,7 +1318,7 @@ mod tests {
             precondition: Option<&'a LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
-                let object_ref = rendered_object_ref(object);
+                let object_ref = object.object_ref();
                 let mut inner = self.inner.lock().expect("fake client lock not poisoned");
                 let operation = match precondition {
                     None => FakeOperation::Create(object_ref.clone()),
@@ -1721,18 +1652,6 @@ mod tests {
 
     fn default_backend_endpoint() -> BackendEndpoint {
         backend_endpoint("http://ready.backend")
-    }
-
-    fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
-        match object {
-            KubernetesObject::Deployment(object) => &object.metadata.labels,
-            KubernetesObject::StatefulSet(object) => &object.metadata.labels,
-            KubernetesObject::Service(object) => &object.metadata.labels,
-            KubernetesObject::Secret(object) => &object.metadata.labels,
-            KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
-            KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
-            KubernetesObject::Raw(object) => &object.metadata.labels,
-        }
     }
 
     fn assert_invalid_manifest(error: MaterializerError, expected_message: &str) {

@@ -269,10 +269,31 @@ pub enum PersistentVolumeAccessMode {
     ReadWriteMany,
 }
 
+impl PersistentVolumeAccessMode {
+    /// The Kubernetes spelling of this access mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWriteOnce => "ReadWriteOnce",
+            Self::ReadOnlyMany => "ReadOnlyMany",
+            Self::ReadWriteMany => "ReadWriteMany",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistentVolumeReclaimPolicy {
     Retain,
     Delete,
+}
+
+impl PersistentVolumeReclaimPolicy {
+    /// The Kubernetes spelling of this reclaim policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "Retain",
+            Self::Delete => "Delete",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
