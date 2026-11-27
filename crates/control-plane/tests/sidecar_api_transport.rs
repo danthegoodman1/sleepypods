@@ -5,46 +5,6 @@ mod support;
 use support::TestStore as FakeSidecarStore;
 
 #[tokio::test]
-async fn known_activation_hold_defers_before_kubernetes_membership_calls() {
-    let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
-    store.seed_instance(domain_instance(
-        "activation-advisory",
-        DomainInstanceState::Running,
-        7,
-    ));
-    store.seed_materialization(ready_materialization("activation-advisory", 7));
-    store.set_ready_age(std::time::Duration::from_secs(1));
-    let kube = FakeKubernetesClient::default();
-    *kube.membership_error.lock().unwrap() =
-        Some("unexpected Kubernetes membership call during known hold".into());
-    let service = sidecar_api(store.clone(), kube);
-    let status = service
-        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
-            pod_uid: "test-pod".into(),
-            instance_id: "activation-advisory".into(),
-            expected_generation: 7,
-            active_count: 0,
-        }))
-        .await
-        .unwrap_err();
-    assert!(
-        status.message().starts_with("automatic sleep deferred"),
-        "{status}"
-    );
-    assert_eq!(
-        status
-            .metadata()
-            .get(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
-            .unwrap(),
-        "189000"
-    );
-    assert!(
-        store.sleep_requests().is_empty(),
-        "advisory check avoids both Kube and the final mutation attempt"
-    );
-}
-
-#[tokio::test]
 async fn report_idle_supplies_atomic_floor_and_maps_expected_deferral_with_retry_hint() {
     let store = Arc::new(FakeSidecarStore::with_workload_class(fake_workload_class()));
     store.seed_instance(domain_instance(

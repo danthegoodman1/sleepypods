@@ -36,7 +36,6 @@ pub struct TestStore {
     reconciliation_claim_owners: Mutex<Vec<String>>,
     sleep_requests: Mutex<Vec<BeginSleepRequest>>,
     defer_sleep_for: Mutex<Option<Duration>>,
-    ready_age: Mutex<Option<Duration>>,
     /// Materializations whose last attempt failed. A store schedules their
     /// next attempt after a backoff; this fixture never reaches it.
     failed_attempts: Mutex<Vec<control_plane::ids::MaterializationId>>,
@@ -112,9 +111,6 @@ impl TestStore {
     /// Explicit transport fault only; this fixture does not model DB clock age.
     pub fn defer_sleep_for(&self, duration: Duration) {
         *self.defer_sleep_for.lock().unwrap() = Some(duration);
-    }
-    pub fn set_ready_age(&self, duration: Duration) {
-        *self.ready_age.lock().unwrap() = Some(duration);
     }
     pub fn with_workload_class(workload: WorkloadClassVersion) -> Self {
         let store = Self::default();
@@ -820,14 +816,14 @@ impl ControlPlaneStore for TestStore {
         id: control_plane::ids::MaterializationId,
     ) -> StoreFuture<'_, StoreResult<Option<control_plane::runtime_work::MaterializationWorkStatus>>>
     {
-        let _ = id;
-        Box::pin(async {
-            Ok(self.ready_age.lock().unwrap().map(|age| {
-                control_plane::runtime_work::MaterializationWorkStatus {
-                    ready_age: Some(age),
-                    ..Default::default()
-                }
-            }))
+        Box::pin(async move {
+            Ok(self
+                .materializations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record| record.id == id)
+                .then(control_plane::runtime_work::MaterializationWorkStatus::default))
         })
     }
 

@@ -24,6 +24,7 @@ use super::{
         route_binding_from_row, sleep_policy_to_json, value_schema_to_json, values_to_json,
         workload_class_version_from_row, workload_exclusivity_keys_to_json,
     },
+    sql,
 };
 
 pub(crate) async fn create_instance(
@@ -31,7 +32,7 @@ pub(crate) async fn create_instance(
     request: CreateInstanceRequest,
 ) -> StoreResult<CreateInstanceResult> {
     let mut client = store.client().await?;
-    let workload_class = load_workload_class_version_from_client(&client, &request.workload_class)
+    let workload_class = load_class(store, &client, &request.workload_class)
         .await?
         .ok_or(StoreError::NotFound {
             resource: "workload class version",
@@ -124,9 +125,9 @@ pub(crate) async fn create_workload_class_version(
     let value_schema = value_schema_to_json(&desired.value_schema);
     let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
     let exclusivity_keys = workload_exclusivity_keys_to_json(&desired.exclusivity_keys)?;
-    let inserted = client
-        .execute(
-            "
+    let inserted = sql::execute(
+        &client,
+        "
             INSERT INTO workload_class_versions (
                 class_id,
                 version,
@@ -138,19 +139,18 @@ pub(crate) async fn create_workload_class_version(
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
-            &[
-                &class_id,
-                &version,
-                &manifest_template,
-                &value_schema,
-                &sleep_policy,
-                &exclusivity_keys,
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[
+            &class_id,
+            &version,
+            &manifest_template,
+            &value_schema,
+            &sleep_policy,
+            &exclusivity_keys,
+        ],
+    )
+    .await?;
 
-    let stored = load_workload_class_version_from_client(&client, &desired.reference)
+    let stored = load_class(store, &client, &desired.reference)
         .await?
         .ok_or(StoreError::NotFound {
             resource: "workload class version",
@@ -169,9 +169,27 @@ pub(crate) async fn load_workload_class_version(
     store: &PostgresStore,
     request: LoadWorkloadClassVersionRequest,
 ) -> StoreResult<Option<WorkloadClassVersion>> {
+    if let Some(class) = store.classes.get(&request.reference) {
+        return Ok(Some(class));
+    }
     let client = store.client().await?;
+    load_class(store, &client, &request.reference).await
+}
 
-    load_workload_class_version_from_client(&client, &request.reference).await
+/// Reads a class version through the process's cache.
+async fn load_class(
+    store: &PostgresStore,
+    client: &impl GenericClient,
+    reference: &WorkloadClassVersionRef,
+) -> StoreResult<Option<WorkloadClassVersion>> {
+    if let Some(class) = store.classes.get(reference) {
+        return Ok(Some(class));
+    }
+    let class = load_workload_class_version_from_client(client, reference).await?;
+    if let Some(class) = &class {
+        store.classes.insert(class);
+    }
+    Ok(class)
 }
 
 pub(crate) async fn get_instance(
@@ -190,18 +208,17 @@ pub(crate) async fn delete_instance(
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let instance_id = request.instance_id.as_str();
-    let current = transaction
-        .query_opt(
-            "
+    let current = sql::query_opt(
+        &transaction,
+        "
             SELECT state
             FROM instances
             WHERE instance_id = $1
             FOR UPDATE
             ",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&instance_id],
+    )
+    .await?;
     let Some(row) = current else {
         transaction.commit().await.map_err(map_postgres_error)?;
         return Ok(false);
@@ -213,16 +230,15 @@ pub(crate) async fn delete_instance(
         ));
     }
 
-    if transaction.query_one("SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&instance_id]).await.map_err(map_postgres_error)?.get::<_,bool>(0) {
+    if sql::query_one(&transaction, "SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&instance_id]).await?.get::<_,bool>(0) {
         return Err(StoreError::invalid_argument("instance deletion requires completed materialization cleanup"));
     }
-    let deleted = transaction
-        .execute(
-            "DELETE FROM instances WHERE instance_id = $1 AND state = 'deleting'",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let deleted = sql::execute(
+        &transaction,
+        "DELETE FROM instances WHERE instance_id = $1 AND state = 'deleting'",
+        &[&instance_id],
+    )
+    .await?;
     transaction.commit().await.map_err(map_postgres_error)?;
 
     Ok(deleted > 0)
@@ -235,18 +251,17 @@ pub(crate) async fn compare_and_swap_instance_state(
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let instance_id = request.instance_id.as_str();
-    let current = transaction
-        .query_opt(
-            "
+    let current = sql::query_opt(
+        &transaction,
+        "
             SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
             FROM instances
             WHERE instance_id = $1
             FOR UPDATE
             ",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&instance_id],
+    )
+    .await?;
 
     let Some(row) = current else {
         return Err(StoreError::NotFound {
@@ -267,19 +282,14 @@ pub(crate) async fn compare_and_swap_instance_state(
 
     let next_generation = generation_to_i64(request.expected_generation.next())?;
     let next_state = instance_state_to_db(request.next_state);
-    let row = transaction
-        .query_one(
-            "
+    let row = sql::query_one(&transaction, "
             UPDATE instances
             SET state = $2,
                 generation = $3
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
-            &[&instance_id, &next_state, &next_generation],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+            &[&instance_id, &next_state, &next_generation],).await?;
     let updated = instance_from_row(&row)?;
     transaction.commit().await.map_err(map_postgres_error)?;
 
@@ -290,17 +300,16 @@ pub(crate) async fn load_instance(
     client: &impl GenericClient,
     instance_id: &str,
 ) -> StoreResult<Option<InstanceRecord>> {
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        client,
+        "
             SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
             FROM instances
             WHERE instance_id = $1
             ",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&instance_id],
+    )
+    .await?;
 
     row.as_ref().map(instance_from_row).transpose()
 }
@@ -311,18 +320,17 @@ async fn load_workload_class_version_from_client(
 ) -> StoreResult<Option<WorkloadClassVersion>> {
     let class_id = reference.class_id.as_str();
     let version = generation_to_i64(reference.version)?;
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        client,
+        "
             SELECT class_id, version, manifest_template, value_schema, sleep_policy,
                 exclusivity_keys
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",
-            &[&class_id, &version],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&class_id, &version],
+    )
+    .await?;
 
     row.as_ref()
         .map(workload_class_version_from_row)
@@ -339,9 +347,7 @@ async fn insert_instance(
     let values = values_to_json(&request.values)?;
     let state = instance_state_to_db(InstanceState::Cold);
     let generation = generation_to_i64(Generation::new(0))?;
-    let row = client
-        .query_one(
-            "
+    let row = sql::query_one(client, "
             INSERT INTO instances (
                 instance_id,
                 workload_class_id,
@@ -360,10 +366,7 @@ async fn insert_instance(
                 &values,
                 &state,
                 &generation,
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+            ],).await?;
 
     instance_from_row(&row)
 }
@@ -392,18 +395,17 @@ async fn load_route_bindings_for_instance(
     client: &impl GenericClient,
     instance_id: &str,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
-    let rows = client
-        .query(
-            "
+    let rows = sql::query(
+        client,
+        "
             SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE instance_id = $1
             ORDER BY route_binding_id
             ",
-            &[&instance_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&instance_id],
+    )
+    .await?;
 
     rows.iter().map(route_binding_from_row).collect()
 }

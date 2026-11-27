@@ -20,6 +20,7 @@ pub struct PostgresStore {
     pub(crate) certificate_work: crate::certificate::work::CertificateWorkLimits,
     pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
     pub(crate) route_changes: super::runtime_work::RouteChangeListener,
+    pub(crate) classes: std::sync::Arc<super::class_cache::ClassCache>,
 }
 
 impl PostgresStore {
@@ -50,6 +51,7 @@ impl PostgresStore {
             ),
             certificate_sealer: None,
             route_changes,
+            classes: Default::default(),
         };
 
         store.run_migrations().await?;

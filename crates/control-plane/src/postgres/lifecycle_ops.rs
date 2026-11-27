@@ -9,6 +9,7 @@ use super::{
         rendered_objects_to_json,
     },
     materialization_ops::upsert_materialization,
+    sql,
 };
 use crate::{
     instance::{InstanceRecord, InstanceState},
@@ -23,30 +24,29 @@ pub(crate) async fn accept_wake(
     let mut client = store.client().await?;
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     let id = request.pending.instance_id.as_str();
-    let row = tx
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        &tx,
+        "
             SELECT instance_id, workload_class_id, workload_class_version, values, state, generation
             FROM instances
             WHERE instance_id = $1
             FOR UPDATE
             ",
-            &[&id],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .ok_or(StoreError::NotFound {
-            resource: "instance",
-        })?;
+        &[&id],
+    )
+    .await?
+    .ok_or(StoreError::NotFound {
+        resource: "instance",
+    })?;
     let current = instance_from_row(&row)?;
     // A replay after commit observes the same accepted work, including if the
     // caller lost the response. It may never replace an accepted projection.
     if current.state == InstanceState::Waking
         && current.generation == request.pending.instance_generation
     {
-        let matching = tx
-            .query_one(
-                "
+        let matching = sql::query_one(
+            &tx,
+            "
             SELECT EXISTS(SELECT 1
             FROM materializations
             WHERE instance_id = $1
@@ -54,15 +54,14 @@ pub(crate) async fn accept_wake(
             AND namespace = $3
             AND state = 'pending')
             ",
-                &[
-                    &id,
-                    &request.pending.target.cluster_id(),
-                    &request.pending.target.namespace(),
-                ],
-            )
-            .await
-            .map_err(map_postgres_error)?
-            .get::<_, bool>(0);
+            &[
+                &id,
+                &request.pending.target.cluster_id(),
+                &request.pending.target.namespace(),
+            ],
+        )
+        .await?
+        .get::<_, bool>(0);
         if !matching {
             return Err(StoreError::invalid_argument(
                 "wake already accepted for another target",
@@ -85,7 +84,7 @@ pub(crate) async fn accept_wake(
             "wake acceptance requires cold, failed, or draining instance",
         ));
     }
-    if current.state != InstanceState::Draining && tx.query_one("SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&id]).await.map_err(map_postgres_error)?.get::<_,bool>(0) {
+    if current.state != InstanceState::Draining && sql::query_one(&tx, "SELECT EXISTS(SELECT 1 FROM materializations WHERE instance_id = $1 AND state <> 'deleted')", &[&id]).await?.get::<_,bool>(0) {
         return Err(StoreError::unavailable("previous materialization cleanup is still pending"));
     }
     let expected_waking = if current.state == InstanceState::Draining {
@@ -102,24 +101,23 @@ pub(crate) async fn accept_wake(
             "accepted wake projection does not match its next incarnation",
         ));
     }
-    let previous_backend: Option<i64> = tx
-        .query_one(
-            "
+    let previous_backend: Option<i64> = sql::query_one(
+        &tx,
+        "
             SELECT MAX(backend_generation)
             FROM materializations
             WHERE instance_id = $1
             AND cluster_id = $2
             AND namespace = $3
             ",
-            &[
-                &id,
-                &request.pending.target.cluster_id(),
-                &request.pending.target.namespace(),
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .get(0);
+        &[
+            &id,
+            &request.pending.target.cluster_id(),
+            &request.pending.target.namespace(),
+        ],
+    )
+    .await?
+    .get(0);
     if let Some(previous) = previous_backend {
         let next = previous
             .checked_add(1)
@@ -140,14 +138,19 @@ pub(crate) async fn accept_wake(
             super::mapping::backend_generation_to_i64(request.pending.backend_generation)?;
         let refs = rendered_objects_to_json(&request.pending.rendered_objects);
         let keys = rendered_exclusivity_keys_to_json(&request.pending.exclusivity_keys);
-        let inserted = tx.execute("
+        let inserted = sql::execute(&tx, "
             INSERT INTO deferred_wake_intents(instance_id, instance_generation, projection_generation, cluster_id, namespace, backend_generation, rendered_objects, exclusivity_keys)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
             ON CONFLICT (instance_id)
             DO NOTHING
-            ", &[&id,&generation,&projection,&request.pending.target.cluster_id(),&request.pending.target.namespace(),&backend,&refs,&keys]).await.map_err(map_postgres_error)?;
+            ", &[&id,&generation,&projection,&request.pending.target.cluster_id(),&request.pending.target.namespace(),&backend,&refs,&keys]).await?;
         if inserted == 0 {
-            let row = tx.query_one("SELECT cluster_id, namespace FROM deferred_wake_intents WHERE instance_id = $1", &[&id]).await.map_err(map_postgres_error)?;
+            let row = sql::query_one(
+                &tx,
+                "SELECT cluster_id, namespace FROM deferred_wake_intents WHERE instance_id = $1",
+                &[&id],
+            )
+            .await?;
             if row.get::<_, String>("cluster_id") != request.pending.target.cluster_id()
                 || row.get::<_, String>("namespace") != request.pending.target.namespace()
             {
@@ -160,12 +163,12 @@ pub(crate) async fn accept_wake(
         return Ok(current);
     }
     let generation = generation_to_i64(expected_waking)?;
-    let row = tx.query_one("
+    let row = sql::query_one(&tx, "
             UPDATE instances
             SET state = 'waking', generation = $2
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
-            ", &[&id,&generation]).await.map_err(map_postgres_error)?;
+            ", &[&id,&generation]).await?;
     upsert_materialization(&tx, &request.pending).await?;
     tx.commit().await.map_err(map_postgres_error)?;
     crate::runtime_work::signal_lifecycle_work();
@@ -186,9 +189,7 @@ async fn revive_draining(
     let running = current.generation.next();
     let running_db = generation_to_i64(running)?;
     let drained_db = generation_to_i64(current.generation)? - 1;
-    let revived = tx
-        .execute(
-            "
+    let revived = sql::execute(tx, "
             UPDATE materializations
             SET state = 'ready',
                 instance_generation = $5,
@@ -208,25 +209,17 @@ async fn revive_draining(
                 &request.pending.target.namespace(),
                 &drained_db,
                 &running_db,
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+            ],).await?;
     if revived == 0 {
         return Ok(None);
     }
-    let row = tx
-        .query_one(
-            "
+    let row = sql::query_one(tx, "
             UPDATE instances
             SET state = 'running', generation = $2
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
-            &[&id, &running_db],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+            &[&id, &running_db],).await?;
     instance_from_row(&row).map(Some)
 }
 
@@ -236,25 +229,24 @@ pub(crate) async fn activate_deferred_wake(
     tx: &impl GenericClient,
     id: &str,
 ) -> StoreResult<Option<InstanceRecord>> {
-    let intent = tx
-        .query_opt(
-            "DELETE FROM deferred_wake_intents WHERE instance_id = $1 RETURNING *",
-            &[&id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let intent = sql::query_opt(
+        tx,
+        "DELETE FROM deferred_wake_intents WHERE instance_id = $1 RETURNING *",
+        &[&id],
+    )
+    .await?;
     let Some(intent) = intent else {
         return Ok(None);
     };
     let generation: i64 = intent.get("instance_generation");
-    let row = tx.query_opt("
+    let row = sql::query_opt(tx, "
             UPDATE instances
             SET state = 'waking', generation = $2
             WHERE instance_id = $1
             AND state = 'cold'
             AND generation = $2::bigint - 1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
-            ", &[&id,&generation]).await.map_err(map_postgres_error)?
+            ", &[&id,&generation]).await?
         .ok_or_else(|| StoreError::invalid_argument("deferred wake no longer matches drained incarnation"))?;
     let mut pending = crate::materialization::RecordMaterializationRequest::new(
         crate::ids::InstanceId::new(id).map_err(|e| StoreError::internal(e.to_string()))?,
@@ -285,13 +277,12 @@ pub(crate) async fn request_instance_deletion(
     let tx = client.transaction().await.map_err(map_postgres_error)?;
     generation_to_i64(request.expected_generation)?;
     let id = request.instance_id.as_str();
-    let row = tx
-        .query_opt(
-            "SELECT state, generation FROM instances WHERE instance_id = $1 FOR UPDATE",
-            &[&id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let row = sql::query_opt(
+        &tx,
+        "SELECT state, generation FROM instances WHERE instance_id = $1 FOR UPDATE",
+        &[&id],
+    )
+    .await?;
     let Some(row) = row else {
         return Ok(false);
     };
@@ -306,7 +297,8 @@ pub(crate) async fn request_instance_deletion(
     }
     if row.get::<_, String>("state") != "deleting" {
         generation_to_i64(actual.next())?;
-        tx.execute(
+        sql::execute(
+            &tx,
             "
             UPDATE instances
             SET state = 'deleting', generation = generation + 1
@@ -314,18 +306,18 @@ pub(crate) async fn request_instance_deletion(
             ",
             &[&id],
         )
-        .await
-        .map_err(map_postgres_error)?;
+        .await?;
     }
-    tx.execute(
+    sql::execute(
+        &tx,
         "DELETE FROM deferred_wake_intents WHERE instance_id = $1",
         &[&id],
     )
-    .await
-    .map_err(map_postgres_error)?;
+    .await?;
     // Preserve any sleep deadline and current lease: deletion does not steal
     // established streams' grace or let another worker overlap a held lease.
-    tx.execute(
+    sql::execute(
+        &tx,
         "
             UPDATE materializations
             SET state = 'deleting'
@@ -334,8 +326,7 @@ pub(crate) async fn request_instance_deletion(
             ",
         &[&id],
     )
-    .await
-    .map_err(map_postgres_error)?;
+    .await?;
     tx.commit().await.map_err(map_postgres_error)?;
     crate::runtime_work::signal_lifecycle_work();
     Ok(true)
@@ -348,9 +339,9 @@ pub(crate) async fn finalize_instance_deletions(
     let limit = i64::try_from(limit)
         .map_err(|_| StoreError::invalid_argument("deletion batch too large"))?;
     let client = store.client().await?;
-    let count = client
-        .execute(
-            "
+    let count = sql::execute(
+        &client,
+        "
             WITH completed AS (SELECT instance_id
             FROM instances i
             WHERE state = 'deleting'
@@ -365,9 +356,8 @@ pub(crate) async fn finalize_instance_deletions(
             WHERE instance_id IN (SELECT instance_id
             FROM completed)
             ",
-            &[&limit],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&limit],
+    )
+    .await?;
     Ok(count as usize)
 }

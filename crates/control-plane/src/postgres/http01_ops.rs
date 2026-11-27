@@ -8,8 +8,8 @@ use crate::{
 
 use super::{
     connection::PostgresStore,
-    error::map_postgres_error,
     mapping::{http01_from_row, unix_millis_from_system_time},
+    sql,
 };
 
 pub(crate) async fn put_http01_challenge(
@@ -21,9 +21,9 @@ pub(crate) async fn put_http01_challenge(
     let token = request.key().token();
     let key_authorization = request.key_authorization();
     let expires_at_unix_millis = unix_millis_from_system_time(request.expires_at())?;
-    let row = client
-        .query_one(
-            "
+    let row = sql::query_one(
+        &client,
+        "
             INSERT INTO http01_challenges (
                 host,
                 token,
@@ -37,10 +37,9 @@ pub(crate) async fn put_http01_challenge(
                 expires_at_unix_millis = EXCLUDED.expires_at_unix_millis
             RETURNING host, token, key_authorization, expires_at_unix_millis
             ",
-            &[&host, &token, &key_authorization, &expires_at_unix_millis],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&host, &token, &key_authorization, &expires_at_unix_millis],
+    )
+    .await?;
 
     http01_from_row(&row)
 }
@@ -56,18 +55,17 @@ pub(crate) async fn resolve_http01_challenge(
     // serving decision on this process's clock would let a skewed replica
     // withhold a live challenge, or serve one past its expiry, and would let
     // two replicas disagree about the same challenge.
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        &client,
+        "
             SELECT host, token, key_authorization, expires_at_unix_millis
             FROM http01_challenges
             WHERE host = $1 AND token = $2
             AND expires_at_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint
             ",
-            &[&host, &token],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&host, &token],
+    )
+    .await?;
 
     row.as_ref().map(http01_from_row).transpose()
 }
@@ -79,13 +77,12 @@ pub(crate) async fn delete_http01_challenge(
     let client = store.client().await?;
     let host = request.key().host().as_str();
     let token = request.key().token();
-    let deleted = client
-        .execute(
-            "DELETE FROM http01_challenges WHERE host = $1 AND token = $2",
-            &[&host, &token],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let deleted = sql::execute(
+        &client,
+        "DELETE FROM http01_challenges WHERE host = $1 AND token = $2",
+        &[&host, &token],
+    )
+    .await?;
 
     Ok(deleted > 0)
 }
@@ -100,9 +97,9 @@ pub(crate) async fn collect_expired_http01_challenges(
         StoreError::invalid_argument("HTTP-01 expire limit does not fit in Postgres bigint")
     })?;
     let client = store.client().await?;
-    let deleted = client
-        .execute(
-            "DELETE FROM http01_challenges
+    let deleted = sql::execute(
+        &client,
+        "DELETE FROM http01_challenges
              WHERE (host, token) IN (
                  SELECT host, token
                  FROM http01_challenges
@@ -111,10 +108,9 @@ pub(crate) async fn collect_expired_http01_challenges(
                  ORDER BY expires_at_unix_millis, host, token
                  LIMIT $1
              )",
-            &[&limit],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&limit],
+    )
+    .await?;
 
     usize::try_from(deleted)
         .map_err(|_| StoreError::internal("deleted HTTP-01 count did not fit in usize"))

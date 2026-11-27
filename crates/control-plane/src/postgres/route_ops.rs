@@ -22,6 +22,7 @@ use super::{
         generation_to_i64, materialization_from_row, route_binding_from_row,
         route_binding_row_from_row, route_identity_parts, RouteBindingRow,
     },
+    sql,
 };
 
 pub(crate) async fn create_route_binding(
@@ -75,13 +76,12 @@ pub(crate) async fn delete_route_binding(
 ) -> StoreResult<bool> {
     let client = store.client().await?;
     let route_binding_id = request.route_binding_id.as_str();
-    let deleted = client
-        .execute(
-            "DELETE FROM route_bindings WHERE route_binding_id = $1",
-            &[&route_binding_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let deleted = sql::execute(
+        &client,
+        "DELETE FROM route_bindings WHERE route_binding_id = $1",
+        &[&route_binding_id],
+    )
+    .await?;
 
     Ok(deleted > 0)
 }
@@ -91,18 +91,17 @@ pub(crate) async fn list_route_bindings_for_instance(
     request: ListRouteBindingsForInstanceRequest,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let client = store.client().await?;
-    let rows = client
-        .query(
-            "
+    let rows = sql::query(
+        &client,
+        "
             SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE instance_id = $1
             ORDER BY route_binding_id
             ",
-            &[&request.instance_id.as_str()],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&request.instance_id.as_str()],
+    )
+    .await?;
 
     rows.iter().map(route_binding_from_row).collect()
 }
@@ -137,20 +136,19 @@ pub(crate) async fn resolve_host_rules(
     let client = store.client().await?;
     let host = request.host.as_str();
     let suffixes: Vec<&str> = proper_suffixes(host).collect();
-    let rows = client
-        .query(
-            HOST_RULES_SQL,
-            &[
-                &route_kind_to_db(request.kind),
-                &host,
-                &suffixes,
-                &request.target.cluster_id(),
-                &request.target.namespace(),
-                &(MAX_HOST_RULES as i64 + 1),
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    let rows = sql::query(
+        &client,
+        HOST_RULES_SQL,
+        &[
+            &route_kind_to_db(request.kind),
+            &host,
+            &suffixes,
+            &request.target.cluster_id(),
+            &request.target.namespace(),
+            &(MAX_HOST_RULES as i64 + 1),
+        ],
+    )
+    .await?;
     if rows.len() > MAX_HOST_RULES {
         return Err(StoreError::invalid_argument(format!(
             "more than {MAX_HOST_RULES} route bindings apply to host {host}"
@@ -235,9 +233,9 @@ pub(super) async fn insert_route_binding(
     let route_binding_id = route_binding_id.as_str();
     let instance_id = instance_id.as_str();
     let path_prefix = parts.path_prefix.as_deref();
-    let row = transaction
-        .query_one(
-            "
+    let row = sql::query_one(
+        transaction,
+        "
             INSERT INTO route_bindings (
                 route_binding_id,
                 instance_id,
@@ -250,18 +248,17 @@ pub(super) async fn insert_route_binding(
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             ",
-            &[
-                &route_binding_id,
-                &instance_id,
-                &parts.key,
-                &parts.identity_kind,
-                &parts.host_kind,
-                &parts.host,
-                &path_prefix,
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[
+            &route_binding_id,
+            &instance_id,
+            &parts.key,
+            &parts.identity_kind,
+            &parts.host_kind,
+            &parts.host,
+            &path_prefix,
+        ],
+    )
+    .await?;
     let created = route_binding_from_row(&row)?;
     check_host_rule_room(transaction, identity).await?;
 
@@ -270,8 +267,12 @@ pub(super) async fn insert_route_binding(
 
 // What a binding counts against its rule sets' byte budget, less
 // HOST_RULE_OVERHEAD_BYTES.
-const RULE_TEXT_BYTES: &str = "octet_length(route_binding_id) + octet_length(instance_id)
-    + octet_length(host) + COALESCE(octet_length(path_prefix), 0)";
+macro_rules! rule_text_bytes {
+    () => {
+        "octet_length(route_binding_id) + octet_length(instance_id)
+        + octet_length(host) + COALESCE(octet_length(path_prefix), 0)"
+    };
+}
 
 /// Refuses the binding just inserted when it gives some name a rule set larger
 /// than one Subscribe answer carries: more than `MAX_HOST_RULES` rules or
@@ -297,41 +298,42 @@ async fn check_host_rule_room(
         bytes: usize,
     }
 
-    transaction
-        .execute(
-            "SELECT pg_advisory_xact_lock('route_bindings'::regclass::oid::bigint)",
-            &[],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+    sql::execute(
+        transaction,
+        "SELECT pg_advisory_xact_lock('route_bindings'::regclass::oid::bigint)",
+        &[],
+    )
+    .await?;
     let kind = route_kind_to_db(identity.kind());
     let host = identity.host().as_str();
     let wildcard = identity.host().is_wildcard();
     let suffixes: Vec<&str> = proper_suffixes(host).collect();
-    let mut rows = transaction
-        .query(
-            &format!(
-                "SELECT host_kind, host, {RULE_TEXT_BYTES} AS text_bytes FROM route_bindings
+    let mut rows = sql::query(
+        transaction,
+        concat!(
+            "SELECT host_kind, host, ",
+            rule_text_bytes!(),
+            " AS text_bytes FROM route_bindings
                 WHERE identity_kind = $1 AND (host = $2
                     OR (host_kind = 'wildcard_suffix' AND host = ANY($3::text[])))"
-            ),
-            &[&kind, &host, &suffixes],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        ),
+        &[&kind, &host, &suffixes],
+    )
+    .await?;
     let under = format!(".{host}");
     if wildcard {
         rows.extend(
-            transaction
-                .query(
-                    &format!(
-                        "SELECT host_kind, host, {RULE_TEXT_BYTES} AS text_bytes
+            sql::query(
+                transaction,
+                concat!(
+                    "SELECT host_kind, host, ",
+                    rule_text_bytes!(),
+                    " AS text_bytes
                         FROM route_bindings WHERE identity_kind = $1 AND right(host, $2) = $3"
-                    ),
-                    &[&kind, &(under.len() as i32), &under],
-                )
-                .await
-                .map_err(map_postgres_error)?,
+                ),
+                &[&kind, &(under.len() as i32), &under],
+            )
+            .await?,
         );
     }
 
@@ -387,17 +389,16 @@ async fn load_route_binding_record(
     client: &impl GenericClient,
     route_binding_id: &str,
 ) -> StoreResult<Option<RouteBindingRecord>> {
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        client,
+        "
             SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE route_binding_id = $1
             ",
-            &[&route_binding_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&route_binding_id],
+    )
+    .await?;
 
     row.as_ref().map(route_binding_from_row).transpose()
 }
@@ -406,17 +407,16 @@ async fn load_route_binding(
     client: &impl GenericClient,
     route_binding_id: &str,
 ) -> StoreResult<Option<RouteBindingRow>> {
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(
+        client,
+        "
             SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE route_binding_id = $1
             ",
-            &[&route_binding_id],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+        &[&route_binding_id],
+    )
+    .await?;
 
     row.as_ref().map(route_binding_row_from_row).transpose()
 }
@@ -427,9 +427,7 @@ pub(crate) async fn load_ready_materialization(
     instance_generation: crate::ids::Generation,
 ) -> StoreResult<Option<MaterializationRecord>> {
     let instance_generation = generation_to_i64(instance_generation)?;
-    let row = client
-        .query_opt(
-            "
+    let row = sql::query_opt(client, "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
                 namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
@@ -439,10 +437,7 @@ pub(crate) async fn load_ready_materialization(
             ORDER BY backend_generation DESC, materialization_id
             LIMIT 1
             ",
-            &[&instance_id, &instance_generation],
-        )
-        .await
-        .map_err(map_postgres_error)?;
+            &[&instance_id, &instance_generation],).await?;
 
     row.as_ref().map(materialization_from_row).transpose()
 }
