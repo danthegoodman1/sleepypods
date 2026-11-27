@@ -839,8 +839,9 @@ async fn postgres_wake_during_drain_grace_revives_the_projection() -> TestResult
     .await
 }
 
-/// The three completions lock the instance before its materialization, as
-/// every acceptance does, so a completion and a deletion never deadlock.
+/// A wake or sleep completion locks the instance before its materialization,
+/// as every acceptance does, and a cleanup completion locks the materialization
+/// alone, so a completion and a deletion never deadlock.
 #[tokio::test]
 async fn postgres_completions_and_deletion_share_one_lock_order() -> TestResult {
     with_store(|store, raw| async move {
@@ -978,16 +979,28 @@ async fn postgres_completions_and_deletion_share_one_lock_order() -> TestResult 
                     }
                 };
                 let mut operations = tokio::task::JoinSet::new();
+                // A cleanup completion finishes while the instance stays locked.
+                let cleanup = completion == "mark-deleted";
+                let waiters = if cleanup { 1 } else { 2 };
+                let unblocked = |_| format!("{name}: a cleanup completion waits for the instance");
                 if deletion_first {
                     operations.spawn(delete());
                     blocked(1).await??;
-                    operations.spawn(finish());
+                    if cleanup {
+                        tokio::time::timeout(Duration::from_secs(5), finish()).await.map_err(unblocked)??;
+                    } else {
+                        operations.spawn(finish());
+                    }
                 } else {
-                    operations.spawn(finish());
-                    blocked(1).await??;
+                    if cleanup {
+                        tokio::time::timeout(Duration::from_secs(5), finish()).await.map_err(unblocked)??;
+                    } else {
+                        operations.spawn(finish());
+                        blocked(1).await??;
+                    }
                     operations.spawn(delete());
                 }
-                blocked(2).await??;
+                blocked(waiters).await??;
                 // Neither waits while holding the materialization.
                 holder
                     .query_one(
