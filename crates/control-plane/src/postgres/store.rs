@@ -20,9 +20,9 @@ use crate::{
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
-        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet, RouteResolution,
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
+        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet,
     },
     store::{ControlPlaneStore, StoreFuture, StoreResult},
     workload::{
@@ -103,6 +103,9 @@ impl ControlPlaneStore for PostgresStore {
     }
     fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
         Box::pin(super::runtime_work::revision(self))
+    }
+    fn route_change_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.route_changes.subscribe()
     }
     fn load_materialization_work_status(
         &self,
@@ -212,11 +215,11 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(async move { route_ops::list_route_bindings_for_instance(self, request).await })
     }
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
-        Box::pin(async move { route_ops::resolve_route(self, request).await })
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>> {
+        Box::pin(async move { route_ops::resolve_host_rules(self, request).await })
     }
 
     fn compare_and_swap_instance_state<'a>(

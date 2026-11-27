@@ -18,19 +18,18 @@ use std::{
 use bytes::Bytes;
 use frontline::{
     serve_frontline_listeners, FrontlineHttpRuntime, FrontlineListeners, FrontlineRouteCoordinator,
-    FrontlineRouteResolver, FrontlineTlsAdapter, RouteRequestId, RouteSubscriptionClient,
-    RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
-    TlsCertificateStore, WakeClient, WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
-    WakeTracker,
+    FrontlineTlsAdapter, RouteStream, RouteStreamEvent, RouteStreamReply, RouteStreamRequest,
+    RouteSubscriptionClient, RouteSubscriptionFuture, TlsCertificateStore, WakeClient,
+    WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper_util::rt::TokioIo;
 use proxy_core::{DrainTracker, ProxyAdmission, ProxyResourceConfig, Shutdown};
-use sleepypods_api::{CachePolicy, RouteIdentity};
+use sleepypods_api::CachePolicy;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{mpsc, Semaphore},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -57,30 +56,57 @@ impl Drop for ActiveRpc {
 }
 impl RouteSubscriptionClient for ControlPlane {
     type Error = Infallible;
-    fn subscribe_route(
-        &mut self,
-        request_id: RouteRequestId,
-        request_identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let gate = self.gate.lock().unwrap().clone();
-        let active = self.active.clone();
+    /// Opens a stream whose every lookup waits on the gate and then reports
+    /// that the host has no route. An unsubscribe cancels its lookup.
+    fn connect(&mut self) -> RouteSubscriptionFuture<'static, RouteStream, Self::Error> {
+        let control_plane = self.clone();
         Box::pin(async move {
-            assert!(active.fetch_add(1, Ordering::SeqCst) < FLIGHTS);
-            let _active = ActiveRpc(active);
-            gate.acquire().await.unwrap().forget();
-            Ok(SubscribeControlPlaneOutput::RouteMiss {
-                request_id,
-                request_identity,
-                negative_cache_policy: CachePolicy::new(Duration::from_millis(100)),
+            let (requests, mut inbound) = mpsc::channel(1024);
+            let (events, outbound) = mpsc::channel(1024);
+            tokio::spawn(async move {
+                let mut lookups = std::collections::HashMap::new();
+                while let Some(request) = inbound.recv().await {
+                    lookups.retain(|_, lookup: &mut tokio::task::JoinHandle<()>| {
+                        !lookup.is_finished()
+                    });
+                    match request {
+                        RouteStreamRequest::Subscribe { id, .. } => {
+                            control_plane.calls.fetch_add(1, Ordering::SeqCst);
+                            let gate = control_plane.gate.lock().unwrap().clone();
+                            let active = control_plane.active.clone();
+                            let events = events.clone();
+                            assert!(active.fetch_add(1, Ordering::SeqCst) < FLIGHTS);
+                            let active = ActiveRpc(active);
+                            lookups.insert(
+                                id,
+                                tokio::spawn(async move {
+                                    let _active = active;
+                                    gate.acquire().await.unwrap().forget();
+                                    let _ = events
+                                        .send(RouteStreamEvent::Reply(RouteStreamReply::Rules {
+                                            id,
+                                            rules: Vec::new(),
+                                            cache_policy: CachePolicy::new(Duration::from_millis(
+                                                100,
+                                            )),
+                                        }))
+                                        .await;
+                                }),
+                            );
+                        }
+                        RouteStreamRequest::Unsubscribe { id } => {
+                            if let Some(lookup) = lookups.remove(&id) {
+                                lookup.abort();
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(RouteStream {
+                requests,
+                events: outbound,
             })
         })
-    }
-    fn unsubscribe(
-        &mut self,
-        _: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
-        panic!("miss-only fixture cannot create subscriptions")
     }
 }
 struct NoWake;
@@ -140,7 +166,7 @@ struct Callers {
     missed: AtomicUsize,
 }
 
-async fn request(addr: SocketAddr, path: String, callers: Arc<Callers>) {
+async fn request(addr: SocketAddr, host: String, callers: Arc<Callers>) {
     // JoinSet aborts the driver if this worker is externally canceled.
     let mut drivers = JoinSet::new();
     let result = timeout(Duration::from_secs(8), async {
@@ -153,8 +179,8 @@ async fn request(addr: SocketAddr, path: String, callers: Arc<Callers>) {
         drivers.spawn(driver);
         let response = sender.send_request(
             Request::builder()
-                .uri(path)
-                .header("host", "resource-envelope.test")
+                .uri("/")
+                .header("host", host)
                 .header("connection", "close")
                 .body(Empty::<Bytes>::new())
                 .unwrap(),
@@ -280,15 +306,16 @@ async fn wave(
     let mut jobs = JoinSet::new();
     for index in 0..mode.width() {
         let key = if matches!(mode, Mode::Same) { 0 } else { index };
+        // The cache, the flights and the subscriptions are per host.
         jobs.spawn(request(
             addr,
-            format!("/{cycle}/{}/{key}", mode.name()),
+            format!("{cycle}-{}-{key}.resource-envelope.test", mode.name()),
             callers.clone(),
         ));
     }
     // Four possible tasks per caller: client worker, owned HTTP driver,
     // production accepted connection, and response-delivery watchdog. Each
-    // admitted route flight can also own one flight task and one CP task.
+    // admitted route flight also owns one lookup task in the fixture.
     let task_bound = baseline + 4 * mode.width() + 2 * FLIGHTS + 16;
     let mut observed_tasks = tasks();
     timeout(Duration::from_secs(3), async {
@@ -327,8 +354,8 @@ async fn wave(
         cp,
     );
     if matches!(mode, Mode::Cancel) {
-        // Do not release the fakeCP gate: real production SubscribeDeadline
-        // must reclaim these futures even after all callers disappear.
+        // The gate stays shut: a flight ends, and unsubscribes its lookup,
+        // once every caller waiting on it has disappeared.
         jobs.abort_all();
         while let Some(result) = jobs.join_next().await {
             if let Err(error) = result {
@@ -361,12 +388,8 @@ async fn run() {
         calls: Arc::new(AtomicUsize::new(0)),
         active: Arc::new(AtomicUsize::new(0)),
     };
-    let coordinator = FrontlineRouteCoordinator::new(
-        FrontlineRouteResolver::from_parts(SubscriptionState::new(64), cp.clone()),
-        WakeTracker::new(),
-        NoWake,
-    )
-    .with_route_deadline(Duration::from_secs(6));
+    let coordinator = FrontlineRouteCoordinator::new(64, cp.clone(), NoWake)
+        .with_route_deadline(Duration::from_secs(6));
     let drain = DrainTracker::new(Duration::from_secs(1));
     // Default telemetry is no-op: no per-event collector can accumulate data.
     let runtime = FrontlineHttpRuntime::new(coordinator, drain.clone());
@@ -386,9 +409,10 @@ async fn run() {
         FrontlineTlsAdapter::new(TlsCertificateStore::disabled()),
         shutdown.clone(),
     ));
-    // One listener task and its production shared coordinator actor.
+    // One listener task, its production shared coordinator actor, and the
+    // fixture's end of the actor's Subscribe stream.
     timeout(Duration::from_secs(1), async {
-        while tasks() != 2 {
+        while tasks() != 3 {
             tokio::task::yield_now().await;
         }
     })

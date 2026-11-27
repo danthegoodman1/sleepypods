@@ -19,7 +19,7 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
-    operator_grpc_service_with_store_and_route_events, operator_grpc_web_cors_layer,
+    operator_grpc_service_with_store, operator_grpc_web_cors_layer,
     pb::{
         operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
         persistent_volume_source_template, route_identity, template_text_part,
@@ -32,13 +32,13 @@ use control_plane::api::{
         HostPathVolumeSourceTemplate, Http01Challenge, Http01ChallengeKey, HttpRouteIdentity,
         IdleTimeoutOverridePolicy, Instance, InstanceRoute, InstanceState, ManifestTemplate,
         PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
-        ProtocolRoute, PutHttp01ChallengeRequest, RawKubernetesManifestTemplate,
-        ReconcileMaterializationRequest, ReconcileMaterializationResponse,
-        ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
-        RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-        SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
-        WorkloadClassVersionRef, WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy,
-        WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+        PutHttp01ChallengeRequest, RawKubernetesManifestTemplate, ReconcileMaterializationRequest,
+        ReconcileMaterializationResponse, ResolveHttp01ChallengeRequest,
+        ResolveHttp01ChallengeResponse, RouteBinding, RouteHost, RouteHostKind, RouteIdentity,
+        ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
+        TemplateTextPart, VolumeTemplate, WorkloadClassVersion, WorkloadClassVersionRef,
+        WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+        WorkloadValueFieldRule, WorkloadValueSchema,
     },
     RouteSubscriptionBroker, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME,
 };
@@ -85,11 +85,10 @@ fn store_proxy_api(
 fn store_operator_grpc_service(
     store: Arc<dyn ControlPlaneStore>,
 ) -> control_plane::api::server::StoreBackedOperatorGrpcService<FakeKubernetesClient> {
-    operator_grpc_service_with_store_and_route_events(
+    operator_grpc_service_with_store(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
-        RouteSubscriptionBroker::new(),
     )
 }
 
@@ -263,7 +262,6 @@ fn generated_api_contains_expected_v1_resource_shape() {
         route_binding_id: "route-1".to_owned(),
         instance_id: request.instance_id.clone(),
         identity: None,
-        protocol: ProtocolRoute::Http as i32,
     };
     let workload_class = CreateWorkloadClassVersionRequest {
         class_id: "class-1".to_owned(),
@@ -305,7 +303,6 @@ fn generated_api_contains_expected_v1_resource_shape() {
         PersistentVolumeAccessMode::ReadWriteOnce as i32
     );
     assert_eq!(InstanceState::Cold as i32, 1);
-    assert_eq!(ProtocolRoute::Http as i32, 1);
     assert_eq!(RouteHostKind::WildcardSuffix as i32, 2);
     assert_eq!(
         workload_class
@@ -1267,7 +1264,6 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
             route_binding_id: "route-1".to_owned(),
             instance_id: "instance-1".to_owned(),
             identity: Some(http_identity("App.Example.COM.", Some("/api"))),
-            protocol: ProtocolRoute::Http as i32,
         }))
         .await
         .expect("create route binding succeeds")
@@ -1976,7 +1972,6 @@ async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
                 route_binding_id: "route-transport".to_owned(),
                 instance_id: "instance-transport".to_owned(),
                 identity: Some(sni_identity("DB.Example.COM.")),
-                protocol: ProtocolRoute::TlsSni as i32,
             },
             "application/grpc",
             Version::HTTP_2,
@@ -2000,7 +1995,6 @@ async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
 
     let created = decode_grpc_route_binding_response(collected.to_bytes().as_ref());
     assert_eq!(created.route_binding_id, "route-transport");
-    assert_eq!(created.protocol, ProtocolRoute::TlsSni as i32);
     let sni = match created
         .identity
         .as_ref()
@@ -2100,7 +2094,6 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
             route_binding_id: "route-grpc-web".to_owned(),
             instance_id: "instance-grpc-web".to_owned(),
             identity: Some(http_identity("App.Example.COM.", Some("/app"))),
-            protocol: ProtocolRoute::Http as i32,
         },
     )
     .await;
@@ -2259,7 +2252,6 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
             route_binding_id: "route-native".to_owned(),
             instance_id: "instance-native".to_owned(),
             identity: Some(http_identity("Native.Example.COM.", Some("/app"))),
-            protocol: ProtocolRoute::Http as i32,
         },
     )
     .await;

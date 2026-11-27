@@ -23,11 +23,11 @@ use control_plane::{
     Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey,
     IdleTimeoutOverridePolicy, InstanceId, InstanceRoute, InstanceState, ManifestTemplate,
     MaterializationState, MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
-    ProtocolRoute, PutHttp01ChallengeRequest, RecordMaterializationRequest,
+    PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
-    ResolveRouteRequest, RouteBindingId, RouteDependencyLookup, RouteHost, RouteIdentity,
-    RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
+    ResolveHostRulesRequest, RouteBindingId, RouteDependencyLookup, RouteEntry, RouteHost,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
     StoreError, TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion,
     WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy,
     WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
@@ -495,32 +495,32 @@ async fn run_conformance(
         StoreError::InvalidArgument { .. }
     ));
 
-    let initial_resolution = store
-        .resolve_route(ResolveRouteRequest::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("APP.example.com").expect("valid host"),
-                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-            },
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
+    let initial_resolution = resolve_route(
+        store,
+        RouteIdentity::Http {
+            host: RouteHost::exact("APP.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        },
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
     let route_entry = match initial_resolution {
-        RouteResolution::Resolved { entry, .. } => entry,
-        RouteResolution::Miss { .. } => panic!("route should resolve"),
+        Some(entry) => entry,
+        None => panic!("route should resolve"),
     };
     assert_eq!(route_entry.instance_id.as_str(), "instance-a");
     assert_eq!(route_entry.backend, None);
 
-    let miss = store
-        .resolve_route(ResolveRouteRequest::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("missing.example.com").expect("valid host"),
-                path: None,
-            },
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
-    assert!(matches!(miss, RouteResolution::Miss { .. }));
+    let miss = resolve_route(
+        store,
+        RouteIdentity::Http {
+            host: RouteHost::exact("missing.example.com").expect("valid host"),
+            path: None,
+        },
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
+    assert_eq!(miss, None);
 
     let waking = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
@@ -606,24 +606,24 @@ async fn run_conformance(
         Some(BackendGeneration::new(2))
     );
 
-    let resolved_with_backend = store
-        .resolve_route(ResolveRouteRequest::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("app.example.com").expect("valid host"),
-                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-            },
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
+    let resolved_with_backend = resolve_route(
+        store,
+        RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        },
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
     match resolved_with_backend {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
                 Some("http://10.0.0.10:8080")
             );
             assert_eq!(entry.backend_generation, Some(BackendGeneration::new(2)));
         }
-        RouteResolution::Miss { .. } => panic!("route should resolve after materialization"),
+        None => panic!("route should resolve after materialization"),
     }
 
     let mut rewind = RecordMaterializationRequest::new(
@@ -645,24 +645,24 @@ async fn run_conformance(
         other => panic!("expected backend rewind invalid argument, got {other}"),
     }
 
-    let resolved_after_rewind_rejection = store
-        .resolve_route(ResolveRouteRequest::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("app.example.com").expect("valid host"),
-                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-            },
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
+    let resolved_after_rewind_rejection = resolve_route(
+        store,
+        RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        },
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
     match resolved_after_rewind_rejection {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(
                 entry.backend.as_ref().map(BackendEndpoint::uri),
                 Some("http://10.0.0.10:8080")
             );
             assert_eq!(entry.backend_generation, Some(BackendGeneration::new(2)));
         }
-        RouteResolution::Miss { .. } => panic!("route should still resolve"),
+        None => panic!("route should still resolve"),
     }
 
     let draining = store
@@ -692,22 +692,22 @@ async fn run_conformance(
         other => panic!("expected stale sidecar generation conflict, got {other}"),
     }
 
-    let resolved_after_generation_advance = store
-        .resolve_route(ResolveRouteRequest::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("app.example.com").expect("valid host"),
-                path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-            },
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
+    let resolved_after_generation_advance = resolve_route(
+        store,
+        RouteIdentity::Http {
+            host: RouteHost::exact("app.example.com").expect("valid host"),
+            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
+        },
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
     match resolved_after_generation_advance {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(entry.instance_generation, Generation::new(3));
             assert_eq!(entry.backend, None);
             assert_eq!(entry.backend_generation, None);
         }
-        RouteResolution::Miss { .. } => panic!("route binding should still resolve"),
+        None => panic!("route binding should still resolve"),
     }
 
     let dependencies_after_generation_advance = store
@@ -2585,14 +2585,14 @@ async fn exercise_complete_wake(
         "non-ready materialization must not load"
     );
 
-    match store
-        .resolve_route(ResolveRouteRequest::new(
-            http_identity("complete-wake.example.com", None),
-            MaterializationTarget::new("cluster-complete", "apps").unwrap(),
-        ))
-        .await?
+    match resolve_route(
+        store,
+        http_identity("complete-wake.example.com", None),
+        MaterializationTarget::new("cluster-complete", "apps").unwrap(),
+    )
+    .await?
     {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(entry.route_binding_id, route_binding_id);
             assert_eq!(entry.instance_id, completed.instance.id);
             assert_eq!(entry.instance_state, InstanceState::Running);
@@ -2603,7 +2603,7 @@ async fn exercise_complete_wake(
             );
             assert_eq!(entry.backend_generation, Some(BackendGeneration::new(7)));
         }
-        RouteResolution::Miss { .. } => panic!("route should resolve after complete_wake"),
+        None => panic!("route should resolve after complete_wake"),
     }
     let dependencies = store
         .lookup_route_dependencies(RouteDependencyLookup::new(route_binding_id))
@@ -2888,14 +2888,14 @@ async fn exercise_complete_wake(
         .expect("rewind complete_wake target still exists");
     assert_eq!(rewind_after.state, InstanceState::Waking);
     assert_eq!(rewind_after.generation, Generation::new(1));
-    match store
-        .resolve_route(ResolveRouteRequest::new(
-            http_identity("complete-wake-rewind.example.com", None),
-            MaterializationTarget::new("cluster-complete", "rewind").unwrap(),
-        ))
-        .await?
+    match resolve_route(
+        store,
+        http_identity("complete-wake-rewind.example.com", None),
+        MaterializationTarget::new("cluster-complete", "rewind").unwrap(),
+    )
+    .await?
     {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(entry.route_binding_id, rewind_route_binding_id);
             assert_eq!(entry.instance_state, InstanceState::Waking);
             assert_eq!(entry.instance_generation, Generation::new(1));
@@ -2905,7 +2905,7 @@ async fn exercise_complete_wake(
             );
             assert_eq!(entry.backend_generation, Some(BackendGeneration::new(9)));
         }
-        RouteResolution::Miss { .. } => {
+        None => {
             panic!("route should still resolve to the unchanged old materialization")
         }
     }
@@ -2949,7 +2949,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::exact("App.Routes.Example.COM.").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     assert_eq!(
@@ -2971,7 +2970,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::exact("app.routes.example.com").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     assert_eq!(repeated_exact, exact_root);
@@ -2989,7 +2987,6 @@ async fn exercise_route_bindings(
                 "route-exact-root",
                 instance_id,
                 identity,
-                ProtocolRoute::Http,
             ))
             .await
             .expect_err("a different request for an existing binding ID is refused");
@@ -3012,7 +3009,6 @@ async fn exercise_route_bindings(
             "route-duplicate-identity",
             "instance-routes",
             http_identity("APP.ROUTES.EXAMPLE.COM.", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("duplicate normalized route identity is rejected");
@@ -3028,7 +3024,6 @@ async fn exercise_route_bindings(
             "route-exact-root",
             "instance-routes",
             http_identity("duplicate-id.routes.example.com", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("duplicate route binding ID is rejected");
@@ -3044,7 +3039,6 @@ async fn exercise_route_bindings(
             "route-missing-instance",
             "missing-instance",
             http_identity("missing.routes.example.com", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("route binding must point at an existing instance");
@@ -3055,26 +3049,11 @@ async fn exercise_route_bindings(
         }
     ));
 
-    let protocol_mismatch = store
-        .create_route_binding(create_route_binding_request(
-            "route-protocol-mismatch",
-            "instance-routes",
-            http_identity("mismatch.routes.example.com", None),
-            ProtocolRoute::TlsSni,
-        ))
-        .await
-        .expect_err("route identity and protocol must be compatible");
-    assert!(matches!(
-        protocol_mismatch,
-        StoreError::InvalidArgument { .. }
-    ));
-
     let exact_api = store
         .create_route_binding(create_route_binding_request(
             "route-exact-api",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api")),
-            ProtocolRoute::Http,
         ))
         .await?;
     let exact_api_v1 = store
@@ -3082,7 +3061,6 @@ async fn exercise_route_bindings(
             "route-exact-api-v1",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api/v1")),
-            ProtocolRoute::Http,
         ))
         .await?;
     let wildcard_broad = store
@@ -3093,7 +3071,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::wildcard_suffix("routes.example.com").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     let wildcard_specific = store
@@ -3105,7 +3082,6 @@ async fn exercise_route_bindings(
                     .expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
 
@@ -3151,7 +3127,6 @@ async fn exercise_route_bindings(
             "route-sni-exact",
             "instance-routes",
             sni_identity("DB.Routes.Example.COM."),
-            ProtocolRoute::TlsSni,
         ))
         .await?;
     let sni_wildcard = store
@@ -3161,7 +3136,6 @@ async fn exercise_route_bindings(
             RouteIdentity::Sni {
                 host: RouteHost::wildcard_suffix("routes.example.com").expect("valid host"),
             },
-            ProtocolRoute::TlsSni,
         ))
         .await?;
     let duplicate_sni = store
@@ -3169,7 +3143,6 @@ async fn exercise_route_bindings(
             "route-sni-duplicate",
             "instance-routes",
             sni_identity("db.routes.example.com"),
-            ProtocolRoute::TlsSni,
         ))
         .await
         .expect_err("duplicate normalized SNI identity is rejected");
@@ -3187,20 +3160,16 @@ async fn exercise_route_bindings(
     )
     .await?;
 
-    let miss = store
-        .resolve_route(ResolveRouteRequest::new(
-            http_identity("routes.example.com", None),
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?;
-    match miss {
-        RouteResolution::Miss { negative_cache } => {
-            assert!(negative_cache.ttl() > Duration::from_secs(0));
-        }
-        RouteResolution::Resolved { entry, .. } => {
-            panic!("base wildcard suffix should not match itself: {entry:?}")
-        }
-    }
+    let miss = resolve_route(
+        store,
+        http_identity("routes.example.com", None),
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?;
+    assert_eq!(
+        miss, None,
+        "a wildcard suffix does not match its own base name"
+    );
 
     assert!(
         store
@@ -3226,23 +3195,208 @@ async fn exercise_route_bindings(
     Ok(())
 }
 
+/// The path a proxy matches for a request identity: `/` when an HTTP request
+/// has none, and nothing for SNI.
+fn request_path(identity: &RouteIdentity) -> &str {
+    match identity {
+        RouteIdentity::Http { path, .. } => path.as_ref().map_or("/", |path| path.as_str()),
+        RouteIdentity::Sni { .. } => "",
+    }
+}
+
+/// Routes one request as a proxy does: the host's rule set from the store,
+/// then the first rule that covers the path.
+async fn resolve_route(
+    store: &PostgresStore,
+    identity: RouteIdentity,
+    target: MaterializationTarget,
+) -> Result<Option<RouteEntry>, StoreError> {
+    let rules = store
+        .resolve_host_rules(ResolveHostRulesRequest::new(
+            identity.kind(),
+            identity.host().clone(),
+            target,
+        ))
+        .await?;
+    Ok(rules
+        .select(request_path(&identity))
+        .map(|rule| rule.entry.clone()))
+}
+
+/// The binding Postgres itself picks for one request: among the bindings whose
+/// host and path cover it, an exact host first, then the longer suffix, then
+/// the longer path prefix.
+const RESOLVE_ONE_REQUEST_SQL: &str = "
+    SELECT route_binding_id FROM route_bindings
+    WHERE identity_kind = $1
+        AND ((host_kind = 'exact' AND host = $2)
+            OR (host_kind = 'wildcard_suffix'
+                AND right($2, octet_length(host) + 1) = '.' || host))
+        AND (path_prefix IS NULL OR path_prefix = '/' OR path_prefix = $3
+            OR (right(path_prefix, 1) = '/' AND starts_with($3, path_prefix))
+            OR starts_with($3, path_prefix || '/'))
+    ORDER BY (host_kind = 'exact') DESC, octet_length(host) DESC,
+        COALESCE(octet_length(path_prefix), 0) DESC, route_binding_id
+    LIMIT 1
+";
+
+/// Asserts that matching a request against the host's rule set picks the
+/// binding Postgres resolves for that request.
+async fn assert_local_match_equals_postgres(
+    store: &PostgresStore,
+    raw: &tokio_postgres::Client,
+    identity: RouteIdentity,
+    context: &str,
+) -> TestResult {
+    let kind = match identity {
+        RouteIdentity::Http { .. } => "http",
+        RouteIdentity::Sni { .. } => "sni",
+    };
+    let resolved: Option<String> = raw
+        .query_opt(
+            RESOLVE_ONE_REQUEST_SQL,
+            &[&kind, &identity.host().as_str(), &request_path(&identity)],
+        )
+        .await?
+        .map(|row| row.get(0));
+    let local = resolve_route(
+        store,
+        identity.clone(),
+        MaterializationTarget::new("target", "apps")?,
+    )
+    .await?
+    .map(|entry| entry.route_binding_id.as_str().to_owned());
+    assert_eq!(local, resolved, "{context}: {identity:?}");
+    Ok(())
+}
+
+/// A deterministic generator, so a failure names the round that produced it.
+struct Random(u64);
+
+impl Random {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+
+    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+}
+
+/// Random binding sets over nested hosts and overlapping path prefixes, each
+/// checked with random requests.
+async fn local_matching_equals_postgres_for_random_binding_sets(
+    store: &PostgresStore,
+    raw: &tokio_postgres::Client,
+    instance_id: &str,
+) -> TestResult {
+    let exact_hosts = [
+        "prop.example.net",
+        "a.prop.example.net",
+        "b.a.prop.example.net",
+        "c.b.a.prop.example.net",
+        "ab.prop.example.net",
+    ];
+    let suffixes = [
+        "prop.example.net",
+        "a.prop.example.net",
+        "b.a.prop.example.net",
+        "ab.prop.example.net",
+    ];
+    let prefixes = [
+        None,
+        Some("/"),
+        Some("/a"),
+        Some("/a/"),
+        Some("/a/b"),
+        Some("/ab"),
+        Some("/a/%_"),
+    ];
+    let paths = [
+        "/", "/a", "/a/", "/a/b", "/a/b/c", "/ab", "/abc", "/b", "/a/%_", "/a/xy",
+    ];
+    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    for round in 0..40 {
+        let mut identities: Vec<RouteIdentity> = Vec::new();
+        for _ in 0..random.below(14) {
+            let host = if random.below(2) == 0 {
+                RouteHost::exact(random.pick(&exact_hosts))?
+            } else {
+                RouteHost::wildcard_suffix(random.pick(&suffixes))?
+            };
+            let identity = if random.below(4) == 0 {
+                RouteIdentity::Sni { host }
+            } else {
+                RouteIdentity::Http {
+                    host,
+                    path: random.pick(&prefixes).map(PathPrefix::new).transpose()?,
+                }
+            };
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        let mut bindings = Vec::new();
+        for (index, identity) in identities.iter().enumerate() {
+            let id = format!("prop-{round}-{index}");
+            bindings.push(
+                store
+                    .create_route_binding(create_route_binding_request(
+                        &id,
+                        instance_id,
+                        identity.clone(),
+                    ))
+                    .await?
+                    .id,
+            );
+        }
+        for _ in 0..24 {
+            let host = RouteHost::exact(random.pick(&exact_hosts))?;
+            let request = if random.below(4) == 0 {
+                RouteIdentity::Sni { host }
+            } else {
+                RouteIdentity::Http {
+                    host,
+                    path: Some(PathPrefix::new(*random.pick(&paths))?),
+                }
+            };
+            assert_local_match_equals_postgres(
+                store,
+                raw,
+                request,
+                &format!("round {round} with {identities:?}"),
+            )
+            .await?;
+        }
+        for binding in bindings {
+            store
+                .delete_route_binding(DeleteRouteBindingRequest::new(binding))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn assert_resolves_to(
     store: &PostgresStore,
     identity: RouteIdentity,
     expected_route_binding_id: &RouteBindingId,
 ) -> Result<(), StoreError> {
-    match store
-        .resolve_route(ResolveRouteRequest::new(
-            identity,
-            MaterializationTarget::new("cluster-a", "default").unwrap(),
-        ))
-        .await?
+    match resolve_route(
+        store,
+        identity,
+        MaterializationTarget::new("cluster-a", "default").unwrap(),
+    )
+    .await?
     {
-        RouteResolution::Resolved { entry, .. } => {
+        Some(entry) => {
             assert_eq!(&entry.route_binding_id, expected_route_binding_id);
             Ok(())
         }
-        RouteResolution::Miss { .. } => panic!("route should resolve"),
+        None => panic!("route should resolve"),
     }
 }
 
@@ -3380,13 +3534,11 @@ fn create_route_binding_request(
     route_binding_id: &str,
     instance_id: &str,
     identity: RouteIdentity,
-    protocol: ProtocolRoute,
 ) -> CreateRouteBindingRequest {
     CreateRouteBindingRequest::new(
         RouteBindingId::new(route_binding_id).expect("valid route binding ID"),
         InstanceId::new(instance_id).expect("valid instance ID"),
         identity,
-        protocol,
     )
 }
 
@@ -3717,7 +3869,7 @@ async fn phase5_route_scale_snapshot_and_target(
     let request = create_instance_request("phase5-routing", class.reference.clone(), vec![]);
     let instance = store.create_instance(request).await?.instance;
     let mut raw = raw_client(config).await?;
-    raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host, protocol) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net', 'http' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
+    raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
     let rules = [
         (
             "broad",
@@ -3753,7 +3905,6 @@ async fn phase5_route_scale_snapshot_and_target(
                 name,
                 instance.id.as_str(),
                 identity.clone(),
-                ProtocolRoute::Http,
             ))
             .await?;
     }
@@ -3772,29 +3923,17 @@ async fn phase5_route_scale_snapshot_and_target(
             Some("/api/v1/users"),
             Some("/api/%_/child"),
         ] {
-            let identity = http_identity(host, path);
-            let expected = rules
-                .iter()
-                .filter_map(|(name, rule)| {
-                    control_plane::route::route_match_score(rule, &identity)
-                        .map(|score| (score, *name))
-                })
-                .max_by_key(|(score, _)| *score);
-            match store
-                .resolve_route(ResolveRouteRequest::new(
-                    identity,
-                    MaterializationTarget::new("target", "apps")?,
-                ))
-                .await?
-            {
-                RouteResolution::Resolved { entry, .. } => assert_eq!(
-                    Some(entry.route_binding_id.as_str()),
-                    expected.map(|(_, name)| name)
-                ),
-                RouteResolution::Miss { .. } => assert!(expected.is_none()),
-            }
+            assert_local_match_equals_postgres(
+                store,
+                &raw,
+                http_identity(host, path),
+                "fixed rules among 100k unrelated routes",
+            )
+            .await?;
         }
     }
+    local_matching_equals_postgres_for_random_binding_sets(store, &raw, instance.id.as_str())
+        .await?;
     let running = wake_to_running(store, instance.id.clone()).await?;
     for (cluster, generation, uri) in [
         ("target", 1, "http://127.0.0.1:8081"),
@@ -3810,13 +3949,15 @@ async fn phase5_route_scale_snapshot_and_target(
         materialization.backend = Some(BackendEndpoint::new(uri)?);
         store.record_materialization(materialization).await?;
     }
-    let lookup = ResolveRouteRequest::new(
-        http_identity("app.customer.example.net", None),
-        MaterializationTarget::new("target", "apps")?,
-    );
-    let resolution = store.resolve_route(lookup.clone()).await?;
+    let lookup = || {
+        resolve_route(
+            store,
+            http_identity("app.customer.example.net", None),
+            MaterializationTarget::new("target", "apps").unwrap(),
+        )
+    };
     assert!(
-        matches!(resolution, RouteResolution::Resolved { entry, .. } if entry.backend.as_ref().unwrap().uri() == "http://127.0.0.1:8081")
+        matches!(lookup().await?, Some(entry) if entry.backend.as_ref().unwrap().uri() == "http://127.0.0.1:8081")
     );
     // During a concurrent uncommitted cascade the complete pre-delete snapshot
     // remains usable; after commit resolution is a miss, never NotFound.
@@ -3827,16 +3968,10 @@ async fn phase5_route_scale_snapshot_and_target(
             &[&instance.id.as_str()],
         )
         .await?;
-    assert!(matches!(
-        store.resolve_route(lookup.clone()).await?,
-        RouteResolution::Resolved { .. }
-    ));
+    assert!(lookup().await?.is_some());
     deletion.commit().await?;
-    assert!(matches!(
-        store.resolve_route(lookup).await?,
-        RouteResolution::Miss { .. }
-    ));
-    eprintln!("phase5 route_scale_snapshot_and_target passed; matcher parity over 100k routes, correct target backend, atomic delete/miss");
+    assert_eq!(lookup().await?, None);
+    eprintln!("phase5 route_scale_snapshot_and_target passed; local matching equals Postgres resolution over 100k routes and random binding sets, correct target backend, atomic delete/miss");
     Ok(())
 }
 
@@ -4853,5 +4988,7 @@ mod certificates;
 #[path = "postgres_store/crash_boundaries.rs"]
 mod crash_boundaries;
 
+#[path = "postgres_store/host_rule_bounds.rs"]
+mod host_rule_bounds;
 #[path = "postgres_store/lifecycle_recovery.rs"]
 mod lifecycle_recovery;

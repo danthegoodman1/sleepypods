@@ -5,6 +5,101 @@ use crate::{
     store::{StoreError, StoreResult},
 };
 
+/// Names the channel the route-change trigger notifies at commit for the
+/// schema this connection's store lives in.
+const ROUTE_CHANGE_CHANNEL: &str = "SELECT 'sleepypods_routes_' || md5(current_schema())";
+const LISTENER_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const LISTENER_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One dedicated connection that listens for route-change notifications and
+/// wakes the dispatcher. It starts with the first subscriber and stops when
+/// the store is dropped. Notifications are a wake-up only: the dispatcher reads
+/// the outbox by cursor, so a missed notification delays a change by one poll.
+#[derive(Clone)]
+pub(crate) struct RouteChangeListener {
+    shared: std::sync::Arc<ListenerShared>,
+}
+
+struct ListenerShared {
+    config: tokio_postgres::Config,
+    signal: std::sync::Arc<tokio::sync::Notify>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl RouteChangeListener {
+    pub(super) fn new(mut config: tokio_postgres::Config) -> Self {
+        config.keepalives(true);
+        config.keepalives_idle(LISTENER_KEEPALIVE_IDLE);
+        Self {
+            shared: std::sync::Arc::new(ListenerShared {
+                config,
+                signal: std::sync::Arc::new(tokio::sync::Notify::new()),
+                task: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(super) fn subscribe(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        let mut task = self.shared.task.lock().expect("route change listener");
+        if task.is_none() {
+            *task = Some(tokio::spawn(listen_for_route_changes(
+                self.shared.config.clone(),
+                self.shared.signal.clone(),
+            )));
+        }
+        self.shared.signal.clone()
+    }
+}
+
+impl Drop for ListenerShared {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.get_mut().expect("route change listener").take() {
+            task.abort();
+        }
+    }
+}
+
+impl std::fmt::Debug for RouteChangeListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteChangeListener")
+            .finish_non_exhaustive()
+    }
+}
+
+async fn listen_for_route_changes(
+    config: tokio_postgres::Config,
+    signal: std::sync::Arc<tokio::sync::Notify>,
+) {
+    loop {
+        if let Ok((client, mut connection)) = config.connect(tokio_postgres::NoTls).await {
+            let notifications = async {
+                while let Some(Ok(message)) =
+                    std::future::poll_fn(|cx| connection.poll_message(cx)).await
+                {
+                    if matches!(message, tokio_postgres::AsyncMessage::Notification(_)) {
+                        signal.notify_one();
+                    }
+                }
+            };
+            tokio::pin!(notifications);
+            let listen = async {
+                let channel: String = client.query_one(ROUTE_CHANGE_CHANNEL, &[]).await?.get(0);
+                client.batch_execute(&format!("LISTEN {channel}")).await
+            };
+            let listening = tokio::select! {
+                _ = &mut notifications => false,
+                result = listen => result.is_ok(),
+            };
+            if listening {
+                // Changes committed while no connection was listening.
+                signal.notify_one();
+                notifications.await;
+            }
+        }
+        tokio::time::sleep(LISTENER_RECONNECT_DELAY).await;
+    }
+}
+
 pub(super) async fn revision(store: &PostgresStore) -> StoreResult<u64> {
     let client = store.client().await?;
     let row = client

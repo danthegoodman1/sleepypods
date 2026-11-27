@@ -17,7 +17,7 @@ use control_plane::api::pb::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteHttp01ChallengeRequest, DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity, Instance,
-    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, ProxyWakeInstanceRequest,
+    InstanceState as PbInstanceState, ManifestTemplate, ProxyWakeInstanceRequest,
     PutHttp01ChallengeRequest, ReconcileMaterializationRequest, ReconcileMaterializationResponse,
     ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
     ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
@@ -1023,7 +1023,6 @@ async fn create_route(
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 

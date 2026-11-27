@@ -1,10 +1,8 @@
 use std::{
-    collections::VecDeque,
     convert::Infallible,
-    fmt,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -21,14 +19,14 @@ use hyper_util::{
 use proxy_core::{DrainTracker, Shutdown};
 use rcgen::generate_simple_self_signed;
 use sleepypods_api::{
-    BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
-    Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
-    RouteHost, RouteIdentity,
+    BackendEndpoint, BackendGeneration, Generation, Http01ChallengeKey, Http01ChallengeRecord,
+    InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry, RouteHost, RouteIdentity,
+    RouteKind, RouteRule,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{oneshot, Mutex as TokioMutex},
+    sync::oneshot,
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::{
@@ -56,11 +54,10 @@ use super::{
     FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
 };
 use crate::{
-    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineRouteOutcome, FrontlineRouteResolver,
-    FrontlineTlsAdapter, Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteRequestId,
-    RouteSubscriptionClient, RouteSubscriptionFuture, SubscribeControlPlaneOutput, SubscriptionId,
-    SubscriptionState, TlsCertificateStore, WakeClient, WakeClientFuture, WakeInstanceRequest,
-    WakeInstanceResponse, WakeTracker,
+    route::testing::{FakeControlPlane, FakeWake},
+    FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineTlsAdapter,
+    Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteLookupCounters,
+    RouteSubscriptionClient, TlsCertificateStore, WakeClient,
 };
 
 /// A frontline that serves plain HTTP on `listener` with default bounds.
@@ -107,17 +104,12 @@ where
 
 const READY_RESPONSE: &[u8] = b"ready-from-listener-upstream";
 const TLS_REQUEST_BODY: &[u8] = b"tls-listener-request";
-type BlockingSubscribeResponse =
-    oneshot::Receiver<Result<SubscribeControlPlaneOutput, TestRouteError>>;
 
 #[tokio::test]
 async fn actual_serve_boundary_rejects_oversized_programmatic_activation_budget() {
-    let coordinator = FrontlineRouteCoordinator::new(
-        FrontlineRouteResolver::from_parts(SubscriptionState::new(4), FakeRouteClient::default()),
-        WakeTracker::new(),
-        FakeWakeClient::default(),
-    )
-    .with_route_deadline(Duration::from_secs(131));
+    let coordinator =
+        FrontlineRouteCoordinator::new(4, FakeControlPlane::default(), FakeWake::default())
+            .with_route_deadline(Duration::from_secs(131));
     let runtime = FrontlineHttpRuntime::new(coordinator, DrainTracker::new(Duration::from_secs(1)));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -139,162 +131,8 @@ async fn actual_serve_boundary_rejects_oversized_programmatic_activation_budget(
 }
 
 #[derive(Clone, Debug, Default)]
-struct FakeRouteClient {
-    calls: Arc<Mutex<Vec<RouteClientCall>>>,
-    subscribe_responses: Arc<Mutex<VecDeque<Result<SubscribeControlPlaneOutput, TestRouteError>>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RouteClientCall {
-    Subscribe {
-        request_id: RouteRequestId,
-        identity: RouteIdentity,
-    },
-    Unsubscribe {
-        subscription_id: SubscriptionId,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TestRouteError;
-
-#[derive(Clone, Debug, Default)]
-struct FakeWakeClient {
-    calls: Arc<Mutex<Vec<WakeInstanceRequest>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TestWakeError;
-
-#[derive(Clone, Debug, Default)]
 struct FakeHttp01Resolver {
     calls: Arc<Mutex<Vec<(String, String)>>>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct BlockingRouteClient {
-    calls: Arc<Mutex<Vec<RouteClientCall>>>,
-    subscribe_responses: Arc<Mutex<VecDeque<BlockingSubscribeResponse>>>,
-    subscribe_notifications: Arc<Mutex<VecDeque<oneshot::Sender<()>>>>,
-}
-
-impl FakeRouteClient {
-    fn push_subscribe_response(&self, response: SubscribeControlPlaneOutput) {
-        self.subscribe_responses
-            .lock()
-            .expect("responses lock")
-            .push_back(Ok(response));
-    }
-
-    fn calls(&self) -> Vec<RouteClientCall> {
-        self.calls.lock().expect("calls lock").clone()
-    }
-}
-
-impl BlockingRouteClient {
-    fn push_subscribe_response_channel(
-        &self,
-    ) -> oneshot::Sender<Result<SubscribeControlPlaneOutput, TestRouteError>> {
-        let (tx, rx) = oneshot::channel();
-        self.subscribe_responses
-            .lock()
-            .expect("responses lock")
-            .push_back(rx);
-        tx
-    }
-
-    fn notify_next_subscribe(&self) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        self.subscribe_notifications
-            .lock()
-            .expect("notifications lock")
-            .push_back(tx);
-        rx
-    }
-
-    fn calls(&self) -> Vec<RouteClientCall> {
-        self.calls.lock().expect("calls lock").clone()
-    }
-}
-
-impl RouteSubscriptionClient for FakeRouteClient {
-    type Error = TestRouteError;
-
-    fn subscribe_route(
-        &mut self,
-        request_id: RouteRequestId,
-        identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(RouteClientCall::Subscribe {
-                request_id,
-                identity,
-            });
-        let response = self
-            .subscribe_responses
-            .lock()
-            .expect("responses lock")
-            .pop_front()
-            .expect("queued subscribe response");
-        Box::pin(async move { response })
-    }
-
-    fn unsubscribe(
-        &mut self,
-        subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(RouteClientCall::Unsubscribe { subscription_id });
-        Box::pin(async { Ok(()) })
-    }
-}
-
-impl RouteSubscriptionClient for BlockingRouteClient {
-    type Error = TestRouteError;
-
-    fn subscribe_route(
-        &mut self,
-        request_id: RouteRequestId,
-        identity: RouteIdentity,
-    ) -> RouteSubscriptionFuture<'static, SubscribeControlPlaneOutput, Self::Error> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(RouteClientCall::Subscribe {
-                request_id,
-                identity,
-            });
-        if let Some(notification) = self
-            .subscribe_notifications
-            .lock()
-            .expect("notifications lock")
-            .pop_front()
-        {
-            let _ = notification.send(());
-        }
-        let response = self
-            .subscribe_responses
-            .lock()
-            .expect("responses lock")
-            .pop_front()
-            .expect("queued subscribe response channel");
-        Box::pin(async move { response.await.expect("subscribe response sent") })
-    }
-
-    fn unsubscribe(
-        &mut self,
-        subscription_id: SubscriptionId,
-    ) -> RouteSubscriptionFuture<'static, (), Self::Error> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(RouteClientCall::Unsubscribe { subscription_id });
-        Box::pin(async { Ok(()) })
-    }
 }
 
 impl FakeHttp01Resolver {
@@ -318,54 +156,21 @@ impl Http01ChallengeResolver for FakeHttp01Resolver {
     }
 }
 
-impl WakeClient for FakeWakeClient {
-    type Error = TestWakeError;
-
-    fn wake_instance(
-        &mut self,
-        request: WakeInstanceRequest,
-    ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
-        self.calls.lock().expect("calls lock").push(request);
-        Box::pin(async { panic!("wake should not be called in listener tests") })
-    }
-}
-
-impl fmt::Display for TestRouteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("route error")
-    }
-}
-
-impl std::error::Error for TestRouteError {}
-
-impl fmt::Display for TestWakeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("wake error")
-    }
-}
-
-impl std::error::Error for TestWakeError {}
-
 #[tokio::test]
 async fn listener_forwards_http_request_through_ready_route() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-ready"),
-            http_identity("app.example.com", "/ready"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/ready"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
-    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
 
     let response = listener_request(addr, "app.example.com", "/ready?via=listener").await;
 
@@ -379,7 +184,7 @@ async fn listener_forwards_http_request_through_ready_route() {
             .to_bytes(),
         Bytes::from_static(READY_RESPONSE)
     );
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -392,22 +197,17 @@ async fn listener_forwards_http_request_through_ready_route() {
 async fn listener_applies_forwarded_header_trust_policy_to_http_upstream() {
     let (upstream_addr, upstream_task) =
         spawn_forwarded_header_asserting_http_upstream("http").await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-forwarded-http"),
-            http_identity("app.example.com", "/forwarded"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/forwarded"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
-    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
     let client = Client::builder(TokioExecutor::new()).build_http();
 
     let response = client
@@ -431,7 +231,7 @@ async fn listener_applies_forwarded_header_trust_policy_to_http_upstream() {
         .expect("listener request succeeds");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -444,20 +244,15 @@ async fn listener_applies_forwarded_header_trust_policy_to_http_upstream() {
 async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::CREATED, READY_RESPONSE).await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-tls"),
-            http_identity("app.example.com", "/secure"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/secure"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let http_addr = reserve_addr().await;
     let tls_addr = reserve_addr().await;
@@ -470,7 +265,6 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
         .expect("cert inserts");
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
-        state,
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(5)),
     );
@@ -498,7 +292,7 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
         response.ends_with("ready-from-listener-upstream"),
         "{response}"
     );
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -512,20 +306,15 @@ async fn frontline_runtime_wires_tls_termination_listener_to_http_forwarding() {
 async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream() {
     let (upstream_addr, upstream_task) =
         spawn_forwarded_header_asserting_http_upstream("https").await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-forwarded-tls"),
-            http_identity("app.example.com", "/secure-forwarded"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/secure-forwarded"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let http_addr = reserve_addr().await;
     let tls_addr = reserve_addr().await;
@@ -538,7 +327,6 @@ async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream(
         .expect("cert inserts");
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
-        state,
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(5)),
     );
@@ -569,7 +357,7 @@ async fn tls_termination_applies_forwarded_header_trust_policy_to_http_upstream(
     .await;
 
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -608,23 +396,21 @@ async fn frontline_runtime_wires_tls_passthrough_listener_to_sni_route_and_prese
         }
     });
 
-    let route_client = FakeRouteClient::default();
+    let route_client = FakeControlPlane::default();
     let request_identity = sni_identity("db.example.com");
-    route_client.push_subscribe_response(resolved_response(
-        generated_request_id(1),
-        subscription_id("sub-sni"),
-        request_identity.clone(),
+    seed(
+        &route_client,
+        request_identity,
         route_entry(
             InstanceState::Running,
             7,
             Some((format!("tcp://{upstream_addr}"), 3)),
         ),
-    ));
+    );
     let http_addr = reserve_addr().await;
     let passthrough_addr = reserve_addr().await;
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
-        SubscriptionState::new(4),
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(5)),
     );
@@ -654,12 +440,10 @@ async fn frontline_runtime_wires_tls_passthrough_listener_to_sni_route_and_prese
 
     assert_eq!(response, upstream_response);
     assert_eq!(
-        route_client.calls(),
-        vec![RouteClientCall::Subscribe {
-            request_id: generated_request_id(1),
-            identity: request_identity,
-        }]
+        route_client.subscribes_for(RouteKind::Sni, "db.example.com"),
+        1
     );
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -670,12 +454,11 @@ async fn frontline_runtime_wires_tls_passthrough_listener_to_sni_route_and_prese
 
 #[tokio::test]
 async fn tls_passthrough_listener_rejects_malformed_or_missing_sni_without_route_lookup() {
-    let route_client = FakeRouteClient::default();
+    let route_client = FakeControlPlane::default();
     let http_addr = reserve_addr().await;
     let passthrough_addr = reserve_addr().await;
     let shutdown = Shutdown::new();
     let runtime = runtime_with_state(
-        SubscriptionState::new(4),
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(5)),
     );
@@ -714,7 +497,7 @@ async fn tls_passthrough_listener_rejects_malformed_or_missing_sni_without_route
 
     assert!(malformed_response.is_empty());
     assert!(missing_sni_response.is_empty());
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 0);
 
     shutdown.shutdown();
     task.await
@@ -725,22 +508,17 @@ async fn tls_passthrough_listener_rejects_malformed_or_missing_sni_without_route
 #[tokio::test]
 async fn listener_h2c_grpc_shaped_request_routes_and_preserves_body_trailers() {
     let (upstream_addr, upstream_task) = spawn_h2c_grpc_upstream().await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-h2c"),
-            http_identity("grpc.example.com", "/grpc.Test/Echo"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("grpc.example.com", "/grpc.Test/Echo"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
-    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
     let stream = TcpStream::connect(addr).await.expect("h2c client connects");
     let (mut sender, connection) =
         client_http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
@@ -787,7 +565,7 @@ async fn listener_h2c_grpc_shaped_request_routes_and_preserves_body_trailers() {
     );
     assert_eq!(trailers.get("grpc-status").expect("grpc-status"), "0");
     assert_eq!(trailers.get("grpc-message").expect("grpc-message"), "ok");
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     client_task.await.expect("h2c client task joins");
@@ -803,20 +581,15 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
         .await
         .expect("upstream binds");
     let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-websocket"),
-            http_identity("ws.example.com", "/socket"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("ws.example.com", "/socket"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let (path_seen_tx, path_seen_rx) = oneshot::channel();
     let upstream_task = tokio::spawn(async move {
@@ -863,7 +636,7 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
         assert!(matches!(close, Message::Close(Some(_))));
         websocket.flush().await.expect("upstream flushes close");
     });
-    let (addr, shutdown, task) = spawn_frontline_listener(state, route_client.clone()).await;
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
     let mut request = format!("ws://{addr}/socket?room=blue")
         .into_client_request()
         .expect("websocket request builds");
@@ -940,7 +713,7 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
         .expect("client receives close")
         .expect("close frame valid");
     assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "done"));
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
     drop(client);
 
     upstream_task.await.expect("upstream task joins");
@@ -953,20 +726,15 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
 #[tokio::test]
 async fn listener_websocket_backend_refusal_expires_without_upgrade() {
     let refused_addr = reserve_addr().await;
-    let route_client = FakeRouteClient::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-websocket-refused"),
-            http_identity("ws-refused.example.com", "/socket"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{refused_addr}"), 3)),
-            ),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("ws-refused.example.com", "/socket"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{refused_addr}"), 3)),
         ),
-        now(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -980,7 +748,6 @@ async fn listener_websocket_backend_refusal_expires_without_upgrade() {
         .unwrap();
     let admission = proxy_core::ProxyAdmission::new(resources);
     let runtime = runtime_with_state(
-        state,
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(1)),
     );
@@ -1001,7 +768,7 @@ async fn listener_websocket_backend_refusal_expires_without_upgrade() {
     .unwrap();
 
     assert!(status.starts_with("HTTP/1.1 504"), "{status}");
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
     tokio::time::timeout(Duration::from_secs(1), async {
         while admission.requests.in_flight() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1020,21 +787,16 @@ async fn listener_websocket_backend_refusal_expires_without_upgrade() {
 async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
-    let route_client = FakeRouteClient::default();
+    let route_client = FakeControlPlane::default();
     let http01_resolver = FakeHttp01Resolver::default();
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-normal"),
-            http_identity("app.example.com", "/normal"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    seed(
+        &route_client,
+        http_identity("app.example.com", "/normal"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1042,11 +804,7 @@ async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
     let addr = listener.local_addr().expect("listener addr");
     let shutdown = Shutdown::new();
     let runtime = FrontlineHttpRuntime::with_http01_resolver(
-        FrontlineRouteCoordinator::new(
-            FrontlineRouteResolver::from_parts(state, route_client.clone()),
-            WakeTracker::new(),
-            FakeWakeClient::default(),
-        ),
+        FrontlineRouteCoordinator::new(4, route_client.clone(), FakeWake::default()),
         http01_resolver.clone(),
         DrainTracker::new(Duration::from_secs(5)),
     );
@@ -1065,7 +823,7 @@ async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
         Bytes::from_static(READY_RESPONSE)
     );
     assert!(http01_resolver.calls().is_empty());
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 1);
 
     shutdown.shutdown();
     task.await
@@ -1076,24 +834,15 @@ async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
 
 #[tokio::test]
 async fn listener_route_miss_returns_not_found() {
-    let route_client = FakeRouteClient::default();
-    let request_identity = http_identity("missing.example.com", "/");
-    route_client.push_subscribe_response(miss_response(
-        generated_request_id(1),
-        request_identity.clone(),
-    ));
-    let (addr, shutdown, task) =
-        spawn_frontline_listener(SubscriptionState::new(4), route_client.clone()).await;
+    let route_client = FakeControlPlane::default();
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
 
     let response = listener_request(addr, "missing.example.com", "/").await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        route_client.calls(),
-        vec![RouteClientCall::Subscribe {
-            request_id: generated_request_id(1),
-            identity: request_identity,
-        }]
+        route_client.subscribes_for(RouteKind::Http, "missing.example.com"),
+        1
     );
 
     shutdown.shutdown();
@@ -1104,9 +853,8 @@ async fn listener_route_miss_returns_not_found() {
 
 #[tokio::test]
 async fn listener_invalid_or_missing_host_returns_bad_request_without_control_plane_call() {
-    let route_client = FakeRouteClient::default();
-    let (addr, shutdown, task) =
-        spawn_frontline_listener(SubscriptionState::new(4), route_client.clone()).await;
+    let route_client = FakeControlPlane::default();
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
 
     let invalid = listener_request(addr, "localhost", "/").await;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
@@ -1118,7 +866,7 @@ async fn listener_invalid_or_missing_host_returns_bad_request_without_control_pl
     let status = read_status_line(&mut raw).await;
     assert!(status.starts_with("HTTP/1.1 400"), "{status}");
 
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 0);
 
     shutdown.shutdown();
     task.await
@@ -1128,9 +876,8 @@ async fn listener_invalid_or_missing_host_returns_bad_request_without_control_pl
 
 #[tokio::test]
 async fn listener_websocket_invalid_or_missing_host_rejects_without_control_plane_call() {
-    let route_client = FakeRouteClient::default();
-    let (addr, shutdown, task) =
-        spawn_frontline_listener(SubscriptionState::new(4), route_client.clone()).await;
+    let route_client = FakeControlPlane::default();
+    let (addr, shutdown, task) = spawn_frontline_listener(route_client.clone()).await;
 
     let missing_host_status = raw_websocket_upgrade_status(addr, None).await;
     assert!(
@@ -1144,7 +891,7 @@ async fn listener_websocket_invalid_or_missing_host_rejects_without_control_plan
         "{invalid_host_status}"
     );
 
-    assert!(route_client.calls().is_empty());
+    assert_eq!(route_client.subscribes(), 0);
 
     shutdown.shutdown();
     task.await
@@ -1155,28 +902,23 @@ async fn listener_websocket_invalid_or_missing_host_rejects_without_control_plan
 #[tokio::test]
 async fn listener_shutdown_drains_active_http_response() {
     let (upstream_addr, release_upstream, upstream_task) = spawn_chunked_upstream().await;
-    let route_client = FakeRouteClient::default();
+    let route_client = FakeControlPlane::default();
     let drain = DrainTracker::new(Duration::from_secs(5));
-    let mut state = SubscriptionState::new(4);
-    state.apply_control_plane_message(
-        resolved_response(
-            request_id("initial"),
-            subscription_id("sub-stream"),
-            http_identity("stream.example.com", "/stream"),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some((format!("http://{upstream_addr}"), 3)),
-            ),
+    seed(
+        &route_client,
+        http_identity("stream.example.com", "/stream"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{upstream_addr}"), 3)),
         ),
-        now(),
     );
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("listener binds");
     let addr = listener.local_addr().expect("listener addr");
     let shutdown = Shutdown::new();
-    let runtime = runtime_with_state(state, route_client, drain.clone());
+    let runtime = runtime_with_state(route_client, drain.clone());
     let mut task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));
 
     let mut client = TcpStream::connect(addr).await.expect("raw client connects");
@@ -1202,87 +944,8 @@ async fn listener_shutdown_drains_active_http_response() {
     upstream_task.await.expect("upstream task joins");
 }
 
-#[tokio::test]
-async fn listener_shared_coordinator_prevents_duplicate_in_flight_subscribe_route() {
-    let route_client = BlockingRouteClient::default();
-    let release_first_subscribe = route_client.push_subscribe_response_channel();
-    let first_subscribe_started = route_client.notify_next_subscribe();
-    let coordinator = Arc::new(TokioMutex::new(FrontlineRouteCoordinator::new(
-        FrontlineRouteResolver::new(4, route_client.clone()),
-        WakeTracker::new(),
-        FakeWakeClient::default(),
-    )));
-    let identity = http_identity("app.example.com", "/same");
-
-    let (first_locked_tx, first_locked_rx) = oneshot::channel();
-    let first_coordinator = Arc::clone(&coordinator);
-    let first_identity = identity.clone();
-    let first = tokio::spawn(async move {
-        let mut coordinator = first_coordinator.lock().await;
-        let _ = first_locked_tx.send(());
-        coordinator.route(first_identity, now()).await
-    });
-    first_locked_rx.await.expect("first route holds lock");
-    first_subscribe_started
-        .await
-        .expect("first subscribe starts");
-    assert!(
-        coordinator.try_lock().is_err(),
-        "coordinator lock remains held while first subscribe is in flight"
-    );
-
-    let second_coordinator = Arc::clone(&coordinator);
-    let second_identity = identity.clone();
-    let second = tokio::spawn(async move {
-        let mut coordinator = second_coordinator.lock().await;
-        coordinator.route(second_identity, now()).await
-    });
-    assert_eq!(
-        route_client.calls(),
-        vec![RouteClientCall::Subscribe {
-            request_id: generated_request_id(1),
-            identity: identity.clone(),
-        }]
-    );
-
-    release_first_subscribe
-        .send(Ok(resolved_response(
-            generated_request_id(1),
-            subscription_id("sub-shared"),
-            identity.clone(),
-            route_entry(
-                InstanceState::Running,
-                7,
-                Some(("http://127.0.0.1:1".to_owned(), 3)),
-            ),
-        )))
-        .expect("first subscribe response is received");
-
-    let first = tokio::time::timeout(Duration::from_secs(1), first)
-        .await
-        .expect("first route completes")
-        .expect("first route task joins")
-        .expect("first route succeeds");
-    let second = tokio::time::timeout(Duration::from_secs(1), second)
-        .await
-        .expect("second route completes")
-        .expect("second route task joins")
-        .expect("second route succeeds");
-
-    assert!(matches!(first, FrontlineRouteOutcome::Ready(_)));
-    assert!(matches!(second, FrontlineRouteOutcome::Ready(_)));
-    assert_eq!(
-        route_client.calls(),
-        vec![RouteClientCall::Subscribe {
-            request_id: generated_request_id(1),
-            identity,
-        }]
-    );
-}
-
 async fn spawn_frontline_listener(
-    state: SubscriptionState,
-    route_client: FakeRouteClient,
+    route_client: FakeControlPlane,
 ) -> (
     SocketAddr,
     Shutdown,
@@ -1294,25 +957,39 @@ async fn spawn_frontline_listener(
     let addr = listener.local_addr().expect("listener addr");
     let shutdown = Shutdown::new();
     let drain = DrainTracker::new(Duration::from_secs(5));
-    let runtime = runtime_with_state(state, route_client, drain.clone());
+    let runtime = runtime_with_state(route_client, drain.clone());
     let task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));
 
     (addr, shutdown, task)
 }
 
 fn runtime_with_state(
-    state: SubscriptionState,
-    route_client: FakeRouteClient,
+    route_client: FakeControlPlane,
     drain: DrainTracker,
-) -> FrontlineHttpRuntime<FakeRouteClient, FakeWakeClient> {
+) -> FrontlineHttpRuntime<FakeControlPlane, FakeWake> {
     FrontlineHttpRuntime::new(
-        FrontlineRouteCoordinator::new(
-            FrontlineRouteResolver::from_parts(state, route_client),
-            WakeTracker::new(),
-            FakeWakeClient::default(),
-        ),
+        FrontlineRouteCoordinator::new(4, route_client, FakeWake::default()),
         drain,
     )
+}
+
+/// Gives `identity`'s host one rule that covers every path on it.
+fn seed(route_client: &FakeControlPlane, identity: RouteIdentity, entry: RouteEntry) {
+    let rule_identity = match &identity {
+        RouteIdentity::Http { host, .. } => RouteIdentity::Http {
+            host: host.clone(),
+            path: None,
+        },
+        RouteIdentity::Sni { host } => RouteIdentity::Sni { host: host.clone() },
+    };
+    route_client.set_rules(
+        identity.kind(),
+        identity.host().as_str(),
+        vec![RouteRule {
+            identity: rule_identity,
+            entry,
+        }],
+    );
 }
 
 async fn listener_request(addr: SocketAddr, host: &str, path: &str) -> Response<Incoming> {
@@ -1683,26 +1360,6 @@ async fn read_to_end_or_reset(stream: &mut TcpStream) -> Vec<u8> {
     }
 }
 
-fn now() -> Instant {
-    Instant::now()
-}
-
-fn ttl(seconds: u64) -> CachePolicy {
-    CachePolicy::new(Duration::from_secs(seconds))
-}
-
-fn request_id(value: &str) -> RouteRequestId {
-    RouteRequestId::new(value).expect("request ID")
-}
-
-fn generated_request_id(index: u64) -> RouteRequestId {
-    request_id(&format!("req:{index}"))
-}
-
-fn subscription_id(value: &str) -> SubscriptionId {
-    SubscriptionId::new(value).expect("subscription ID")
-}
-
 fn instance_id(value: &str) -> InstanceId {
     InstanceId::new(value).expect("instance ID")
 }
@@ -1766,32 +1423,6 @@ fn route_entry(
             .map(|(uri, _generation)| backend(uri.clone())),
         backend_generation: backend_uri_and_generation
             .map(|(_uri, generation)| BackendGeneration::new(generation)),
-    }
-}
-
-fn resolved_response(
-    request_id: RouteRequestId,
-    subscription_id: SubscriptionId,
-    matched_identity: RouteIdentity,
-    entry: RouteEntry,
-) -> SubscribeControlPlaneOutput {
-    SubscribeControlPlaneOutput::RouteResolved {
-        request_id,
-        subscription_id,
-        matched_identity,
-        entry,
-        cache_policy: ttl(30),
-    }
-}
-
-fn miss_response(
-    request_id: RouteRequestId,
-    identity: RouteIdentity,
-) -> SubscribeControlPlaneOutput {
-    SubscribeControlPlaneOutput::RouteMiss {
-        request_id,
-        request_identity: identity,
-        negative_cache_policy: ttl(30),
     }
 }
 
@@ -1872,81 +1503,72 @@ fn push_u24(bytes: &mut Vec<u8>, value: usize) {
     ]);
 }
 
-#[derive(Clone)]
-struct AcceptedWakeClient(Arc<std::sync::atomic::AtomicUsize>);
-impl WakeClient for AcceptedWakeClient {
-    type Error = TestWakeError;
-    fn wake_instance(
-        &mut self,
-        request: WakeInstanceRequest,
-    ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Box::pin(async move {
-            Ok(WakeInstanceResponse::WakeStarted {
-                instance_id: request.instance_id,
-                generation: request.expected_generation.next(),
-            })
-        })
-    }
-}
 #[tokio::test]
 async fn listener_first_cold_request_waits_through_accepted_and_waking_until_ready() {
     let (upstream, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
     let identity = http_identity("app.example.com", "/cold");
-    let mut state = SubscriptionState::new(8);
-    state.cache_mut().insert_positive(
-        subscription_id("cold"),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
         identity.clone(),
         route_entry(InstanceState::Cold, 7, None),
-        CachePolicy::new(Duration::from_secs(30)),
-        now(),
     );
-    let client = FakeRouteClient::default();
-    client.push_subscribe_response(resolved_response(
-        generated_request_id(1),
-        subscription_id("waking"),
-        identity.clone(),
-        route_entry(InstanceState::Waking, 8, None),
-    ));
-    client.push_subscribe_response(resolved_response(
-        generated_request_id(2),
-        subscription_id("ready"),
-        identity,
-        route_entry(
-            InstanceState::Running,
-            8,
-            Some((format!("http://{upstream}"), 3)),
-        ),
-    ));
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wake = FakeWake::default();
     let runtime = FrontlineHttpRuntime::new(
-        FrontlineRouteCoordinator::new(
-            FrontlineRouteResolver::from_parts(state, client),
-            WakeTracker::new(),
-            AcceptedWakeClient(calls.clone()),
-        ),
+        FrontlineRouteCoordinator::new(8, route_client.clone(), wake.clone()),
         DrainTracker::new(Duration::from_secs(5)),
     );
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown = Shutdown::new();
     let task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        listener_request(addr, "app.example.com", "/cold"),
-    )
+    let request = tokio::spawn(listener_request(addr, "app.example.com", "/cold"));
+
+    // The wake is accepted, the instance wakes, and then it runs. Each change
+    // reaches the proxy as its host's rule set.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while wake.calls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
     .await
-    .unwrap();
+    .expect("the cold request asks for a wake");
+    seed(
+        &route_client,
+        identity.clone(),
+        route_entry(InstanceState::Waking, 8, None),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!request.is_finished());
+    seed(
+        &route_client,
+        identity,
+        route_entry(
+            InstanceState::Running,
+            8,
+            Some((format!("http://{upstream}"), 3)),
+        ),
+    );
+
+    let response = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
         Bytes::from_static(READY_RESPONSE)
     );
     assert_eq!(
-        calls.load(std::sync::atomic::Ordering::Relaxed),
+        wake.calls().len(),
         1,
-        "Waking is observed instead of repeatedly dispatching wake"
+        "a waking instance is waited on, not woken again"
+    );
+    assert_eq!(
+        route_client.subscribes(),
+        1,
+        "the pushes carried every change"
     );
     shutdown.shutdown();
     task.await.unwrap().unwrap();
@@ -1954,32 +1576,23 @@ async fn listener_first_cold_request_waits_through_accepted_and_waking_until_rea
 }
 
 #[tokio::test]
-async fn listener_records_one_cache_miss_then_one_hit_per_request() {
-    use proxy_core::observability::{
-        metrics::RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME,
-        recorder::{InMemoryObservability, ObservabilityEvent, EVENT_ROUTE_CACHE_LOOKUP},
-    };
+async fn listener_counts_one_cache_miss_then_one_hit_per_request() {
     let (upstream_addr, upstream_task) =
         spawn_http_upstream(1, StatusCode::ACCEPTED, READY_RESPONSE).await;
-    let route_client = FakeRouteClient::default();
-    route_client.push_subscribe_response(resolved_response(
-        request_id("req:1"),
-        subscription_id("observed"),
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
         http_identity("app.example.com", "/"),
         route_entry(
             InstanceState::Running,
             7,
             Some((format!("http://{upstream_addr}"), 3)),
         ),
-    ));
-    let sink = InMemoryObservability::default();
+    );
+    let lookups = RouteLookupCounters::default();
     let runtime = FrontlineHttpRuntime::new(
-        FrontlineRouteCoordinator::with_observability(
-            FrontlineRouteResolver::new(4, route_client.clone()),
-            WakeTracker::new(),
-            FakeWakeClient::default(),
-            sink.recorder(),
-        ),
+        FrontlineRouteCoordinator::new(4, route_client.clone(), FakeWake::default())
+            .with_lookup_counters(lookups.clone()),
         DrainTracker::new(Duration::from_secs(5)),
     );
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1991,30 +1604,9 @@ async fn listener_records_one_cache_miss_then_one_hit_per_request() {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         response.into_body().collect().await.unwrap();
     }
-    let events = sink.events();
-    let outcomes: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            ObservabilityEvent::Metric(metric)
-                if metric.name() == RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME =>
-            {
-                assert_eq!(metric.value(), 1.0);
-                Some(metric.labels()[0].value())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(outcomes, ["miss", "hit"]);
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(
-                event, ObservabilityEvent::Log(log) if log.name() == EVENT_ROUTE_CACHE_LOOKUP,
-            ))
-            .count(),
-        2
-    );
-    assert_eq!(route_client.calls().len(), 1);
+
+    assert_eq!(lookups.totals(), (1, 1), "one hit after one miss");
+    assert_eq!(route_client.subscribes(), 1);
     shutdown.shutdown();
     task.await.unwrap().unwrap();
     upstream_task.await.unwrap();

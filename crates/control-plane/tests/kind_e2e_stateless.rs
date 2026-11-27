@@ -17,10 +17,10 @@ use control_plane::{
         template_text_part, ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest,
         CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
         GetInstanceRequest, HttpRouteIdentity, Instance, InstanceState as PbInstanceState,
-        ManifestTemplate, ProtocolRoute, ProxyWakeInstanceRequest, RouteHost, RouteHostKind,
-        RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest,
-        SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind,
-        WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
+        ManifestTemplate, ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity,
+        ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
+        TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+        WorkloadTemplate, WorkloadValueSchema,
     },
     render_instance_scoped_name, BearerToken, InstanceId, OptionalBearerTokenInterceptor,
 };
@@ -236,7 +236,6 @@ async fn stateless_wake_latency_through_deployed_platform() -> TestResult<()> {
                         path_prefix: None,
                     })),
                 }),
-                protocol: ProtocolRoute::Http as i32,
             })
             .await?;
         let sample = wake_latency::WakeSample {
@@ -488,7 +487,6 @@ async fn create_operator_resources(
                     path_prefix: None,
                 })),
             }),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 

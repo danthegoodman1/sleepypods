@@ -14,11 +14,11 @@ use control_plane::api::pb::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteInstanceRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance,
     InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute,
-    ProxyWakeInstanceRequest, RawKubernetesManifestTemplate, ReconcileMaterializationRequest,
-    RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProxyWakeInstanceRequest,
+    RawKubernetesManifestTemplate, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -658,7 +658,6 @@ async fn create_class_instance_and_route(
                     path_prefix: None,
                 })),
             }),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 

@@ -13,9 +13,9 @@ write to it directly.
 - Kubernetes contains only active, warming, or draining materializations.
 Sleeping instances should not require Deployments, StatefulSets, Services,
 PVs, or PVCs to remain in the cluster.
-- Frontline proxies use lazy route resolution: resolve identities on cache miss,
-  keep a bounded local route cache, and receive targeted updates or
-  invalidations through opaque subscription IDs returned by the control plane.
+- Frontline proxies resolve routes lazily: on a cache miss they subscribe to the
+  request's exact host, keep that host's complete rule set in a bounded local
+  cache, and receive every later rule set for the host on the same subscription.
 - Workloads are described by reusable classes plus per-instance values, not by
 one permanent Kubernetes manifest per instance.
 
@@ -119,8 +119,7 @@ The control plane owns:
 - PV/PVC manifest rendering from `WorkloadClass` templates and instance values.
 - Wake/sleep/delete state machines.
 - Template rendering and generation hashes.
-- Route resolution and targeted update/invalidation streams for active proxy
-  subscriptions.
+- Route resolution and rule-set pushes for active proxy subscriptions.
 - Assignment of active materializations to clusters.
 
 Example APIs:
@@ -133,12 +132,11 @@ ReportIdle(instance_id, generation, sidecar_observation)
 PutHTTP01Challenge(host, token, key_authorization, expires_at)
 ResolveHTTP01Challenge(host, token)
 DeleteHTTP01Challenge(host, token)
-Subscribe(proxy_id) bidi stream:
-  proxy -> SubscribeRoute(request_id, identity)
+Subscribe bidi stream:
+  proxy -> Subscribe(subscription_id, kind, host)
   proxy -> Unsubscribe(subscription_id)
-  control plane -> RouteResolved(request_id, subscription_id, route_entry, cache_policy)
-  control plane -> RouteMiss(request_id, negative_cache_policy)
-  control plane -> RouteInvalidated(subscription_id, reason)
+  control plane -> Rules(subscription_id, rules, cache_policy)
+  control plane -> Error(subscription_id, code, message)
 WatchMaterializations(cluster_id)
 ```
 
@@ -169,153 +167,151 @@ left to the operator integrating the control plane.
 
 Frontline proxies are always on and keep local route state.
 
-The proxy should not assume it can derive an instance ID directly from every
-request. It first extracts request identity and canonicalizes it into a local
-cache key. That key is only a proxy-local lookup handle; route dependency
-tracking is represented by opaque subscription IDs from the control plane.
+A request names a host: the HTTP Host or the TLS SNI name. The proxy
+canonicalizes it to lower case without port or trailing dots, and keys its cache
+by listener family and exact host. For HTTP it also keeps the request path. An
+HTTP request with a host over 253 bytes is answered 400, and one with a path
+over 4,096 bytes 414, before any lookup.
 
-Examples:
-
-```text
-HTTP Host:
-  host:app.customer.com
-
-TLS SNI:
-  sni:db.customer.com
-
-HTTP Host + path prefix:
-  host:app.customer.com|path:/api
-
-Wildcard host:
-  host:*.customer.com
-```
-
-For the first production routing model, support host-like identity, meaning HTTP
-Host or TLS SNI, plus optional HTTP path prefix. Hosts may be exact names or
-wildcard suffixes. Richer compound identity such as headers, ALPN, and
-protocol-specific fields can be added later after this path is solid.
-
-The proxy keeps a bounded local cache of answers for **exact canonical queried
-identities**. A wildcard or prefix in the returned match is metadata: it never
-authorizes reuse for an unseen host, path, or SNI name. The control plane owns
-exact-host, wildcard-specificity and longest-path ranking. Separate positive and
-negative FIFO budgets bound scanner traffic without mutating order on every hit.
+Route bindings carry a host-like identity: an HTTP Host or TLS SNI name, exact
+or a wildcard suffix, plus an optional HTTP path prefix. Richer compound
+identity such as headers, ALPN, and protocol-specific fields can be added later
+after this path is solid.
 
 ```text
-exact queried host + full path, or SNI
-  -> opaque subscription ID
-  -> matched route rule (metadata)
-  -> route ID / instance ID / state / generation / backend
+HTTP Host:                app.customer.com
+TLS SNI:                  db.customer.com
+HTTP Host + path prefix:  app.customer.com  /api
+Wildcard host:            *.customer.com
 ```
+
+The cache authority is the **exact queried host with its complete rule set**.
+One lookup returns every binding for that host and every wildcard-suffix binding
+that covers it, each with its instance state, generation and backend. The set is
+ranked most specific first: an exact host before a wildcard suffix, a longer
+suffix before a shorter one, then a longer path prefix before a shorter one. The
+proxy routes a request to the first rule whose path prefix covers the request
+path. The store and the proxy share this ranking through `HostRules` in
+`sleepypods-api`.
+
+```text
+(http | sni, exact host)
+  -> subscription ID chosen by the proxy
+  -> ranked rules: matched identity, route ID, instance ID, state, generation, backend
+```
+
+Because the set is complete, every path on a cached host resolves locally, and a
+cached wildcard or root rule can never hide an exact-host or longer-path
+binding. A rule set answers only its own host; another name under the same
+wildcard gets its own lookup. Rule sets and empty answers have separate
+first-in, first-out budgets, so lookups for unknown hosts cannot push routed
+hosts out, and a cache hit writes no shared state.
 
 Request flow:
 
 ```text
 client request
-  -> proxy extracts Host/SNI and optional path
-  -> proxy canonicalizes identity into an exact request identity
-  -> proxy resolves that exact identity from local cache
-  -> if missing: send SubscribeRoute(request ID, identity) on Subscribe stream
-  -> control plane returns RouteResolved or RouteMiss for that request ID
-  -> if route is unknown: reject
-  -> if route is Running with backend: route to backend
-  -> if route is Cold or missing backend: call WakeInstance(instance ID)
-  -> wait for Running materialization
+  -> proxy extracts Host/SNI and path
+  -> proxy looks up the exact host in its local cache
+  -> if missing: send Subscribe(subscription ID, kind, host) on the Subscribe stream
+  -> control plane answers Rules or Error for that subscription ID
+  -> proxy picks the first rule that covers the path
+  -> if no rule covers it: reject
+  -> if the rule's instance is Running with a backend: route to the backend
+  -> if it is Cold, Draining, Failed or has no backend: call WakeInstance(instance ID)
+  -> wait for a rule set that reports Running with a backend
   -> route request or connection
 ```
 
-Proxies must receive explicit invalidation or generation updates for active
-subscriptions when an instance sleeps, drains, changes route ownership, or is
-deleted. TTL-only cache invalidation is not sufficient for production, but TTLs
-remain useful as a safety net if a proxy misses an invalidation.
+The control plane keeps every subscription current. It sends the host's rule set
+again when a binding for the host or a covering suffix is added or removed, and
+when an instance or materialization behind one of the rules changes. TTLs bound
+how long a proxy whose stream is gone can serve what it holds. A host with no
+binding gets an empty rule set, cached briefly, and holds no subscription. When
+a subscribed host loses its last binding, the proxy drops the host and asks again
+on the next request, so a binding committed a moment later is served at once.
 
-Every canonical host/path and SNI identity is independently resolved. A cache
-containing only a broad wildcard or root route cannot hide an exact-host or
-longer-path exception. Negative resolutions are cached briefly without creating
-subscriptions.
-
-Invalidations and stream loss progress independently of cold requests. The
-production coordinator polls its event queue every 10ms; the frontend processing
-target is 100ms after an event reaches that queue under supported load.
-Commit-to-cache delivery also includes the control plane's 250ms polling interval,
-database/runtime scheduling and any backlog, as described in the
+One actor in each proxy owns the stream, the cache and reconnection. The stream
+reader forwards every message to it in order. Request tasks read an immutable
+snapshot of the cache, so a hit takes no lock and throughput rises with cores.
+Pushes, expiry and stream loss progress independently of cold requests.
+Commit-to-cache delivery is described in the
 [delivery bounds](operator-guide.md#runtime-failure-and-delivery-bounds).
-Reaching the subscription lifetime ends a stream in order. Cached answers keep
-serving under identifiers the control plane can never reissue, bounded by the TTL
-they already carried, while the frontline registers them on the replacement
-stream; half the identity flights stay reserved for first-time misses. A bounded
-queue overflow closes the subscription stream and clears all cached authority,
-because a lost invalidation can name any cached route. Reconnection never erases
-this barrier. Responses crossing a consumed invalidation are
-re-resolved, preventing an invalidation-before-install race.
 
-Cold requests share up to 64 identity flights with at most 256 waiting callers.
-Wake acceptance is not readiness: the frontline waits for Running under
-`SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` (130000ms by default), refreshing the
-authoritative answer every 100ms while waiting. The wake RPC retains its separate
-`SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` deadline (5000ms by default).
-Frontline also rejects configuration where the route timeout plus the greater of
-setup and upstream HTTP header idle timeouts exceeds 190 seconds. Defaults are
-`130 + max(10, 60) = 190` seconds. This ceiling matches the activation handoff
-window described in the [proxy protocol contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep);
+A stream ends in one of two ways, and a lookup can fail on its own:
+
+- Reaching the subscription lifetime ends a stream in order. The proxy keeps
+  the rule sets that requests used during that stream, opens the replacement at
+  once and registers those hosts again in the background; half the lookup
+  flights stay reserved for first-time misses. A kept rule set serves until its
+  TTL, which outlasts the stream lifetime by at least ten seconds.
+- The control plane ends a stream with an error status when route-change
+  events were lost or the proxy stopped reading. Such a stream may have missed
+  a change to any cached host, so the proxy clears its cache before it serves
+  another request and reconnects after a short backoff. A broken connection is
+  treated the same way.
+- A lookup that fails ends that subscription alone: an invalid host, a store
+  error, a lookup timeout or the per-stream subscription limit. At the limit
+  the proxy releases its oldest hosts and asks again.
+
+A lookup flight covers the resolve only. Up to 64 hosts resolve at once with at
+most 256 waiting callers, and a flight ends when its last waiter leaves.
+Requests for an instance that is not yet running park on that instance and
+generation, and hold no flight, so hosts on waking instances leave lookups for
+other hosts free. The proxy asks for one wake per instance generation. Parked
+requests continue when a pushed rule set reports the instance Running; as a
+fallback each asks for its host's rule set again every 1.5 seconds. Wake
+acceptance is not readiness: the frontline waits for Running under
+`SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` (130000ms by default). The wake RPC
+retains its separate `SLEEPYPODS_FRONTLINE_WAKE_INSTANCE_TIMEOUT_MS` deadline
+(5000ms by default). Frontline also rejects configuration where the route
+timeout plus the greater of setup and upstream HTTP header idle timeouts exceeds
+190 seconds. Defaults are `130 + max(10, 60) = 190` seconds. This ceiling
+matches the activation handoff window described in the
+[proxy protocol contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep);
 these setup deadlines do not limit the duration of an established stream.
 
-`SubscribeRoute` is the authoritative cache-miss path. The producer observes
-dependency events before resolving the identity and installs active subscription
-state before returning `RouteResolved`, so a concurrent change cannot be lost
-between resolution and subscription setup.
-That response includes the current route entry, cache policy, and an opaque
-`subscription_id`. The proxy stores that ID with the local cache entry and uses
-it only to apply later stream messages; it must not parse the ID or assume it is
-a route binding, instance, version, or cursor. The control plane maps that
-subscription to the underlying dependencies, such as the matched `RouteBinding`,
-`Instance`, and active `Materialization`.
-
-`Subscribe` is a long-lived bidirectional stream. The proxy sends
-`SubscribeRoute` when a request misses local cache and sends `Unsubscribe` when
-it evicts a cache entry. The control plane streams lookup responses and later
-targeted messages for active subscriptions:
+`Subscribe` is a long-lived bidirectional stream. The proxy sends `Subscribe`
+when a request misses its cache and `Unsubscribe` when it evicts a host. The
+control plane answers each subscription and follows it with later rule sets:
 
 ```text
-SubscribeRoute(request_id, identity)
+Subscribe(subscription_id, kind, host)
 Unsubscribe(subscription_id)
-RouteResolved(request_id, subscription_id, route_entry, cache_policy)
-RouteMiss(request_id, negative_cache_policy)
-RouteInvalidated(subscription_id, reason)
-RouteUpdated(subscription_id, route_entry, cache_policy)  // later optimization
+Rules(subscription_id, rules, cache_policy)
+Error(subscription_id, code, message)
 ```
 
-V1 can be invalidation-only: remove the cache entry associated with
-`subscription_id`, then let the next request send `SubscribeRoute` again. If a
-proxy restarts, it loses its cache and subscriptions; it simply subscribes routes
-lazily again as requests arrive.
-
-`request_id` is stream-local and only correlates a `SubscribeRoute` request with
-its first response because the stream can have multiple in-flight route misses.
-`RouteMiss` should not return a subscription ID by default; unknown Host/SNI
-scans should get short negative caching without creating unbounded control-plane
-subscription state. `Unsubscribe` should be idempotent because cache eviction,
-stream reconnect, and invalidation handling can race.
+The proxy chooses `subscription_id`. It is unique among the stream's live
+subscriptions and names the subscription in every later message. The control
+plane registers the subscription for route-change events before it reads the
+rule set and reads again when a change the set depends on commits meanwhile, so
+a change cannot fall between the lookup and the registration. `Rules` answers
+the subscribe and follows every later change. `Error` ends one subscription
+with `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED` or `UNAVAILABLE`; the stream and
+its other subscriptions continue. `Unsubscribe` is idempotent and
+unacknowledged because cache eviction, stream reconnect and pushes can race. A
+proxy that restarts loses its cache and subscriptions and subscribes again as
+requests arrive.
 
 The active subscription registry is in-memory in the control-plane process that
-owns the proxy's `Subscribe` stream. Every replica independently reads durable
-transactional change history from PostgreSQL and targets its own subscribers;
-one replica does not consume another's events. Retention gaps or dispatcher read
-failures reset subscriptions. Positive and negative TTLs provide a bounded
-fallback. See the [operator guide](operator-guide.md#runtime-failure-and-delivery-bounds)
-for the delivery and admission limits.
+owns the proxy's `Subscribe` stream, indexed by host, by binding and by
+instance. Every replica independently reads durable transactional change history
+from PostgreSQL and targets its own subscribers; one replica does not consume
+another's events. A gap in that history ends every stream with an error status.
+A failed read of the history is retried with the cursor intact and leaves
+streams open. Positive and negative TTLs provide a bounded fallback. See the
+[operator guide](operator-guide.md#runtime-failure-and-delivery-bounds) for the
+delivery and admission limits.
 
 Polling loops, provider change streams, versions, watch cursors, and ordering
 tokens are entirely internal to the control plane and store provider. The proxy
-does not send a cursor on reconnect. If `Subscribe` reconnects, the proxy should
-drop or mark stale its subscription-backed cache entries, resubscribe any kept
-identities through `SubscribeRoute`, and rebuild missing ones lazily as requests
-arrive.
+sends no cursor on reconnect.
 
 Route entries include instance generation so proxies can discard stale backends
-after sleep, delete, route reassignment, or failed wake. Subscriptions should be
-ephemeral and bounded by cache TTL, heartbeat, stream lifetime, or explicit
-unsubscribe when a proxy evicts a local cache entry.
+after sleep, delete, route reassignment, or failed wake. Subscriptions are
+ephemeral and bounded by cache TTL, stream lifetime, or explicit unsubscribe
+when a proxy evicts a host.
 
 The same model should support:
 
@@ -447,7 +443,7 @@ Wake:
 
 Sleep:
   mark Draining
-  invalidate proxy routes for old generation
+  push the draining generation to subscribed proxies
   wait for the drain deadline; a wake before it revives the instance
   delete workload and Service
   delete PVC and PV
@@ -474,8 +470,8 @@ storage mode explicitly adds that ownership.
 2. Move tenant creation behind a versioned protobuf control-plane API exposed
    through native gRPC and gRPC-Web for operator clients.
 3. Replace header-only routing with route identity extraction for Host and SNI.
-4. Add a route subscription API that resolves cache misses on the stream,
-   targets later updates by opaque subscription ID, and keeps watch cursors,
+4. Add a route subscription API that resolves a host's rule set on the stream,
+   pushes later rule sets on the same subscription, and keeps watch cursors,
    versions, and provider polling internal to the control plane.
 5. Render active Kubernetes objects from `WorkloadClass + Instance.values`.
 6. Add static PV/PVC materialization from `WorkloadClass` templates and

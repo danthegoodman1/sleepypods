@@ -6,12 +6,9 @@ use std::{
 use tonic::{Request, Response, Status};
 
 use crate::{
-    api::{
-        pb::{
-            self,
-            operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
-        },
-        route_events::RouteSubscriptionBroker,
+    api::pb::{
+        self,
+        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
     },
     http01 as domain_http01,
     ids::{InstanceId, MaterializationId, WorkloadClassId},
@@ -44,7 +41,6 @@ pub struct StoreBackedOperatorApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
 }
 
 impl<C> StoreBackedOperatorApi<C> {
@@ -53,20 +49,10 @@ impl<C> StoreBackedOperatorApi<C> {
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
-        Self::with_route_events(store, materializer, target, RouteSubscriptionBroker::new())
-    }
-
-    pub fn with_route_events(
-        store: Arc<dyn ControlPlaneStore>,
-        materializer: KubernetesMaterializer<C>,
-        target: MaterializationTarget,
-        route_events: RouteSubscriptionBroker,
-    ) -> Self {
         Self {
             store,
             materializer,
             target,
-            route_events,
         }
     }
 }
@@ -115,23 +101,17 @@ where
 }
 pub type StoreBackedOperatorGrpcService<C> = OperatorControlPlaneServer<StoreBackedOperatorApi<C>>;
 
-pub fn operator_grpc_service_with_store_and_route_events<C>(
+pub fn operator_grpc_service_with_store<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
 ) -> StoreBackedOperatorGrpcService<C>
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    OperatorControlPlaneServer::new(StoreBackedOperatorApi::with_route_events(
-        store,
-        materializer,
-        target,
-        route_events,
-    ))
-    .max_decoding_message_size(256 * 1024)
-    .max_encoding_message_size(1024 * 1024)
+    OperatorControlPlaneServer::new(StoreBackedOperatorApi::new(store, materializer, target))
+        .max_decoding_message_size(256 * 1024)
+        .max_encoding_message_size(1024 * 1024)
 }
 
 #[tonic::async_trait]
@@ -256,8 +236,6 @@ where
             .await
             .map_err(store_error_to_status)?;
 
-        self.route_events
-            .notify_routes_changed(&result.route_bindings);
         Ok(Response::new(instance_to_proto(result.instance)))
     }
 
@@ -295,15 +273,11 @@ where
             instance_id: parse_instance_id(request.instance_id)?,
             expected_generation: crate::ids::Generation::new(expected_generation),
         };
-        let instance_id = request.instance_id.clone();
         let deleted = self
             .store
             .request_instance_deletion(request)
             .await
             .map_err(store_error_to_status)?;
-        if deleted {
-            self.route_events.notify_instance_changed(instance_id);
-        }
 
         Ok(Response::new(pb::DeleteInstanceResponse {
             accepted: deleted,
@@ -321,11 +295,6 @@ where
             )?)
             .await
             .map_err(store_error_to_status)?;
-        self.route_events.notify_route_changed(
-            route_binding.id.clone(),
-            route_binding.identity.clone(),
-            route_binding.protocol,
-        );
 
         Ok(Response::new(route_binding_to_proto(route_binding)))
     }
@@ -352,15 +321,12 @@ where
         request: Request<pb::DeleteRouteBindingRequest>,
     ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
         let route_binding_id = parse_route_binding_id(request.into_inner().route_binding_id)?;
-        let request = domain_route::DeleteRouteBindingRequest::new(route_binding_id.clone());
+        let request = domain_route::DeleteRouteBindingRequest::new(route_binding_id);
         let deleted = self
             .store
             .delete_route_binding(request)
             .await
             .map_err(store_error_to_status)?;
-        if deleted {
-            self.route_events.notify_route_removed(route_binding_id);
-        }
 
         Ok(Response::new(pb::DeleteRouteBindingResponse { deleted }))
     }
@@ -598,13 +564,11 @@ fn create_route_binding_request_from_proto(
         .identity
         .ok_or_else(|| Status::invalid_argument("identity is required"))
         .and_then(route_identity_from_proto)?;
-    let protocol = protocol_from_proto(request.protocol)?;
 
     Ok(domain_route::CreateRouteBindingRequest::new(
         parse_route_binding_id(request.route_binding_id)?,
         parse_instance_id(request.instance_id)?,
         identity,
-        protocol,
     ))
 }
 
@@ -716,18 +680,6 @@ fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost,
         ));
     }
     Ok(host)
-}
-
-fn protocol_from_proto(protocol: i32) -> Result<domain_route::ProtocolRoute, Status> {
-    match pb::ProtocolRoute::try_from(protocol)
-        .map_err(|_| Status::invalid_argument("protocol route is invalid"))?
-    {
-        pb::ProtocolRoute::Http => Ok(domain_route::ProtocolRoute::Http),
-        pb::ProtocolRoute::TlsSni => Ok(domain_route::ProtocolRoute::TlsSni),
-        pb::ProtocolRoute::Unspecified => {
-            Err(Status::invalid_argument("protocol route is required"))
-        }
-    }
 }
 
 fn put_http01_request_from_proto(
@@ -884,7 +836,6 @@ fn route_binding_to_proto(route_binding: domain_route::RouteBindingRecord) -> pb
         route_binding_id: route_binding.id.as_str().to_owned(),
         instance_id: route_binding.instance_id.as_str().to_owned(),
         identity: Some(route_identity_to_proto(route_binding.identity)),
-        protocol: protocol_to_proto(route_binding.protocol) as i32,
     }
 }
 
@@ -917,13 +868,6 @@ fn route_host_kind_to_proto(kind: domain_route::RouteHostKind) -> pb::RouteHostK
     match kind {
         domain_route::RouteHostKind::Exact => pb::RouteHostKind::Exact,
         domain_route::RouteHostKind::WildcardSuffix => pb::RouteHostKind::WildcardSuffix,
-    }
-}
-
-fn protocol_to_proto(protocol: domain_route::ProtocolRoute) -> pb::ProtocolRoute {
-    match protocol {
-        domain_route::ProtocolRoute::Http => pb::ProtocolRoute::Http,
-        domain_route::ProtocolRoute::TlsSni => pb::ProtocolRoute::TlsSni,
     }
 }
 

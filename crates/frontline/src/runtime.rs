@@ -13,15 +13,12 @@ use proxy_core::observability::{
 };
 use proxy_core::DrainTracker;
 
-#[cfg(test)]
-use crate::is_http01_challenge_candidate_path;
-
 use crate::{
     intercept_http01_challenge, FrontlineForwardContext, FrontlineForwardError, FrontlineForwarder,
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
     Http01ChallengeResolver, Http01InterceptDecision, Http01InterceptError,
-    NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteRequestIdentity,
-    RouteSubscriptionClient, SharedFrontlineRouteCoordinator, WakeClient,
+    NoopHttp01ChallengeResolver, ReadyBackend, RequestIdentityError, RouteSubscriptionClient,
+    SharedFrontlineRouteCoordinator, WakeClient,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -119,60 +116,6 @@ impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01> 
     }
 }
 
-#[cfg(test)]
-impl<RouteClient, Wake, Http01> FrontlineHttpRuntime<RouteClient, Wake, Http01>
-where
-    RouteClient: RouteSubscriptionClient,
-    Wake: WakeClient,
-    Http01: Http01ChallengeResolver,
-{
-    pub async fn handle_http<B>(
-        &mut self,
-        request: Request<B>,
-        now: Instant,
-    ) -> Response<FrontlineRuntimeBody>
-    where
-        B: Body<Data = Bytes> + Send + Unpin + 'static,
-        B::Error: Into<BoxError>,
-    {
-        self.handle_http_with_forwarding_context(request, now, None)
-            .await
-    }
-
-    pub async fn handle_http_with_forwarding_context<B>(
-        &mut self,
-        request: Request<B>,
-        now: Instant,
-        forwarding_context: Option<FrontlineForwardContext>,
-    ) -> Response<FrontlineRuntimeBody>
-    where
-        B: Body<Data = Bytes> + Send + Unpin + 'static,
-        B::Error: Into<BoxError>,
-    {
-        if is_http01_challenge_candidate_path(request.uri().path()) {
-            match resolve_http01_response(&mut self.http01_resolver, &request).await {
-                Ok(Some(response)) => {
-                    record_http01_response(&self.observability, response.status());
-                    return response;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    record_http01_error(&self.observability, &error);
-                    return http01_intercept_error_response(error);
-                }
-            }
-        }
-
-        let outcome = match resolve_http_route(&mut self.coordinator, &request, now).await {
-            Ok(outcome) => outcome,
-            Err(error) => return route_resolution_error_response(error),
-        };
-
-        route_outcome_or_forward_response(&self.forwarder, outcome, request, forwarding_context)
-            .await
-    }
-}
-
 pub(crate) fn record_http01_response(observability: &ObservabilityRecorder, status: StatusCode) {
     let outcome = if status == StatusCode::OK {
         Outcome::Success
@@ -229,47 +172,33 @@ where
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum FrontlineHttpRouteError<RouteClientError, WakeClientError> {
-    Identity(RequestIdentityError),
-    Coordinator(FrontlineRouteCoordinatorError<RouteClientError, WakeClientError>),
-}
-
-#[cfg(test)]
-pub(crate) async fn resolve_http_route<RouteClient, Wake, B>(
-    coordinator: &mut FrontlineRouteCoordinator<RouteClient, Wake>,
-    request: &Request<B>,
-    now: Instant,
-) -> Result<FrontlineRouteOutcome, FrontlineHttpRouteError<RouteClient::Error, Wake::Error>>
-where
-    RouteClient: RouteSubscriptionClient,
-    Wake: WakeClient,
-{
-    let identity = http_request_identity(request).map_err(FrontlineHttpRouteError::Identity)?;
-
-    coordinator
-        .route(identity.into_identity(), now)
-        .await
-        .map_err(FrontlineHttpRouteError::Coordinator)
-}
-
+/// Routes a request by its Host header, or its URI authority when it has
+/// none, and its path.
 pub(crate) async fn resolve_http_route_shared<RouteClient, Wake, B>(
     coordinator: &SharedFrontlineRouteCoordinator<RouteClient, Wake>,
     request: &Request<B>,
     now: Instant,
-) -> Result<FrontlineRouteOutcome, FrontlineHttpRouteError<RouteClient::Error, Wake::Error>>
+) -> Result<FrontlineRouteOutcome, FrontlineRouteCoordinatorError<Wake::Error>>
 where
-    RouteClient: RouteSubscriptionClient + Send + 'static,
-    RouteClient::Error: Clone + Send + 'static,
-    Wake: WakeClient + Send + 'static,
-    Wake::Error: Clone + Send + 'static,
+    RouteClient: RouteSubscriptionClient,
+    Wake: WakeClient,
+    Wake::Error: Clone + Send + Sync + 'static,
 {
-    let identity = http_request_identity(request).map_err(FrontlineHttpRouteError::Identity)?;
+    let host = match request.headers().get(HOST) {
+        Some(value) => value.to_str().map_err(|_| {
+            FrontlineRouteCoordinatorError::Identity(RequestIdentityError::UnsupportedHostSyntax)
+        })?,
+        None => request
+            .uri()
+            .authority()
+            .map(|authority| authority.as_str())
+            .ok_or(FrontlineRouteCoordinatorError::Identity(
+                RequestIdentityError::EmptyHost,
+            ))?,
+    };
+    let path = request.uri().path_and_query().map(|value| value.path());
 
-    coordinator
-        .route(identity.into_identity(), now)
-        .await
-        .map_err(FrontlineHttpRouteError::Coordinator)
+    coordinator.route_http(host, path, now).await
 }
 
 pub(crate) async fn route_outcome_or_forward_response<B>(
@@ -288,31 +217,6 @@ where
         }
         outcome => route_outcome_response(outcome),
     }
-}
-
-fn http_request_identity<B>(
-    request: &Request<B>,
-) -> Result<RouteRequestIdentity, RequestIdentityError> {
-    let host_header = request
-        .headers()
-        .get(HOST)
-        .map(|value| {
-            value
-                .to_str()
-                .map_err(|_| RequestIdentityError::UnsupportedHostSyntax)
-        })
-        .transpose()?;
-    let host = host_header
-        .or_else(|| {
-            request
-                .uri()
-                .authority()
-                .map(|authority| authority.as_str())
-        })
-        .ok_or(RequestIdentityError::EmptyHost)?;
-    let path = request.uri().path_and_query().map(|value| value.path());
-
-    RouteRequestIdentity::http(host, path)
 }
 
 async fn forward_ready_response<B>(
@@ -340,33 +244,30 @@ where
     }
 }
 
-fn route_outcome_response(outcome: FrontlineRouteOutcome) -> Response<FrontlineRuntimeBody> {
+pub(crate) fn route_outcome_response(
+    outcome: FrontlineRouteOutcome,
+) -> Response<FrontlineRuntimeBody> {
     match outcome {
         FrontlineRouteOutcome::Ready(_) => {
             unreachable!("ready route outcomes are forwarded before response mapping")
         }
-        FrontlineRouteOutcome::Miss(_) => status_response(StatusCode::NOT_FOUND),
-        FrontlineRouteOutcome::Waiting(_)
-        | FrontlineRouteOutcome::Waking { .. }
-        | FrontlineRouteOutcome::Unavailable(_)
-        | FrontlineRouteOutcome::WakeFailed { .. }
-        | FrontlineRouteOutcome::WakeUnavailable { .. }
-        | FrontlineRouteOutcome::GenerationConflict { .. }
-        | FrontlineRouteOutcome::RejectedWakeObservation(_) => {
-            status_response(StatusCode::SERVICE_UNAVAILABLE)
-        }
+        FrontlineRouteOutcome::Miss => status_response(StatusCode::NOT_FOUND),
+        FrontlineRouteOutcome::Unavailable(_) => status_response(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
-pub(crate) fn route_resolution_error_response<RouteClientError, WakeClientError>(
-    error: FrontlineHttpRouteError<RouteClientError, WakeClientError>,
+/// A request the proxy does not route gets 414 for an over-long path and 400
+/// otherwise. A request it could not route in time gets 503.
+pub(crate) fn route_resolution_error_response<WakeClientError>(
+    error: FrontlineRouteCoordinatorError<WakeClientError>,
 ) -> Response<FrontlineRuntimeBody> {
-    match error {
-        FrontlineHttpRouteError::Identity(error) => identity_error_response(error),
-        FrontlineHttpRouteError::Coordinator(_error) => {
-            status_response(StatusCode::SERVICE_UNAVAILABLE)
+    status_response(match error {
+        FrontlineRouteCoordinatorError::Identity(RequestIdentityError::PathTooLong) => {
+            StatusCode::URI_TOO_LONG
         }
-    }
+        FrontlineRouteCoordinatorError::Identity(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    })
 }
 
 pub(crate) fn http01_intercept_error_response<E>(
@@ -398,10 +299,6 @@ fn forward_error_response(error: FrontlineForwardError) -> Response<FrontlineRun
     };
 
     status_response(status)
-}
-
-fn identity_error_response(_error: RequestIdentityError) -> Response<FrontlineRuntimeBody> {
-    status_response(StatusCode::BAD_REQUEST)
 }
 
 fn status_response(status: StatusCode) -> Response<FrontlineRuntimeBody> {

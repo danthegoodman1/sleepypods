@@ -1,436 +1,274 @@
-use super::{CacheLookup, CacheLookupHit, CacheLookupStatus, PositiveCacheEntry, RouteCache};
-use crate::{subscription::tests::route_entry_for_instance, SubscriptionId};
-use sleepypods_api::{CachePolicy, PathPrefix, RouteHost, RouteIdentity};
 use std::time::{Duration, Instant};
-fn request(host: &str, path: &str) -> RouteIdentity {
-    RouteIdentity::Http {
-        host: RouteHost::exact(host).unwrap(),
-        path: Some(PathPrefix::new(path).unwrap()),
-    }
+
+use sleepypods_api::{HostRules, RouteKind};
+
+use super::{HostKey, RouteTable};
+use crate::route::testing::{http_rule, running};
+
+fn key(host: &str) -> HostKey {
+    HostKey::new(RouteKind::Http, host)
 }
-fn sub(id: &str) -> SubscriptionId {
-    SubscriptionId::new(id).unwrap()
+
+fn rules(host: &str, instance: &str) -> HostRules {
+    HostRules::ranked(vec![http_rule(host, None, running(instance))])
 }
-fn positive(
-    id: &str,
-    matched: RouteIdentity,
-    generation: u64,
-    ttl: u64,
+
+fn install(
+    table: &mut RouteTable,
+    host: &str,
+    subscription: u64,
     now: Instant,
-) -> PositiveCacheEntry {
-    PositiveCacheEntry::new(
-        sub(id),
-        matched,
-        route_entry_for_instance(id, "instance", generation, Some(generation)),
-        CachePolicy::new(Duration::from_secs(ttl)),
-        now,
+) -> super::Displaced {
+    table.install(
+        key(host),
+        rules(host, "instance"),
+        now + Duration::from_secs(60),
+        Some(subscription),
     )
 }
+
+fn cached(table: &mut RouteTable, host: &str) -> bool {
+    table.publish();
+    table.get(&key(host)).is_some()
+}
+
 #[test]
-fn wildcard_and_prefix_answers_authorize_only_the_queried_identity() {
+fn a_published_snapshot_holds_what_was_installed_and_stays_as_it_was() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(4);
-    let queried = request("public.example.com", "/api/users");
-    let matched = RouteIdentity::Http {
-        host: RouteHost::wildcard_suffix("example.com").unwrap(),
-        path: Some(PathPrefix::new("/api").unwrap()),
-    };
-    cache.insert_resolved(
-        queried.clone(),
-        positive("wild", matched.clone(), 1, 30, now),
-        now,
+    let mut table = RouteTable::new(4);
+    assert!(table.publish().is_none(), "nothing changed yet");
+
+    install(&mut table, "a.example.com", 1, now);
+    let first = table.publish().expect("the table changed");
+    assert!(first.get(RouteKind::Http, "a.example.com").is_some());
+    assert!(first.get(RouteKind::Sni, "a.example.com").is_none());
+    assert!(table.publish().is_none());
+
+    install(&mut table, "b.example.com", 2, now);
+    let second = table.publish().expect("the table changed");
+    assert_eq!(second.len(), 2);
+    assert_eq!(first.len(), 1, "a published snapshot never changes");
+}
+
+#[test]
+fn rule_sets_leave_first_in_first_out_and_release_their_subscriptions() {
+    let now = Instant::now();
+    let mut table = RouteTable::new(2);
+    install(&mut table, "a.example.com", 1, now);
+    install(&mut table, "b.example.com", 2, now);
+
+    let displaced = install(&mut table, "c.example.com", 3, now);
+
+    assert_eq!(displaced.unsubscribe, vec![1]);
+    assert_eq!(displaced.entries.len(), 1);
+    assert!(!cached(&mut table, "a.example.com"));
+    assert!(cached(&mut table, "b.example.com"));
+    assert!(cached(&mut table, "c.example.com"));
+    assert_eq!(table.positive_len(), 2);
+}
+
+#[test]
+fn a_replaced_rule_set_keeps_its_place_and_its_subscription() {
+    let now = Instant::now();
+    let mut table = RouteTable::new(2);
+    install(&mut table, "a.example.com", 1, now);
+    install(&mut table, "b.example.com", 2, now);
+    let before = table.get(&key("a.example.com")).unwrap().version;
+
+    // The same subscription delivers a new rule set for the oldest host.
+    let displaced = install(&mut table, "a.example.com", 1, now);
+    assert!(displaced.unsubscribe.is_empty());
+    assert_eq!(
+        displaced.entries.len(),
+        1,
+        "the replaced answer is reported"
     );
-    let CacheLookup::Hit(CacheLookupHit::Positive(entry)) = cache.lookup(&queried, now) else {
-        panic!("queried route absent")
-    };
-    assert_eq!(entry.matched_identity, matched);
-    for unseen in [
-        request("private.example.com", "/api/users"),
-        request("public.example.com", "/api/private"),
-        request("public.example.com", "/api"),
-    ] {
-        assert_eq!(
-            cache.lookup(&unseen, now).status(),
-            CacheLookupStatus::Absent
+    assert!(table.get(&key("a.example.com")).unwrap().version > before);
+
+    // It is still the oldest, so it is the one that leaves.
+    let displaced = install(&mut table, "c.example.com", 3, now);
+    assert_eq!(displaced.unsubscribe, vec![1]);
+    assert!(cached(&mut table, "b.example.com"));
+}
+
+#[test]
+fn a_new_subscription_for_a_cached_host_releases_the_old_one() {
+    let now = Instant::now();
+    let mut table = RouteTable::new(2);
+    install(&mut table, "a.example.com", 1, now);
+
+    let displaced = install(&mut table, "a.example.com", 9, now);
+
+    assert_eq!(displaced.unsubscribe, vec![1]);
+    assert_eq!(table.host_of(9), Some(&key("a.example.com")));
+    assert_eq!(table.host_of(1), None);
+}
+
+#[test]
+fn empty_answers_have_their_own_budget_and_hold_no_subscription() {
+    let now = Instant::now();
+    let mut table = RouteTable::new(2);
+    install(&mut table, "a.example.com", 1, now);
+    install(&mut table, "b.example.com", 2, now);
+
+    for (index, host) in ["x", "y", "z"].into_iter().enumerate() {
+        let displaced = table.install(
+            key(&format!("{host}.example.com")),
+            HostRules::default(),
+            now + Duration::from_secs(1),
+            Some(10 + index as u64),
         );
+        assert!(displaced.unsubscribe.is_empty());
     }
+
+    assert_eq!(
+        table.positive_len(),
+        2,
+        "hosts with no route push no route out"
+    );
+    assert_eq!(table.negative_len(), 2);
+    assert!(!cached(&mut table, "x.example.com"));
+    assert_eq!(table.host_of(12), None);
 }
+
 #[test]
-fn same_matched_rule_can_have_independent_subscriptions() {
+fn a_rule_set_that_empties_stops_counting_as_a_route_and_keeps_no_subscription() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(2);
-    let matched = request("app.example.com", "/");
-    let a = request("app.example.com", "/a");
-    let b = request("app.example.com", "/b");
-    cache.insert_resolved(a.clone(), positive("a", matched.clone(), 1, 30, now), now);
-    cache.insert_resolved(b.clone(), positive("b", matched, 1, 30, now), now);
-    assert!(cache.invalidate_subscription(&sub("a")));
-    assert_eq!(cache.lookup(&a, now).status(), CacheLookupStatus::Absent);
-    assert_eq!(
-        cache.lookup(&b, now).status(),
-        CacheLookupStatus::PositiveHit
-    );
-}
-#[test]
-fn update_changes_metadata_without_expanding_authority() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(2);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(
-        key.clone(),
-        positive("a", request("app.example.com", "/"), 1, 30, now),
-        now,
-    );
-    cache.replace_subscription(
-        &sub("a"),
-        request("app.example.com", "/a"),
-        route_entry_for_instance("new", "instance", 2, Some(2)),
-        CachePolicy::new(Duration::from_secs(40)),
-        now,
-    );
-    assert_eq!(
-        cache.lookup(&key, now).status(),
-        CacheLookupStatus::PositiveHit
-    );
-    assert_eq!(
-        cache
-            .lookup(&request("app.example.com", "/a/child"), now)
-            .status(),
-        CacheLookupStatus::Absent
-    );
-}
-#[test]
-fn positive_and_negative_fifo_budgets_are_independent() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(1);
-    let key = request("hot.example.com", "/");
-    cache.insert_resolved(key.clone(), positive("hot", key.clone(), 1, 30, now), now);
-    for i in 0..100 {
-        cache.insert_negative(
-            request(&format!("scan{i}.example.com"), "/"),
-            CachePolicy::new(Duration::from_secs(3)),
-            now,
-        );
-    }
-    assert_eq!(cache.len(), 2);
-    assert_eq!(
-        cache.lookup(&key, now).status(),
-        CacheLookupStatus::PositiveHit
-    );
-    assert_eq!(cache.negative_order.len(), 1);
-    assert_eq!(cache.negative_expiry.len(), 1);
-}
-#[test]
-fn fifo_eviction_and_expiry_indices_remain_bounded_during_churn() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    for i in 0..1000 {
-        let key = request("app.example.com", &format!("/{i}"));
-        cache.insert_resolved(
-            key.clone(),
-            positive(&format!("sub{i}"), key, 1, 30, now),
-            now,
-        );
-    }
-    assert_eq!(cache.len(), 8);
-    assert_eq!(cache.positive_order.len(), 8);
-    assert_eq!(cache.positive_expiry.len(), 8);
-    assert_eq!(
-        cache
-            .lookup(&request("app.example.com", "/0"), now)
-            .status(),
-        CacheLookupStatus::Absent
-    );
-    assert_eq!(
-        cache
-            .lookup(&request("app.example.com", "/999"), now)
-            .status(),
-        CacheLookupStatus::PositiveHit
-    );
-    assert_eq!(
-        cache
-            .expire(now + Duration::from_secs(30))
-            .subscriptions_to_unsubscribe
-            .len(),
-        8
-    );
-    assert!(cache.is_empty());
-    assert!(cache.by_subscription.is_empty());
-    assert!(cache.positive_expiry.is_empty());
-}
-#[test]
-fn stale_exact_answer_is_rejected_but_other_identities_do_not_conflict() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(4);
-    let a = request("app.example.com", "/a");
-    cache.insert_resolved(a.clone(), positive("new", a.clone(), 7, 30, now), now);
-    let result = cache.insert_resolved(a.clone(), positive("old", a, 6, 30, now), now);
-    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("old")]);
-    assert!(cache.positive_by_subscription(&sub("new")).is_some());
-}
-#[test]
-fn expired_positive_and_exact_negative_have_bounded_lifetimes() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(4);
-    let key = request("app.example.com", "/");
-    cache.insert_resolved(key.clone(), positive("a", key.clone(), 1, 1, now), now);
-    assert_eq!(
-        cache.lookup(&key, now + Duration::from_secs(1)).status(),
-        CacheLookupStatus::Expired
-    );
-    let result = cache.insert_negative(
-        key.clone(),
-        CachePolicy::new(Duration::from_secs(2)),
+    let mut table = RouteTable::new(2);
+    install(&mut table, "a.example.com", 1, now);
+
+    let displaced = table.install(
+        key("a.example.com"),
+        HostRules::default(),
         now + Duration::from_secs(1),
+        Some(1),
     );
-    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("a")]);
-    assert_eq!(
-        cache.lookup(&key, now + Duration::from_secs(2)).status(),
-        CacheLookupStatus::NegativeHit
-    );
-    cache.expire(now + Duration::from_secs(3));
-    assert!(cache.is_empty());
-}
-#[test]
-fn sni_wildcard_answer_does_not_authorize_an_unseen_exact_host() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(4);
-    let key = RouteIdentity::Sni {
-        host: RouteHost::exact("public.example.com").unwrap(),
-    };
-    let matched = RouteIdentity::Sni {
-        host: RouteHost::wildcard_suffix("example.com").unwrap(),
-    };
-    cache.insert_resolved(key.clone(), positive("sni", matched, 1, 30, now), now);
-    assert_eq!(
-        cache.lookup(&key, now).status(),
-        CacheLookupStatus::PositiveHit
-    );
-    assert_eq!(
-        cache
-            .lookup(
-                &RouteIdentity::Sni {
-                    host: RouteHost::exact("private.example.com").unwrap()
-                },
-                now
-            )
-            .status(),
-        CacheLookupStatus::Absent
-    );
-}
 
-#[test]
-fn has_expired_agrees_with_what_expire_limited_would_evict() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    assert!(!cache.has_expired(now), "an empty cache has nothing due");
-
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub-a", key, 1, 1, now), now);
-    cache.insert_negative(
-        request("miss.example.com", "/b"),
-        CachePolicy::new(Duration::from_secs(1)),
-        now,
-    );
-    assert!(!cache.has_expired(now), "fresh entries are not due");
-
-    // Positive and negative budgets expire independently, so each side has to
-    // be able to report on its own.
-    let expired = now + Duration::from_secs(1);
-    assert!(cache.has_expired(expired));
-    assert_eq!(
-        cache
-            .expire_limited(expired, usize::MAX)
-            .subscriptions_to_unsubscribe
-            .len(),
-        1
-    );
     assert!(
-        !cache.has_expired(expired),
-        "nothing remains due once expiry has run"
+        displaced.unsubscribe.is_empty(),
+        "the control plane already dropped it"
     );
-    assert_eq!(cache.len(), 0);
+    assert_eq!((table.positive_len(), table.negative_len()), (0, 1));
+    assert_eq!(table.host_of(1), None);
+    assert!(table.get(&key("a.example.com")).unwrap().rules.is_empty());
 }
 
 #[test]
-fn expiration_work_is_incremental_without_serving_expired_entries() {
+fn answers_expire_in_deadline_order_up_to_the_limit() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(512);
-    for index in 0..512 {
-        let key = request("app.example.com", &format!("/{index}"));
-        cache.insert_resolved(
-            key.clone(),
-            positive(&format!("sub{index}"), key, 1, 1, now),
-            now,
+    let mut table = RouteTable::new(8);
+    for (index, host) in ["a", "b", "c"].into_iter().enumerate() {
+        table.install(
+            key(&format!("{host}.example.com")),
+            rules(&format!("{host}.example.com"), "instance"),
+            now + Duration::from_secs(index as u64 + 1),
+            Some(index as u64 + 1),
         );
     }
-    let expired = now + Duration::from_secs(1);
-    assert_eq!(
-        cache
-            .expire_limited(expired, 64)
-            .subscriptions_to_unsubscribe
-            .len(),
-        64
-    );
-    assert_eq!(cache.len(), 448);
-    assert_eq!(
-        cache
-            .lookup(&request("app.example.com", "/511"), expired)
-            .status(),
-        CacheLookupStatus::Expired
-    );
+    assert_eq!(table.next_expiry(), Some(now + Duration::from_secs(1)));
+
+    assert!(table.expire(now, usize::MAX).entries.is_empty());
+    let displaced = table.expire(now + Duration::from_secs(2), 1);
+    assert_eq!(displaced.unsubscribe, vec![1]);
+    let displaced = table.expire(now + Duration::from_secs(2), usize::MAX);
+    assert_eq!(displaced.unsubscribe, vec![2]);
+    assert!(cached(&mut table, "c.example.com"));
 }
 
 #[test]
-fn rotation_retains_answers_under_dead_ids_that_are_never_unsubscribed() {
+fn an_ended_session_keeps_used_rule_sets_unregistered_and_drops_the_rest() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
+    let mut table = RouteTable::new(8);
+    install(&mut table, "used.example.com", 1, now);
+    install(&mut table, "idle.example.com", 2, now);
+    table.get(&key("used.example.com")).unwrap().mark_used();
 
-    let identities = cache.rotate_session();
-    assert_eq!(identities, vec![key.clone()]);
+    let (kept, displaced) = table.end_session();
 
-    // The answer still serves, and still answers the identity it was cached for.
-    let entry = match cache.lookup(&key, now) {
-        CacheLookup::Hit(CacheLookupHit::Positive(entry)) => entry,
-        other => panic!("a rotated answer keeps serving, got {other:?}"),
-    };
-    assert_eq!(
-        entry.subscription_id, None,
-        "a retained answer holds no ID the next stream could reissue"
-    );
-    assert!(cache.needs_reregistration(&key, now));
-
-    // The next stream reissues sub:1 for a different route. It must neither
-    // collide with nor invalidate the retained answer.
-    let other = request("other.example.com", "/b");
-    cache.insert_resolved(
-        other.clone(),
-        positive("sub:1", other.clone(), 1, 30, now),
-        now,
-    );
-    assert!(matches!(
-        cache.lookup(&key, now),
-        CacheLookup::Hit(CacheLookupHit::Positive(_))
-    ));
-    assert!(cache.invalidate_subscription(&sub("sub:1")));
+    assert_eq!(kept, vec![key("used.example.com")]);
+    assert!(displaced.unsubscribe.is_empty(), "the stream is gone");
+    assert_eq!(displaced.entries.len(), 1);
+    assert!(table.awaits_registration(&key("used.example.com"), now));
+    assert!(!cached(&mut table, "idle.example.com"));
+    assert_eq!(table.host_of(1), None);
+    let carried = table.get(&key("used.example.com")).unwrap();
+    assert_eq!(carried.subscription(), None);
     assert!(
-        matches!(
-            cache.lookup(&key, now),
-            CacheLookup::Hit(CacheLookupHit::Positive(_))
-        ),
-        "invalidating the reissued ID must not remove the retained answer"
+        !carried.was_used(),
+        "use is counted afresh on the next stream"
     );
 
-    // Expiring a rotated answer never sends its dead ID to the control plane.
-    let expired = now + Duration::from_secs(31);
-    assert!(cache.has_expired(expired));
-    assert!(
-        cache
-            .expire_limited(expired, usize::MAX)
-            .subscriptions_to_unsubscribe
-            .is_empty(),
-        "a dead subscription ID is never unsubscribed on the new stream"
-    );
+    // Registering it again makes it live under the new subscription.
+    install(&mut table, "used.example.com", 7, now);
+    assert!(!table.awaits_registration(&key("used.example.com"), now));
+    assert_eq!(table.host_of(7), Some(&key("used.example.com")));
 }
 
 #[test]
-fn a_rotated_answer_stays_bounded_by_the_ttl_it_was_given() {
+fn a_carried_rule_set_keeps_its_deadline() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
-    cache.rotate_session();
+    let mut table = RouteTable::new(8);
+    install(&mut table, "a.example.com", 1, now);
+    table.get(&key("a.example.com")).unwrap().mark_used();
+    table.end_session();
 
-    // Rotation preserves the original deadline rather than extending it: losing
-    // invalidation must shorten the trust window, never lengthen it.
-    assert!(matches!(
-        cache.lookup(&key, now + Duration::from_secs(29)),
-        CacheLookup::Hit(CacheLookupHit::Positive(_))
-    ));
-    assert_eq!(
-        cache.lookup(&key, now + Duration::from_secs(30)).status(),
-        CacheLookupStatus::Expired
-    );
-    assert!(!cache.needs_reregistration(&key, now + Duration::from_secs(30)));
+    assert!(table.awaits_registration(&key("a.example.com"), now + Duration::from_secs(59)));
+    assert!(!table.awaits_registration(&key("a.example.com"), now + Duration::from_secs(60)));
+    let displaced = table.expire(now + Duration::from_secs(60), usize::MAX);
+    assert_eq!(displaced.entries.len(), 1);
+    assert!(displaced.unsubscribe.is_empty());
 }
 
 #[test]
-fn a_rotated_answer_rejected_as_stale_is_dropped_rather_than_left_unreachable() {
+fn removing_an_ended_subscription_drops_its_host_and_asks_for_no_release() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 7, 30, now), now);
-    cache.rotate_session();
+    let mut table = RouteTable::new(8);
+    install(&mut table, "a.example.com", 1, now);
+    install(&mut table, "b.example.com", 2, now);
 
-    // Re-registration resolves afresh and comes back behind what is cached. The
-    // new subscription is refused, which spends the retained answer's one chance
-    // to register again.
-    let result =
-        cache.insert_resolved(key.clone(), positive("sub:9", key.clone(), 6, 30, now), now);
-    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("sub:9")]);
-    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
-    assert!(!cache.needs_reregistration(&key, now));
+    let displaced = table.remove_subscription(1);
+
+    assert!(displaced.unsubscribe.is_empty());
+    assert_eq!(displaced.entries.len(), 1);
+    assert!(!cached(&mut table, "a.example.com"));
+    assert!(cached(&mut table, "b.example.com"));
+    assert!(table.remove_subscription(99).entries.is_empty());
 }
 
 #[test]
-fn a_registered_answer_rejected_as_stale_keeps_serving() {
+fn a_lowered_capacity_holds_for_later_installs() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 7, 30, now), now);
+    let mut table = RouteTable::new(8);
+    for index in 0..4 {
+        install(&mut table, &format!("h{index}.example.com"), index + 1, now);
+    }
 
-    let result =
-        cache.insert_resolved(key.clone(), positive("sub:9", key.clone(), 6, 30, now), now);
-    assert_eq!(result.subscriptions_to_unsubscribe, vec![sub("sub:9")]);
-    let entry = match cache.lookup(&key, now) {
-        CacheLookup::Hit(CacheLookupHit::Positive(entry)) => entry,
-        other => panic!("a registered answer survives a stale rival, got {other:?}"),
-    };
-    assert!(entry.is_registered());
-    assert_eq!(entry.subscription_id, Some(sub("sub:1")));
+    let displaced = table.evict_oldest(2);
+    assert_eq!(displaced.unsubscribe, vec![1, 2]);
+    table.limit_capacity(table.positive_len());
+    assert_eq!(table.capacity(), 2);
+
+    let displaced = install(&mut table, "new.example.com", 9, now);
+    assert_eq!(displaced.unsubscribe, vec![3]);
+    assert_eq!(table.positive_len(), 2);
 }
 
 #[test]
-fn a_rotated_answer_is_absent_from_every_control_plane_facing_view() {
+fn clearing_reports_every_answer_and_empties_the_snapshot() {
     let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
-    assert_eq!(cache.active_subscription_ids(), vec![sub("sub:1")]);
-
-    cache.rotate_session();
-    assert!(
-        cache.active_subscription_ids().is_empty(),
-        "a rotated answer has no subscription to report"
-    );
-    assert!(cache.positive_by_subscription(&sub("sub:1")).is_none());
-    assert!(!cache.invalidate_subscription(&sub("sub:1")));
-    assert!(
-        matches!(
-            cache.lookup(&key, now),
-            CacheLookup::Hit(CacheLookupHit::Positive(_))
-        ),
-        "an ID the next stream reissues reaches nothing the previous one cached"
-    );
-}
-
-#[test]
-fn invalidating_by_identity_releases_only_an_id_the_control_plane_issued() {
-    let now = Instant::now();
-    let mut cache = RouteCache::new(8);
-    let key = request("app.example.com", "/a");
-    cache.insert_resolved(key.clone(), positive("sub:1", key.clone(), 1, 30, now), now);
-    assert_eq!(cache.invalidate_request(&key), Some(sub("sub:1")));
-    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
-
-    cache.insert_resolved(key.clone(), positive("sub:2", key.clone(), 1, 30, now), now);
-    cache.rotate_session();
-    assert_eq!(
-        cache.invalidate_request(&key),
+    let mut table = RouteTable::new(8);
+    install(&mut table, "a.example.com", 1, now);
+    table.install(
+        key("none.example.com"),
+        HostRules::default(),
+        now + Duration::from_secs(1),
         None,
-        "a rotated answer has no ID to release"
     );
-    assert_eq!(cache.lookup(&key, now).status(), CacheLookupStatus::Absent);
+
+    let displaced = table.clear();
+
+    assert_eq!(displaced.entries.len(), 2);
+    assert!(table.publish().expect("the table changed").is_empty());
+    assert_eq!((table.positive_len(), table.negative_len()), (0, 0));
+    assert_eq!(table.next_expiry(), None);
 }

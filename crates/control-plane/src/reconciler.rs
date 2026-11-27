@@ -24,7 +24,6 @@ use sleepypods_observability::{
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    api::RouteSubscriptionBroker,
     ids::InstanceId,
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     manifest::{render_manifests_with_options, RenderManifestRequest},
@@ -79,7 +78,6 @@ pub struct MaterializationReconciler<C> {
     target: crate::materialization::MaterializationTarget,
     config: MaterializationReconcilerConfig,
     observability: ObservabilityRecorder,
-    route_events: RouteSubscriptionBroker,
     cancellation: crate::runtime_work::Cancellation,
 }
 
@@ -268,14 +266,8 @@ where
             target,
             config,
             observability,
-            route_events: RouteSubscriptionBroker::new(),
             cancellation: crate::runtime_work::Cancellation::new(),
         }
-    }
-
-    pub fn with_route_events(mut self, route_events: RouteSubscriptionBroker) -> Self {
-        self.route_events = route_events;
-        self
     }
 
     /// Drives lifecycle work until shutdown.
@@ -651,12 +643,10 @@ where
             lease.attempt(),
             complete,
         );
-        let result = lease
+        lease
             .retry(|| self.store.complete_wake_reconciliation(request.clone()))
             .await
             .map_err(MaterializationReconcileError::Store)?;
-        self.notify_instance_routes_changed(result.instance.id)
-            .await?;
         Ok(())
     }
 
@@ -693,20 +683,10 @@ where
             lease.attempt(),
             FinalizeSleepRequest::new(instance.id, instance.generation, materialization.target),
         );
-        let result = lease
+        lease
             .retry(|| self.store.finalize_sleep_reconciliation(request.clone()))
             .await
             .map_err(MaterializationReconcileError::Store)?;
-        self.notify_instance_routes_changed(result.instance.id)
-            .await?;
-        Ok(())
-    }
-
-    async fn notify_instance_routes_changed(
-        &self,
-        instance_id: InstanceId,
-    ) -> Result<(), MaterializationReconcileError> {
-        self.route_events.notify_instance_changed(instance_id);
         Ok(())
     }
 
@@ -974,7 +954,6 @@ where
             target: self.target.clone(),
             config: self.config.clone(),
             observability: self.observability.clone(),
-            route_events: self.route_events.clone(),
             cancellation: self.cancellation.clone(),
         }
     }

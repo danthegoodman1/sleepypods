@@ -13,23 +13,18 @@ pub mod forward;
 pub mod http01;
 pub mod identity;
 pub mod listener;
-pub mod matcher;
-pub mod resolver;
 pub mod route;
 pub mod runtime;
 pub mod subscription;
 pub mod tls;
 pub mod wake;
 
-pub use cache::{
-    CacheInsertResult, CacheLookup, CacheLookupHit, CacheLookupStatus, NegativeCacheEntry,
-    PositiveCacheEntry, RouteCache,
-};
+pub use cache::{HostEntry, HostKey, RouteSnapshot, RouteTable};
 pub use config::{FrontlineEnvConfig, FrontlineEnvConfigError};
 pub use control_plane::{
     http01_challenge_key_to_proto, http01_challenge_record_from_proto,
-    proxy_subscribe_input_to_proto, proxy_subscribe_response_from_proto,
-    proxy_wake_response_from_proto, wake_instance_request_to_proto, ProxyProtocolAdapterError,
+    proxy_wake_response_from_proto, route_stream_reply_from_proto, route_stream_request_to_proto,
+    wake_instance_request_to_proto, ProxyProtocolAdapterError,
 };
 pub use control_plane_transport::{
     GrpcProxyControlPlaneClient, GrpcProxyControlPlaneError, GrpcProxyHttp01Resolver,
@@ -51,21 +46,14 @@ pub use listener::{
     FrontlineListenerError, FrontlineListenerKind, FrontlineListeners, FrontlineListenersConfig,
     FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
 };
-pub use matcher::{MatchedRoute, RouteMatcher, RouteRule};
-pub use resolver::{
-    FrontlineRouteResolution, FrontlineRouteResolver, FrontlineRouteResolverError,
-    RouteResolverProtocolError, RouteSubscriptionClient, RouteSubscriptionEvent,
-    RouteSubscriptionFuture, UnexpectedSubscribeResponseKind,
-};
 pub use route::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
-    SharedFrontlineRouteCoordinator, WakeClient, WakeClientFuture,
+    RouteLookupCounters, SharedFrontlineRouteCoordinator, WakeClient, WakeClientFuture,
 };
 pub use runtime::{FrontlineHttpRuntime, FrontlineRuntimeBody};
 pub use subscription::{
-    ApplyControlPlaneMessageOutcome, ApplyUpdateOutcome, InvalidationReason, ProxySubscribeInput,
-    RouteRequestId, SubscribeControlPlaneOutput, SubscriptionId, SubscriptionState,
-    UnsubscribeOutcome,
+    RouteStream, RouteStreamEvent, RouteStreamReply, RouteStreamRequest, RouteSubscriptionClient,
+    RouteSubscriptionFuture, SubscribeErrorCode, SubscriptionId,
 };
 pub use tls::{
     passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateStore,
@@ -73,8 +61,6 @@ pub use tls::{
     TlsTerminationError,
 };
 pub use wake::{
-    route_wake_decision, validate_route_update, validate_wake_response, ReadyBackend,
-    RouteUpdateDisposition, RouteWakeDecision, StaleWakeObservation, WakeAdmission,
-    WakeInstanceRequest, WakeInstanceResponse, WakeReason, WakeResponseDisposition, WakeTracker,
-    WakeUnavailable, WakeUnavailableReason, WakeWait, WakeWaitReason,
+    route_disposition, ReadyBackend, RouteDisposition, WakeInstanceRequest, WakeInstanceResponse,
+    WakeUnavailable, WakeUnavailableReason,
 };

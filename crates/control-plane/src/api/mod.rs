@@ -6,6 +6,7 @@ mod certificates;
 pub mod grpc_web;
 mod proxy;
 mod route_events;
+mod route_subscriptions;
 pub mod server;
 mod sidecar;
 mod template;
@@ -27,12 +28,12 @@ pub use proxy::{
 };
 pub use route_events::RouteSubscriptionBroker;
 pub use server::{
-    operator_grpc_service_with_store_and_route_events, StoreBackedOperatorApi,
-    StoreBackedOperatorGrpcService, OPERATOR_SERVICE_NAME,
+    operator_grpc_service_with_store, StoreBackedOperatorApi, StoreBackedOperatorGrpcService,
+    OPERATOR_SERVICE_NAME,
 };
 pub use sidecar::{
-    sidecar_grpc_service_with_store, sidecar_grpc_service_with_store_and_route_events,
-    StoreBackedSidecarApi, StoreBackedSidecarGrpcService, SIDECAR_SERVICE_NAME,
+    sidecar_grpc_service_with_store, StoreBackedSidecarApi, StoreBackedSidecarGrpcService,
+    SIDECAR_SERVICE_NAME,
 };
 
 /// Maps a store failure to the status a caller receives. Unavailable and

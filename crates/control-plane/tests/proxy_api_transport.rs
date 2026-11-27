@@ -1,6 +1,8 @@
 #[macro_use]
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
+#[path = "proxy_api_transport/route_edge.rs"]
+mod route_edge;
 mod support;
 use support::TestStore as FakeWakeStore;
 
@@ -12,22 +14,18 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
+    admission::ApiLimits,
     pb::{
-        operator_control_plane_server::OperatorControlPlane,
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::ProxyControlPlane, proxy_subscribe_request,
-        proxy_subscribe_response, proxy_wake_instance_response,
-        sidecar_control_plane_server::SidecarControlPlane, sidecar_report_idle_response,
-        HttpRouteIdentity, InstanceState, ProtocolRoute, ProxyCachePolicy, ProxyRouteEntry,
-        ProxyRouteInvalidatedResponse, ProxyRouteInvalidationReason, ProxyRouteMissResponse,
-        ProxyRouteResolvedResponse, ProxySubscribeRequest, ProxySubscribeResponse,
-        ProxySubscribeRouteRequest, ProxyWakeInstanceRequest, ProxyWakeInstanceResponse,
-        ProxyWakeUnavailableReason, RouteHost as ProtoRouteHost, RouteHostKind,
-        RouteIdentity as ProtoRouteIdentity, SidecarReportIdleRequest, SniRouteIdentity,
+        proxy_subscribe_response, proxy_wake_instance_response, InstanceState, ProxyCachePolicy,
+        ProxyHostRulesResponse, ProxyRouteEntry, ProxySubscribeErrorCode,
+        ProxySubscribeErrorResponse, ProxySubscribeHostRequest, ProxySubscribeRequest,
+        ProxySubscribeResponse, ProxyWakeInstanceRequest, ProxyWakeInstanceResponse,
+        ProxyWakeUnavailableReason, RouteHostKind, RouteKind as ProtoRouteKind,
     },
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
-    RouteSubscriptionBroker, StoreBackedOperatorApi, StoreBackedProxyApi,
-    StoreBackedProxyGrpcService, StoreBackedSidecarApi, PROXY_SERVICE_NAME,
+    RouteSubscriptionBroker, StoreBackedProxyApi, StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
@@ -101,21 +99,9 @@ fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
         PROXY_SERVICE_NAME
     );
 
-    let subscribe = ProxySubscribeRequest {
-        input: Some(proxy_subscribe_request::Input::SubscribeRoute(
-            ProxySubscribeRouteRequest {
-                request_id: "request-1".to_owned(),
-                identity: Some(proto_http_identity(
-                    RouteHostKind::Exact,
-                    "app.example.com",
-                    Some("/"),
-                )),
-            },
-        )),
-    };
     assert!(matches!(
-        subscribe.input,
-        Some(proxy_subscribe_request::Input::SubscribeRoute(_))
+        subscribe_http(1, "app.example.com").input,
+        Some(proxy_subscribe_request::Input::Subscribe(_))
     ));
 }
 
@@ -144,7 +130,7 @@ async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend(
     let accepted = expect_accepted(response);
     assert_eq!(accepted.instance_generation, 2);
     assert_eq!(client.applied_objects_len(), 0);
-    reconcile_proxy_work(store, client.clone(), RouteSubscriptionBroker::new()).await;
+    reconcile_proxy_work(store, client.clone()).await;
     let ready = expect_ready(
         service
             .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
@@ -199,7 +185,7 @@ async fn proxy_wake_unowned_live_ref_blocks_apply() {
         .into_inner();
 
     expect_accepted(response);
-    reconcile_proxy_work(store, client.clone(), RouteSubscriptionBroker::new()).await;
+    reconcile_proxy_work(store, client.clone()).await;
     assert_eq!(client.applied_objects_len(), 0);
 }
 
@@ -347,68 +333,44 @@ async fn native_grpc_proxy_auth_accepts_valid_wake_credentials() {
     assert_eq!(client.applied_objects_len(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn native_grpc_request_dispatches_to_store_backed_proxy_subscribe() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("example.com", Some("/")),
+        wildcard_http("example.com", Some("/")),
         domain_route_entry(
             "route-transport",
             "instance-transport",
             DomainInstanceState::Running,
         ),
     );
+    let mut proxy = proxy_client_with_route_events(store, RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
 
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-transport",
-            proto_http_identity(RouteHostKind::Exact, "app.example.com", Some("/v1")),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("native gRPC request should route through proxy subscribe service");
+    stream.send(subscribe_http(7, "app.example.com")).await;
 
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    let resolved = expect_route_resolved(single_message(messages));
-    assert_eq!(resolved.request_id, "request-transport");
-    assert!(!resolved.subscription_id.is_empty());
-    assert!(!resolved.subscription_id.contains("route-transport"));
-    assert!(!resolved.subscription_id.contains("instance-transport"));
-    assert!(!resolved.subscription_id.contains("example.com"));
+    let rules = stream.rules().await;
+    assert_eq!(rules.subscription_id, 7);
     assert_eq!(
-        resolved
-            .matched_identity
-            .as_ref()
-            .and_then(|identity| identity.kind.as_ref())
-            .and_then(|kind| match kind {
-                control_plane::api::pb::route_identity::Kind::Http(http) => http.host.as_ref(),
-                _ => None,
-            })
-            .map(|host| (host.kind, host.host.as_str())),
-        Some((RouteHostKind::WildcardSuffix as i32, "example.com"))
+        rule_summary(&rules),
+        vec![(
+            RouteHostKind::WildcardSuffix as i32,
+            "example.com".to_owned(),
+            Some("/".to_owned()),
+            "route-transport".to_owned()
+        )]
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn native_grpc_proxy_auth_rejects_subscribe_before_route_resolution() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("auth.example.com", Some("/")),
+        exact_http("auth.example.com", Some("/")),
         domain_route_entry("route-auth", "instance-auth", DomainInstanceState::Running),
     );
     let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
-    let request = subscribe_route_request(
-        "request-auth",
-        proto_http_identity(RouteHostKind::Exact, "auth.example.com", Some("/")),
-    );
+    let request = subscribe_http(1, "auth.example.com");
 
     let missing_status = collect_grpc_status(
         authenticated_proxy_service(
@@ -425,7 +387,6 @@ async fn native_grpc_proxy_auth_rejects_subscribe_before_route_resolution() {
     )
     .await;
     assert_eq!(missing_status, "16");
-    assert_eq!(store.resolve_route_requests(), 0);
 
     let wrong_role_status = collect_grpc_status(
         authenticated_proxy_service(
@@ -433,11 +394,7 @@ async fn native_grpc_proxy_auth_rejects_subscribe_before_route_resolution() {
             FakeKubernetesClient::default(),
         )
         .oneshot(with_authorization(
-            grpc_proxy_subscribe_request(
-                vec![request.clone()],
-                "application/grpc",
-                Version::HTTP_2,
-            ),
+            grpc_proxy_subscribe_request(vec![request], "application/grpc", Version::HTTP_2),
             "Bearer sidecar-token",
         ))
         .await
@@ -445,73 +402,94 @@ async fn native_grpc_proxy_auth_rejects_subscribe_before_route_resolution() {
     )
     .await;
     assert_eq!(wrong_role_status, "7");
+    tokio::time::sleep(Duration::from_millis(1)).await;
     assert_eq!(store.resolve_route_requests(), 0);
 
-    let response = authenticated_proxy_service(store_for_service, FakeKubernetesClient::default())
-        .oneshot(with_authorization(
-            grpc_proxy_subscribe_request(vec![request], "application/grpc", Version::HTTP_2),
-            "Bearer proxy-token",
-        ))
-        .await
-        .expect("valid proxy credentials dispatch subscribe");
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    assert_eq!(store.resolve_route_requests(), 1);
-    assert_eq!(
-        expect_route_resolved(single_message(messages)).request_id,
-        "request-auth"
+    let mut proxy = ProxyControlPlaneClient::with_interceptor(
+        InProcessService::new(authenticated_proxy_service(
+            store_for_service,
+            FakeKubernetesClient::default(),
+        )),
+        |mut request: tonic::Request<()>| {
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer proxy-token".parse().unwrap());
+            Ok(request)
+        },
     );
+    let (requests, incoming) = tokio::sync::mpsc::channel(4);
+    let mut responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .expect("valid proxy credentials dispatch subscribe")
+        .into_inner();
+    requests
+        .send(subscribe_http(1, "auth.example.com"))
+        .await
+        .unwrap();
+    let rules = expect_rules(next_subscribe_response(&mut responses).await);
+    assert_eq!(rules.rules.len(), 1);
+    assert_eq!(store.resolve_route_requests(), 1);
 }
 
-#[tokio::test]
-async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
+#[tokio::test(start_paused = true)]
+async fn proxy_subscribe_returns_the_complete_rule_set_for_the_host_most_specific_first() {
     let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("service.example.com", Some("/api")),
-        domain_route_entry(
-            "route-resolved",
-            "instance-resolved",
-            DomainInstanceState::Cold,
+    for (binding, identity) in [
+        (
+            "route-wildcard",
+            wildcard_http("example.com", Some("/api/v1")),
         ),
-    );
+        ("route-root", exact_http("service.example.com", None)),
+        ("route-api", exact_http("service.example.com", Some("/api"))),
+        (
+            "route-deep-wildcard",
+            wildcard_http("service.example.com", None),
+        ),
+        ("route-other-host", exact_http("other.example.com", None)),
+        ("route-sni", exact_sni("service.example.com")),
+    ] {
+        store.seed_route_resolved(
+            identity,
+            domain_route_entry(binding, "instance-resolved", DomainInstanceState::Cold),
+        );
+    }
     store.seed_ready_materialization(ready_materialization("instance-resolved", 7));
+    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
 
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-resolved",
-            proto_http_identity(RouteHostKind::Exact, "service.example.com", Some("/api/v1")),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
+    stream.send(subscribe_http(3, "service.example.com")).await;
 
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    let resolved = expect_route_resolved(single_message(messages));
-    assert_eq!(resolved.request_id, "request-resolved");
-    assert!(!resolved.subscription_id.is_empty());
-    assert!(!resolved.subscription_id.contains("route-resolved"));
-    assert!(!resolved.subscription_id.contains("instance-resolved"));
-    assert!(!resolved.subscription_id.contains("service.example.com"));
+    let rules = stream.rules().await;
+    assert_eq!(rules.subscription_id, 3);
     assert_eq!(
-        resolved.matched_identity,
-        Some(proto_http_identity(
-            RouteHostKind::WildcardSuffix,
-            "service.example.com",
-            Some("/api")
-        ))
+        rule_summary(&rules),
+        vec![
+            (
+                RouteHostKind::Exact as i32,
+                "service.example.com".to_owned(),
+                Some("/api".to_owned()),
+                "route-api".to_owned()
+            ),
+            (
+                RouteHostKind::Exact as i32,
+                "service.example.com".to_owned(),
+                None,
+                "route-root".to_owned()
+            ),
+            (
+                RouteHostKind::WildcardSuffix as i32,
+                "example.com".to_owned(),
+                Some("/api/v1".to_owned()),
+                "route-wildcard".to_owned()
+            ),
+        ],
+        "a wildcard suffix covers names under it, and the host itself only as an exact binding"
     );
     assert_eq!(
-        resolved.route,
+        rules.rules[0].route,
         Some(ProxyRouteEntry {
-            route_binding_id: "route-resolved".to_owned(),
+            route_binding_id: "route-api".to_owned(),
             instance_id: "instance-resolved".to_owned(),
             instance_state: InstanceState::Cold as i32,
             instance_generation: 7,
@@ -520,45 +498,25 @@ async fn proxy_subscribe_route_resolved_returns_subscription_and_route_entry() {
         })
     );
     assert_eq!(
-        resolved.cache_policy,
-        Some(ProxyCachePolicy { ttl_millis: 60_000 })
+        rules.cache_policy,
+        Some(ProxyCachePolicy { ttl_millis: 90_000 })
     );
-}
 
-#[tokio::test]
-async fn proxy_subscribe_publishes_backend_only_from_ready_materialization_for_target() {
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("ready.example.com", None),
-        domain_route_entry(
-            "route-ready",
-            "instance-ready",
-            DomainInstanceState::Running,
-        ),
-    );
-    store.seed_ready_materialization(ready_materialization("instance-ready", 7));
-
-    let resolved = subscribe_resolved_route(
-        store,
-        "request-ready",
-        proto_http_identity(RouteHostKind::Exact, "ready.example.com", None),
-        proxy_target(),
-    )
-    .await;
-
-    let route = resolved.route.expect("route entry is returned");
+    stream.send(subscribe_sni(4, "service.example.com")).await;
+    let sni = stream.rules().await;
+    assert_eq!(rules_bindings(&sni), vec!["route-sni"]);
     assert_eq!(
-        route.backend_uri,
-        Some("http://svc-acme.apps.svc.cluster.local:80".to_owned())
+        store.resolve_route_requests(),
+        2,
+        "one store read per answer"
     );
-    assert_eq!(route.backend_generation, Some(7));
 }
 
-#[tokio::test]
-async fn proxy_subscribe_preserves_the_resolver_snapshot_without_a_second_backend_read() {
+#[tokio::test(start_paused = true)]
+async fn proxy_subscribe_publishes_the_backend_its_one_store_read_resolved() {
     let store = Arc::new(FakeWakeStore::failing_ready_lookup());
     store.seed_route_resolved(
-        domain_http_identity("snapshot.example.com", None),
+        exact_http("snapshot.example.com", None),
         domain_route_entry(
             "route-snapshot",
             "instance-snapshot",
@@ -567,15 +525,9 @@ async fn proxy_subscribe_preserves_the_resolver_snapshot_without_a_second_backen
     );
     store.seed_ready_materialization(ready_materialization("instance-snapshot", 7));
 
-    let resolved = subscribe_resolved_route(
-        store,
-        "request-snapshot",
-        proto_http_identity(RouteHostKind::Exact, "snapshot.example.com", None),
-        proxy_target(),
-    )
-    .await;
+    let rules = subscribe_once(store, "snapshot.example.com").await;
 
-    let route = resolved.route.expect("snapshot route entry is returned");
+    let route = rules.rules[0].route.clone().expect("route entry");
     assert_eq!(
         route.backend_uri.as_deref(),
         Some("http://svc-acme.apps.svc.cluster.local:80")
@@ -583,8 +535,8 @@ async fn proxy_subscribe_preserves_the_resolver_snapshot_without_a_second_backen
     assert_eq!(route.backend_generation, Some(7));
 }
 
-#[tokio::test]
-async fn proxy_subscribe_withholds_backend_without_ready_materialization() {
+#[tokio::test(start_paused = true)]
+async fn proxy_subscribe_publishes_no_backend_without_a_ready_materialization() {
     let cases = [
         ("absent", None),
         ("pending", Some(MaterializationState::Pending)),
@@ -595,9 +547,10 @@ async fn proxy_subscribe_withholds_backend_without_ready_materialization() {
 
     for (suffix, materialization_state) in cases {
         let instance_id = format!("instance-{suffix}");
+        let host = format!("{suffix}.example.com");
         let store = Arc::new(FakeWakeStore::default());
         store.seed_route_resolved(
-            domain_http_identity(&format!("{suffix}.example.com"), None),
+            exact_http(&host, None),
             domain_route_entry(
                 &format!("route-{suffix}"),
                 &instance_id,
@@ -608,15 +561,10 @@ async fn proxy_subscribe_withholds_backend_without_ready_materialization() {
             store.seed_materialization(materialization_with_state(&instance_id, 7, state));
         }
 
-        let resolved = subscribe_resolved_route(
-            store,
-            &format!("request-{suffix}"),
-            proto_http_identity(RouteHostKind::Exact, &format!("{suffix}.example.com"), None),
-            proxy_target(),
-        )
-        .await;
+        let rules = subscribe_once(store, &host).await;
 
-        let route = resolved.route.expect("route entry is returned");
+        let route = rules.rules[0].route.clone().expect("route entry");
+        assert_eq!(route.instance_state, InstanceState::Running as i32);
         assert_eq!(route.backend_uri, None, "{suffix} must not publish backend");
         assert_eq!(
             route.backend_generation, None,
@@ -625,748 +573,264 @@ async fn proxy_subscribe_withholds_backend_without_ready_materialization() {
     }
 }
 
-#[tokio::test]
-async fn proxy_subscribe_withholds_backend_for_stale_generation_or_wrong_target() {
-    let stale_store = Arc::new(FakeWakeStore::default());
-    stale_store.seed_route_resolved(
-        domain_http_identity("stale.example.com", None),
-        domain_route_entry(
-            "route-stale",
-            "instance-stale",
-            DomainInstanceState::Running,
-        ),
-    );
-    stale_store.seed_ready_materialization(ready_materialization("instance-stale", 6));
-
-    let stale = subscribe_resolved_route(
-        stale_store,
-        "request-stale",
-        proto_http_identity(RouteHostKind::Exact, "stale.example.com", None),
-        proxy_target(),
-    )
-    .await;
-    let stale_route = stale.route.expect("route entry is returned");
-    assert_eq!(stale_route.instance_generation, 7);
-    assert_eq!(stale_route.backend_uri, None);
-    assert_eq!(stale_route.backend_generation, None);
-
-    let wrong_target_store = Arc::new(FakeWakeStore::default());
-    wrong_target_store.seed_route_resolved(
-        domain_http_identity("wrong-target.example.com", None),
-        domain_route_entry(
-            "route-wrong-target",
-            "instance-wrong-target",
-            DomainInstanceState::Running,
-        ),
-    );
-    wrong_target_store.seed_materialization(materialization_with_state_and_target(
-        "instance-wrong-target",
-        7,
-        MaterializationState::Ready,
-        MaterializationTarget::new("cluster-other", "apps").expect("target is valid"),
-    ));
-
-    let wrong_target = subscribe_resolved_route(
-        wrong_target_store,
-        "request-wrong-target",
-        proto_http_identity(RouteHostKind::Exact, "wrong-target.example.com", None),
-        proxy_target(),
-    )
-    .await;
-    let wrong_target_route = wrong_target.route.expect("route entry is returned");
-    assert_eq!(wrong_target_route.backend_uri, None);
-    assert_eq!(wrong_target_route.backend_generation, None);
-}
-
-#[tokio::test]
-async fn proxy_subscribe_route_miss_returns_negative_cache_policy() {
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_miss(Duration::from_secs(5));
-    let request_identity = proto_http_identity(RouteHostKind::Exact, "missing.example.com", None);
-
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-miss",
-            request_identity.clone(),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
-
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    let miss = expect_route_miss(single_message(messages));
-    assert_eq!(miss.request_id, "request-miss");
-    assert_eq!(miss.request_identity, Some(request_identity));
-    assert_eq!(
-        miss.negative_cache_policy,
-        Some(ProxyCachePolicy { ttl_millis: 5_000 })
-    );
-}
-
-#[tokio::test]
-async fn proxy_subscribe_unsubscribe_is_idempotent_and_unacknowledged() {
+#[tokio::test(start_paused = true)]
+async fn a_host_with_no_binding_gets_an_empty_rule_set_and_holds_no_subscription() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("unsubscribe.example.com", None),
+        exact_http("bound.example.com", None),
+        domain_route_entry(
+            "route-bound",
+            "instance-bound",
+            DomainInstanceState::Running,
+        ),
+    );
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        subscriptions_per_stream: 1,
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store, broker);
+    let mut stream = open_stream(&mut proxy).await;
+
+    stream.send(subscribe_http(1, "missing.example.com")).await;
+    let missing = stream.rules().await;
+    assert_eq!(missing.subscription_id, 1);
+    assert!(missing.rules.is_empty());
+    assert_eq!(
+        missing.cache_policy,
+        Some(ProxyCachePolicy { ttl_millis: 1_000 })
+    );
+
+    // The stream's one subscription is still free.
+    stream.send(subscribe_http(2, "bound.example.com")).await;
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["route-bound"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsubscribe_is_idempotent_unacknowledged_and_frees_the_subscription() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        exact_http("unsubscribe.example.com", None),
         domain_route_entry(
             "route-unsubscribe",
             "instance-unsubscribe",
             DomainInstanceState::Running,
         ),
     );
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        subscriptions_per_stream: 1,
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store, broker.clone());
+    let mut stream = open_stream(&mut proxy).await;
 
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![
-            subscribe_route_request(
-                "request-unsubscribe",
-                proto_http_identity(RouteHostKind::Exact, "unsubscribe.example.com", None),
-            ),
-            unsubscribe_request("sub:1"),
-            unsubscribe_request("sub:1"),
-            unsubscribe_request("unknown-subscription"),
-        ],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
+    stream
+        .send(subscribe_http(1, "unsubscribe.example.com"))
+        .await;
+    stream.rules().await;
+    for id in [1, 1, 99] {
+        stream.send(unsubscribe_request(id)).await;
+    }
+    stream.quiet().await;
 
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    assert_eq!(messages.len(), 1, "unsubscribe does not produce an ack");
-    let resolved = expect_route_resolved(single_message(messages));
-    assert_eq!(resolved.request_id, "request-unsubscribe");
+    // A released subscription receives no pushes and leaves room for another.
+    broker.notify_instance_changed(InstanceId::new("instance-unsubscribe").unwrap());
+    stream.quiet().await;
+    stream
+        .send(subscribe_http(2, "unsubscribe.example.com"))
+        .await;
+    assert_eq!(stream.rules().await.subscription_id, 2);
 }
 
-#[tokio::test]
-async fn operator_route_binding_delete_invalidates_active_proxy_subscription() {
-    let broker = RouteSubscriptionBroker::new();
+#[tokio::test(start_paused = true)]
+async fn an_invalid_subscribe_ends_that_subscription_and_the_stream_stays_up() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("delete-route.example.com", None),
+        exact_http("valid.example.com", None),
         domain_route_entry(
-            "route-delete-active",
-            "instance-delete-active",
+            "route-valid",
+            "instance-valid",
             DomainInstanceState::Running,
         ),
     );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
+    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
 
-    requests
-        .send(subscribe_route_request(
-            "request-delete-active",
-            proto_http_identity(RouteHostKind::Exact, "delete-route.example.com", None),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    let oversized = format!("{}.example.com", "a".repeat(242));
+    assert_eq!(oversized.len(), 254);
+    for (id, request) in [
+        (
+            1,
+            subscribe_request(1, ProtoRouteKind::Unspecified, "valid.example.com"),
+        ),
+        (2, subscribe_http(2, &oversized)),
+        (3, subscribe_http(3, "Valid.Example.com")),
+        (4, subscribe_http(4, "valid.example.com.")),
+        (5, subscribe_http(5, "localhost")),
+    ] {
+        stream.send(request).await;
+        let error = stream.error().await;
+        assert_eq!(error.subscription_id, id);
+        assert_eq!(error.code, ProxySubscribeErrorCode::InvalidArgument as i32);
+    }
     assert_eq!(
-        resolved.route.expect("route returned").route_binding_id,
-        "route-delete-active"
+        store.resolve_route_requests(),
+        0,
+        "refused before any lookup"
     );
 
-    let deleted = operator
-        .delete_route_binding(tonic::Request::new(
-            control_plane::api::pb::DeleteRouteBindingRequest {
-                route_binding_id: "route-delete-active".to_owned(),
-            },
-        ))
-        .await
-        .expect("operator delete route succeeds")
-        .into_inner();
-    assert!(deleted.deleted);
+    stream.send(subscribe_http(6, "valid.example.com")).await;
+    assert_eq!(stream.rules().await.subscription_id, 6);
 
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
+    // An ID names one live subscription.
+    stream.send(subscribe_http(6, "valid.example.com")).await;
+    let duplicate = stream.error().await;
     assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteRemoved as i32
+        duplicate.code,
+        ProxySubscribeErrorCode::InvalidArgument as i32
     );
+    assert_eq!(store.resolve_route_requests(), 1);
 }
 
-#[tokio::test]
-async fn sidecar_report_idle_accepted_invalidates_active_proxy_subscription() {
-    let broker = RouteSubscriptionBroker::new();
+#[tokio::test(start_paused = true)]
+async fn a_failed_store_lookup_ends_that_subscription_and_the_stream_stays_up() {
     let store = Arc::new(FakeWakeStore::default());
-    store.seed_instance(domain_instance(
-        "instance-idle-active",
-        DomainInstanceState::Running,
-        7,
-    ));
-    store.seed_workload_class(domain_workload_class());
-    store.seed_ready_materialization(ready_materialization("instance-idle-active", 7));
     store.seed_route_resolved(
-        domain_http_identity("idle-active.example.com", None),
+        exact_http("offline.example.com", None),
         domain_route_entry(
-            "route-idle-active",
-            "instance-idle-active",
+            "route-offline",
+            "instance-offline",
             DomainInstanceState::Running,
         ),
     );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let sidecar = sidecar_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-idle-active",
-            proto_http_identity(RouteHostKind::Exact, "idle-active.example.com", None),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        resolved.route.expect("route returned").route_binding_id,
-        "route-idle-active"
-    );
-
-    // Accepted ReportIdle begins sleep through the sidecar API and must notify
-    // proxies before cleanup relies on cache expiry.
-    let response = sidecar
-        .report_idle(tonic::Request::new(SidecarReportIdleRequest {
-            pod_uid: "test-pod".to_owned(),
-            instance_id: "instance-idle-active".to_owned(),
-            expected_generation: 7,
-            active_count: 0,
-        }))
-        .await
-        .expect("sidecar idle report succeeds")
-        .into_inner();
-    assert!(matches!(
-        response.outcome,
-        Some(sidecar_report_idle_response::Outcome::Accepted(_))
-    ));
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn proxy_wake_completion_invalidates_active_proxy_subscription() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_instance(domain_instance(
-        "instance-wake-active",
-        DomainInstanceState::Cold,
-        7,
-    ));
-    store.seed_workload_class(domain_workload_class());
-    store.seed_route_resolved(
-        domain_http_identity("wake-active.example.com", None),
-        domain_route_entry(
-            "route-wake-active",
-            "instance-wake-active",
-            DomainInstanceState::Cold,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-wake-active",
-            proto_http_identity(RouteHostKind::Exact, "wake-active.example.com", None),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        resolved.route.expect("route returned").route_binding_id,
-        "route-wake-active"
-    );
-
-    // A completed proxy wake changes the instance/backend visible to subscribed
-    // routes and must invalidate the held subscription immediately.
-    let response = proxy
-        .wake_instance(tonic::Request::new(ProxyWakeInstanceRequest {
-            instance_id: "instance-wake-active".to_owned(),
-            expected_generation: 7,
-            backend_generation: Some(44),
-        }))
-        .await
-        .expect("proxy wake succeeds")
-        .into_inner();
-    expect_accepted(response);
-    reconcile_proxy_work(store, FakeKubernetesClient::default(), broker).await;
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn operator_delete_instance_invalidates_active_proxy_subscription() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_instance(domain_instance(
-        "instance-delete-route-active",
-        DomainInstanceState::Running,
-        7,
-    ));
-    store.seed_ready_materialization(ready_materialization("instance-delete-route-active", 7));
-    store.seed_route_resolved(
-        domain_http_identity("delete-instance-active.example.com", None),
-        domain_route_entry(
-            "route-delete-instance-active",
-            "instance-delete-route-active",
-            DomainInstanceState::Running,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-delete-instance-active",
-            proto_http_identity(
-                RouteHostKind::Exact,
-                "delete-instance-active.example.com",
-                None,
-            ),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        resolved.route.expect("route returned").route_binding_id,
-        "route-delete-instance-active"
-    );
-
-    // Operator DeleteInstance removes all instance routes from proxy caches even
-    // though the route binding itself is not deleted through the route API.
-    let deleted = operator
-        .delete_instance(tonic::Request::new(
-            control_plane::api::pb::DeleteInstanceRequest {
-                instance_id: "instance-delete-route-active".to_owned(),
-                expected_generation: Some(7),
-            },
-        ))
-        .await
-        .expect("operator delete instance succeeds")
-        .into_inner();
-    assert!(deleted.accepted);
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, resolved.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn operator_route_binding_reassignment_invalidates_old_route_before_resubscribe() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("reassign-route.example.com", None),
-        domain_route_entry(
-            "route-reassign-old",
-            "instance-reassign-old",
-            DomainInstanceState::Running,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(Arc::clone(&store), broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-reassign-old",
-            proto_http_identity(RouteHostKind::Exact, "reassign-route.example.com", None),
-        ))
-        .await
-        .expect("old subscribe request sends");
-    let old = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        old.route
-            .as_ref()
-            .expect("old route returned")
-            .route_binding_id,
-        "route-reassign-old"
-    );
-
-    let deleted = operator
-        .delete_route_binding(tonic::Request::new(
-            control_plane::api::pb::DeleteRouteBindingRequest {
-                route_binding_id: "route-reassign-old".to_owned(),
-            },
-        ))
-        .await
-        .expect("old route delete succeeds")
-        .into_inner();
-    assert!(deleted.deleted);
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, old.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteRemoved as i32
-    );
-
-    store.seed_route_resolved(
-        domain_http_identity("reassign-route.example.com", None),
-        domain_route_entry(
-            "route-reassign-new",
-            "instance-reassign-new",
-            DomainInstanceState::Running,
-        ),
-    );
-    operator
-        .create_route_binding(tonic::Request::new(
-            control_plane::api::pb::CreateRouteBindingRequest {
-                route_binding_id: "route-reassign-new".to_owned(),
-                instance_id: "instance-reassign-new".to_owned(),
-                identity: Some(proto_http_identity(
-                    RouteHostKind::Exact,
-                    "reassign-route.example.com",
-                    None,
-                )),
-                protocol: ProtocolRoute::Http as i32,
-            },
-        ))
-        .await
-        .expect("new route create succeeds");
-
-    requests
-        .send(subscribe_route_request(
-            "request-reassign-new",
-            proto_http_identity(RouteHostKind::Exact, "reassign-route.example.com", None),
-        ))
-        .await
-        .expect("new subscribe request sends");
-    let new = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    let new_route = new.route.expect("new route returned");
-    assert_eq!(new_route.route_binding_id, "route-reassign-new");
-    assert_eq!(new_route.instance_id, "instance-reassign-new");
-}
-
-#[tokio::test]
-async fn operator_exact_http_host_create_invalidates_cached_wildcard_subscription() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("example.com", None),
-        domain_route_entry(
-            "route-wildcard-http",
-            "instance-wildcard-http",
-            DomainInstanceState::Running,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-http-shadow-host",
-            proto_http_identity(RouteHostKind::Exact, "app.example.com", None),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let cached = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        cached
-            .route
-            .as_ref()
-            .expect("cached route returned")
-            .route_binding_id,
-        "route-wildcard-http"
-    );
-
-    operator
-        .create_route_binding(tonic::Request::new(
-            control_plane::api::pb::CreateRouteBindingRequest {
-                route_binding_id: "route-exact-http".to_owned(),
-                instance_id: "instance-exact-http".to_owned(),
-                identity: Some(proto_http_identity(
-                    RouteHostKind::Exact,
-                    "app.example.com",
-                    None,
-                )),
-                protocol: ProtocolRoute::Http as i32,
-            },
-        ))
-        .await
-        .expect("more specific route create succeeds");
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, cached.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn operator_longer_http_path_create_invalidates_cached_shorter_path_subscription() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity_exact("path.example.com", Some("/api")),
-        domain_route_entry(
-            "route-short-path",
-            "instance-short-path",
-            DomainInstanceState::Running,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-http-shadow-path",
-            proto_http_identity(
-                RouteHostKind::Exact,
-                "path.example.com",
-                Some("/api/v1/users"),
-            ),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let cached = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        cached
-            .route
-            .as_ref()
-            .expect("cached route returned")
-            .route_binding_id,
-        "route-short-path"
-    );
-
-    operator
-        .create_route_binding(tonic::Request::new(
-            control_plane::api::pb::CreateRouteBindingRequest {
-                route_binding_id: "route-long-path".to_owned(),
-                instance_id: "instance-long-path".to_owned(),
-                identity: Some(proto_http_identity(
-                    RouteHostKind::Exact,
-                    "path.example.com",
-                    Some("/api/v1"),
-                )),
-                protocol: ProtocolRoute::Http as i32,
-            },
-        ))
-        .await
-        .expect("more specific route create succeeds");
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, cached.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn operator_exact_sni_create_invalidates_cached_wildcard_sni_subscription() {
-    let broker = RouteSubscriptionBroker::new();
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_sni_identity("example.com", RouteHostKind::WildcardSuffix),
-        domain_route_entry(
-            "route-wildcard-sni",
-            "instance-wildcard-sni",
-            DomainInstanceState::Running,
-        ),
-    );
-    let mut proxy = proxy_client_with_route_events(Arc::clone(&store), broker.clone());
-    let operator = operator_api_with_route_events(store, broker);
-    let (requests, request_stream) = tokio::sync::mpsc::channel(4);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(request_stream))
-        .await
-        .expect("subscribe stream opens")
-        .into_inner();
-
-    requests
-        .send(subscribe_route_request(
-            "request-sni-shadow-host",
-            proto_sni_identity(RouteHostKind::Exact, "db.example.com"),
-        ))
-        .await
-        .expect("subscribe request sends");
-    let cached = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    assert_eq!(
-        cached
-            .route
-            .as_ref()
-            .expect("cached route returned")
-            .route_binding_id,
-        "route-wildcard-sni"
-    );
-
-    operator
-        .create_route_binding(tonic::Request::new(
-            control_plane::api::pb::CreateRouteBindingRequest {
-                route_binding_id: "route-exact-sni".to_owned(),
-                instance_id: "instance-exact-sni".to_owned(),
-                identity: Some(proto_sni_identity(RouteHostKind::Exact, "db.example.com")),
-                protocol: ProtocolRoute::TlsSni as i32,
-            },
-        ))
-        .await
-        .expect("more specific SNI route create succeeds");
-
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(invalidated.subscription_id, cached.subscription_id);
-    assert_eq!(
-        invalidated.reason,
-        ProxyRouteInvalidationReason::RouteChanged as i32
-    );
-}
-
-#[tokio::test]
-async fn proxy_subscribe_invalid_request_returns_invalid_argument() {
-    let response = proxy_grpc_service_with_store(
-        Arc::new(FakeWakeStore::default()),
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "",
-            proto_http_identity(RouteHostKind::Exact, "invalid.example.com", None),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
-
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert!(messages.is_empty());
-    assert_eq!(status, "3");
-}
-
-#[tokio::test]
-async fn proxy_subscribe_invalid_route_identity_returns_invalid_argument() {
-    let response = proxy_grpc_service_with_store(
-        Arc::new(FakeWakeStore::default()),
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-invalid-identity",
-            proto_http_identity(RouteHostKind::Unspecified, "invalid.example.com", None),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
-
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert!(messages.is_empty());
-    assert_eq!(status, "3");
-}
-
-#[tokio::test]
-async fn proxy_subscribe_store_unavailable_terminates_stream() {
-    let store = Arc::new(FakeWakeStore::default());
     store.seed_route_error_unavailable("store is offline");
+    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
 
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-store-error",
-            proto_http_identity(RouteHostKind::Exact, "offline.example.com", None),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
+    stream.send(subscribe_http(1, "offline.example.com")).await;
+    let error = stream.error().await;
+    assert_eq!(error.subscription_id, 1);
+    assert_eq!(error.code, ProxySubscribeErrorCode::Unavailable as i32);
+    assert_eq!(error.message, "control-plane store is unavailable");
 
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert!(messages.is_empty());
-    assert_eq!(status, "14");
+    // The same stream, and the same ID, serve the host once the store is back.
+    store.clear_route_error();
+    stream.send(subscribe_http(1, "offline.example.com")).await;
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["route-offline"]);
 }
 
-#[tokio::test]
-async fn proxy_subscribe_store_internal_error_terminates_stream() {
-    let response = proxy_grpc_service_with_store(
-        Arc::new(FakeWakeStore::default()),
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(
-            "request-store-internal-error",
-            proto_http_identity(RouteHostKind::Exact, "internal.example.com", None),
-        )],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
+#[tokio::test(start_paused = true)]
+async fn a_lookup_that_times_out_ends_that_subscription_and_the_stream_stays_up() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        exact_http("slow.example.com", None),
+        domain_route_entry("route-slow", "instance-slow", DomainInstanceState::Running),
+    );
+    let gate = Arc::new(tokio::sync::Notify::new());
+    store.set_resolve_gate(gate.clone());
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        lookup_timeout: Duration::from_millis(30),
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
+    let mut stream = open_stream(&mut proxy).await;
 
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert!(messages.is_empty());
-    assert_eq!(status, "13");
+    let started = tokio::time::Instant::now();
+    stream.send(subscribe_http(1, "slow.example.com")).await;
+    let error = stream.error().await;
+    assert_eq!(error.code, ProxySubscribeErrorCode::Unavailable as i32);
+    assert_eq!(started.elapsed(), Duration::from_millis(30));
+
+    gate.notify_one();
+    stream.send(subscribe_http(2, "slow.example.com")).await;
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["route-slow"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_subscription_limit_refuses_one_subscription_and_the_stream_stays_up() {
+    let store = Arc::new(FakeWakeStore::default());
+    for host in ["first.example.com", "second.example.com"] {
+        store.seed_route_resolved(
+            exact_http(host, None),
+            domain_route_entry(host, "instance-limit", DomainInstanceState::Running),
+        );
+    }
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        subscriptions_per_stream: 1,
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
+    let mut stream = open_stream(&mut proxy).await;
+
+    stream.send(subscribe_http(1, "first.example.com")).await;
+    stream.rules().await;
+    stream.send(subscribe_http(2, "second.example.com")).await;
+    let error = stream.error().await;
+    assert_eq!(error.subscription_id, 2);
+    assert_eq!(
+        error.code,
+        ProxySubscribeErrorCode::ResourceExhausted as i32
+    );
+    assert_eq!(
+        store.resolve_route_requests(),
+        1,
+        "the limit precedes the lookup"
+    );
+
+    stream.send(unsubscribe_request(1)).await;
+    stream.send(subscribe_http(2, "second.example.com")).await;
+    assert_eq!(
+        rules_bindings(&stream.rules().await),
+        vec!["second.example.com"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rule_set_too_large_to_send_ends_that_subscription_and_the_stream_stays_up() {
+    let store = Arc::new(FakeWakeStore::default());
+    // 256 rules of about 4.1 KiB each exceed the 1 MiB response limit.
+    for index in 0..256 {
+        store.seed_route_resolved(
+            exact_http(
+                "large.example.com",
+                Some(&format!("/{index:03}/{}", "p".repeat(4_088))),
+            ),
+            domain_route_entry(
+                &format!("large-{index}"),
+                "instance-large",
+                DomainInstanceState::Running,
+            ),
+        );
+    }
+    store.seed_route_resolved(
+        exact_http("small.example.com", None),
+        domain_route_entry("small", "instance-small", DomainInstanceState::Running),
+    );
+    let mut proxy = proxy_client_with_route_events(store, RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
+
+    stream.send(subscribe_http(1, "large.example.com")).await;
+    let error = stream.error().await;
+    assert_eq!(error.subscription_id, 1);
+    assert_eq!(error.code, ProxySubscribeErrorCode::InvalidArgument as i32);
+
+    stream.send(subscribe_http(2, "small.example.com")).await;
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["small"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_without_input_ends_the_stream_as_invalid() {
+    let mut proxy = proxy_client_with_route_events(
+        Arc::new(FakeWakeStore::default()),
+        RouteSubscriptionBroker::new(),
+    );
+    let mut stream = open_stream(&mut proxy).await;
+
+    stream.send(ProxySubscribeRequest { input: None }).await;
+
+    assert_eq!(
+        stream.end().await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
 }
 
 #[tokio::test]
@@ -1427,12 +891,7 @@ async fn accepted_proxy_wake_survives_api_drop_and_completes_in_fresh_driver() {
     assert_eq!(expect_accepted(response).instance_generation, 6);
     assert_eq!(client.applied_objects_len(), 0);
     drop(service);
-    reconcile_proxy_work(
-        store.clone(),
-        client.clone(),
-        RouteSubscriptionBroker::new(),
-    )
-    .await;
+    reconcile_proxy_work(store.clone(), client.clone()).await;
     let ready = store
         .load_ready_materialization(
             control_plane::materialization::LoadReadyMaterializationRequest::new(
@@ -1586,162 +1045,261 @@ async fn accepted_proxy_wake_remains_recoverable_when_readiness_fails() {
 
     expect_accepted(response);
     assert_eq!(client.applied_objects_len(), 0);
-    reconcile_proxy_work(store.clone(), client, RouteSubscriptionBroker::new()).await;
+    reconcile_proxy_work(store.clone(), client).await;
     let records = store.materializations();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].state, MaterializationState::Pending);
     assert!(records[0].backend.is_none());
 }
 
-#[tokio::test]
-async fn subscriptions_bound_streams_entries_expiry_and_recover() {
+#[tokio::test(start_paused = true)]
+async fn subscription_streams_are_bounded_end_in_order_at_their_lifetime_and_free_their_slot() {
     let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("bounded.example.com", None),
-        domain_route_entry(
-            "bounded-route",
-            "bounded-instance",
-            DomainInstanceState::Running,
-        ),
-    );
-    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
         subscription_streams: 1,
-        subscriptions_per_stream: 1,
         subscription_lifetime: Duration::from_millis(80),
         ..Default::default()
     });
-    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
-    let (requests, incoming) = tokio::sync::mpsc::channel(4);
-    let mut stream = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
+    let mut proxy = proxy_client_with_route_events(store, broker);
+    let opened = tokio::time::Instant::now();
+    let mut stream = open_stream(&mut proxy).await;
+
     let (_other, incoming) = tokio::sync::mpsc::channel(1);
-    let error = proxy
+    let refused = proxy
         .subscribe(ReceiverStream::new(incoming))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-    requests
-        .send(subscribe_route_request(
-            "first",
-            proto_http_identity(RouteHostKind::Exact, "bounded.example.com", None),
-        ))
+    assert_eq!(refused.code(), Code::ResourceExhausted);
+
+    stream
+        .end()
         .await
-        .unwrap();
-    expect_route_resolved(next_subscribe_response(&mut stream).await);
-    requests
-        .send(subscribe_route_request(
-            "second",
-            proto_http_identity(RouteHostKind::Exact, "bounded.example.com", None),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        stream.message().await.unwrap_err().code(),
-        tonic::Code::ResourceExhausted
-    );
-    assert_eq!(
-        store.resolve_route_requests(),
-        1,
-        "entry cap precedes lookup"
-    );
+        .expect("a stream ends in order at its lifetime");
+    assert_eq!(opened.elapsed(), Duration::from_millis(80));
     drop(stream);
-    drop(requests);
-    tokio::task::yield_now().await;
-    let (requests, incoming) = tokio::sync::mpsc::channel(1);
-    let mut expired = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), expired.message())
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
-    );
-    drop(expired);
-    drop(requests);
-    tokio::task::yield_now().await;
-    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
-    let recovered = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap();
-    drop(recovered);
+    settle().await;
+    drop(open_stream(&mut proxy).await);
 }
 
-#[tokio::test]
-async fn oversized_subscription_identity_is_rejected_before_lookup() {
-    let store = Arc::new(FakeWakeStore::default());
-    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
-    let (requests, incoming) = tokio::sync::mpsc::channel(1);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
-    requests
-        .send(subscribe_route_request(
-            "oversized",
-            proto_http_identity(RouteHostKind::Exact, &"a".repeat(254), None),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        responses.message().await.unwrap_err().code(),
-        tonic::Code::InvalidArgument
-    );
-    assert_eq!(store.resolve_route_requests(), 0);
-}
-
-#[tokio::test]
-async fn unrelated_instance_churn_preserves_the_hot_subscription() {
+#[tokio::test(start_paused = true)]
+async fn lost_route_changes_end_the_stream_with_data_loss() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("hot.example.com", None),
+        exact_http("lossy.example.com", None),
+        domain_route_entry(
+            "route-lossy",
+            "instance-lossy",
+            DomainInstanceState::Running,
+        ),
+    );
+    let broker = RouteSubscriptionBroker::new();
+    let mut proxy = proxy_client_with_route_events(store, broker.clone());
+
+    // The dispatcher found a gap in the change history.
+    let mut reset = open_stream(&mut proxy).await;
+    reset.send(subscribe_http(1, "lossy.example.com")).await;
+    reset.rules().await;
+    broker.reset();
+    assert_eq!(reset.end().await.unwrap_err().code(), Code::DataLoss);
+
+    // The stream fell further behind than the broker keeps.
+    let mut lagged = open_stream(&mut proxy).await;
+    lagged.send(subscribe_http(1, "lossy.example.com")).await;
+    lagged.rules().await;
+    for index in 0..5_000 {
+        broker.notify_instance_changed(InstanceId::new(format!("unrelated-{index}")).unwrap());
+    }
+    assert_eq!(lagged.end().await.unwrap_err().code(), Code::DataLoss);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_proxy_that_stops_reading_ends_the_stream_with_deadline_exceeded_and_frees_its_slot() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        exact_http("blocked.example.com", None),
+        domain_route_entry(
+            "route-blocked",
+            "instance-blocked",
+            DomainInstanceState::Cold,
+        ),
+    );
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        subscription_streams: 1,
+        response_timeout: Duration::from_millis(30),
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
+    let mut stream = open_stream(&mut proxy).await;
+    for id in 0..200 {
+        stream.send(subscribe_http(id, "blocked.example.com")).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let lookups = store.resolve_route_requests();
+    assert!(
+        (1..200).contains(&lookups),
+        "a full response queue stops the lookups: {lookups}"
+    );
+
+    // The stream holds its slot until the proxy lets go of it.
+    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    assert_eq!(
+        proxy
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+
+    // What was queued arrives first, then the status that ended the stream.
+    let mut delivered = 0;
+    let status = loop {
+        match stream.responses.message().await {
+            Ok(Some(_)) => delivered += 1,
+            Ok(None) => panic!("a stream the proxy stopped reading ends with a status"),
+            Err(status) => break status,
+        }
+    };
+    assert_eq!(status.code(), Code::DeadlineExceeded);
+    assert!(delivered > 0 && delivered < 200, "{delivered}");
+    assert_eq!(store.resolve_route_requests(), lookups);
+
+    drop(stream);
+    settle().await;
+    drop(open_stream(&mut proxy).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_instance_change_pushes_the_rule_set_and_unrelated_churn_pushes_nothing() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        exact_http("hot.example.com", None),
         domain_route_entry("hot-route", "hot-instance", DomainInstanceState::Running),
     );
     let broker = RouteSubscriptionBroker::new();
     let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
-    let (requests, incoming) = tokio::sync::mpsc::channel(1);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
-    requests
-        .send(subscribe_route_request(
-            "hot",
-            proto_http_identity(RouteHostKind::Exact, "hot.example.com", None),
-        ))
-        .await
-        .unwrap();
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
+    let mut stream = open_stream(&mut proxy).await;
+    stream.send(subscribe_http(1, "hot.example.com")).await;
+    let first = stream.rules().await;
+    assert_eq!(first.rules[0].route.as_ref().unwrap().backend_uri, None);
+
     for index in 0..100 {
         broker.notify_instance_changed(InstanceId::new(format!("unrelated-{index}")).unwrap());
     }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), responses.message())
-            .await
-            .is_err()
-    );
+    stream.quiet().await;
     assert_eq!(store.resolve_route_requests(), 1);
+
+    // The instance's materialization became ready.
+    store.seed_ready_materialization(ready_materialization("hot-instance", 7));
     broker.notify_instance_changed(InstanceId::new("hot-instance").unwrap());
+    let pushed = stream.rules().await;
+    assert_eq!(pushed.subscription_id, 1);
     assert_eq!(
-        expect_route_invalidated(next_subscribe_response(&mut responses).await).subscription_id,
-        resolved.subscription_id
+        pushed.rules[0]
+            .route
+            .as_ref()
+            .unwrap()
+            .backend_uri
+            .as_deref(),
+        Some("http://svc-acme.apps.svc.cluster.local:80")
+    );
+    assert_eq!(store.resolve_route_requests(), 2);
+    stream.quiet().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_binding_change_for_the_host_or_one_of_its_suffixes_pushes_the_new_rule_set() {
+    let store = Arc::new(FakeWakeStore::default());
+    let broker = RouteSubscriptionBroker::new();
+    let bind = |binding: &str, identity: RouteIdentity| {
+        store.seed_route_resolved(
+            identity.clone(),
+            domain_route_entry(binding, "instance-push", DomainInstanceState::Running),
+        );
+        broker.notify_route_changed(RouteBindingId::new(binding).unwrap(), identity);
+    };
+    store.seed_route_resolved(
+        exact_http("app.team.example.com", None),
+        domain_route_entry("root", "instance-push", DomainInstanceState::Running),
+    );
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
+    let mut stream = open_stream(&mut proxy).await;
+    stream.send(subscribe_http(1, "app.team.example.com")).await;
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["root"]);
+
+    bind("api", exact_http("app.team.example.com", Some("/api")));
+    assert_eq!(rules_bindings(&stream.rules().await), vec!["api", "root"]);
+
+    bind("team", wildcard_http("team.example.com", None));
+    assert_eq!(
+        rules_bindings(&stream.rules().await),
+        vec!["api", "root", "team"]
+    );
+
+    bind("apex", wildcard_http("example.com", Some("/apex")));
+    assert_eq!(
+        rules_bindings(&stream.rules().await),
+        vec!["api", "root", "team", "apex"]
+    );
+
+    // Bindings that cannot serve this host leave the subscription alone.
+    bind("other-host", exact_http("other.team.example.com", None));
+    bind("other-suffix", wildcard_http("app.team.example.com", None));
+    bind("other-kind", exact_sni("app.team.example.com"));
+    stream.quiet().await;
+    assert_eq!(store.resolve_route_requests(), 4);
+
+    // A removed binding is announced with the identity it had.
+    store.remove_route("team");
+    broker.notify_route_changed(
+        RouteBindingId::new("team").unwrap(),
+        wildcard_http("team.example.com", None),
+    );
+    assert_eq!(
+        rules_bindings(&stream.rules().await),
+        vec!["api", "root", "apex"]
     );
 }
 
-#[tokio::test]
-async fn subscription_registers_before_slow_snapshot_and_replays_the_concurrent_change() {
+#[tokio::test(start_paused = true)]
+async fn removing_the_last_binding_pushes_an_empty_rule_set_and_ends_the_subscription() {
     let store = Arc::new(FakeWakeStore::default());
     store.seed_route_resolved(
-        domain_http_identity("snapshot.example.com", None),
+        exact_http("leaving.example.com", None),
+        domain_route_entry("leaving", "instance-leaving", DomainInstanceState::Running),
+    );
+    let broker = RouteSubscriptionBroker::with_limits(ApiLimits {
+        subscriptions_per_stream: 1,
+        ..Default::default()
+    });
+    let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
+    let mut stream = open_stream(&mut proxy).await;
+    stream.send(subscribe_http(1, "leaving.example.com")).await;
+    stream.rules().await;
+
+    store.remove_route("leaving");
+    broker.notify_route_changed(
+        RouteBindingId::new("leaving").unwrap(),
+        exact_http("leaving.example.com", None),
+    );
+
+    let emptied = stream.rules().await;
+    assert_eq!(emptied.subscription_id, 1);
+    assert!(emptied.rules.is_empty());
+    assert_eq!(
+        emptied.cache_policy,
+        Some(ProxyCachePolicy { ttl_millis: 1_000 })
+    );
+    // Its place is free for another host.
+    stream.send(subscribe_http(2, "leaving.example.com")).await;
+    assert!(stream.rules().await.rules.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_change_that_commits_during_a_lookup_is_followed_by_the_newer_rule_set() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.seed_route_resolved(
+        exact_http("snapshot.example.com", None),
         domain_route_entry(
             "snapshot-route",
             "snapshot-instance",
@@ -1752,133 +1310,127 @@ async fn subscription_registers_before_slow_snapshot_and_replays_the_concurrent_
     store.set_resolve_gate(gate.clone());
     let broker = RouteSubscriptionBroker::new();
     let mut proxy = proxy_client_with_route_events(store.clone(), broker.clone());
-    let (requests, incoming) = tokio::sync::mpsc::channel(1);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
-    requests
-        .send(subscribe_route_request(
-            "snapshot",
-            proto_http_identity(RouteHostKind::Exact, "snapshot.example.com", None),
-        ))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while store.resolve_route_requests() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let mut stream = open_stream(&mut proxy).await;
+    stream.send(subscribe_http(1, "snapshot.example.com")).await;
+    settle().await;
+    assert_eq!(store.resolve_route_requests(), 1, "the lookup is in flight");
+
+    // The stream cannot yet know which instances the host depends on.
+    broker.notify_instance_changed(InstanceId::new("unrelated-instance").unwrap());
     broker.notify_instance_changed(InstanceId::new("snapshot-instance").unwrap());
+    settle().await;
     gate.notify_one();
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await);
-    let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await);
-    assert_eq!(resolved.subscription_id, invalidated.subscription_id);
-    assert_eq!(store.resolve_route_requests(), 1);
+    stream.rules().await;
+
+    // The change may postdate the snapshot the first answer came from.
+    settle().await;
+    assert_eq!(store.resolve_route_requests(), 2);
+    gate.notify_one();
+    assert_eq!(stream.rules().await.subscription_id, 1);
+    stream.quiet().await;
+    assert_eq!(store.resolve_route_requests(), 2);
 }
 
-#[tokio::test]
-async fn slow_subscription_lookup_expires_and_releases_owned_capacity() {
+#[tokio::test(start_paused = true)]
+async fn lookups_on_one_stream_run_sixteen_at_a_time() {
     let store = Arc::new(FakeWakeStore::default());
-    store.set_resolve_gate(Arc::new(tokio::sync::Notify::new()));
-    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
-        subscription_streams: 1,
-        lookup_timeout: Duration::from_millis(30),
-        ..Default::default()
-    });
-    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
-    let (requests, incoming) = tokio::sync::mpsc::channel(1);
-    let mut responses = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap()
-        .into_inner();
-    requests
-        .send(subscribe_route_request(
-            "slow",
-            proto_http_identity(RouteHostKind::Exact, "slow.example.com", None),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), responses.message())
-            .await
-            .unwrap()
-            .unwrap_err()
-            .code(),
-        tonic::Code::DeadlineExceeded
-    );
-    drop(responses);
-    drop(requests);
-    tokio::task::yield_now().await;
-    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
-    drop(
-        proxy
-            .subscribe(ReceiverStream::new(incoming))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(store.resolve_route_requests(), 1);
-}
+    let gate = Arc::new(tokio::sync::Notify::new());
+    store.set_resolve_gate(gate.clone());
+    let mut proxy = proxy_client_with_route_events(store.clone(), RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
 
-#[tokio::test]
-async fn unconsumed_subscription_output_stops_production_and_recovers_on_drop() {
-    let store = Arc::new(FakeWakeStore::default());
-    store.seed_route_resolved(
-        domain_http_identity("blocked.example.com", None),
-        domain_route_entry(
-            "blocked-route",
-            "blocked-instance",
-            DomainInstanceState::Cold,
-        ),
-    );
-    let broker = RouteSubscriptionBroker::with_limits(control_plane::api::admission::ApiLimits {
-        subscription_streams: 1,
-        response_timeout: Duration::from_millis(30),
-        ..Default::default()
-    });
-    let mut proxy = proxy_client_with_route_events(store.clone(), broker);
-    let (requests, incoming) = tokio::sync::mpsc::channel(64);
-    let responses = proxy
-        .subscribe(ReceiverStream::new(incoming))
-        .await
-        .unwrap();
-    for n in 0..64 {
-        requests
-            .send(subscribe_route_request(
-                &format!("blocked-{n}"),
-                proto_http_identity(RouteHostKind::Exact, "blocked.example.com", None),
-            ))
-            .await
-            .unwrap();
+    for id in 0..40 {
+        stream
+            .send(subscribe_http(id, &format!("h{id}.example.com")))
+            .await;
     }
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let count = store.resolve_route_requests();
-    assert!(
-        count <= 18 && count > 0,
-        "bounded output must stop lookups: {count}"
-    );
-    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+    settle().await;
+    assert_eq!(store.resolve_route_requests(), 16);
+
+    // Each finished lookup makes room for the next one waiting.
+    gate.notify_waiters();
+    settle().await;
+    assert_eq!(store.resolve_route_requests(), 32);
+    gate.notify_waiters();
+    settle().await;
+    gate.notify_waiters();
+    let mut answered: Vec<u64> = Vec::new();
+    for _ in 0..40 {
+        answered.push(stream.rules().await.subscription_id);
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, (0..40).collect::<Vec<_>>());
+    assert_eq!(store.resolve_route_requests(), 40);
+}
+
+fn spawn_route_dispatcher(
+    store: Arc<FakeWakeStore>,
+    broker: RouteSubscriptionBroker,
+    cursor: u64,
+) -> tokio::sync::watch::Sender<bool> {
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(control_plane::runtime::dispatch_route_changes(
+        store, broker, cursor, receiver,
+    ));
+    shutdown
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatcher_publishes_only_changes_committed_after_its_cursor() {
+    let store = Arc::new(FakeWakeStore::default());
+    store.record_instance_change("before-cursor");
+    let cursor = store.load_route_change_revision().await.unwrap();
+    let broker = RouteSubscriptionBroker::new();
+    let mut events = broker.subscribe();
+    let _shutdown = spawn_route_dispatcher(store.clone(), broker, cursor);
+
+    store.record_instance_change("after-cursor");
+    let event = events.recv().await.unwrap();
+    assert!(format!("{event:?}").contains("after-cursor"), "{event:?}");
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatcher_reads_on_the_store_signal_without_waiting_for_its_poll() {
+    let store = Arc::new(FakeWakeStore::default());
+    let broker = RouteSubscriptionBroker::new();
+    let mut events = broker.subscribe();
+    let _shutdown = spawn_route_dispatcher(store.clone(), broker, 0);
+    // Let the dispatcher take its first poll tick and park.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let started = tokio::time::Instant::now();
+    store.record_instance_change("signalled");
+    events.recv().await.unwrap();
     assert_eq!(
-        proxy
-            .subscribe(ReceiverStream::new(incoming))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::ResourceExhausted
+        started.elapsed(),
+        Duration::ZERO,
+        "the signal wakes the dispatcher at once"
     );
-    drop(responses);
-    drop(requests);
-    tokio::task::yield_now().await;
-    let (_requests, incoming) = tokio::sync::mpsc::channel(1);
-    drop(
-        proxy
-            .subscribe(ReceiverStream::new(incoming))
-            .await
-            .unwrap(),
+
+    let started = tokio::time::Instant::now();
+    store.record_instance_change_quietly("polled");
+    events.recv().await.unwrap();
+    assert!(
+        started.elapsed() <= Duration::from_millis(250),
+        "the poll finds a change no signal announced"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatcher_read_failure_keeps_subscribers_and_delivers_after_recovery() {
+    let store = Arc::new(FakeWakeStore::default());
+    let broker = RouteSubscriptionBroker::new();
+    let mut events = broker.subscribe();
+    let _shutdown = spawn_route_dispatcher(store.clone(), broker, 0);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    store.fail_route_change_reads(8);
+    store.record_instance_change("during-outage");
+    let event = events.recv().await.unwrap();
+    assert!(
+        format!("{event:?}").contains("during-outage"),
+        "the first event after the outage is the change itself, with no reset: {event:?}"
     );
 }
 
@@ -1971,32 +1523,6 @@ fn decode_grpc_proxy_wake_response(bytes: &[u8]) -> ProxyWakeInstanceResponse {
     decode_grpc_message(bytes)
 }
 
-async fn collect_grpc_proxy_subscribe_response<B>(
-    response: HttpResponse<B>,
-) -> (Vec<ProxySubscribeResponse>, String)
-where
-    B: tonic::codegen::Body<Data = Bytes>,
-    B::Error: std::fmt::Debug,
-{
-    let headers = response.headers().clone();
-    let collected = response
-        .into_body()
-        .collect()
-        .await
-        .expect("native response body should collect");
-    let trailers = collected.trailers().cloned();
-    let status = trailers
-        .as_ref()
-        .and_then(|trailers| trailers.get("grpc-status"))
-        .or_else(|| headers.get("grpc-status"))
-        .expect("gRPC status is returned")
-        .to_str()
-        .expect("gRPC status is valid")
-        .to_owned();
-
-    (decode_grpc_messages(collected.to_bytes().as_ref()), status)
-}
-
 async fn collect_grpc_status<B>(response: HttpResponse<B>) -> String
 where
     B: tonic::codegen::Body<Data = Bytes>,
@@ -2032,76 +1558,88 @@ fn decode_grpc_message<M: Message + Default>(bytes: &[u8]) -> M {
     M::decode(&bytes[5..5 + length]).expect("gRPC response decodes")
 }
 
-fn decode_grpc_messages<M: Message + Default>(bytes: &[u8]) -> Vec<M> {
-    let mut messages = Vec::new();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        assert_eq!(bytes.get(offset), Some(&0), "gRPC message is uncompressed");
-        let length = u32::from_be_bytes(
-            bytes[offset + 1..offset + 5]
-                .try_into()
-                .expect("gRPC response frame has a length prefix"),
-        ) as usize;
-        offset += 5;
-        messages.push(M::decode(&bytes[offset..offset + length]).expect("gRPC response decodes"));
-        offset += length;
-    }
-
-    messages
-}
-
-fn single_message(messages: Vec<ProxySubscribeResponse>) -> ProxySubscribeResponse {
-    assert_eq!(messages.len(), 1, "expected exactly one subscribe response");
-    messages
-        .into_iter()
-        .next()
-        .expect("one response is present")
-}
-
-fn subscribe_route_request(
-    request_id: &str,
-    identity: ProtoRouteIdentity,
+fn subscribe_request(
+    subscription_id: u64,
+    kind: ProtoRouteKind,
+    host: &str,
 ) -> ProxySubscribeRequest {
     ProxySubscribeRequest {
-        input: Some(proxy_subscribe_request::Input::SubscribeRoute(
-            ProxySubscribeRouteRequest {
-                request_id: request_id.to_owned(),
-                identity: Some(identity),
+        input: Some(proxy_subscribe_request::Input::Subscribe(
+            ProxySubscribeHostRequest {
+                subscription_id,
+                kind: kind as i32,
+                host: host.to_owned(),
             },
         )),
     }
 }
 
-fn unsubscribe_request(subscription_id: &str) -> ProxySubscribeRequest {
+fn subscribe_http(subscription_id: u64, host: &str) -> ProxySubscribeRequest {
+    subscribe_request(subscription_id, ProtoRouteKind::Http, host)
+}
+
+fn subscribe_sni(subscription_id: u64, host: &str) -> ProxySubscribeRequest {
+    subscribe_request(subscription_id, ProtoRouteKind::Sni, host)
+}
+
+fn unsubscribe_request(subscription_id: u64) -> ProxySubscribeRequest {
     ProxySubscribeRequest {
         input: Some(proxy_subscribe_request::Input::Unsubscribe(
-            control_plane::api::pb::ProxyUnsubscribeRequest {
-                subscription_id: subscription_id.to_owned(),
-            },
+            control_plane::api::pb::ProxyUnsubscribeRequest { subscription_id },
         )),
     }
 }
 
-fn expect_route_resolved(response: ProxySubscribeResponse) -> ProxyRouteResolvedResponse {
-    let Some(proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output else {
-        panic!("expected route resolved response");
-    };
-    resolved
+fn expect_rules(response: ProxySubscribeResponse) -> ProxyHostRulesResponse {
+    match response.output {
+        Some(proxy_subscribe_response::Output::Rules(rules)) => rules,
+        other => panic!("expected a rule set, got {other:?}"),
+    }
 }
 
-fn expect_route_miss(response: ProxySubscribeResponse) -> ProxyRouteMissResponse {
-    let Some(proxy_subscribe_response::Output::RouteMiss(miss)) = response.output else {
-        panic!("expected route miss response");
-    };
-    miss
+fn expect_error(response: ProxySubscribeResponse) -> ProxySubscribeErrorResponse {
+    match response.output {
+        Some(proxy_subscribe_response::Output::Error(error)) => error,
+        other => panic!("expected a subscription error, got {other:?}"),
+    }
 }
 
-fn expect_route_invalidated(response: ProxySubscribeResponse) -> ProxyRouteInvalidatedResponse {
-    let Some(proxy_subscribe_response::Output::RouteInvalidated(invalidated)) = response.output
-    else {
-        panic!("expected route invalidated response");
-    };
-    invalidated
+/// Host kind, host, path prefix and binding of each rule, in the order sent.
+fn rule_summary(rules: &ProxyHostRulesResponse) -> Vec<(i32, String, Option<String>, String)> {
+    rules
+        .rules
+        .iter()
+        .map(|rule| {
+            let identity = rule
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.kind.as_ref());
+            let (host, path) = match identity.expect("rule identity") {
+                control_plane::api::pb::route_identity::Kind::Http(http) => {
+                    (http.host.clone(), http.path_prefix.clone())
+                }
+                control_plane::api::pb::route_identity::Kind::Sni(sni) => (sni.host.clone(), None),
+            };
+            let host = host.expect("rule host");
+            (
+                host.kind,
+                host.host,
+                path,
+                rule.route
+                    .as_ref()
+                    .expect("rule route")
+                    .route_binding_id
+                    .clone(),
+            )
+        })
+        .collect()
+}
+
+fn rules_bindings(rules: &ProxyHostRulesResponse) -> Vec<String> {
+    rule_summary(rules)
+        .into_iter()
+        .map(|(_, _, _, binding)| binding)
+        .collect()
 }
 
 async fn next_subscribe_response<S>(responses: &mut S) -> ProxySubscribeResponse
@@ -2116,66 +1654,121 @@ where
         .expect("subscribe response succeeds")
 }
 
-fn proto_http_identity(
-    kind: RouteHostKind,
-    host: &str,
-    path_prefix: Option<&str>,
-) -> ProtoRouteIdentity {
-    ProtoRouteIdentity {
-        kind: Some(control_plane::api::pb::route_identity::Kind::Http(
-            HttpRouteIdentity {
-                host: Some(ProtoRouteHost {
-                    kind: kind as i32,
-                    host: host.to_owned(),
-                }),
-                path_prefix: path_prefix.map(str::to_owned),
-            },
-        )),
+type ProxyClient =
+    ProxyControlPlaneClient<InProcessService<StoreBackedProxyGrpcService<FakeKubernetesClient>>>;
+
+/// One open Subscribe stream and the sender that keeps its request side open.
+struct OpenStream {
+    requests: tokio::sync::mpsc::Sender<ProxySubscribeRequest>,
+    responses: tonic::Streaming<ProxySubscribeResponse>,
+}
+
+async fn open_stream(proxy: &mut ProxyClient) -> OpenStream {
+    let (requests, incoming) = tokio::sync::mpsc::channel(256);
+    let responses = proxy
+        .subscribe(ReceiverStream::new(incoming))
+        .await
+        .expect("the stream opens")
+        .into_inner();
+    OpenStream {
+        requests,
+        responses,
     }
 }
 
-fn proto_sni_identity(kind: RouteHostKind, host: &str) -> ProtoRouteIdentity {
-    ProtoRouteIdentity {
-        kind: Some(control_plane::api::pb::route_identity::Kind::Sni(
-            SniRouteIdentity {
-                host: Some(ProtoRouteHost {
-                    kind: kind as i32,
-                    host: host.to_owned(),
-                }),
-            },
-        )),
+impl OpenStream {
+    async fn send(&self, request: ProxySubscribeRequest) {
+        self.requests
+            .send(request)
+            .await
+            .expect("the stream is open");
     }
+
+    async fn rules(&mut self) -> ProxyHostRulesResponse {
+        expect_rules(next_subscribe_response(&mut self.responses).await)
+    }
+
+    async fn error(&mut self) -> ProxySubscribeErrorResponse {
+        expect_error(next_subscribe_response(&mut self.responses).await)
+    }
+
+    /// Asserts the control plane has nothing to say.
+    async fn quiet(&mut self) {
+        let next = tokio::time::timeout(Duration::from_millis(50), self.responses.message()).await;
+        assert!(next.is_err(), "unexpected stream activity: {next:?}");
+    }
+
+    /// Waits for the stream to end and reports how.
+    async fn end(&mut self) -> Result<(), tonic::Status> {
+        match tokio::time::timeout(Duration::from_secs(120), self.responses.message())
+            .await
+            .expect("the stream ends")
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => panic!("expected the stream to end, got {message:?}"),
+            Err(status) => Err(status),
+        }
+    }
+}
+
+/// Subscribes to one HTTP host on a fresh stream and returns its rule set.
+async fn subscribe_once(store: Arc<FakeWakeStore>, host: &str) -> ProxyHostRulesResponse {
+    let mut proxy = proxy_client_with_route_events(store, RouteSubscriptionBroker::new());
+    let mut stream = open_stream(&mut proxy).await;
+    stream.send(subscribe_http(1, host)).await;
+    stream.rules().await
+}
+
+/// Lets every task run until all of them wait.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 #[derive(Clone)]
 struct InProcessService<S> {
     inner: S,
+    /// Answers every call with `UNAVAILABLE` while set, as an unreachable
+    /// control plane would.
+    unreachable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S> InProcessService<S> {
     fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            unreachable: Arc::default(),
+        }
     }
 }
 
-impl<S> Service<Request<Body>> for InProcessService<S>
+impl<S, B> Service<Request<Body>> for InProcessService<S>
 where
-    S: Service<Request<Body>, Response = HttpResponse<Body>, Error = Infallible>
+    S: Service<Request<Body>, Response = HttpResponse<B>, Error = Infallible>
         + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
+    B: tonic::codegen::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError>,
 {
     type Response = HttpResponse<Body>;
     type Error = Infallible;
-    type Future = S::Future;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Infallible>> + Send>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        self.inner.call(request)
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async {
+                Ok(tonic::Status::unavailable("the control plane is unreachable").into_http())
+            });
+        }
+        let call = self.inner.call(request);
+        Box::pin(async move { Ok(call.await?.map(Body::new)) })
     }
 }
 
@@ -2346,30 +1939,6 @@ fn proxy_api_with_target(
     StoreBackedProxyApi::new(store, KubernetesMaterializer::new(client), target)
 }
 
-fn operator_api_with_route_events(
-    store: Arc<FakeWakeStore>,
-    route_events: RouteSubscriptionBroker,
-) -> StoreBackedOperatorApi<FakeKubernetesClient> {
-    StoreBackedOperatorApi::with_route_events(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-        route_events,
-    )
-}
-
-fn sidecar_api_with_route_events(
-    store: Arc<FakeWakeStore>,
-    route_events: RouteSubscriptionBroker,
-) -> StoreBackedSidecarApi<FakeKubernetesClient> {
-    StoreBackedSidecarApi::with_route_events(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        proxy_target(),
-        route_events,
-    )
-}
-
 fn proxy_client_with_route_events(
     store: Arc<FakeWakeStore>,
     route_events: RouteSubscriptionBroker,
@@ -2388,11 +1957,7 @@ fn proxy_target() -> MaterializationTarget {
     MaterializationTarget::new("cluster-a", "apps").expect("proxy target is valid")
 }
 
-async fn reconcile_proxy_work(
-    store: Arc<FakeWakeStore>,
-    client: FakeKubernetesClient,
-    broker: RouteSubscriptionBroker,
-) {
+async fn reconcile_proxy_work(store: Arc<FakeWakeStore>, client: FakeKubernetesClient) {
     store.retry_failed_attempts();
     let observed = store.clone();
     support::reconcile_until(
@@ -2402,8 +1967,7 @@ async fn reconcile_proxy_work(
             proxy_target(),
             support::reconciler_config(),
             sleepypods_observability::recorder::ObservabilityRecorder::noop(),
-        )
-        .with_route_events(broker),
+        ),
         || {
             let settled = observed.lifecycle_settled(&proxy_target());
             async move { settled }
@@ -2419,30 +1983,6 @@ fn expect_accepted(
         Some(proxy_wake_instance_response::Outcome::StillWaking(result)) => result,
         other => panic!("expected durable wake acceptance, got {other:?}"),
     }
-}
-
-async fn subscribe_resolved_route(
-    store: Arc<FakeWakeStore>,
-    request_id: &str,
-    identity: ProtoRouteIdentity,
-    target: MaterializationTarget,
-) -> ProxyRouteResolvedResponse {
-    let response = proxy_grpc_service_with_store(
-        store,
-        KubernetesMaterializer::new(FakeKubernetesClient::default()),
-        target,
-    )
-    .oneshot(grpc_proxy_subscribe_request(
-        vec![subscribe_route_request(request_id, identity)],
-        "application/grpc",
-        Version::HTTP_2,
-    ))
-    .await
-    .expect("subscribe request should dispatch");
-
-    let (messages, status) = collect_grpc_proxy_subscribe_response(response).await;
-    assert_eq!(status, "0");
-    expect_route_resolved(single_message(messages))
 }
 
 fn expect_ready(
@@ -2567,29 +2107,30 @@ fn materialization_with_state_and_target(
     }
 }
 
-fn domain_http_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
-    RouteIdentity::Http {
-        host: RouteHost::wildcard_suffix(host).expect("route host is valid"),
-        path: path_prefix.map(|path| PathPrefix::new(path).expect("path prefix is valid")),
-    }
-}
-
-fn domain_http_identity_exact(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
+fn exact_http(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
     RouteIdentity::Http {
         host: RouteHost::exact(host).expect("route host is valid"),
         path: path_prefix.map(|path| PathPrefix::new(path).expect("path prefix is valid")),
     }
 }
 
-fn domain_sni_identity(host: &str, kind: RouteHostKind) -> RouteIdentity {
-    let host = match kind {
-        RouteHostKind::Exact => RouteHost::exact(host),
-        RouteHostKind::WildcardSuffix => RouteHost::wildcard_suffix(host),
-        RouteHostKind::Unspecified => panic!("unspecified route host kind is invalid"),
+fn wildcard_http(suffix: &str, path_prefix: Option<&str>) -> RouteIdentity {
+    RouteIdentity::Http {
+        host: RouteHost::wildcard_suffix(suffix).expect("route host is valid"),
+        path: path_prefix.map(|path| PathPrefix::new(path).expect("path prefix is valid")),
     }
-    .expect("route host is valid");
+}
 
-    RouteIdentity::Sni { host }
+fn exact_sni(host: &str) -> RouteIdentity {
+    RouteIdentity::Sni {
+        host: RouteHost::exact(host).expect("route host is valid"),
+    }
+}
+
+fn wildcard_sni(suffix: &str) -> RouteIdentity {
+    RouteIdentity::Sni {
+        host: RouteHost::wildcard_suffix(suffix).expect("route host is valid"),
+    }
 }
 
 fn domain_route_entry(

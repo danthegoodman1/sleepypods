@@ -1,9 +1,9 @@
 use super::admission::ApiLimits;
-use crate::{InstanceId, ProtocolRoute, RouteBindingId, RouteBindingRecord, RouteIdentity};
+use crate::{InstanceId, RouteBindingId, RouteIdentity};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 
-const ROUTE_EVENT_BUFFER: usize = 1024;
+const ROUTE_EVENT_BUFFER: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct RouteSubscriptionBroker {
@@ -15,15 +15,17 @@ pub struct RouteSubscriptionBroker {
     pub(crate) cancellation: crate::runtime_work::Cancellation,
 }
 
+/// One committed change that a host subscription may depend on.
 #[derive(Clone, Debug)]
 pub enum RouteBindingChange {
+    /// A binding was added, changed or removed.
     Route {
         route_binding_id: RouteBindingId,
-        removed: bool,
-        identity: Option<RouteIdentity>,
-        protocol: Option<ProtocolRoute>,
+        identity: RouteIdentity,
     },
+    /// An instance or its materialization changed state.
     Instance(InstanceId),
+    /// Changes were lost; every subscriber starts over.
     Reset,
 }
 
@@ -57,40 +59,11 @@ impl RouteSubscriptionBroker {
     pub fn notify_instance_changed(&self, id: InstanceId) {
         let _ = self.sender.send(RouteBindingChange::Instance(id));
     }
-    pub fn notify_route_removed(&self, route_binding_id: RouteBindingId) {
+    pub fn notify_route_changed(&self, route_binding_id: RouteBindingId, identity: RouteIdentity) {
         let _ = self.sender.send(RouteBindingChange::Route {
             route_binding_id,
-            removed: true,
-            identity: None,
-            protocol: None,
+            identity,
         });
-    }
-    pub fn notify_routes_removed(&self, bindings: &[RouteBindingRecord]) {
-        for binding in bindings {
-            self.notify_route_removed(binding.id.clone());
-        }
-    }
-    pub fn notify_route_changed(
-        &self,
-        route_binding_id: RouteBindingId,
-        identity: RouteIdentity,
-        protocol: ProtocolRoute,
-    ) {
-        let _ = self.sender.send(RouteBindingChange::Route {
-            route_binding_id,
-            removed: false,
-            identity: Some(identity),
-            protocol: Some(protocol),
-        });
-    }
-    pub fn notify_routes_changed(&self, bindings: &[RouteBindingRecord]) {
-        for binding in bindings {
-            self.notify_route_changed(
-                binding.id.clone(),
-                binding.identity.clone(),
-                binding.protocol,
-            );
-        }
     }
     pub(crate) fn publish_durable(
         &self,
@@ -109,26 +82,22 @@ impl RouteSubscriptionBroker {
         } else {
             let id = RouteBindingId::new(field("route_binding_id")?)
                 .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-            if payload["removed"].as_bool() == Some(true) {
-                self.notify_route_removed(id);
-                return Ok(());
-            }
             let host = match field("host_kind")? {
                 "exact" => crate::RouteHost::exact(field("host")?),
                 _ => crate::RouteHost::wildcard_suffix(field("host")?),
             }
             .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-            let (identity, protocol) = if field("identity_kind")? == "http" {
+            let identity = if field("identity_kind")? == "http" {
                 let path = payload["path_prefix"]
                     .as_str()
                     .map(crate::PathPrefix::new)
                     .transpose()
                     .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-                (RouteIdentity::Http { host, path }, ProtocolRoute::Http)
+                RouteIdentity::Http { host, path }
             } else {
-                (RouteIdentity::Sni { host }, ProtocolRoute::TlsSni)
+                RouteIdentity::Sni { host }
             };
-            self.notify_route_changed(id, identity, protocol);
+            self.notify_route_changed(id, identity);
         }
         Ok(())
     }

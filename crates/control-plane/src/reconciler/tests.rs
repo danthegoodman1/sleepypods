@@ -321,7 +321,7 @@ impl ControlPlaneStore for FakeStore {
         create_route_binding,
         get_route_binding,
         delete_route_binding,
-        resolve_route,
+        resolve_host_rules,
         compare_and_swap_instance_state,
         record_materialization,
         load_ready_materialization,

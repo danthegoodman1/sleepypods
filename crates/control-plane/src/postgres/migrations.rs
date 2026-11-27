@@ -65,6 +65,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0011_dynamic_certificates.sql"),
     },
     Migration {
+        version: 12,
+        name: "route_host_rules",
+        sql: include_str!("../../migrations/0012_route_host_rules.sql"),
+    },
+    Migration {
         version: 13,
         name: "lifecycle_recovery",
         sql: include_str!("../../migrations/0013_lifecycle_recovery.sql"),
