@@ -366,6 +366,7 @@ fn certificate_method(path: &str) -> bool {
             | "/sleepypods.controlplane.v1.OperatorControlPlane/GetTlsBinding"
             | "/sleepypods.controlplane.v1.OperatorControlPlane/RemoveCertificate"
             | "/sleepypods.controlplane.v1.OperatorControlPlane/ReencryptCertificate"
+            | "/sleepypods.controlplane.v1.OperatorControlPlane/ReencryptCertificates"
             | "/sleepypods.controlplane.v1.ProxyControlPlane/ResolveTlsCertificate"
             | "/sleepypods.controlplane.v1.ProxyControlPlane/WatchTlsCertificates"
     )

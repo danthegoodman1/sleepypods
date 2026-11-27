@@ -94,7 +94,7 @@ async fn run_with_shutdown(
     );
     let (tls_certificates, certificate_worker) =
         TlsCertificateStore::with_observability(certificate_client.clone(), observability.clone());
-    let certificate_worker = certificate_worker.with_watch(certificate_client)?;
+    let certificate_worker = certificate_worker.with_watch(certificate_client);
     let route_lookups = RouteLookupCounters::default();
     let coordinator =
         FrontlineRouteCoordinator::new(env.route_cache_capacity(), route_client, wake_client)

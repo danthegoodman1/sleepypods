@@ -15,7 +15,6 @@ pub struct PostgresStore {
     pub(crate) pool: Pool,
     pub(crate) certificate_work: crate::certificate::work::CertificateWorkLimits,
     pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
-    pub(crate) idempotency_retention_millis: Option<i64>,
     pub(crate) route_changes: super::runtime_work::RouteChangeListener,
 }
 
@@ -24,9 +23,6 @@ impl PostgresStore {
         config.validate_limits().map_err(|setting| {
             StoreError::invalid_argument(format!("{setting} is outside its supported limits"))
         })?;
-        let retention = config
-            .idempotency_retention
-            .map(|duration| duration.as_millis() as i64);
         let statement_timeout = config.statement_timeout.as_millis();
         let operation_timeout = config.operation_timeout.as_millis();
         let mut pg_config = parse_connection_url(config.connection_url())?;
@@ -57,7 +53,6 @@ impl PostgresStore {
                 config.max_connections,
             ),
             certificate_sealer: None,
-            idempotency_retention_millis: retention,
             route_changes,
         };
 
@@ -76,10 +71,11 @@ impl PostgresStore {
         self
     }
 
-    /// Removes at most `limit` keys whose explicitly configured lifetime expired.
-    /// Permanent keys and unexpired tombstones are never removed.
-    pub async fn expire_idempotency_records(&self, limit: u32) -> StoreResult<u64> {
-        super::idempotency::expire_records(self, limit).await
+    /// Sealing key IDs that active certificates use and the configured key ring
+    /// lacks. Those certificates stay unreadable until the keys return, so the
+    /// control plane refuses to start while any are listed.
+    pub async fn missing_sealing_key_ids(&self) -> StoreResult<Vec<String>> {
+        super::certificate_ops::missing_sealing_key_ids(self).await
     }
 
     pub async fn run_migrations(&self) -> StoreResult<()> {
@@ -143,11 +139,5 @@ mod tests {
         let error = PostgresStore::connect(&config).await.unwrap_err();
         assert!(matches!(error, StoreError::InvalidArgument { message }
             if message.contains("SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS")));
-
-        config.statement_timeout = std::time::Duration::from_millis(1);
-        config.idempotency_retention = Some(std::time::Duration::from_millis(i64::MAX as u64));
-        let error = PostgresStore::connect(&config).await.unwrap_err();
-        assert!(matches!(error, StoreError::InvalidArgument { message }
-            if message.contains("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS")));
     }
 }

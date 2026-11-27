@@ -104,7 +104,10 @@ async fn tls12_and_tls13_offered_sessions_require_current_authorization_and_full
             let authorized = round < 3;
             if round == 3 {
                 fixture.api.responses.lock().unwrap().clear();
-                fixture.cache.shared.state.lock().unwrap().entries.clear();
+                evict(
+                    &mut fixture.cache.shared.state.lock().unwrap(),
+                    "app.example",
+                );
             }
             let old_offers = sessions.offered.load(Ordering::SeqCst);
             let server = async {

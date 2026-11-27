@@ -67,6 +67,15 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.fail("reencrypt_certificate", format!("{request:?}"))
     }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+        self.fail(
+            "reencrypt_certificates_sealed_by",
+            format!("{sealing_key_id:?}"),
+        )
+    }
 
     fn snapshot_tls_bindings(
         &self,
@@ -344,12 +353,6 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         self.fail("delete_http01_challenge", format!("{request:?}"))
     }
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        self.fail("expire_http01_challenges", format!("{request:?}"))
-    }
 }
 
 #[tokio::test]
@@ -449,6 +452,7 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             expected_sealing_revision: CertificateRevision::new(31).unwrap()
         }
     );
+    check!(1, reencrypt_certificates_sealed_by, "retired".to_owned());
     let hosts = vec![TlsHostname::new("snapshot.example").unwrap()];
     for known in [None, Some(cert_rev)] {
         assert!(store
@@ -497,15 +501,9 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     check!(
         1,
         create_instance,
-        CreateInstanceRequest::new(
-            IdempotencyKey::new("instance-key").unwrap(),
-            instance.clone(),
-            class.reference.clone()
+        CreateInstanceRequest::new(instance.clone(), class.reference.clone()).with_values(
+            std::collections::BTreeMap::from([("sentinel".into(), "value".into())])
         )
-        .with_values(std::collections::BTreeMap::from([(
-            "sentinel".into(),
-            "value".into()
-        )]))
     );
     check!(2, get_instance, GetInstanceRequest::new(instance.clone()));
     check!(
@@ -526,12 +524,7 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     check!(
         1,
         create_route_binding,
-        CreateRouteBindingRequest::new(
-            IdempotencyKey::new("route-key").unwrap(),
-            route.clone(),
-            instance.clone(),
-            identity.clone(),
-        )
+        CreateRouteBindingRequest::new(route.clone(), instance.clone(), identity.clone(),)
     );
     check!(
         2,
@@ -737,11 +730,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
         1,
         delete_http01_challenge,
         DeleteHttp01ChallengeRequest::new(key)
-    );
-    check!(
-        2,
-        expire_http01_challenges,
-        ExpireHttp01ChallengesRequest::new(now).with_limit(101)
     );
 }
 

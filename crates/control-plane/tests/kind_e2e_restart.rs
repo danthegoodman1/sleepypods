@@ -16,8 +16,8 @@ use control_plane::api::pb::{
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteHttp01ChallengeRequest, DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProxyWakeInstanceRequest,
+    GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, ProxyWakeInstanceRequest,
     PutHttp01ChallengeRequest, ReconcileMaterializationRequest, ReconcileMaterializationResponse,
     ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
     ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
@@ -81,7 +81,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.late_app_image,
         &config.sidecar_image,
         sleep_policy(900_000),
-        "late",
     )
     .await?;
     create_workload_class(
@@ -90,7 +89,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.app_image,
         &config.sidecar_image,
         sleep_policy(900_000),
-        "normal",
     )
     .await?;
     create_workload_class(
@@ -99,7 +97,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.app_image,
         &config.sidecar_image,
         sleep_policy(5_000),
-        "fast-sleep",
     )
     .await?;
 
@@ -192,7 +189,6 @@ async fn restart_during_wake_recovers_without_stale_backend(
             host: WAKE_HOST,
             target: "wake",
         },
-        "wake",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -297,7 +293,6 @@ async fn restart_during_sleep_report_recovers(
             host: SLEEP_HOST,
             target: "sleep",
         },
-        "sleep",
     )
     .await?;
     eprintln!("==> restart E2E: sleep recovery setup created");
@@ -362,7 +357,6 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             host: DELETE_HOST,
             target: "delete",
         },
-        "delete",
     )
     .await?;
     wait_for_instance_response(
@@ -385,22 +379,13 @@ async fn accepted_delete_survives_restart_without_another_mutation(
     let delete_generation = get_instance(operator, "restart-delete").await?.generation;
     let selector = format!("{INSTANCE_ID_LABEL}=restart-delete");
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &config.namespace);
-    let deployment = single_labeled_object(
+    single_labeled_object(
         "Deployment",
         "restart-delete",
         deployments
             .list(&ListParams::default().labels(&selector))
             .await?,
     )?;
-    let materialization_id = deployment
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| {
-            annotations.get(control_plane::projection::ANNOTATION_MATERIALIZATION_ID)
-        })
-        .ok_or("restart-delete workload has no materialization identity")?
-        .clone();
     let pods: Api<Pod> = Api::namespaced(kube.clone(), &config.namespace);
     let pod = single_labeled_object(
         "Pod",
@@ -453,7 +438,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pods,
             &pod_name,
             &pod_uid,
-            &materialization_id,
+            "restart-delete",
             FINALIZER,
             0,
         )
@@ -484,7 +469,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
         // baseline so the following increment proves a new controller pass.
         let restored = recovered_operator
             .reconcile_materialization(ReconcileMaterializationRequest {
-                materialization_id: materialization_id.clone(),
+                instance_id: "restart-delete".into(),
                 status_only: true,
             })
             .await?
@@ -497,7 +482,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pods,
             &pod_name,
             &pod_uid,
-            &materialization_id,
+            "restart-delete",
             FINALIZER,
             restored.failure_count,
         )
@@ -543,7 +528,7 @@ async fn wait_for_blocked_delete(
     pods: &Api<Pod>,
     name: &str,
     uid: &str,
-    materialization_id: &str,
+    instance_id: &str,
     finalizer: &str,
     previous_failures: u32,
 ) -> TestResult<ReconcileMaterializationResponse> {
@@ -552,7 +537,7 @@ async fn wait_for_blocked_delete(
         let pod = pods.get(name).await?;
         let status = operator
             .reconcile_materialization(ReconcileMaterializationRequest {
-                materialization_id: materialization_id.into(),
+                instance_id: instance_id.into(),
                 status_only: true,
             })
             .await?
@@ -617,28 +602,13 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
     kube: Client,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "restart-reassign-old",
-        "old",
-        "reassign-old",
-    )
-    .await?;
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "restart-reassign-new",
-        "new",
-        "reassign-new",
-    )
-    .await?;
+    create_instance(operator, NORMAL_CLASS_ID, "restart-reassign-old", "old").await?;
+    create_instance(operator, NORMAL_CLASS_ID, "restart-reassign-new", "new").await?;
     create_route(
         operator,
         "restart-reassign-old-route",
         "restart-reassign-old",
         REASSIGN_HOST,
-        "reassign-old",
     )
     .await?;
     let aliases = [
@@ -656,7 +626,7 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
         ),
     ];
     for (route_id, instance_id, host, _) in aliases {
-        create_route(operator, route_id, instance_id, host, route_id).await?;
+        create_route(operator, route_id, instance_id, host).await?;
     }
     // Prewarm both backends without resolving REASSIGN_HOST through the
     // frontend. Its first later lookup will have a fresh positive cache TTL.
@@ -745,7 +715,6 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
             "restart-reassign-new-route",
             "restart-reassign-new",
             REASSIGN_HOST,
-            "reassign-new",
         )
         .await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -831,7 +800,6 @@ async fn http01_challenges_survive_restart_and_cleanup(
             host: HTTP01_HOST,
             target: "http01",
         },
-        "http01",
     )
     .await?;
     wait_for_instance_response(
@@ -981,25 +949,6 @@ async fn http01_challenges_survive_restart_and_cleanup(
     {
         return Err("expired HTTP-01 token still resolves authoritatively".into());
     }
-    // Maintenance may already have collected the row. The manual pass is
-    // idempotent; authoritative absence, not which worker deleted it, matters.
-    operator
-        .expire_http01_challenges(ExpireHttp01ChallengesRequest {
-            now_unix_millis: unix_millis(SystemTime::now())?,
-            limit: Some(10),
-        })
-        .await?
-        .into_inner();
-    if operator
-        .delete_http01_challenge(DeleteHttp01ChallengeRequest {
-            key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
-        })
-        .await?
-        .into_inner()
-        .deleted
-    {
-        return Err("expired HTTP-01 row remained after bounded cleanup".into());
-    }
 
     Ok(())
 }
@@ -1019,14 +968,11 @@ async fn create_workload_class(
     app_image: &str,
     sidecar_image: &str,
     sleep_policy: WorkloadSleepPolicy,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-class"),
             class_id: class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -1037,7 +983,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(app_image, sidecar_image)),
             sleep_policy: Some(sleep_policy),
             exclusivity_keys: vec![],
@@ -1050,24 +995,9 @@ async fn create_workload_class(
 async fn create_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
     spec: InstanceRouteSpec<'_>,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
-    create_instance(
-        operator,
-        spec.class_id,
-        spec.instance_id,
-        spec.target,
-        idempotency_suffix,
-    )
-    .await?;
-    create_route(
-        operator,
-        spec.route_id,
-        spec.instance_id,
-        spec.host,
-        idempotency_suffix,
-    )
-    .await
+    create_instance(operator, spec.class_id, spec.instance_id, spec.target).await?;
+    create_route(operator, spec.route_id, spec.instance_id, spec.host).await
 }
 
 async fn create_instance(
@@ -1075,17 +1005,16 @@ async fn create_instance(
     class_id: &str,
     instance_id: &str,
     target: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-instance"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: class_id.to_owned(),
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), target.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -1097,11 +1026,9 @@ async fn create_route(
     route_id: &str,
     instance_id: &str,
     host: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-route"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),
@@ -1814,12 +1741,14 @@ fn manifest_template(app_image: &str, sidecar_image: &str) -> ManifestTemplate {
                     value: Some(target_text("", "")),
                 }],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("restart-", "")),

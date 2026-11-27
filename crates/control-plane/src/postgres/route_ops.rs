@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 use deadpool_postgres::GenericClient;
 
 use crate::{
@@ -16,7 +14,6 @@ use crate::{
 use super::{
     connection::PostgresStore,
     error::map_postgres_error,
-    idempotency::{self, CREATE_ROUTE_BINDING_OPERATION},
     instance_ops::load_instance,
     mapping::{
         generation_to_i64, materialization_from_row, route_binding_from_row,
@@ -28,47 +25,23 @@ pub(crate) async fn create_route_binding(
     store: &PostgresStore,
     request: CreateRouteBindingRequest,
 ) -> StoreResult<RouteBindingRecord> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let fingerprint = idempotency::create_route_binding_fingerprint(&request)?;
-    let idempotency_key = request.idempotency_key.as_str();
-    let route_binding_id = request.route_binding_id.as_str();
-    idempotency::expire_key(&transaction, idempotency_key).await?;
-    let inserted = transaction
-        .execute(
-            "
-            INSERT INTO idempotency_records (
-                idempotency_key,
-                operation,
-                request_fingerprint,
-                resource_id,
-                expires_at_unix_millis
-            )
-            VALUES ($1, $2, $3, $4, (extract(epoch from clock_timestamp()) * 1000)::bigint + $5::bigint)
-            ON CONFLICT (idempotency_key) DO NOTHING
-            ",
-            &[
-                &idempotency_key,
-                &CREATE_ROUTE_BINDING_OPERATION,
-                &fingerprint,
-                &route_binding_id,
-                &store.idempotency_retention_millis,
-            ],
-        )
-        .await
-        .map_err(map_postgres_error)?;
-
-    if inserted == 0 {
-        let result =
-            replay_create_route_binding(&transaction, idempotency_key, &fingerprint).await?;
-        transaction.commit().await.map_err(map_postgres_error)?;
-        return Ok(result);
+    let client = store.client().await?;
+    match insert_route_binding(&client, &request).await {
+        Err(StoreError::AlreadyExists { .. }) => {}
+        result => return result,
     }
-
-    let result = insert_route_binding(&transaction, &request).await?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-
-    Ok(result)
+    // A binding holds this ID or this identity. The binding under this ID is
+    // the one the request describes when it names the same instance and identity.
+    match load_route_binding_record(&client, request.route_binding_id.as_str()).await? {
+        Some(stored)
+            if stored.instance_id == request.instance_id && stored.identity == request.identity =>
+        {
+            Ok(stored)
+        }
+        _ => Err(StoreError::AlreadyExists {
+            resource: "route binding",
+        }),
+    }
 }
 
 pub(crate) async fn get_route_binding(
@@ -230,50 +203,6 @@ pub(crate) async fn lookup_route_dependencies(
         instance_id: instance.id,
         materialization_generation: materialization.map(|record| record.backend_generation),
     }))
-}
-
-async fn replay_create_route_binding(
-    client: &impl GenericClient,
-    idempotency_key: &str,
-    fingerprint: &Value,
-) -> StoreResult<RouteBindingRecord> {
-    let row = client
-        .query_opt(
-            "
-            SELECT operation, request_fingerprint, resource_id, resource_deleted_at_unix_millis
-            FROM idempotency_records
-            WHERE idempotency_key = $1
-            FOR UPDATE
-            ",
-            &[&idempotency_key],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .ok_or_else(|| {
-            StoreError::unavailable("idempotency key expired during replay; retry request")
-        })?;
-    let operation: String = row.get("operation");
-    let stored_fingerprint: Value = row.get("request_fingerprint");
-    let resource_id: String = row.get("resource_id");
-
-    if operation != CREATE_ROUTE_BINDING_OPERATION || stored_fingerprint != *fingerprint {
-        return Err(idempotency::idempotency_conflict());
-    }
-
-    if row
-        .get::<_, Option<i64>>("resource_deleted_at_unix_millis")
-        .is_some()
-    {
-        return Err(StoreError::IdempotencyResourceDeleted {
-            resource: "route binding",
-        });
-    }
-
-    load_route_binding_record(client, &resource_id)
-        .await?
-        .ok_or(StoreError::NotFound {
-            resource: "route binding",
-        })
 }
 
 async fn insert_route_binding(

@@ -252,8 +252,6 @@ spec:
               value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: no-auth
-            - name: SLEEPYPODS_STORE_PROVIDER
-              value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
             - name: SLEEPYPODS_CLUSTER_ID

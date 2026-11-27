@@ -5,7 +5,6 @@ mod certificate_ops;
 mod connection;
 mod error;
 mod http01_ops;
-mod idempotency;
 mod instance_ops;
 mod lifecycle_ops;
 mod mapping;

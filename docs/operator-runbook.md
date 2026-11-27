@@ -8,6 +8,11 @@ observability.type=metric metric.name=<name> metric.value=<number> metric.labels
 observability.type=event event.name=<name> <field=value ...>
 ```
 
+The control plane writes event lines for lifecycle changes, errors and rejected
+callers, and exports metric samples through its Prometheus listener. Metric
+samples and accepted callers write no line, so a successful RPC that changes no
+lifecycle state leaves stderr untouched.
+
 Production binaries can also expose an opt-in Prometheus `/metrics` listener.
 It is disabled unless an explicit listen address is configured:
 
@@ -36,11 +41,13 @@ certificate cannot repair the control plane's own TLS identity or caller trust.
 | Resolution returns `Missing` | Inspect the exact hostname binding, including whether its certificate was removed. Binding and certificate resources are independent of the application's route. |
 | `Unavailable` or deadline errors | Check PostgreSQL health and certificate work saturation. A timeout may follow a committed mutation; inspect current state before another conditional write. |
 | Resolution returns `Internal` | Check that each replica has the required sealing read key and consistent key material. Investigate damaged stored material without dumping private keys into diagnostics. Storage/decryption errors are not authoritative misses. |
+| Control plane exits at startup with `active certificates are sealed under keys missing from the sealing key ring: <ids>` | Restore the named keys to that replica's key ring. To retire a key, keep it in the ring, call `ReencryptCertificates` for it until `remaining` is zero, then remove it. |
+| `ReencryptCertificates` returns `InvalidArgument` | The named key is the ring's active key, whose certificates are current, or the ring lacks it. Call a replica whose ring holds the key being retired. |
 
 Follow the [operator guide](operator-guide.md#control-plane-transport-and-sealing-configuration)
 for bootstrap configuration and coordinated endpoint/CA changes. Keep old sealing
-keys until old-writer database work is settled, live rows are verified under the
-new key, and retained backups no longer require them.
+keys until old-writer database work is settled, `ReencryptCertificates` reports
+zero certificates remaining under them, and retained backups stop requiring them.
 
 ## Metric Names
 
@@ -60,10 +67,11 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
-| `sleepypods_runtime_certificate_entries` | gauge | none | Cached positive, missing and pending hostname entries. |
-| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Owned cache reservations and retained configurations; separate from process RSS. |
-| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetch permits held by queued, running, validating or completed work awaiting release. |
-| `sleepypods_runtime_certificate_queue` | gauge | none | Work waiting in the bounded certificate fetch channel. |
+| `sleepypods_runtime_certificate_entries` | gauge | none | Hostnames with a cached certificate; at most 1,024. |
+| `sleepypods_runtime_certificate_negative_entries` | gauge | none | Hostnames cached without a certificate: missing, pending or failed lookups; at most 1,024. |
+| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Chain and key bytes held by cached certificates; separate from process RSS. |
+| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetches running or validating; at most three. |
+| `sleepypods_runtime_certificate_queue` | gauge | none | Handshake lookups and background refreshes awaiting a fetch slot. |
 | `sleepypods_runtime_certificate_tasks` | gauge | none | Supervisor task records, including completed tasks not yet reaped. |
 | `sleepypods_runtime_certificate_task_high_water` | gauge | none | Maximum retained supervisor task records since startup. |
 | `sleepypods_runtime_certificate_watches` | gauge | none | Watch sessions in setup, streaming or teardown. |
@@ -73,6 +81,7 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline requests the route cache answered (`hit`) and requests that needed a lookup (`miss`), exported at scrape time. |
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream events: `closed` for an orderly end, `error` for a failed stream that cost the cache, `updated` for a pushed rule set, `invalidated` for a host the control plane stopped serving. |
 | `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
+| `sleepypods_control_plane_auth_decisions_total` | counter | `outcome` | Control-plane caller authentication decisions: `success` for accepted calls, `rejected` otherwise. |
 | `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization discovery/scheduling scans. |
 | `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one discovery/scheduling scan. |
 | `sleepypods_reconciler_candidates_total` | counter | `state` | Rows selected for reconciliation. |
@@ -127,6 +136,7 @@ Event names:
 - `runtime.idle_report.event`
 - `runtime.http01.event`
 - `control_plane.auth.decision`
+- `control_plane.store.error`
 
 Lifecycle field keys:
 
@@ -138,6 +148,7 @@ Lifecycle field keys:
 - `cluster.id`
 - `namespace`
 - `error.reason`
+- `error.message`
 - `active.count`
 - `duration.ms`
 - `auth.decision`
@@ -212,18 +223,25 @@ Build dashboards from the exact names above:
   increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
   handshake failures. Installation errors require investigation even when fetch
   receipt succeeded. Compare cache and work gauges to their configured bounds
-  and observe process RSS separately. Watch streams normally reconnect at their
+  and observe process RSS separately. A
+  `sleepypods_runtime_certificate_queue` that stays above zero means lookups
+  or refreshes are waiting for the three fetch slots: check control-plane
+  resolve latency, and the rate of `certificate_fetch` `miss` outcomes for a
+  flood of unknown SNI names. Watch streams normally reconnect at their
   60-second lifetime; a close event alone is not an outage. Sustained absence of
-  a watch while the cache has entries calls for checking connectivity and
+  a watch while the cache holds certificates calls for checking connectivity and
   control-plane admission.
 - Load-budget gates: show the latest results from
   `docs/proxy-hot-path-budgets.md` scripts, especially p99 added latency,
   request-rate/throughput ratios, hot-cache zero-control-plane-call assertions,
   and benchmark regression checker output.
-- Control-plane auth: `control_plane.auth.decision` by `grpc.service`,
-  `auth.required.role`, `auth.reason`, and `auth.caller.role`. Reasons are
-  `accepted`, `missing`, `malformed`, `invalid`, and `wrong_role`; token values
-  are not emitted.
+- Control-plane auth: rate of
+  `sleepypods_control_plane_auth_decisions_total` by `outcome`; alert on a
+  sustained `rejected` rate. Each rejection also writes
+  `control_plane.auth.decision` with `grpc.service`, `auth.required.role`,
+  `auth.reason`, and `auth.caller.role`. Reasons are `missing`, `malformed`,
+  `invalid`, and `wrong_role`; token values are not emitted. Accepted calls
+  increment the counter and write no event.
 
 ## Symptom Runbooks
 
@@ -245,7 +263,7 @@ Rendered object name collision:
 2. The wake failed before Kubernetes apply; inspect the failed instance and the
    owner instance named in the error.
 3. Use DNS-label-safe `instance_id` values and readable base templates. The
-   control plane appends the first eight lowercase hexadecimal characters of
+   control plane appends the first sixteen lowercase hexadecimal characters of
    SHA-256 over the complete instance ID, prefixed by `-`, to final object names
    and truncates the base first.
 4. Retry after changing the naming template or deleting/finalizing the
@@ -263,7 +281,7 @@ Workload exclusivity key conflict:
    second same-key instance until the first materialization has safely finalized
    or an operator has deliberately changed the workload values/key declaration.
 5. If cleanup was externally verified and the old process/request path has been
-   fenced so no delayed mutation can take effect, use `ForceDeleteMaterialization` with the materialization id, operator, and
+   fenced so no delayed mutation can take effect, use `ForceDeleteMaterialization` with the instance ID, operator, and
    reason. If only the lock must be released, use `ForceReleaseExclusivityKey`
    with the exact target, key name, and key value. Both force responses include
    best-effort projection observations for scoped refs, but treat key release as
@@ -274,7 +292,7 @@ Non-terminal materialization is stuck:
 
 1. Search `runtime.materialization.reconciliation` for `operation=claim`,
    `operation=reconcile`, `operation=lease_lost`, and `outcome=error`.
-2. Call `ReconcileMaterialization` with the materialization id. It enqueues
+2. Call `ReconcileMaterialization` with the instance ID. It enqueues
    eligible work through the shared scheduler; `attempted` means enqueue accepted.
    Use `status_only=true` for read-only inspection. The response includes state,
    lease metadata, recorded refs, projection observations, failure details,
@@ -372,8 +390,8 @@ HTTP-01 challenge fails:
    and token.
 3. Confirm the client path is
    `/.well-known/acme-challenge/{token}` and that the Host header matches.
-4. Check token expiry and run `ExpireHttp01Challenges` after the expected
-   validation window.
+4. Check token expiry. The frontline stops serving a challenge at its expiry,
+   and control-plane maintenance removes the record.
 
 TLS termination or SNI passthrough fails:
 
@@ -402,9 +420,11 @@ TLS termination or SNI passthrough fails:
 
 Postgres or database outage:
 
-1. Check control-plane process logs for store provider errors and runtime
-   control-plane call `outcome=error`.
-2. Verify `SLEEPYPODS_STORE_PROVIDER=postgres` and `SLEEPYPODS_POSTGRES_URL`.
+1. Search control-plane logs for `event.name=control_plane.store.error` and
+   check runtime control-plane call `outcome=error`. The event's `error.reason`
+   is `unavailable` or `internal` and its `error.message` carries the backend
+   text; callers receive the status code with a fixed message.
+2. Verify `SLEEPYPODS_POSTGRES_URL`.
 3. Restore database availability before restarting frontlines aggressively;
    proxies can keep hot cached routes briefly but cold wakes and misses need the
    control plane.
@@ -431,7 +451,7 @@ Control-plane API returns `Unauthenticated` or `PermissionDenied`:
 
 1. Search `event.name=control_plane.auth.decision` and group by
    `grpc.service`, `auth.required.role`, `auth.reason`, and
-   `auth.caller.role`.
+   `auth.caller.role`. The control plane writes this event for each rejection.
 2. `auth.reason=missing`, `malformed`, or `invalid` maps to
    `Unauthenticated`; check that the caller sends `Authorization: Bearer ...`
    and that its configured token matches the control-plane static token for

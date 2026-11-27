@@ -78,7 +78,8 @@ async fn until(mut condition: impl FnMut() -> bool) {
 async fn coalesced_cold_waiters_and_independent_host_then_zero_rpc_warm() {
     let mut rig = Rig::new();
     let mut waiters = JoinSet::new();
-    for _ in 0..64 {
+    let coalesced = CERTIFICATE_LOOKUP_WAITERS - 1;
+    for _ in 0..coalesced {
         let c = rig.cache.clone();
         waiters.spawn(async move { c.resolve("App.Example.").await });
     }
@@ -88,7 +89,7 @@ async fn coalesced_cold_waiters_and_independent_host_then_zero_rpc_warm() {
         rig.cache.shared.state.lock().unwrap().entries["app.example"]
             .changed
             .receiver_count()
-            == 64
+            == coalesced
     })
     .await;
     let c = rig.cache.clone();
@@ -162,10 +163,7 @@ async fn late_result_after_eviction_and_reinsertion_cannot_replace_new_view() {
     let c = rig.cache.clone();
     requests.spawn(async move { c.resolve("app.example").await });
     let (_, old) = rig.next().await;
-    {
-        let mut state = rig.cache.shared.state.lock().unwrap();
-        assert!(evict_one(&mut state, None));
-    }
+    evict(&mut rig.cache.shared.state.lock().unwrap(), "app.example");
     let c = rig.cache.clone();
     requests.spawn(async move { c.resolve("app.example").await });
     let (_, new) = rig.next().await;
@@ -193,55 +191,6 @@ async fn late_result_after_eviction_and_reinsertion_cannot_replace_new_view() {
         2
     );
     rig.finish().await;
-}
-#[tokio::test]
-async fn entries_bytes_fetches_and_old_configuration_ownership_remain_bounded() {
-    let fixture = CertificateFixture::new();
-    for i in 0..1100 {
-        assert!(fixture
-            .cache
-            .resolve(&format!("n{i}.example"))
-            .await
-            .unwrap()
-            .is_none());
-    }
-    assert_eq!(fixture.cache.usage().entries, CERTIFICATE_CACHE_ENTRIES);
-    assert!(
-        fixture
-            .cache
-            .shared
-            .task_high_water
-            .load(std::sync::atomic::Ordering::SeqCst)
-            <= CERTIFICATE_FETCHES
-    );
-    let (cert, key) = material("app.example");
-    fixture.publish("app.example", vec![cert], key).unwrap();
-    let retained = fixture.cache.resolve("app.example").await.unwrap().unwrap();
-    fixture.cache.shared.state.lock().unwrap().entries.clear();
-    let charged = fixture.cache.usage().accounted_bytes;
-    assert!(charged >= STRUCTURE_BYTES + CONFIG_OVERHEAD);
-    assert!(charged < STRUCTURE_BYTES + FETCH_BYTES);
-    drop(retained);
-    assert_eq!(fixture.cache.usage().accounted_bytes, STRUCTURE_BYTES);
-    fixture.finish().await;
-    let mut rig = Rig::new();
-    let mut callers = JoinSet::new();
-    let mut held = Vec::new();
-    for i in 0..CERTIFICATE_FETCHES {
-        let c = rig.cache.clone();
-        callers.spawn(async move { c.resolve(&format!("f{i}.example")).await });
-        held.push(rig.next().await.1);
-    }
-    assert_eq!(rig.cache.usage().fetches, CERTIFICATE_FETCHES);
-    assert_eq!(
-        rig.cache.resolve("overflow.example").await.unwrap_err(),
-        CertificateLookupError::Capacity
-    );
-    assert!(rig.cache.usage().accounted_bytes <= CERTIFICATE_CACHE_BYTES);
-    callers.abort_all();
-    while callers.join_next().await.is_some() {}
-    rig.finish().await;
-    drop(held);
 }
 #[tokio::test]
 async fn current_wall_validity_and_fixed_monotonic_lease_both_gate_warm_selection() {
@@ -422,13 +371,6 @@ async fn malformed_and_delayed_responses_cannot_install_or_extend_a_view() {
         generation: 1,
         prior,
         floor: 0,
-        memory: fixture
-            .cache
-            .shared
-            .bytes
-            .clone()
-            .try_acquire_many_owned(FETCH_BYTES as u32)
-            .unwrap(),
         _slot: fixture
             .cache
             .shared
@@ -579,36 +521,6 @@ async fn short_positive_lease_refreshes_in_the_worker_before_original_expiry() {
 }
 
 #[tokio::test]
-async fn due_refreshes_can_evict_each_other_under_byte_pressure_without_panicking() {
-    let fixture = CertificateFixture::new();
-    for hostname in ["a.example", "b.example"] {
-        let (cert, key) = material(hostname);
-        fixture.publish(hostname, vec![cert], key).unwrap();
-        assert!(fixture.cache.resolve(hostname).await.unwrap().is_some());
-    }
-    // Leave less than one fetch reservation. Starting the first refresh must
-    // evict the other due entry; its name is still in the captured due list.
-    let hold = fixture
-        .cache
-        .shared
-        .bytes
-        .clone()
-        .try_acquire_many_owned(
-            (fixture.cache.shared.bytes.available_permits() - FETCH_BYTES + 1) as u32,
-        )
-        .unwrap();
-    {
-        let mut state = fixture.cache.shared.state.lock().unwrap();
-        for entry in state.entries.values_mut() {
-            entry.value.as_mut().unwrap().refresh = Instant::now() - Duration::from_secs(1);
-        }
-    }
-    until(|| fixture.cache.usage().entries == 1).await;
-    drop(hold);
-    fixture.finish().await;
-}
-
-#[tokio::test]
 async fn cancelled_waiter_and_shutdown_join_the_real_blocking_validation_owner() {
     use futures_util::FutureExt;
     let fixture = CertificateFixture::new();
@@ -624,7 +536,6 @@ async fn cancelled_waiter_and_shutdown_join_the_real_blocking_validation_owner()
     calls.abort_all();
     while calls.join_next().await.is_some() {}
     assert_eq!(fixture.cache.usage().fetches, 1);
-    assert!(fixture.cache.usage().accounted_bytes >= STRUCTURE_BYTES + FETCH_BYTES);
     let cache = fixture.cache.clone();
     let mut finish = Box::pin(fixture.finish());
     assert!(finish.as_mut().now_or_never().is_none());
@@ -637,7 +548,6 @@ async fn cancelled_waiter_and_shutdown_join_the_real_blocking_validation_owner()
     drop(release);
     finish.await;
     assert_eq!(cache.usage().fetches, 0);
-    assert_eq!(cache.usage().accounted_bytes, STRUCTURE_BYTES);
 }
 
 #[tokio::test]

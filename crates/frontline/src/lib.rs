@@ -31,8 +31,8 @@ pub use control_plane_transport::{
     GrpcProxyHttp01ResolverError,
 };
 pub use forward::{
-    http_upstream_origin, websocket_upstream_url, BackendForwardError, FrontlineForwardContext,
-    FrontlineForwardError, FrontlineForwarder,
+    http_upstream_origin, BackendForwardError, FrontlineForwardContext, FrontlineForwardError,
+    FrontlineForwarder,
 };
 pub use http01::{
     http01_challenge_key, http01_challenge_token, intercept_http01_challenge,
@@ -42,10 +42,9 @@ pub use http01::{
 };
 pub use identity::{RequestIdentityError, RouteRequestIdentity};
 pub use listener::{
-    serve_frontline, serve_http, serve_http_listener, serve_http_listener_with_admission,
-    FrontlineHttpListenerConfig, FrontlineHttpListenerError, FrontlineListenerError,
-    FrontlineListenerKind, FrontlineListenersConfig, FrontlineTlsPassthroughListenerConfig,
-    FrontlineTlsTerminationListenerConfig,
+    serve_frontline, serve_frontline_listeners, FrontlineHttpListenerConfig,
+    FrontlineListenerError, FrontlineListenerKind, FrontlineListeners, FrontlineListenersConfig,
+    FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
 };
 pub use route::{
     FrontlineRouteCoordinator, FrontlineRouteCoordinatorError, FrontlineRouteOutcome,
@@ -58,7 +57,7 @@ pub use subscription::{
 };
 pub use tls::{
     passthrough_backend_addr, FrontlineTlsAdapter, TerminatedTls, TlsCertificateStore,
-    TlsPassthrough, TlsPassthroughBackendError, TlsPassthroughClientHello, TlsPassthroughError,
+    TlsPassthroughBackendError, TlsPassthroughClientHello, TlsPassthroughError,
     TlsTerminationError,
 };
 pub use wake::{

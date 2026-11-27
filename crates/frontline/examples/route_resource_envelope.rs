@@ -17,10 +17,10 @@ use std::{
 
 use bytes::Bytes;
 use frontline::{
-    listener::serve_http_listener_with_admission, FrontlineHttpRuntime, FrontlineRouteCoordinator,
-    RouteStream, RouteStreamEvent, RouteStreamReply, RouteStreamRequest, RouteSubscriptionClient,
-    RouteSubscriptionFuture, WakeClient, WakeClientFuture, WakeInstanceRequest,
-    WakeInstanceResponse,
+    serve_frontline_listeners, FrontlineHttpRuntime, FrontlineListeners, FrontlineRouteCoordinator,
+    FrontlineTlsAdapter, RouteStream, RouteStreamEvent, RouteStreamReply, RouteStreamRequest,
+    RouteSubscriptionClient, RouteSubscriptionFuture, TlsCertificateStore, WakeClient,
+    WakeClientFuture, WakeInstanceRequest, WakeInstanceResponse,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Limited};
@@ -402,11 +402,12 @@ async fn run() {
     let addr = listener.local_addr().unwrap();
     let shutdown = Shutdown::new();
     let mut server = JoinSet::new();
-    server.spawn(serve_http_listener_with_admission(
-        listener,
-        runtime,
-        shutdown.clone(),
+    server.spawn(serve_frontline_listeners(
+        FrontlineListeners::http(listener),
         admission.clone(),
+        runtime,
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled()),
+        shutdown.clone(),
     ));
     // One listener task, its production shared coordinator actor, and the
     // fixture's end of the actor's Subscribe stream.

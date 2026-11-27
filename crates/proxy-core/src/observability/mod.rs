@@ -165,7 +165,6 @@ mod tests {
             Outcome::from(&AdmissionError::Saturated { limit: 5000 }),
             Outcome::Rejected
         );
-        assert_eq!(Outcome::from(&AdmissionError::Closed), Outcome::Rejected);
         assert_eq!(Outcome::from(&DrainError::Draining), Outcome::Rejected);
         assert_eq!(
             Outcome::from(&DrainError::GraceTimeout {

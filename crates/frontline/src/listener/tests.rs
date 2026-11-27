@@ -49,15 +49,58 @@ use tokio_tungstenite::{
 };
 
 use super::{
-    serve_frontline, serve_http_listener, FrontlineHttpListenerConfig, FrontlineListenersConfig,
+    serve_frontline, serve_frontline_listeners, FrontlineHttpListenerConfig,
+    FrontlineListenerError, FrontlineListeners, FrontlineListenersConfig,
     FrontlineTlsPassthroughListenerConfig, FrontlineTlsTerminationListenerConfig,
 };
 use crate::{
     route::testing::{FakeControlPlane, FakeWake},
     FrontlineHttpRuntime, FrontlineRouteCoordinator, FrontlineTlsAdapter,
     Http01ChallengeResolveFuture, Http01ChallengeResolver, RouteLookupCounters,
-    TlsCertificateStore,
+    RouteSubscriptionClient, TlsCertificateStore, WakeClient,
 };
+
+/// A frontline that serves plain HTTP on `listener` with default bounds.
+async fn serve_http_listener<RouteClient, Wake, Http01>(
+    listener: TcpListener,
+    runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
+    shutdown: Shutdown,
+) -> Result<(), FrontlineListenerError>
+where
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    RouteClient::Error: Clone + Send,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send,
+    Http01: Http01ChallengeResolver + Send + 'static,
+    Http01::Error: Send,
+{
+    let admission = proxy_core::ProxyAdmission::new(proxy_core::ProxyResourceConfig::default());
+    serve_http_listener_with_admission(listener, runtime, shutdown, admission).await
+}
+
+async fn serve_http_listener_with_admission<RouteClient, Wake, Http01>(
+    listener: TcpListener,
+    runtime: FrontlineHttpRuntime<RouteClient, Wake, Http01>,
+    shutdown: Shutdown,
+    admission: proxy_core::ProxyAdmission,
+) -> Result<(), FrontlineListenerError>
+where
+    RouteClient: RouteSubscriptionClient + Send + 'static,
+    RouteClient::Error: Clone + Send,
+    Wake: WakeClient + Send + 'static,
+    Wake::Error: Clone + Send,
+    Http01: Http01ChallengeResolver + Send + 'static,
+    Http01::Error: Send,
+{
+    serve_frontline_listeners(
+        FrontlineListeners::http(listener),
+        admission,
+        runtime,
+        FrontlineTlsAdapter::new(TlsCertificateStore::disabled()),
+        shutdown,
+    )
+    .await
+}
 
 const READY_RESPONSE: &[u8] = b"ready-from-listener-upstream";
 const TLS_REQUEST_BODY: &[u8] = b"tls-listener-request";
@@ -74,7 +117,7 @@ async fn actual_serve_boundary_rejects_oversized_programmatic_activation_budget(
     let result = serve_http_listener(listener, runtime, Shutdown::new()).await;
     assert!(matches!(
         result,
-        Err(super::FrontlineHttpListenerError::InitialActivationBudgetExceeded)
+        Err(FrontlineListenerError::InitialActivationBudgetExceeded)
     ));
     let mut byte = [0; 1];
     let closed = tokio::time::timeout(Duration::from_secs(1), owned_connection.read(&mut byte))
@@ -671,6 +714,7 @@ async fn listener_websocket_forwards_cached_ready_route_bidirectionally_and_clos
         .expect("close frame valid");
     assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "done"));
     assert_eq!(route_client.subscribes(), 1);
+    drop(client);
 
     upstream_task.await.expect("upstream task joins");
     shutdown.shutdown();
@@ -707,7 +751,7 @@ async fn listener_websocket_backend_refusal_expires_without_upgrade() {
         route_client.clone(),
         DrainTracker::new(Duration::from_secs(1)),
     );
-    let task = tokio::spawn(super::serve_http_listener_with_admission(
+    let task = tokio::spawn(serve_http_listener_with_admission(
         listener,
         runtime,
         shutdown.clone(),
@@ -725,10 +769,11 @@ async fn listener_websocket_backend_refusal_expires_without_upgrade() {
 
     assert!(status.starts_with("HTTP/1.1 504"), "{status}");
     assert_eq!(route_client.subscribes(), 1);
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        admission.requests.wait_for_in_flight(0),
-    )
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while admission.requests.in_flight() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
     .await
     .unwrap();
 
@@ -855,25 +900,6 @@ async fn listener_websocket_invalid_or_missing_host_rejects_without_control_plan
 }
 
 #[tokio::test]
-async fn listener_websocket_task_reaper_drops_completed_entries_without_blocking() {
-    let mut tasks = JoinSet::new();
-    tasks.spawn(async {});
-    tokio::task::yield_now().await;
-
-    super::reap_completed_tasks(&mut tasks);
-    assert_eq!(tasks.len(), 0);
-
-    tasks.spawn(async {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    });
-    super::reap_completed_tasks(&mut tasks);
-    assert_eq!(tasks.len(), 1);
-
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-}
-
-#[tokio::test]
 async fn listener_shutdown_drains_active_http_response() {
     let (upstream_addr, release_upstream, upstream_task) = spawn_chunked_upstream().await;
     let route_client = FakeControlPlane::default();
@@ -923,7 +949,7 @@ async fn spawn_frontline_listener(
 ) -> (
     SocketAddr,
     Shutdown,
-    JoinHandle<Result<(), super::FrontlineHttpListenerError>>,
+    JoinHandle<Result<(), FrontlineListenerError>>,
 ) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await

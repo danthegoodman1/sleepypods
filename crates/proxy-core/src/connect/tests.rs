@@ -42,15 +42,17 @@ async fn stalled_socket_is_dropped_before_fresh_attempt_uses_remaining_budget() 
             let attempt = calls.fetch_add(1, Ordering::SeqCst);
             let active = active.clone();
             async move {
-                if attempt == 0 {
-                    assert_eq!(cap, Duration::from_secs(1));
+                // Probes double inside the one-second window, then end with it.
+                const PROBES: [u64; 4] = [100, 200, 400, 150];
+                if attempt < PROBES.len() {
+                    assert_eq!(cap, Duration::from_millis(PROBES[attempt]));
                     tcp_attempt(cap, async move {
                         let _socket = AttemptGuard::new(active);
                         std::future::pending::<io::Result<usize>>().await
                     })
                     .await
                 } else {
-                    assert_eq!(attempt, 1);
+                    assert_eq!(attempt, PROBES.len());
                     assert_eq!(cap, Duration::from_millis(8950));
                     tcp_attempt(cap, async move {
                         let _socket = AttemptGuard::new(active);
@@ -66,14 +68,14 @@ async fn stalled_socket_is_dropped_before_fresh_attempt_uses_remaining_budget() 
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result, 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(result, 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     assert_eq!(active.load(Ordering::SeqCst), 0);
     assert_eq!(started.elapsed(), Duration::from_millis(4050));
 }
 
 #[tokio::test(start_paused = true)]
-async fn persistent_stall_has_one_rotation_and_one_total_deadline() {
+async fn persistent_stall_probes_briefly_then_holds_one_attempt_to_the_total_deadline() {
     let active = Arc::new(AtomicUsize::new(0));
     let calls = AtomicUsize::new(0);
     let started = Instant::now();
@@ -94,7 +96,7 @@ async fn persistent_stall_has_one_rotation_and_one_total_deadline() {
     .await;
     assert!(result.is_err());
     assert_eq!(started.elapsed(), Duration::from_secs(10));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
@@ -125,11 +127,12 @@ async fn short_refusal_preserves_remaining_initial_probing_window() {
             async move {
                 match call {
                     0 => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
-                    1 => {
-                        assert_eq!(cap, Duration::from_millis(950));
+                    1..=3 => {
+                        let probes = [200, 400, 250];
+                        assert_eq!(cap, Duration::from_millis(probes[call - 1]));
                         tcp_attempt(cap, std::future::pending::<io::Result<()>>()).await
                     }
-                    2 => {
+                    4 => {
                         assert_eq!(cap, Duration::from_millis(2950));
                         Ok(())
                     }
@@ -355,8 +358,57 @@ async fn multiaddress_refusal_masking_timeout_cannot_starve_slow_replacement() {
     )
     .await;
     result.unwrap().unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 5);
-    assert_eq!(early_caps[0], Duration::from_secs(1));
-    assert!(early_caps.windows(2).all(|pair| pair[1] < pair[0]));
-    assert!(early_caps.last().unwrap() < &Duration::from_millis(50));
+    assert_eq!(
+        early_caps,
+        [100, 200, 400, 500, 200, 50].map(Duration::from_millis)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), early_caps.len() + 1);
+}
+
+/// A full accept queue drops SYNs, as a Service address does before the
+/// node has programmed it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connect_completes_one_short_probe_after_dropped_syns_stop() {
+    use socket2::{Domain, Socket, Type};
+
+    const OUTAGE: Duration = Duration::from_millis(300);
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    socket.listen(0).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(socket.into()).unwrap();
+    let address = listener.local_addr().unwrap();
+    // One unaccepted connection fills the queue; every later SYN is dropped.
+    let _filler = TcpStream::connect(address).await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(50), TcpStream::connect(address))
+            .await
+            .is_err(),
+        "the full accept queue drops SYNs"
+    );
+    let server = tokio::spawn(async move {
+        tokio::time::sleep(OUTAGE).await;
+        let mut accepted = Vec::new();
+        loop {
+            accepted.push(listener.accept().await.unwrap());
+        }
+    });
+
+    let started = Instant::now();
+    connect_tcp(address, Duration::from_secs(10)).await.unwrap();
+    let elapsed = started.elapsed();
+
+    // The kernel resends a dropped SYN after a second. Short probes send a
+    // fresh one sooner: here the 400 ms probe that starts at 400 ms.
+    assert!(elapsed >= OUTAGE, "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    server.abort();
 }

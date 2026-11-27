@@ -1,8 +1,9 @@
 //! Retained native Channel recovery: caller cancellation must not leave an
 //! unbounded connection attempt blocking every subsequent request.
-use control_plane::api::{
-    operator_grpc_service,
-    pb::{operator_control_plane_client::OperatorControlPlaneClient, GetInstanceRequest},
+use control_plane::api::pb::{
+    sidecar_control_plane_client::SidecarControlPlaneClient,
+    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
+    SidecarReportIdleRequest, SidecarReportIdleResponse,
 };
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::{
@@ -22,10 +23,24 @@ use tokio::{
 };
 use tonic::{
     transport::{Identity, Server, ServerTlsConfig},
-    Code,
+    Code, Request, Response, Status,
 };
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+/// Answers every call with one definite status, so a completed RPC proves the
+/// transport reached the server.
+struct RefusingSidecarService;
+
+#[tonic::async_trait]
+impl SidecarControlPlane for RefusingSidecarService {
+    async fn report_idle(
+        &self,
+        _request: Request<SidecarReportIdleRequest>,
+    ) -> Result<Response<SidecarReportIdleResponse>, Status> {
+        Err(Status::unimplemented("transport fixture"))
+    }
+}
 
 #[tokio::test]
 async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> TestResult<()> {
@@ -45,7 +60,7 @@ async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> Test
     tasks.spawn(async move {
         Server::builder()
             .tls_config(ServerTlsConfig::new().identity(identity))?
-            .add_service(operator_grpc_service())
+            .add_service(SidecarControlPlaneServer::new(RefusingSidecarService))
             .serve_with_incoming(
                 tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(backend),
             )
@@ -105,13 +120,14 @@ async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> Test
         )?
         .connect()
         .await?;
-        let mut client = OperatorControlPlaneClient::new(channel);
-        let request = || GetInstanceRequest {
+        let mut client = SidecarControlPlaneClient::new(channel);
+        let request = || SidecarReportIdleRequest {
             instance_id: "reconnect-proof".into(),
+            ..Default::default()
         };
-        let warm = match client.get_instance(request()).await {
+        let warm = match client.report_idle(request()).await {
             Err(status) => status,
-            Ok(_) => return Err("placeholder unexpectedly succeeded".into()),
+            Ok(_) => return Err("refusing fixture unexpectedly succeeded".into()),
         };
         if warm.code() != Code::Unimplemented {
             return Err("initial verified native call failed".into());
@@ -123,7 +139,7 @@ async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> Test
         // safe read drives this exact same Channel into its held TLS attempt.
         let mut canceled = Box::pin(async {
             loop {
-                let _ = client.get_instance(request()).await;
+                let _ = client.report_idle(request()).await;
                 tokio::task::yield_now().await;
             }
         });
@@ -134,7 +150,7 @@ async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> Test
         drop(canceled);
         // Cancel one concrete pending RPC, not the driver loop above: an
         // immediately returned status must fail this observation.
-        if timeout(Duration::from_millis(50), client.get_instance(request()))
+        if timeout(Duration::from_millis(50), client.report_idle(request()))
             .await
             .is_ok()
         {
@@ -144,7 +160,7 @@ async fn retained_native_channel_recovers_after_canceled_tls_reconnect() -> Test
         // connection remains untouched. No endpoint or Channel is recreated.
         timeout(Duration::from_secs(4), async {
             loop {
-                match client.get_instance(request()).await {
+                match client.report_idle(request()).await {
                     Err(status) if status.code() == Code::Unimplemented => {
                         return Ok::<_, Box<dyn Error + Send + Sync>>(())
                     }

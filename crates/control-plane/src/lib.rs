@@ -42,19 +42,19 @@ pub use auth::{
     ControlPlaneAuthInterceptor, InvalidBearerToken, InvalidStaticBearerTokens,
     OptionalBearerTokenInterceptor, StaticBearerAuthProvider, StaticBearerTokens,
 };
-pub use config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
+pub use config::{ControlPlaneConfig, PostgresStoreConfig};
 pub use http01::{
-    DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-    Http01ChallengeRecord, PutHttp01ChallengeRequest,
+    DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+    PutHttp01ChallengeRequest,
 };
 pub use ids::{
-    BackendGeneration, Generation, IdempotencyKey, InstanceId, MaterializationId, NonEmptyString,
-    RouteBindingId, WorkloadClassId,
+    materialization_id, BackendGeneration, Generation, InstanceId, MaterializationId,
+    NonEmptyString, RouteBindingId, WorkloadClassId,
 };
 pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
     CreateInstanceValidationError, DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
-    InstanceState, InstanceValues, StateTransitionReason,
+    InstanceRoute, InstanceState, InstanceValues, StateTransitionReason,
 };
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
@@ -97,9 +97,9 @@ pub use retry::RetryPolicy;
 pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
     HostRules, ListRouteBindingsForInstanceRequest, PathPrefix, ResolveHostRulesRequest,
-    RouteBindingRecord, RouteBindingSpec, RouteDependencyLookup, RouteDependencySet, RouteEntry,
-    RouteHost, RouteHostKind, RouteIdentity, RouteKind, RouteRule, MAX_HOST_RULES,
-    MAX_ROUTE_HOST_BYTES, MAX_ROUTE_PATH_BYTES,
+    RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost,
+    RouteHostKind, RouteIdentity, RouteKind, RouteRule, MAX_HOST_RULES, MAX_ROUTE_HOST_BYTES,
+    MAX_ROUTE_PATH_BYTES,
 };
 pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,

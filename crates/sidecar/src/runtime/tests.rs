@@ -105,7 +105,7 @@ async fn initial_http_setup_timeout_releases_idle_work_without_any_request() {
         app.local_addr().unwrap().port(),
         InstanceId::new("setup").unwrap(),
         Generation::new(1),
-        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF).unwrap(),
+        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF, Duration::from_secs(10)).unwrap(),
         DRAIN_GRACE_TIMEOUT,
     )
     .unwrap()
@@ -121,7 +121,9 @@ async fn initial_http_setup_timeout_releases_idle_work_without_any_request() {
         shutdown.clone(),
     ));
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    admission.handshakes.wait_for_in_flight(1).await;
+    while admission.handshakes.in_flight() != 1 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     tokio::time::sleep(IDLE_TIMEOUT * 2).await;
     assert_recorded_count(&reports, 0);
     assert_eq!(
@@ -252,8 +254,17 @@ async fn h2c_grpc_shaped_stream_delays_idle_report_until_stream_closes() {
     let shutdown = Shutdown::new();
     let client = FakeReportIdleClient::new();
     let requests = client.requests();
-    let (runtime_addr, runtime_task) =
-        spawn_runtime(upstream_addr.port(), client, shutdown.clone()).await;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let runtime_addr = listener.local_addr().unwrap();
+    let runtime_task = spawn_runtime_for_app(
+        upstream_addr.port(),
+        proxy_core::AppProtocol::H2c,
+        listener,
+        runtime_addr,
+        client,
+        shutdown.clone(),
+    )
+    .await;
 
     let stream = TcpStream::connect(runtime_addr).await.unwrap();
     let (mut h2_client, connection) =
@@ -667,15 +678,7 @@ async fn spawn_runtime_with_drain_timeout(
         .await
         .expect("runtime listener binds");
     let runtime_addr = listener.local_addr().expect("runtime listener has addr");
-    let config = SidecarRuntimeConfig::new(
-        runtime_addr,
-        app_port,
-        InstanceId::new("test-instance").expect("instance id is valid"),
-        Generation::new(7),
-        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF).expect("idle config is valid"),
-        drain_grace_timeout,
-    )
-    .expect("runtime config is valid");
+    let config = runtime_config(runtime_addr, app_port, drain_grace_timeout);
 
     let task = tokio::spawn(serve_http_listener_with_idle(
         listener, config, client, shutdown,
@@ -683,6 +686,39 @@ async fn spawn_runtime_with_drain_timeout(
     tokio::task::yield_now().await;
 
     (runtime_addr, task)
+}
+
+fn runtime_config(
+    runtime_addr: SocketAddr,
+    app_port: u16,
+    drain_grace_timeout: Duration,
+) -> SidecarRuntimeConfig {
+    SidecarRuntimeConfig::new(
+        runtime_addr,
+        app_port,
+        InstanceId::new("test-instance").expect("instance id is valid"),
+        Generation::new(7),
+        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF, Duration::from_secs(10))
+            .expect("idle config is valid"),
+        drain_grace_timeout,
+    )
+    .expect("runtime config is valid")
+}
+
+/// A sidecar in front of an app port that serves `app_protocol`.
+async fn spawn_runtime_for_app(
+    app_port: u16,
+    app_protocol: proxy_core::AppProtocol,
+    listener: impl proxy_core::Accept + Send + 'static,
+    runtime_addr: SocketAddr,
+    client: FakeReportIdleClient,
+    shutdown: Shutdown,
+) -> JoinHandle<Result<(), crate::runtime::SidecarRuntimeError>> {
+    let config =
+        runtime_config(runtime_addr, app_port, DRAIN_GRACE_TIMEOUT).with_app_protocol(app_protocol);
+    tokio::spawn(serve_http_listener_with_idle(
+        listener, config, client, shutdown,
+    ))
 }
 
 async fn spawn_tcp_runtime(
@@ -714,7 +750,8 @@ async fn spawn_tcp_runtime_with_drain_timeout(
         app_port,
         InstanceId::new("test-instance").expect("instance id is valid"),
         Generation::new(7),
-        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF).expect("idle config is valid"),
+        IdleReportConfig::new(IDLE_TIMEOUT, RETRY_BACKOFF, Duration::from_secs(10))
+            .expect("idle config is valid"),
         drain_grace_timeout,
     )
     .expect("runtime config is valid");
@@ -1098,22 +1135,18 @@ async fn read_http_response(stream: &mut TcpStream, expected_body: &[u8]) -> Str
     String::from_utf8(response).expect("response is utf8")
 }
 
+/// Waits for at least `expected` reports. An idle sidecar keeps reporting.
 async fn wait_for_recorded_count(requests: &RecordedRequests, expected: usize) {
     tokio::time::timeout(
         IDLE_TIMEOUT + RETRY_BACKOFF + Duration::from_secs(1),
         async {
-            loop {
-                if recorded_count(requests) == expected {
-                    return;
-                }
+            while recorded_count(requests) < expected {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         },
     )
     .await
     .expect("recorded request count reached before timeout");
-
-    assert_recorded_count(requests, expected);
 }
 
 async fn expect_within<F>(future: F, label: &'static str) -> F::Output
@@ -1137,3 +1170,4 @@ fn recorded_count(requests: &RecordedRequests) -> usize {
 }
 
 mod admission;
+mod protocol;

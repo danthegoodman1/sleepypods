@@ -64,32 +64,29 @@ Phase 0 unblocks CI. Phases 1 and 2 are independent, small and next. Phases 3,
 4 and 5 are the architectural work and can run in parallel after Phase 1.
 Phases 6–8 follow in any order. Item IDs are stable references.
 
-### Decisions for the owner
+### Decisions
 
-Each has a recommendation; the phase records the outcome.
+The owner accepted every recommendation on 2026-11-27.
 
-- **3A, cache authority by host.** Cache the complete rule set for an exact
-  host and match paths locally. A host's answer is complete, so a broad rule
-  still cannot hide an exact-host or longer-path rule. Recommended.
-- **4H, revive during drain.** A wake that arrives before teardown starts
-  returns the instance to Running on the existing pod. Recommended.
-- **5C, late creates.** Either create workloads with zero replicas and activate
-  them with a conditional patch, which makes a late create inert and removes
-  the effect journal, or keep the journal and resolve an uncertain create by
-  re-inspection after a settle window longer than the API server's request
-  timeout. Both replace operator settlement with bounded automatic recovery.
-  Spike the first; fall back to the second.
-- **7D, one lifecycle row.** Carry projection, lease, schedule and one
-  incarnation stamp on the instance row. Decide after Phases 4 and 5 land.
-- **8C, tunnel WebSockets.** Relay upgraded bytes instead of re-framing; this
-  changes the per-hop challenge and extension clauses of the protocol
-  contract. Recommended.
-- **8D, render into `k8s-openapi` types** and drop Deployment and StatefulSet
-  from the raw allow-list. Changes the rendered hash of live objects.
-- **8E, drop idempotency keys** in favour of insert-or-compare on the
-  caller-chosen ID.
-- **6C, `default_values`.** Delete it; per-field defaults in the value schema
-  already work.
+- **3A, cache authority by host: accepted.** Cache the complete rule set for an
+  exact host and match paths locally. A host's answer is complete, so a broad
+  rule still cannot hide an exact-host or longer-path rule.
+- **4H, revive during drain: accepted.** A wake that arrives before teardown
+  starts returns the instance to Running on the existing pod.
+- **5C, late creates: inert creates.** The spike passed: a zero-replica
+  Deployment, StatefulSet or raw workload starts no Pod, and a conditional
+  activation patch with a stale resourceVersion or UID is refused. Workloads
+  are created with zero replicas and activated by a conditional patch, and the
+  effect journal is deleted.
+- **6C, `default_values`: deleted.** Per-field defaults in the value schema
+  remain.
+- **7D, one lifecycle row: open.** Decide after Phases 4 and 5 land.
+- **8C, tunnel WebSockets: accepted.** Upgraded bytes are relayed; the protocol
+  contract's per-hop challenge and extension clauses changed with it.
+- **8D, render into `k8s-openapi` types: accepted,** with Deployment and
+  StatefulSet dropped from the raw allow-list.
+- **8E, drop idempotency keys: accepted,** in favour of insert-or-compare on
+  the caller-chosen ID.
 
 ## Implementation Principles
 
@@ -150,8 +147,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 0A: Replace deprecated `fetch_update` calls | Missing: three call sites updated; clippy clean on 1.100. |
-| Incomplete | Work | 0B: Pinned toolchain | Missing: `rust-toolchain.toml` and CI reading it. |
+| Complete | Work | 0A: Replace deprecated `fetch_update` calls | Commit `2c27de5`: three call sites use `try_update`; `cargo clippy --workspace --all-targets -- -D warnings` exits 0 on 1.100.0. |
+| Complete | Work | 0B: Pinned toolchain | Commit `2c27de5`: `rust-toolchain.toml` pins 1.100.0; both CI jobs run `rustup toolchain install`; the four image builds use `rust:1.100-bookworm`. |
 | Incomplete | Gate | CI green on the pinned toolchain | Missing: hosted CI run. |
 
 ## Phase 1: Contain Single-Request and Single-Fault Failures in the Proxies
@@ -226,12 +223,12 @@ Status ledger:
 | Incomplete | Work | 1B: Per-request Subscribe errors and terminal flights | Missing: proto reply, stream kept on lookup failure, flight retry bound, waiter-less flight cancellation. |
 | Incomplete | Work | 1C: Agreeing, validated defaults and eager reconnect | Missing: TTL above lifetime, capacity within stream cap, startup validation, reconnect without backoff after a clean end. |
 | Incomplete | Work | 1D: Lossy ends clear authority; cursor before serving | Missing: terminal status on `Lagged`/`Reset`, streams kept on read failure, cursor load ahead of listeners. |
-| Incomplete | Work | 1E: Shared resilient accept helper | Missing: helper in `proxy_core` and its use by all six loops. |
-| Incomplete | Work | 1F: Outbound liveness | Missing: keepalive settings on both control-plane channels and upstream clients; `ReportIdle` deadline. |
-| Incomplete | Work | 1G: Count-bounded certificate cache | Missing: entry-count bound, negative budget, waiting fetch admission. |
-| Incomplete | Work | 1H: WebSocket message cap | Missing: explicit `WebSocketConfig` limits. |
+| Complete | Work | 1E: Shared resilient accept helper | Commit `9603f06`: `proxy_core::serve_listener` serves all six loops; `accept_errors_leave_the_listener_serving`, `shutdown_closes_the_listener_while_connections_drain`, and the sidecar and frontline equivalents inject `EMFILE` and `ECONNABORTED`. |
+| Complete | Work | 1F: Outbound liveness | Commit `9603f06`: HTTP/2 and TCP keepalive on the control-plane channel and the frontline-to-sidecar hop; a header timeout poisons its pooled connection; `a_silent_control_plane_connection_fails_the_report_at_the_keepalive_deadline`, `a_report_that_never_answers_ends_at_its_deadline_and_retries`. The sidecar sends no HTTP/2 pings to the app, because gRPC servers close connections that ping too often. |
+| Complete | Work | 1G: Count-bounded certificate cache | Commits `5da8ab7`, `9a4da04`, `e73bd7f`, `1e287de`: 1,024 certificates and 1,024 negative entries in separate budgets; lookups queue for a fetch slot, at most 64 handshakes waiting; worst-case memory about 220 MiB, stated in the operator guide. |
+| Complete | Work | 1H: WebSocket message cap | Superseded by 8C (`9603f06`): the relay tunnels bytes and holds no message; `a_withheld_final_fragment_reaches_the_upstream_as_it_arrives`. |
 | Incomplete | Gate | Unrelated cached routes keep serving through each fault | Missing: the composed regression tests above, passing. |
-| Incomplete | Test | 1,024 certificates across a refresh cycle | Missing: test with real certificates and concurrent fetches. |
+| Complete | Test | 1,024 certificates across a refresh cycle | `full_cache_stays_warm_through_a_refresh_cycle_with_three_fetches_in_flight` (the earlier code kept 407 of 1,024), `unknown_hostnames_leave_every_certificate_cached`, and `a_full_lookup_wait_serves_cached_hostnames_and_fails_further_lookups_at_once` in `crates/frontline/src/certificates/capacity_tests.rs`. |
 | Incomplete | Test | Routing kind gate | Missing: passing `scripts/test-kind-e2e-routing.sh` run. |
 
 ## Phase 2: Deliver Every Client Protocol to the App
@@ -278,13 +275,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: App protocol per workload port | Missing: class field, sidecar setting, upstream client selection by declared protocol. |
-| Incomplete | Work | 2B: Authority and `te: trailers` across hops | Missing: `Host` and `X-Forwarded-Host` from authority; `te` forwarding on HTTP/2. |
-| Incomplete | Work | 2C: Separate keep-alive idle timeout | Missing: setting, default and pool-idle validation. |
+| Complete | Work | 2A: App protocol per workload port | Commits `8a2ff7d`, `9603f06`: `SidecarTemplate.app_protocol` renders `SLEEPYPODS_APP_PROTOCOL`; the sidecar's `AppHttpProxy` speaks it; gRPC to an `http1` port answers `grpc-status: 12`. |
+| Complete | Work | 2B: Authority and `te: trailers` across hops | Commit `9603f06`: `h2c_app_receives_te_trailers_and_the_client_authority_from_either_client_version`, `forwarded_host_comes_from_the_request_target_when_host_is_absent`. |
+| Complete | Work | 2C: Separate keep-alive idle timeout | Commit `9603f06`: `SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS` (90 s); `http1_keepalive_connection_outlives_the_setup_timeout_and_ends_at_its_idle_timeout`, `upstream_pool_idle_must_stay_below_the_keepalive_idle_timeout`. |
 | Incomplete | Work | 2D: Resolved backend address | Missing: ClusterIP publication or resolve-once route entry. |
-| Incomplete | Gate | Every client protocol reaches both app kinds | Missing: kind runs for each client and app combination. |
-| Incomplete | Test | HTTP/2 client to HTTP/1.1 upstream | Missing: permanent `proxy-core` regression test. |
-| Incomplete | Test | C-core gRPC through both proxies | Missing: grpcio fixture in the protocol gate. |
+| In Progress | Gate | Every client protocol reaches both app kinds | In process: `http1_http2_and_websocket_clients_reach_both_app_protocols_with_the_client_host` through frontline and sidecar. Missing: protocols and TLS kind gate runs. |
+| Complete | Test | HTTP/2 client to HTTP/1.1 upstream | `http2_request_reaches_an_http1_only_app_with_the_client_host` in `crates/proxy-core/tests/http_protocols.rs`. |
+| In Progress | Test | C-core gRPC through both proxies | `te: trailers` is asserted at the proxy and sidecar. Missing: grpcio fixture in the protocols gate. |
 
 ## Phase 3: Route by Host Rule Set
 
@@ -337,7 +334,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Decision | 3A: Cache authority by host | Needs: owner decision. Recommended: accept. |
+| Complete | Decision | 3A: Cache authority by host | Accepted by the owner on 2026-11-27. |
 | Incomplete | Work | 3B: Host rule-set resolution, dependencies and push | Missing: proto, store query, per-host dependency index, concurrent lookups. |
 | Incomplete | Work | 3C: Host-keyed frontline cache with local matching | Missing: re-keyed cache and flights, synchronous read path, atomic hit counter. |
 | Incomplete | Work | 3D: One ordered event channel; test-only resolver removed | Missing: actor-owned reconnect, single session number, deleted modules, ported tests. |
@@ -384,6 +381,14 @@ Scope:
   returns the materialization to Ready and the instance to Running in one
   transaction; the sidecar re-arms its idle detector
   (`crates/control-plane/src/postgres/lifecycle_ops.rs:132-157`).
+- 4I: Frontline connects to the ready Pod address first and falls back to the
+  Service ClusterIP. The sidecar verifies the instance ID that frontline sends
+  and answers 421 before the app sees a request meant for another instance,
+  because Pod addresses are reused outside the control plane's control. TCP
+  and SNI passthrough routes carry no identity and keep the ClusterIP. With
+  readiness watched (4C), the first connect lands before kube-proxy has
+  programmed the Service: in kind, Running-to-first-byte rose from 41 ms to
+  1,099 ms mean while endpoint-to-Running fell from 1,583 ms to 18 ms.
 
 Out of scope:
 - Pod start time itself (image pulls, scheduling).
@@ -409,14 +414,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Test | 4A: Wake-latency gate and baseline | Missing: measurement in the kind scripts and a recorded baseline. |
+| In Progress | Test | 4A: Wake-latency gate and baseline | Lifecycle stream measured the unmodified code in kind (12 samples): stateless adds 2,355 ms mean and 2,943 ms worst; stateful 4,780 ms and 9,896 ms. Missing: merged measurement code and the recorded per-phase baseline. |
 | Incomplete | Work | 4B: Reconciler signalled on new work | Missing: in-process signal from acceptance, finalization and job completion. |
 | Incomplete | Work | 4C: Readiness by watch; no PVC Bound wait | Missing: EndpointSlice watch and reordered apply. |
 | Incomplete | Work | 4D: Separate wake and cleanup capacity | Missing: per-state `claim_next`, slot release during readiness wait, configuration. |
 | Incomplete | Work | 4E: Dispatcher woken by `NOTIFY` | Missing: listener connection, fallback poll, removal of direct notifies. |
 | Incomplete | Work | 4F: Parked waiters per instance | Missing: resolve-only flights, per-instance waiter set, cancellation on last waiter. |
 | Incomplete | Work | 4G: Cleanup completes when pods stop | Missing: in-attempt absence wait, rendered termination grace, failure counter untouched by normal sleeps. |
-| Incomplete | Decision | 4H: Revive during drain | Needs: owner decision. Recommended: accept. |
+| In Progress | Decision | 4H: Revive during drain | Accepted by the owner. Sidecar side in `9603f06`: `an_idle_pod_reports_again_every_backoff_after_an_accepted_report`. Missing: the control-plane transition. |
+| Incomplete | Work | 4I: Pod address first, with sidecar identity check and ClusterIP fallback | Missing: Pod address on the route entry, identity header and 421 in the sidecar, fallback connect, and the 4A measurement after it. |
 | Incomplete | Gate | Wake latency and burst bounds | Missing: 4A results at or under 200 ms mean and 500 ms worst; burst, never-ready and sleep-wave tests. |
 | Incomplete | Test | Lifecycle-races and stateful kind gates | Missing: passing runs after 4C, 4G and 4H. |
 
@@ -485,7 +491,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Incomplete | Work | 5A: Definite outcomes on cancellation and renewal errors | Missing: mutation runs to timeout, renewal retry until expiry, queued ACK for unsent effects. |
 | Incomplete | Work | 5B: Conditional effects clear at claim | Missing: claim change and re-inspection tests for patch and delete. |
-| Incomplete | Decision | 5C: Late creates | Needs: spike result and owner decision between inert creates and a settle window. |
+| In Progress | Decision | 5C: Late creates | Inert creates chosen after the spike passed. Missing: merged implementation and the journal's removal. |
 | Incomplete | Work | 5D: Force delete leaves a wakeable instance | Missing: instance transition in the force-delete transaction. |
 | Incomplete | Work | 5E: Cleanup retries until it succeeds | Missing: non-terminal classification for Deleting rows; alert on oldest age. |
 | Incomplete | Work | 5F: Control plane survives store unavailability | Missing: tick tolerance, I/O error classification, readiness reporting. |
@@ -545,14 +551,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: Render at create time | Missing: dry-run render, declared-value check, added limits. |
-| Incomplete | Work | 6B: 16-hex name suffix | Missing: constant change and collision test. |
-| Incomplete | Work | 6C: Inert API removed | Missing: proto and store changes; `routes` on `CreateInstance`; admin RPCs by instance. |
-| Incomplete | Work | 6D: gRPC-Web TLS and configured origins | Missing: TLS on the web listener and origin configuration. |
-| Incomplete | Work | 6E: Sealing key completeness | Missing: startup check and bulk re-encrypt. |
-| Incomplete | Work | 6F: Quiet control-plane logging | Missing: filtered sink and auth counter. |
-| Incomplete | Gate | Accepted means renderable | Missing: per-input rejection tests and the render property test. |
-| Incomplete | Doc | Operator guide | Missing: updates for removed fields, TLS on gRPC-Web and key rotation. |
+| Complete | Work | 6A: Render at create time | Commit `3c09124`: `CreateInstance` dry-runs the render and class creation renders with placeholders; twelve rejection tests in `crates/control-plane/tests/api_transport/create_validation.rs`, plus manifest tests for the hostPath boundary, raw-object suffix and name limits. |
+| Complete | Work | 6B: 16-hex name suffix | Commit `9a1e36f`: `ten_million_sequential_instance_ids_render_distinct_names` (ignored by default, zero collisions in 39 s) and `colliding_32_bit_prefixes_render_distinct_names`. |
+| Complete | Work | 6C: Inert API removed | Commits `87170fe`, `78aa212`: `default_values`, class `idempotency_key`, `template_generation`, `ExpireHttp01Challenges` and the placeholder service are gone; `create_instance_creates_its_routes_with_the_instance`; admin RPCs take `instance_id`. `ProtocolRoute` goes with Phase 3. |
+| Complete | Work | 6D: gRPC-Web TLS and configured origins | Commits `4cce567`, `8760681`: `grpc_web_listener_refuses_plaintext_when_tls_is_configured`, `grpc_web_listener_serves_allowed_origins_and_refuses_others`. |
+| Complete | Work | 6E: Sealing key completeness | Commits `1321320`, `cb36fc4`: `postgres_startup_requires_every_sealing_key_in_use` and `postgres_sealing_key_rotation_reencrypts_certificates_in_bulk` (`ReencryptCertificates`). |
+| Complete | Work | 6F: Quiet control-plane logging | Commit `833940b`: `successful_rpc_writes_no_stderr_line` and `accepted_decisions_are_counted_and_write_no_log_event`. |
+| In Progress | Gate | Accepted means renderable | Property test `every_accepted_instance_renders_at_wake` (175 accepted instances, all render) and the rejection tests pass; workspace 962 passed, real-Postgres target 28 passed at `42222f3`. Missing: the gRPC-Web kind gate over TLS. |
+| Complete | Doc | Operator guide | Commit `7e0701b`. |
 
 ## Phase 7: Store Cost and Shape
 
@@ -653,9 +659,9 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Work | 8A: One reconciler scheduler | Missing: deleted entry points and ported tests. |
-| Incomplete | Work | 8B: Proxy test-only API and per-request bookkeeping | Missing: deletions, measurement, watchdog and `Arc` changes. |
-| Incomplete | Decision | 8C: Tunnel WebSockets | Needs: owner decision on the protocol-contract change. Recommended: accept. |
-| Incomplete | Decision | 8D: `k8s-openapi` manifest types | Needs: owner decision; coordinate the rendered-hash change with Phase 5. |
-| Incomplete | Decision | 8E: Drop idempotency keys | Needs: owner decision and replay edge-case review. |
+| Complete | Work | 8B: Proxy test-only API and per-request bookkeeping | Commits `9603f06`, `7d424a3`: test-only serve, relay and idle entry points deleted; the delivery watchdog runs for HTTP/2 bodies only; each runtime sits behind one `Arc`. Criterion `proxy_primitives`: admission acquire and release 286 ns to 29 ns, accounting 266 ns to 24 ns, header preparation unchanged. |
+| Complete | Decision | 8C: Tunnel WebSockets | Accepted and implemented in `9603f06`, `c38541f`: `handshake_fields_and_upgraded_bytes_pass_through_unchanged` (Authorization, Cookie, subprotocol, permessage-deflate); `tokio-tungstenite` is a dev-dependency; WebSocket round trip 27.4 µs to 10.9 µs. |
+| Incomplete | Decision | 8D: `k8s-openapi` manifest types | Accepted by the owner. Missing: implementation, after Phase 5 merges. |
+| In Progress | Decision | 8E: Drop idempotency keys | Accepted by the owner. Missing: implementation and the replay edge-case tests. |
 | Incomplete | Work | 8F: Evidence out of tree; crate and setting cleanup | Missing: moved evidence, folded crate, removed setting, README links. |
 | Incomplete | Gate | Production modules hold production code | Missing: caller audit and benches without regression. |

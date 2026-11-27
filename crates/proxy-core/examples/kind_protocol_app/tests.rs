@@ -2,7 +2,10 @@ use super::*;
 use std::{sync::Arc, time::Duration};
 
 use http_body_util::{Empty, Limited};
-use proxy_core::{serve_http_connection, DrainTracker, HttpProxy, Shutdown};
+use proxy_core::{
+    AppHttpProxy, AppProtocol, DrainTracker, HttpProxy, ProxyAdmission, ProxyResourceConfig,
+    Shutdown,
+};
 use tokio::{task::JoinSet, time::timeout};
 
 async fn backend(tasks: &mut JoinSet<AppResult<()>>, connections: usize) -> AppResult<SocketAddr> {
@@ -18,26 +21,73 @@ async fn backend(tasks: &mut JoinSet<AppResult<()>>, connections: usize) -> AppR
     Ok(address)
 }
 
+/// One production proxy hop in front of `upstream`.
+#[derive(Clone)]
+enum Hop {
+    /// Frontline: keeps the client's HTTP version to a sidecar.
+    Frontline(Arc<HttpProxy>, http::Uri),
+    /// Sidecar: speaks the protocol declared for the app port.
+    Sidecar(AppHttpProxy),
+}
+
 async fn forwarder(
     tasks: &mut JoinSet<AppResult<()>>,
     upstream: SocketAddr,
+    app_protocol: Option<AppProtocol>,
 ) -> AppResult<SocketAddr> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let address = listener.local_addr()?;
-    let origin: http::Uri = format!("http://{upstream}").parse()?;
-    let proxy = Arc::new(HttpProxy::new(DrainTracker::new(Duration::from_secs(1))));
+    let drain = DrainTracker::new(Duration::from_secs(1));
+    let hop = match app_protocol {
+        Some(protocol) => Hop::Sidecar(AppHttpProxy::new(
+            drain,
+            ProxyResourceConfig::default(),
+            upstream,
+            protocol,
+        )),
+        None => Hop::Frontline(
+            Arc::new(HttpProxy::new(drain)),
+            format!("http://{upstream}").parse()?,
+        ),
+    };
     tasks.spawn(async move {
         let (stream, _) = listener.accept().await?;
-        serve_http_connection(stream, Shutdown::new(), move |request| {
-            let proxy = proxy.clone();
-            let origin = origin.clone();
-            async move {
-                proxy
-                    .proxy(request, &origin)
-                    .await
-                    .map_err(|error| io::Error::other(format!("production proxy error: {error:?}")))
-            }
-        })
+        let admission = ProxyAdmission::new(ProxyResourceConfig::default());
+        let handshake = admission.handshakes.try_acquire()?;
+        let stream = admission.admit_io(stream)?;
+        proxy_core::serve_http_connection_admitted(
+            stream,
+            Shutdown::new(),
+            admission,
+            handshake,
+            None,
+            move |mut request| {
+                let hop = hop.clone();
+                async move {
+                    let proxied = match &hop {
+                        Hop::Frontline(proxy, origin) => {
+                            // The edge names the client's authority for the next hop.
+                            proxy_core::apply_forwarded_header_policy(
+                                &mut request,
+                                "127.0.0.1".parse().expect("loopback address"),
+                                "http",
+                            );
+                            proxy
+                                .proxy(request, origin)
+                                .await
+                                .map_err(|error| format!("{error:?}"))
+                        }
+                        Hop::Sidecar(proxy) => proxy
+                            .proxy(request)
+                            .await
+                            .map_err(|error| format!("{error:?}")),
+                    };
+                    proxied.map_err(|error| {
+                        io::Error::other(format!("production proxy error: {error}"))
+                    })
+                }
+            },
+        )
         .await;
         Ok(())
     });
@@ -48,6 +98,7 @@ async fn h2_requests(
     tasks: &mut JoinSet<AppResult<()>>,
     address: SocketAddr,
     expected_instance: &str,
+    app_version: &str,
 ) -> AppResult<()> {
     let stream = TcpStream::connect(address).await?;
     let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -58,8 +109,8 @@ async fn h2_requests(
         connection.await?;
         Ok(())
     });
-    // Two requests on this exact sender prove the selected backend handles H2
-    // and does not require a request replay or protocol downgrade.
+    // Two requests on this exact sender prove the hop needs no request replay.
+    // The app reports the version it was served in and the host it saw.
     for path in ["/a/before", "/a/after"] {
         let response = sender
             .send_request(
@@ -79,8 +130,9 @@ async fn h2_requests(
         for marker in [
             "sleepypods-protocol-app".to_owned(),
             format!("instance={expected_instance}"),
-            "request_version=HTTP/2".to_owned(),
+            format!("request_version={app_version}"),
             format!("path={path}"),
+            "host=fixture.test".to_owned(),
         ] {
             if !body.lines().any(|line| line == marker) {
                 return Err(format!("response lacks exact marker {marker:?}").into());
@@ -105,20 +157,28 @@ async fn stop(tasks: &mut JoinSet<AppResult<()>>) -> AppResult<()> {
 }
 
 #[tokio::test]
-async fn h2_backend_and_two_production_hops_preserve_version_instance_and_path() -> AppResult<()> {
-    let mut tasks = JoinSet::new();
-    let result = timeout(Duration::from_secs(5), async {
-        let app = backend(&mut tasks, 2).await?;
-        let expected_instance = instance();
-        h2_requests(&mut tasks, app, &expected_instance).await?;
-        let sidecar = forwarder(&mut tasks, app).await?;
-        let frontline = forwarder(&mut tasks, sidecar).await?;
-        h2_requests(&mut tasks, frontline, &expected_instance).await
-    })
-    .await;
-    let cleanup = stop(&mut tasks).await;
-    result??;
-    cleanup
+async fn http2_client_reaches_the_app_in_its_declared_protocol_through_two_production_hops(
+) -> AppResult<()> {
+    for (app_protocol, app_version) in [
+        (AppProtocol::H2c, "HTTP/2"),
+        (AppProtocol::Http1, "HTTP/1.1"),
+    ] {
+        let mut tasks = JoinSet::new();
+        let result = timeout(Duration::from_secs(5), async {
+            // The fixture closes an HTTP/1.1 connection after each response.
+            let app = backend(&mut tasks, 3).await?;
+            let expected_instance = instance();
+            h2_requests(&mut tasks, app, &expected_instance, "HTTP/2").await?;
+            let sidecar = forwarder(&mut tasks, app, Some(app_protocol)).await?;
+            let frontline = forwarder(&mut tasks, sidecar, None).await?;
+            h2_requests(&mut tasks, frontline, &expected_instance, app_version).await
+        })
+        .await;
+        let cleanup = stop(&mut tasks).await;
+        result??;
+        cleanup?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

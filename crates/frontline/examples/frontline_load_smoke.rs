@@ -28,7 +28,6 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
-use proxy_core::websocket_upgrade_response;
 use rcgen::generate_simple_self_signed;
 use sleepypods_api::{
     pb::{
@@ -53,7 +52,10 @@ use tokio_rustls::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, protocol::Role, Bytes as WsBytes, Message},
+    tungstenite::{
+        client::IntoClientRequest, handshake::server::create_response_with_body, protocol::Role,
+        Bytes as WsBytes, Message,
+    },
     WebSocketStream,
 };
 use tonic::{
@@ -380,7 +382,7 @@ fn websocket_backend_response<B>(
 where
     B: Send + 'static,
 {
-    let response = match websocket_upgrade_response(&request, boxed_body(Bytes::new())) {
+    let response = match create_response_with_body(&request, || boxed_body(Bytes::new())) {
         Ok(response) => response,
         Err(_error) => return bad_request_response("invalid WebSocket upgrade".to_owned()),
     };

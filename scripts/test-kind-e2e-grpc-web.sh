@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${repo_root}/scripts/lib/kind-image.sh"
+source "${repo_root}/scripts/lib/native-tls-fixture.sh"
 cluster_name="${SLEEPYPODS_KIND_CLUSTER:-sleepypods-e2e-grpc-web-test}"
 namespace="${SLEEPYPODS_KIND_E2E_NAMESPACE:-sleepypods-e2e-grpc-web}"
 keep_cluster="${SLEEPYPODS_KIND_KEEP_CLUSTER:-0}"
@@ -15,8 +16,10 @@ operator_token="${SLEEPYPODS_KIND_E2E_OPERATOR_TOKEN:-operator-token}"
 proxy_token="${SLEEPYPODS_KIND_E2E_PROXY_TOKEN:-proxy-token}"
 sidecar_token="${SLEEPYPODS_KIND_E2E_SIDECAR_TOKEN:-sidecar-token}"
 invalid_token="${SLEEPYPODS_KIND_E2E_INVALID_TOKEN:-invalid-token}"
+allowed_origin="https://operator.example"
 kubeconfig="$(mktemp)"
 grpc_web_pf_log="$(mktemp)"
+security_dir="$(mktemp -d)"
 created_cluster=0
 grpc_web_pf=""
 
@@ -104,11 +107,12 @@ cleanup() {
   fi
 
   rm -f "${kubeconfig}" "${grpc_web_pf_log}"
+  rm -rf "${security_dir}"
   exit "${status}"
 }
 trap cleanup EXIT
 
-for command in kind kubectl docker cargo; do
+for command in kind kubectl docker cargo openssl; do
   require_command "${command}"
 done
 
@@ -140,6 +144,12 @@ KUBECONFIG="${kubeconfig}" kubectl delete namespace "${namespace}" --ignore-not-
 KUBECONFIG="${kubeconfig}" kubectl create namespace "${namespace}"
 KUBECONFIG="${kubeconfig}" kubectl label namespace "${namespace}" \
   sleepypods.io/kind-e2e=grpc-web --overwrite
+
+echo "==> Creating the platform TLS identity"
+generate_native_tls_fixture "${security_dir}/platform" "sleepypods-control-plane.${namespace}.svc.cluster.local"
+KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" create secret generic sleepypods-native-control-plane \
+  --from-file="${security_dir}/platform/cp.crt" \
+  --from-file="${security_dir}/platform/cp.key"
 
 echo "==> Deploying Postgres"
 KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" apply -f - <<YAML
@@ -297,6 +307,17 @@ spec:
               value: 0.0.0.0:50053
             - name: SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR
               value: 0.0.0.0:50052
+            - name: SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS
+              value: ${allowed_origin}
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE
+              value: /etc/sleepypods/platform/cp.crt
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE
+              value: /etc/sleepypods/platform/cp.key
+            - name: SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT
+              value: https://sleepypods-control-plane.${namespace}.svc.cluster.local:50051
+            - name: SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM
+              valueFrom:
+                secretKeyRef: {name: sleepypods-native-control-plane, key: cp.crt}
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: static-bearer-token
             - name: SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN
@@ -305,14 +326,20 @@ spec:
               value: ${proxy_token}
             - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
               value: ${sidecar_token}
-            - name: SLEEPYPODS_STORE_PROVIDER
-              value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
             - name: SLEEPYPODS_CLUSTER_ID
               value: kind-e2e-grpc-web
             - name: SLEEPYPODS_NAMESPACE
               value: ${namespace}
+          volumeMounts:
+            - name: platform
+              mountPath: /etc/sleepypods/platform
+              readOnly: true
+      volumes:
+        - name: platform
+          secret:
+            secretName: sleepypods-native-control-plane
 ---
 apiVersion: v1
 kind: Service
@@ -348,6 +375,7 @@ echo "==> Running grpc-web kind E2E driver"
 KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_KIND_E2E_GRPC_WEB=1 \
   SLEEPYPODS_E2E_GRPC_WEB_ENDPOINT="127.0.0.1:${grpc_web_port}" \
+  SLEEPYPODS_E2E_GRPC_WEB_CA_FILE="${security_dir}/platform/cp.crt" \
   SLEEPYPODS_E2E_OPERATOR_TOKEN="${operator_token}" \
   SLEEPYPODS_E2E_INVALID_TOKEN="${invalid_token}" \
   cargo test -p control-plane --test kind_e2e_grpc_web -- --ignored --nocapture

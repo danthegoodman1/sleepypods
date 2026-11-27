@@ -413,14 +413,14 @@ defaults to `5000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 
 | Path | Harness | Budget intent |
 | --- | --- | --- |
-| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip` | Measure bidirectional copy overhead without external network variance. |
+| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip`, `tcp/proxy_streams_with_idle_timeout_duplex_4k_round_trip` | Measure the byte relay without external network variance: first with no idle deadline, as a WebSocket session runs it, then with one, as TCP and SNI passthrough run it. |
 | HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
-| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Exercise frame relay over in-memory WebSocket streams without an external service. |
+| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Two WebSocket peers exchange a binary message and close through the byte relay, without an external service. The peers frame; the relay copies bytes. |
 | TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
 | Frontline route lookup | `route_lookup/http_host_many_unrelated`, `route_lookup/http_host_256_path_rules_last_match`, `route_lookup/sni_host_many_unrelated`, `route_lookup/full_resolve_*` | Keep a hot host lookup indexed with 4096 unrelated hosts cached, and bound the scan of the largest rule set a host may have. |
 | Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/{1,8,32}` | Each value times one hit by every task, so it stays near the single-task time while throughput rises with cores. |
 | Frontline route cache writes | `route_cache_scale/*` | Track expiry, eviction and the snapshot copy a cache change publishes, at 1000, 10000 and 100000 hosts. |
-| Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. |
+| Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. A permit is a semaphore operation, and a guard is a few atomic operations that wake a task only while one waits for the count. |
 | Observability helpers | `observability/label_as_str_and_outcome_mapping` | Keep label and outcome mapping low-cardinality and allocation-free. |
 
 ## Provisional Latency Budgets
@@ -441,8 +441,8 @@ expected.
 | TLS ClientHello/SNI parse, fragmented records | `tls/parse_client_hello_sni_fragmented_records` | <= 2 us per fragmented ClientHello |
 | Frontline route lookup | `route_lookup/*` | <= 1 us per hot-cache lookup with 4096 unrelated cached hosts, or with 256 path rules on the host |
 | Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/1` | <= 157 ns per hit; the 8- and 32-task values stay within a small multiple of it |
-| Admission acquire/release | `admission/try_acquire_release` | <= 500 ns per steady-state permit |
-| Active connection track/release | `accounting/track_release` | <= 500 ns per steady-state guard |
+| Admission acquire/release | `admission/try_acquire_release` | <= 100 ns per steady-state permit |
+| Active connection track/release | `accounting/track_release` | <= 100 ns per steady-state guard |
 | Observability label/outcome helpers | `observability/label_as_str_and_outcome_mapping` | <= 50 ns per mapping batch |
 
 ## Allocation Budgets

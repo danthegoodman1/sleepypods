@@ -32,12 +32,6 @@ pub struct DeleteHttp01ChallengeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpireHttp01ChallengesRequest {
-    pub now: SystemTime,
-    pub limit: Option<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvalidHttp01Challenge {
     Host(InvalidRouteHost),
     EmptyToken,
@@ -151,17 +145,6 @@ impl DeleteHttp01ChallengeRequest {
 
     pub fn key(&self) -> &Http01ChallengeKey {
         &self.key
-    }
-}
-
-impl ExpireHttp01ChallengesRequest {
-    pub fn new(now: SystemTime) -> Self {
-        Self { now, limit: None }
-    }
-
-    pub fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
-        self
     }
 }
 

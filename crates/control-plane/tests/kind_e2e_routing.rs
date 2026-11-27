@@ -12,8 +12,8 @@ use control_plane::api::pb::{
     operator_control_plane_client::OperatorControlPlaneClient, route_identity, template_text_part,
     ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
     CreateWorkloadClassVersionRequest, DeleteHttp01ChallengeRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, PutHttp01ChallengeRequest,
+    GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, PutHttp01ChallengeRequest,
     ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
     ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
     WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
@@ -254,10 +254,8 @@ async fn create_operator_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-routing-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -268,7 +266,6 @@ async fn create_operator_resources(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -283,19 +280,18 @@ async fn create_operator_resources(
     for spec in route_specs() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-routing-create-instance-{}", spec.target),
                 instance_id: spec.instance_id.to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: CLASS_ID.to_owned(),
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-routing-create-route-{}", spec.target),
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(http_route_identity(
@@ -541,7 +537,7 @@ async fn assert_http01_flow(
         .await?;
     tokio::time::timeout(
         Duration::from_secs(30),
-        assert_manual_http01_expiry(operator, &mut proxy),
+        assert_http01_delete_leaves_other_tokens(operator, &mut proxy),
     )
     .await??;
 
@@ -558,57 +554,31 @@ async fn assert_http01_flow(
     Ok(())
 }
 
-async fn assert_manual_http01_expiry(
+async fn assert_http01_delete_leaves_other_tokens(
     operator: &mut OperatorControlPlaneClient<Channel>,
     proxy: &mut ProxyControlPlaneClient<Channel>,
 ) -> TestResult<()> {
-    let target = "routing-manual-expiry-token";
-    let sentinel = "routing-later-expiry-token";
-    let now = SystemTime::now();
-    // This whole phase is bounded to 30s. Background wall-clock GC cannot
-    // preempt these future records; only the explicit RPC cutoff reaches them.
-    let target_expiry = now + Duration::from_secs(3_600);
-    for (token, expiry) in [
-        (target, target_expiry),
-        (sentinel, now + Duration::from_secs(7_200)),
-    ] {
+    let target = "routing-deleted-token";
+    let sentinel = "routing-retained-token";
+    let expiry = SystemTime::now() + Duration::from_secs(3_600);
+    for token in [target, sentinel] {
         put_http01_challenge(operator, EXACT_HOST, token, token, expiry).await?;
         assert_proxy_http01_value(proxy, token, Some(token)).await?;
     }
-    let request = ExpireHttp01ChallengesRequest {
-        now_unix_millis: unix_millis(target_expiry)?,
-        limit: Some(1),
-    };
-    let expired = operator
-        .expire_http01_challenges(request)
-        .await?
-        .into_inner();
-    if expired.expired != 1 {
-        return Err(format!(
-            "manual expiry must delete exactly its future target, got {}",
-            expired.expired
-        )
-        .into());
+    for (token, retained) in [(target, Some(sentinel)), (sentinel, None)] {
+        let deleted = operator
+            .delete_http01_challenge(DeleteHttp01ChallengeRequest {
+                key: Some(http01_key(EXACT_HOST, token)),
+            })
+            .await?
+            .into_inner();
+        if !deleted.deleted {
+            return Err(format!("HTTP-01 token {token} must exist until its delete").into());
+        }
+        assert_proxy_http01_value(proxy, token, None).await?;
+        assert_proxy_http01_value(proxy, sentinel, retained).await?;
     }
-    assert_proxy_http01_value(proxy, target, None).await?;
-    assert_proxy_http01_value(proxy, sentinel, Some(sentinel)).await?;
-    let repeated = operator
-        .expire_http01_challenges(request)
-        .await?
-        .into_inner();
-    if repeated.expired != 0 {
-        return Err("repeated manual expiry must be idempotent at the same cutoff".into());
-    }
-    let deleted = operator
-        .delete_http01_challenge(DeleteHttp01ChallengeRequest {
-            key: Some(http01_key(EXACT_HOST, sentinel)),
-        })
-        .await?
-        .into_inner();
-    if !deleted.deleted {
-        return Err("later sentinel must survive manual expiry until explicit cleanup".into());
-    }
-    assert_proxy_http01_value(proxy, sentinel, None).await
+    Ok(())
 }
 
 async fn assert_proxy_http01_value(
@@ -882,12 +852,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                     value: Some(target_text("", "")),
                 }],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("e2e-routing-", "")),

@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, time::Duration};
 
 use crate::{
-    ids::{BackendGeneration, Generation, IdempotencyKey, InstanceId, RouteBindingId},
+    ids::{BackendGeneration, Generation, InstanceId, RouteBindingId},
     instance::InstanceState,
     materialization::{BackendEndpoint, MaterializationTarget},
 };
@@ -25,11 +25,6 @@ pub enum RouteIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteBindingSpec {
-    pub identity: RouteIdentity,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteBindingRecord {
     pub id: RouteBindingId,
     pub instance_id: InstanceId,
@@ -38,7 +33,6 @@ pub struct RouteBindingRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRouteBindingRequest {
-    pub idempotency_key: IdempotencyKey,
     pub route_binding_id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
@@ -203,29 +197,17 @@ pub struct InvalidPathPrefix {
     value: String,
 }
 
-impl RouteBindingSpec {
-    pub fn new(identity: RouteIdentity) -> Self {
-        Self { identity }
-    }
-}
-
 impl CreateRouteBindingRequest {
     pub fn new(
-        idempotency_key: IdempotencyKey,
         route_binding_id: RouteBindingId,
         instance_id: InstanceId,
         identity: RouteIdentity,
     ) -> Self {
         Self {
-            idempotency_key,
             route_binding_id,
             instance_id,
             identity,
         }
-    }
-
-    pub fn spec(&self) -> RouteBindingSpec {
-        RouteBindingSpec::new(self.identity.clone())
     }
 }
 

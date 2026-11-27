@@ -74,15 +74,12 @@ impl E2eConfig {
 async fn create_operator_resources(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-libpq-sni-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -96,19 +93,18 @@ async fn create_operator_resources(operator: &mut Operator, config: &E2eConfig) 
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-libpq-sni-create-instance".to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: HashMap::new(),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-libpq-sni-create-route".to_owned(),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -183,12 +179,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                     },
                 ],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: Some("tcp".to_owned()),
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text(WORKLOAD_NAME)),

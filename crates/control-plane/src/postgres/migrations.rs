@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "route_host_rules",
         sql: include_str!("../../migrations/0012_route_host_rules.sql"),
     },
+    Migration {
+        version: 14,
+        name: "api_cleanup",
+        sql: include_str!("../../migrations/0014_api_cleanup.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {

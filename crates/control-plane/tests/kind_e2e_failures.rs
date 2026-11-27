@@ -55,8 +55,8 @@ const UNBOUND_INSTANCE_ID: &str = "failure-unbound";
 const UNBOUND_ROUTE_ID: &str = "failure-unbound-route";
 const UNBOUND_ROUTE_HOST: &str = "unbound.failure.sleepypods.test";
 const UNBOUND_WORKLOAD_NAME: &str = "failure-unbound-app";
-const UNBOUND_PV_NAME: &str = "failure-unbound-pv";
-const UNBOUND_FIRST_PVC_NAME: &str = "failure-unbound-a-pvc";
+const UNBOUND_PV_NAME: &str = "failure-unbound-pv-69ac89bca4a0a94a";
+const UNBOUND_FIRST_PVC_NAME: &str = "failure-unbound-a-pvc-69ac89bca4a0a94a";
 const UNBOUND_SECOND_PVC_NAME: &str = "failure-unbound-b-pvc";
 // Explicit test-owned stale reservation, never the UID of a live claim.
 const UNBOUND_PREVIOUS_CLAIM_UID: &str = "00000000-0000-4000-8000-000000000001";
@@ -88,7 +88,7 @@ async fn failure_paths_through_deployed_platform() -> TestResult<()> {
         .await?;
     invalid_volume_template_is_rejected_by_operator_api(&mut operator, kube.clone(), &config)
         .await?;
-    duplicate_volume_inventory_is_rejected_before_acceptance(&mut operator, kube.clone(), &config)
+    duplicate_volume_inventory_is_rejected_at_class_creation(&mut operator, kube.clone(), &config)
         .await?;
     wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
         &mut operator,
@@ -158,7 +158,6 @@ async fn bad_route_misses_without_materializing_unrelated_instance(
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        "good",
     )
     .await?;
 
@@ -202,15 +201,12 @@ async fn invalid_volume_template_is_rejected_by_operator_api(
 ) -> TestResult<()> {
     let error = operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-failure-invalid-volume-class".to_owned(),
             class_id: INVALID_VOLUME_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(ManifestTemplate {
                 workload: Some(workload_template(
                     WorkloadKind::StatefulSet,
@@ -289,7 +285,6 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        "readiness",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -377,14 +372,13 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
     Ok(())
 }
 
-async fn duplicate_volume_inventory_is_rejected_before_acceptance(
+async fn duplicate_volume_inventory_is_rejected_at_class_creation(
     operator: &mut OperatorControlPlaneClient<Channel>,
     kube: Client,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_class_instance_and_route(
-        operator,
-        ClassInstanceRoute {
+    let error = operator
+        .create_workload_class_version(workload_class_request(ClassInstanceRoute {
             class_id: DUPLICATE_VOLUME_CLASS_ID,
             instance_id: DUPLICATE_VOLUME_INSTANCE_ID,
             route_id: "failure-duplicate-volume-route",
@@ -395,39 +389,34 @@ async fn duplicate_volume_inventory_is_rejected_before_acceptance(
             workload_kind: WorkloadKind::StatefulSet,
             volumes: duplicate_pv_volume_templates(),
             raw_objects: Vec::new(),
-        },
-        "duplicate-volume",
-    )
-    .await?;
-    let created = get_instance(operator, DUPLICATE_VOLUME_INSTANCE_ID).await?;
-    assert_state(&created, PbInstanceState::Cold)?;
-    let mut proxy = connect_proxy(&config.workload_endpoint).await?;
-    let error = proxy
-        .wake_instance(ProxyWakeInstanceRequest {
-            instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
-            expected_generation: created.generation,
-            backend_generation: None,
-        })
+        }))
         .await
-        .expect_err("duplicate rendered inventory must be rejected before wake acceptance");
-    if error.code() != Code::Internal
+        .expect_err("a class whose inventory cannot render is rejected at creation");
+    if error.code() != Code::InvalidArgument
         || !error
             .message()
             .contains("duplicate rendered Kubernetes object ref v1 PersistentVolume")
     {
         return Err(format!("expected duplicate PV render rejection, got {error}").into());
     }
-    let after = get_instance(operator, DUPLICATE_VOLUME_INSTANCE_ID).await?;
-    assert_state(&after, PbInstanceState::Cold)?;
-    if after.generation != created.generation {
-        return Err("invalid duplicate inventory advanced instance generation".into());
+    let error = operator
+        .create_instance(CreateInstanceRequest {
+            instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: DUPLICATE_VOLUME_CLASS_ID.to_owned(),
+                version: 1,
+            }),
+            values: HashMap::new(),
+            routes: Vec::new(),
+        })
+        .await
+        .expect_err("a rejected class has no instances");
+    if error.code() != Code::NotFound {
+        return Err(format!("expected the rejected class to be absent, got {error}").into());
     }
     let status = operator
         .reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id: format!(
-                "{DUPLICATE_VOLUME_INSTANCE_ID}:kind-e2e-failures:{}",
-                config.namespace
-            ),
+            instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
             status_only: true,
         })
         .await?
@@ -480,7 +469,6 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
             volumes: Vec::new(),
             raw_objects: unbound_static_inventory(&config.namespace),
         },
-        "unbound",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -566,65 +554,71 @@ struct ClassInstanceRoute<'a> {
     raw_objects: Vec<RawKubernetesManifestTemplate>,
 }
 
+fn workload_class_request(spec: ClassInstanceRoute<'_>) -> CreateWorkloadClassVersionRequest {
+    CreateWorkloadClassVersionRequest {
+        class_id: spec.class_id.to_owned(),
+        version: 1,
+        value_schema: Some(WorkloadValueSchema {
+            fields: Default::default(),
+            allow_extra: false,
+        }),
+        template: Some(ManifestTemplate {
+            workload: Some(workload_template(
+                spec.workload_kind,
+                spec.workload_name,
+                spec.app_image,
+            )),
+            sidecar: Some(SidecarTemplate {
+                name: "sleepypods-sidecar".to_owned(),
+                image: Some(literal_text(spec.sidecar_image)),
+                listen_port: SIDECAR_PORT,
+                mode: None,
+                app_protocol: Default::default(),
+            }),
+            service: Some(service_template(spec.workload_name)),
+            volumes: spec.volumes,
+            raw_objects: spec.raw_objects,
+        }),
+        sleep_policy: Some(sleep_policy()),
+        exclusivity_keys: vec![],
+    }
+}
+
 async fn create_class_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
     spec: ClassInstanceRoute<'_>,
-    idempotency_prefix: &str,
 ) -> TestResult<()> {
+    let (class_id, instance_id, route_id, route_host) = (
+        spec.class_id,
+        spec.instance_id,
+        spec.route_id,
+        spec.route_host,
+    );
     operator
-        .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-class"),
-            class_id: spec.class_id.to_owned(),
-            version: 1,
-            default_values: Default::default(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: false,
-            }),
-            template_generation: 1,
-            template: Some(ManifestTemplate {
-                workload: Some(workload_template(
-                    spec.workload_kind,
-                    spec.workload_name,
-                    spec.app_image,
-                )),
-                sidecar: Some(SidecarTemplate {
-                    name: "sleepypods-sidecar".to_owned(),
-                    image: Some(literal_text(spec.sidecar_image)),
-                    listen_port: SIDECAR_PORT,
-                    mode: None,
-                }),
-                service: Some(service_template(spec.workload_name)),
-                volumes: spec.volumes,
-                raw_objects: spec.raw_objects,
-            }),
-            sleep_policy: Some(sleep_policy()),
-            exclusivity_keys: vec![],
-        })
+        .create_workload_class_version(workload_class_request(spec))
         .await?;
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-instance"),
-            instance_id: spec.instance_id.to_owned(),
+            instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
-                class_id: spec.class_id.to_owned(),
+                class_id: class_id.to_owned(),
                 version: 1,
             }),
             values: HashMap::new(),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-route"),
-            route_binding_id: spec.route_id.to_owned(),
-            instance_id: spec.instance_id.to_owned(),
+            route_binding_id: route_id.to_owned(),
+            instance_id: instance_id.to_owned(),
             identity: Some(RouteIdentity {
                 kind: Some(route_identity::Kind::Http(HttpRouteIdentity {
                     host: Some(RouteHost {
                         kind: RouteHostKind::Exact as i32,
-                        host: spec.route_host.to_owned(),
+                        host: route_host.to_owned(),
                     }),
                     path_prefix: None,
                 })),
@@ -1086,6 +1080,7 @@ fn workload_template(kind: WorkloadKind, name: &str, image: &str) -> WorkloadTem
             }],
             env: Vec::new(),
         }),
+        termination_grace_period_seconds: None,
     }
 }
 
@@ -1095,6 +1090,7 @@ fn sidecar_template(config: &E2eConfig) -> SidecarTemplate {
         image: Some(literal_text(&config.sidecar_image)),
         listen_port: SIDECAR_PORT,
         mode: None,
+        app_protocol: Default::default(),
     }
 }
 
@@ -1186,12 +1182,14 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         sidecar: domain::SidecarTemplate {
             name: "sleepypods-sidecar".into(),
             image: domain::TemplateText::literal("fixture-sidecar"),
             listen_port: SIDECAR_PORT as u16,
             mode: None,
+            app_protocol: Default::default(),
         },
         service: Some(domain::ServiceTemplate {
             name: domain::TemplateText::literal(UNBOUND_WORKLOAD_NAME),
@@ -1232,7 +1230,6 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
             drain_grace_timeout_ms: 500,
         },
         namespace,
-        template_generation: Some(domain::Generation::new(1)),
     })?;
     // The projection plan adds the same final managed-by/ownership stamps used
     // by the production reconciler; the pure renderer alone does not add them.

@@ -15,7 +15,6 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
     admission::ApiLimits,
-    operator_grpc_server_builder,
     pb::{
         proxy_control_plane_client::ProxyControlPlaneClient,
         proxy_control_plane_server::ProxyControlPlane, proxy_subscribe_request,
@@ -26,8 +25,7 @@ use control_plane::api::{
         ProxyWakeUnavailableReason, RouteHostKind, RouteKind as ProtoRouteKind,
     },
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
-    RouteSubscriptionBroker, StoreBackedProxyApi, StoreBackedProxyGrpcService,
-    OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
+    RouteSubscriptionBroker, StoreBackedProxyApi, StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
@@ -100,10 +98,6 @@ fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
         <StoreBackedProxyGrpcService<FakeKubernetesClient> as NamedService>::NAME,
         PROXY_SERVICE_NAME
     );
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/WakeInstance"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/Subscribe"));
 
     assert!(matches!(
         subscribe_http(1, "app.example.com").input,
@@ -152,7 +146,7 @@ async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend(
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
+        "http://svc-acme-69856ec0faae6daf.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
     assert_eq!(client.applied_objects_len(), 2);
@@ -168,7 +162,12 @@ async fn proxy_wake_unowned_live_ref_blocks_apply() {
     ));
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
-    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-51c842a3"));
+    client.set_unowned_live_object(object_ref(
+        "v1",
+        "Service",
+        "apps",
+        "svc-acme-51c842a33d8cf7e8",
+    ));
     let service = proxy_api(store.clone(), client.clone());
 
     let response = service
@@ -1428,7 +1427,7 @@ async fn dispatcher_read_failure_keeps_subscribers_and_delivers_after_recovery()
 
 #[test]
 fn native_grpc_server_can_be_constructed_with_store_backed_proxy_service() {
-    let _router = operator_grpc_server_builder().add_service(proxy_grpc_service_with_store(
+    let _router = tonic::transport::Server::builder().add_service(proxy_grpc_service_with_store(
         Arc::new(FakeWakeStore::default()),
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         proxy_target(),
@@ -1885,7 +1884,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("not ready"));
             }
 
-            BackendEndpoint::new("http://svc-acme-69856ec0.apps.svc.cluster.local:80")
+            BackendEndpoint::new("http://svc-acme-69856ec0faae6daf.apps.svc.cluster.local:80")
                 .map_err(|error| KubernetesClientError::new(error.to_string()))
         })
     }
@@ -2009,7 +2008,6 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
 fn domain_workload_class() -> control_plane::WorkloadClassVersion {
     control_plane::WorkloadClassVersion {
         reference: domain_workload_ref(),
-        template_generation: Generation::new(3),
         template: control_plane::ManifestTemplate {
             workload: control_plane::WorkloadTemplate {
                 kind: control_plane::WorkloadKind::Deployment,
@@ -2024,6 +2022,7 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(control_plane::ServiceTemplate {
                 name: control_plane::TemplateText::literal("svc-acme"),
@@ -2038,11 +2037,11 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
                 image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        default_values: control_plane::InstanceValues::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),
         sleep_policy: control_plane::WorkloadSleepPolicy::new(300_000, 5_000, 30_000)
             .expect("valid sleep policy"),

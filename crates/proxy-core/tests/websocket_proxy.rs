@@ -1,406 +1,318 @@
-use std::time::Duration;
+mod support;
+
+use std::{net::SocketAddr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use proxy_core::{
-    proxy_websocket_streams, DrainError, DrainTracker, WebSocketProxy, WebSocketProxyError,
+    DrainError, DrainTracker, WebSocketProxy, WebSocketProxyConfig, WebSocketProxyError,
 };
+use support::{header, proxy_websocket_connection, read_head, spawn_websocket_proxy};
 use tokio::{
-    io::{duplex, AsyncWriteExt},
-    net::TcpListener,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     sync::oneshot,
     time::timeout,
 };
 use tokio_tungstenite::{
-    accept_async, accept_hdr_async, connect_async,
+    accept_async, connect_async,
     tungstenite::{
-        client::IntoClientRequest,
-        handshake::server::{
-            Callback, ErrorResponse, Request as WsRequest, Response as WsResponse,
-        },
-        protocol::{CloseFrame, Role},
-        Bytes as WsBytes, Error as TungsteniteError, Message,
+        handshake::derive_accept_key, protocol::CloseFrame, Bytes as WsBytes,
+        Error as TungsteniteError, Message,
     },
-    WebSocketStream,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+async fn upstream_listener() -> (TcpListener, SocketAddr) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (listener, addr)
+}
+
+fn proxy(drain: &DrainTracker) -> WebSocketProxy {
+    WebSocketProxy::new(drain.clone())
+}
+
+fn drain() -> DrainTracker {
+    DrainTracker::new(Duration::from_secs(5))
+}
+
+/// Answers one raw upgrade request with `101` plus `extra` header lines and
+/// returns the request head with the upgraded socket.
+async fn accept_raw_upgrade(listener: TcpListener, extra: &str) -> (String, TcpStream) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let head = read_head(&mut stream).await;
+    let accept = derive_accept_key(header(&head, "sec-websocket-key").unwrap().as_bytes());
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    (head, stream)
+}
+
+/// Sends a raw upgrade request with `extra` header lines and returns the
+/// response head with the upgraded socket.
+async fn raw_upgrade(proxy_addr: SocketAddr, extra: &str) -> (String, TcpStream) {
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "GET /socket?room=1 HTTP/1.1\r\nHost: chat.example.com\r\nConnection: Upgrade\r\n\
+                 Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: {CLIENT_KEY}\r\n{extra}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_head(&mut client).await;
+    (head, client)
+}
 
 #[tokio::test]
-async fn websocket_proxy_preserves_bidirectional_messages_client_close_and_lifecycle() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-
+async fn websocket_tunnel_relays_messages_close_and_tracks_lifecycle() {
+    let (listener, upstream_addr) = upstream_listener().await;
     let (first_message_tx, first_message_rx) = oneshot::channel();
     let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
-        let mut websocket = accept_async(stream)
-            .await
-            .expect("upstream accepts websocket");
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
 
-        let first = websocket
-            .next()
-            .await
-            .expect("upstream receives first message")
-            .expect("first message is valid");
+        let first = websocket.next().await.unwrap().unwrap();
         assert_eq!(first, Message::Text("client text".into()));
-        first_message_tx
-            .send(())
-            .expect("test waits for first message");
-
+        first_message_tx.send(()).unwrap();
         websocket
             .send(Message::Text("upstream text".into()))
             .await
-            .expect("upstream sends text");
+            .unwrap();
 
-        let second = websocket
-            .next()
-            .await
-            .expect("upstream receives binary message")
-            .expect("binary message is valid");
+        let second = websocket.next().await.unwrap().unwrap();
         assert_eq!(
             second,
             Message::Binary(WsBytes::from_static(b"client bytes"))
         );
-
         websocket
             .send(Message::Binary(WsBytes::from_static(b"upstream bytes")))
             .await
-            .expect("upstream sends binary");
+            .unwrap();
 
-        let close = websocket
-            .next()
-            .await
-            .expect("upstream receives close")
-            .expect("close message is valid");
-        assert!(matches!(close, Message::Close(Some(_))));
-        websocket
-            .flush()
-            .await
-            .expect("upstream flushes close response");
+        let close = websocket.next().await.unwrap().unwrap();
+        assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "done"));
+        let _ = websocket.flush().await;
     });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
 
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
-
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}"))
-        .await
-        .expect("client connects to proxy websocket");
+    let (mut client, _) = connect_async(format!("ws://{proxy_addr}")).await.unwrap();
     client
         .send(Message::Text("client text".into()))
         .await
-        .expect("client sends text");
-
-    first_message_rx
-        .await
-        .expect("upstream received first message");
+        .unwrap();
+    first_message_rx.await.unwrap();
     assert_eq!(drain.active_count(), 1);
-
-    let from_upstream = client
-        .next()
-        .await
-        .expect("client receives upstream text")
-        .expect("upstream text is valid");
-    assert_eq!(from_upstream, Message::Text("upstream text".into()));
-
+    assert_eq!(
+        client.next().await.unwrap().unwrap(),
+        Message::Text("upstream text".into())
+    );
     client
         .send(Message::Binary(WsBytes::from_static(b"client bytes")))
         .await
-        .expect("client sends binary");
-
-    let from_upstream = client
-        .next()
-        .await
-        .expect("client receives upstream binary")
-        .expect("upstream binary is valid");
+        .unwrap();
     assert_eq!(
-        from_upstream,
+        client.next().await.unwrap().unwrap(),
         Message::Binary(WsBytes::from_static(b"upstream bytes"))
     );
-
     client
         .send(Message::Close(Some(CloseFrame {
             code: 1000.into(),
             reason: "done".into(),
         })))
         .await
-        .expect("client sends close");
-
-    let close_response = client
-        .next()
-        .await
-        .expect("client receives close response")
-        .expect("close response is valid");
+        .unwrap();
+    let close_response = client.next().await.unwrap().unwrap();
     assert!(matches!(close_response, Message::Close(Some(frame)) if frame.reason == "done"));
+    drop(client);
 
-    let stats = proxy_task
-        .await
-        .expect("proxy task completed")
-        .expect("proxy completed successfully");
-    assert_eq!(stats.client_to_upstream_messages, 3);
-    assert_eq!(stats.upstream_to_client_messages, 2);
-    assert_eq!(
-        stats.client_to_upstream_bytes,
-        "client text".len() as u64 + b"client bytes".len() as u64 + "done".len() as u64
-    );
-    assert_eq!(
-        stats.upstream_to_client_bytes,
-        "upstream text".len() as u64 + b"upstream bytes".len() as u64
-    );
-
-    upstream_task.await.expect("upstream task completed");
+    upstream_task.await.unwrap();
+    let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
     drain.wait_for_active_count(0).await;
-    assert_eq!(drain.active_count(), 0);
 }
 
 #[tokio::test]
-async fn websocket_proxy_preserves_forwarded_headers_in_upstream_handshake() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-
-    let (headers_seen_tx, headers_seen_rx) = oneshot::channel();
+async fn handshake_fields_and_upgraded_bytes_pass_through_unchanged() {
+    let (listener, upstream_addr) = upstream_listener().await;
     let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
-        let mut websocket = accept_hdr_async(
-            stream,
-            AssertForwardedHeaders {
-                headers_seen_tx: Some(headers_seen_tx),
-            },
+        let (head, mut stream) = accept_raw_upgrade(
+            listener,
+            "Sec-WebSocket-Protocol: chat.v2\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n\
+             Set-Cookie: session=a\r\nSet-Cookie: theme=b\r\nKeep-Alive: timeout=5\r\n",
         )
-        .await
-        .expect("upstream accepts websocket");
-
-        let close = websocket
-            .next()
-            .await
-            .expect("upstream receives close")
-            .expect("close frame valid");
-        assert!(matches!(close, Message::Close(Some(_))));
-        websocket.flush().await.expect("upstream flushes close");
+        .await;
+        let mut frame = [0_u8; 6];
+        stream.read_exact(&mut frame).await.unwrap();
+        stream.write_all(b"\xc1\x02ok").await.unwrap();
+        (head, frame)
     });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
 
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let proxy = WebSocketProxy::new(DrainTracker::new(Duration::from_secs(5)));
+    let (response, mut client) = raw_upgrade(
+        proxy_addr,
+        "Authorization: Bearer token-1\r\nCookie: session=a; theme=b\r\n\
+         Origin: https://chat.example.com\r\nSec-WebSocket-Protocol: chat.v1, chat.v2\r\n\
+         Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
+         X-Forwarded-Host: edge.example.com\r\nX-App: custom\r\nKeep-Alive: timeout=9\r\n",
+    )
+    .await;
+    // A compressed frame travels as the bytes the client wrote.
+    client.write_all(b"\xc1\x84abcd").await.unwrap();
+    let mut reply = [0_u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"\xc1\x02ok");
 
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
+    let (request, frame) = upstream_task.await.unwrap();
+    assert_eq!(&frame, b"\xc1\x84abcd");
+    assert!(request.starts_with("GET /socket?room=1 HTTP/1.1\r\n"));
+    for (name, value) in [
+        ("host", "chat.example.com"),
+        ("authorization", "Bearer token-1"),
+        ("cookie", "session=a; theme=b"),
+        ("origin", "https://chat.example.com"),
+        ("sec-websocket-key", CLIENT_KEY),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-protocol", "chat.v1, chat.v2"),
+        (
+            "sec-websocket-extensions",
+            "permessage-deflate; client_max_window_bits",
+        ),
+        ("x-forwarded-host", "edge.example.com"),
+        ("x-app", "custom"),
+        ("upgrade", "websocket"),
+    ] {
+        assert_eq!(header(&request, name), Some(value), "request {name}");
+    }
+    assert_eq!(header(&request, "keep-alive"), None, "hop-by-hop request");
 
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
+    assert!(response.starts_with("HTTP/1.1 101 "));
+    for (name, value) in [
+        (
+            "sec-websocket-accept",
+            derive_accept_key(CLIENT_KEY.as_bytes()).as_str(),
+        ),
+        ("sec-websocket-protocol", "chat.v2"),
+        (
+            "sec-websocket-extensions",
+            "permessage-deflate; server_no_context_takeover",
+        ),
+        ("upgrade", "websocket"),
+    ] {
+        assert_eq!(header(&response, name), Some(value), "response {name}");
+    }
+    assert_eq!(header(&response, "keep-alive"), None, "hop-by-hop response");
+    let cookies = response
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .count();
+    assert_eq!(cookies, 2, "repeated Set-Cookie fields are preserved");
 
-    let mut request = format!("ws://{proxy_addr}")
-        .into_client_request()
-        .expect("client request builds");
-    request.headers_mut().insert(
-        "forwarded",
-        "for=203.0.113.10;proto=https"
-            .parse()
-            .expect("forwarded header"),
-    );
-    request.headers_mut().insert(
-        "x-forwarded-for",
-        "203.0.113.11".parse().expect("x-forwarded-for header"),
-    );
-    request.headers_mut().insert(
-        "x-forwarded-proto",
-        "https".parse().expect("x-forwarded-proto header"),
-    );
-    request.headers_mut().insert(
-        "x-forwarded-host",
-        "edge.example.com".parse().expect("x-forwarded-host header"),
-    );
-    request.headers_mut().insert(
-        "x-forwarded-prefix",
-        "/edge".parse().expect("x-forwarded-prefix header"),
-    );
-    let (mut client, _) = connect_async(request)
-        .await
-        .expect("client connects to proxy websocket");
-
-    headers_seen_rx.await.expect("upstream saw headers");
-    client
-        .send(Message::Close(Some(CloseFrame {
-            code: 1000.into(),
-            reason: "done".into(),
-        })))
-        .await
-        .expect("client sends close");
-    let close_response = client
-        .next()
-        .await
-        .expect("client receives close response")
-        .expect("close response is valid");
-    assert!(matches!(close_response, Message::Close(Some(frame)) if frame.reason == "done"));
-
-    proxy_task
-        .await
-        .expect("proxy task completed")
-        .expect("proxy completed successfully");
-    upstream_task.await.expect("upstream task completed");
+    drop(client);
+    let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
+    drain.wait_for_active_count(0).await;
 }
 
 #[tokio::test]
-async fn websocket_proxy_forwards_upstream_initiated_close_and_lifecycle() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-
-    let (upstream_accepted_tx, upstream_accepted_rx) = oneshot::channel();
+async fn a_withheld_final_fragment_reaches_the_upstream_as_it_arrives() {
+    const FRAGMENT: usize = 64 * 1024;
+    const FRAGMENTS: usize = 64;
+    let (listener, upstream_addr) = upstream_listener().await;
     let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
-        let mut websocket = accept_async(stream)
-            .await
-            .expect("upstream accepts websocket");
-
-        upstream_accepted_tx
-            .send(())
-            .expect("test waits for upstream websocket");
-        websocket
-            .send(Message::Close(Some(CloseFrame {
-                code: 1000.into(),
-                reason: "upstream done".into(),
-            })))
-            .await
-            .expect("upstream sends close");
-
-        let close_response = websocket
-            .next()
-            .await
-            .expect("upstream receives close response")
-            .expect("close response is valid");
-        assert!(
-            matches!(close_response, Message::Close(Some(frame)) if frame.reason == "upstream done")
-        );
+        let (_, mut stream) = accept_raw_upgrade(listener, "").await;
+        // Each fragment: a 10-byte header, a 4-byte mask and its payload.
+        let mut received = vec![0_u8; FRAGMENTS * (FRAGMENT + 14)];
+        stream.read_exact(&mut received).await.unwrap();
+        stream
     });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
 
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
+    let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+    // One 4 MiB message as non-final fragments. The final fragment never comes.
+    let mut fragment = vec![0x02, 0xff];
+    fragment.extend_from_slice(&(FRAGMENT as u64).to_be_bytes());
+    fragment.extend_from_slice(&[0; 4]);
+    fragment.resize(FRAGMENT + 14, 7);
+    for index in 0..FRAGMENTS {
+        fragment[0] = if index == 0 { 0x02 } else { 0x00 };
+        client.write_all(&fragment).await.unwrap();
+    }
 
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}"))
-        .await
-        .expect("client connects to proxy websocket");
-    upstream_accepted_rx
-        .await
-        .expect("upstream accepted websocket");
+    // The relay holds no message: every fragment has already left it.
+    let upstream = timeout(TEST_TIMEOUT, upstream_task).await.unwrap().unwrap();
     assert_eq!(drain.active_count(), 1);
 
-    let close = client
-        .next()
-        .await
-        .expect("client receives upstream close")
-        .expect("upstream close is valid");
-    assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "upstream done"));
-    client.flush().await.expect("client flushes close response");
-
-    let stats = proxy_task
-        .await
-        .expect("proxy task completed")
-        .expect("proxy completed successfully");
-    assert_eq!(stats.client_to_upstream_messages, 0);
-    assert_eq!(stats.upstream_to_client_messages, 1);
-    assert_eq!(stats.client_to_upstream_bytes, 0);
-    assert_eq!(stats.upstream_to_client_bytes, "upstream done".len() as u64);
-
-    upstream_task.await.expect("upstream task completed");
+    drop((client, upstream));
+    let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
     drain.wait_for_active_count(0).await;
-    assert_eq!(drain.active_count(), 0);
 }
 
 #[tokio::test]
-async fn websocket_proxy_surfaces_upstream_upgrade_failure_and_releases_lifecycle() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-
+async fn a_stalled_direction_leaves_the_other_direction_flowing() {
+    const DOWNLOAD: usize = 4 * 1024 * 1024;
+    let (listener, upstream_addr) = upstream_listener().await;
     let upstream_task = tokio::spawn(async move {
-        let (mut stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
+        let (_, mut stream) = accept_raw_upgrade(listener, "").await;
+        // The app writes its whole payload before it reads anything.
+        stream.write_all(&vec![5_u8; DOWNLOAD]).await.unwrap();
+        stream
+    });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
+
+    let (_, client) = raw_upgrade(proxy_addr, "").await;
+    let (mut client_read, mut client_write) = client.into_split();
+    // The client keeps sending. The unread upload fills every buffer on the
+    // way to the app and stalls there.
+    let upload = tokio::spawn(async move {
+        let chunk = vec![3_u8; 64 * 1024];
+        while client_write.write_all(&chunk).await.is_ok() {}
+    });
+
+    let mut received = vec![0_u8; DOWNLOAD];
+    timeout(TEST_TIMEOUT, client_read.read_exact(&mut received))
+        .await
+        .expect("the download completes while the upload is stalled")
+        .unwrap();
+    assert!(received.iter().all(|byte| *byte == 5));
+
+    upload.abort();
+    drop((client_read, upstream_task.await.unwrap()));
+    let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
+    drain.wait_for_active_count(0).await;
+}
+
+#[tokio::test]
+async fn upstream_rejection_keeps_its_status_headers_and_body() {
+    let (listener, upstream_addr) = upstream_listener().await;
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_head(&mut stream).await;
         stream
             .write_all(
-                b"HTTP/1.1 400 Bad Request\r\n\
-                  Content-Length: 0\r\n\
-                  Connection: close\r\n\
-                  \r\n",
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nX-Reason: policy\r\n\
+                  Connection: close\r\n\r\ndenied",
             )
             .await
-            .expect("upstream writes failed upgrade response");
+            .unwrap();
     });
-
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
-
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
 
     let error = connect_async(format!("ws://{proxy_addr}"))
         .await
@@ -408,430 +320,198 @@ async fn websocket_proxy_surfaces_upstream_upgrade_failure_and_releases_lifecycl
     let TungsteniteError::Http(response) = error else {
         panic!("expected upstream HTTP rejection");
     };
-    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["x-reason"], "policy");
+    assert_eq!(response.body().as_deref(), Some(b"denied".as_slice()));
 
     let error = timeout(TEST_TIMEOUT, proxy_task)
         .await
-        .expect("proxy reports upstream upgrade failure before timeout")
-        .expect("proxy task completed")
-        .expect_err("proxy reports upstream upgrade failure");
-    assert!(matches!(error, WebSocketProxyError::UpstreamConnect(_)));
-
-    upstream_task.await.expect("upstream task completed");
-    drain.wait_for_active_count(0).await;
+        .unwrap()
+        .unwrap()
+        .expect_err("proxy reports the rejection");
+    assert!(matches!(error, WebSocketProxyError::UpstreamRejected(_)));
+    upstream_task.await.unwrap();
     assert_eq!(drain.active_count(), 0);
 }
 
 #[tokio::test]
-async fn websocket_proxy_releases_lifecycle_after_client_peer_disconnect() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-    let (upstream_accepted_tx, upstream_accepted_rx) = oneshot::channel();
-
+async fn an_upstream_that_switches_to_another_protocol_is_a_bad_gateway() {
+    let (listener, upstream_addr) = upstream_listener().await;
     let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_head(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n",
+            )
             .await
-            .expect("upstream accepts proxy connection");
-        let mut websocket = accept_async(stream)
-            .await
-            .expect("upstream accepts websocket");
-        upstream_accepted_tx
-            .send(())
-            .expect("test waits for upstream websocket");
-
-        let disconnected = timeout(TEST_TIMEOUT, websocket.next())
-            .await
-            .expect("upstream observes client peer disconnect before timeout");
-        assert!(
-            matches!(disconnected, Some(Err(_))),
-            "upstream should observe unclean client peer disconnect as a websocket error"
-        );
+            .unwrap();
+        stream
     });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
 
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
-
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-
-    let (client, _) = connect_async(format!("ws://{proxy_addr}"))
-        .await
-        .expect("client connects to proxy websocket");
-    upstream_accepted_rx
-        .await
-        .expect("upstream accepted websocket");
-    assert_eq!(drain.active_count(), 1);
-    drop(client);
-
-    let error = timeout(TEST_TIMEOUT, proxy_task)
-        .await
-        .expect("proxy reports client peer disconnect before timeout")
-        .expect("proxy task completed")
-        .expect_err("unclean client peer disconnect is reported");
-    assert!(matches!(error, WebSocketProxyError::Proxy(_)));
-    upstream_task.await.expect("upstream task completed");
-    drain.wait_for_active_count(0).await;
+    let (response, _client) = raw_upgrade(proxy_addr, "").await;
+    assert!(response.starts_with("HTTP/1.1 502 "), "{response}");
+    assert!(proxy_task.await.unwrap().is_err());
+    drop(upstream_task.await.unwrap());
     assert_eq!(drain.active_count(), 0);
 }
 
 #[tokio::test]
-async fn websocket_proxy_releases_lifecycle_after_upstream_peer_disconnect() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
+async fn session_ends_and_releases_lifecycle_when_either_peer_disconnects() {
+    for client_leaves in [true, false] {
+        let (listener, upstream_addr) = upstream_listener().await;
+        let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+        let drain = drain();
+        let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
+        let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+        let mut upstream = upstream_task.await.unwrap();
+        assert_eq!(drain.active_count(), 1);
 
-    let (disconnect_tx, disconnect_rx) = oneshot::channel();
-    let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
-        let websocket = accept_async(stream)
-            .await
-            .expect("upstream accepts websocket");
-        disconnect_rx.await.unwrap();
-        drop(websocket);
-    });
-
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
-
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}"))
-        .await
-        .expect("client connects to proxy websocket");
-    drain.wait_for_active_count(1).await;
-    disconnect_tx.send(()).unwrap();
-
-    let disconnected = timeout(TEST_TIMEOUT, client.next())
-        .await
-        .expect("client observes upstream peer disconnect before timeout");
-    assert!(
-        disconnected.is_none() || matches!(disconnected, Some(Err(_))),
-        "client should observe EOF or a websocket error after upstream peer disconnect"
-    );
-
-    let error = timeout(TEST_TIMEOUT, proxy_task)
-        .await
-        .expect("proxy reports upstream peer disconnect before timeout")
-        .expect("proxy task completed")
-        .expect_err("unclean upstream peer disconnect is reported");
-    assert!(matches!(error, WebSocketProxyError::Proxy(_)));
-    upstream_task.await.expect("upstream task completed");
-    drain.wait_for_active_count(0).await;
-    assert_eq!(drain.active_count(), 0);
-}
-
-#[tokio::test]
-async fn websocket_proxy_backpressure_blocks_until_slow_downstream_peer_reads() {
-    const MESSAGE_COUNT: usize = 32;
-
-    let (downstream_peer, proxy_downstream) = duplex(1024);
-    let (proxy_upstream, upstream_peer) = duplex(1024);
-    let proxy_downstream =
-        WebSocketStream::from_raw_socket(proxy_downstream, Role::Server, None).await;
-    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
-    let mut downstream =
-        WebSocketStream::from_raw_socket(downstream_peer, Role::Client, None).await;
-    let mut upstream = WebSocketStream::from_raw_socket(upstream_peer, Role::Server, None).await;
-    let payload = WsBytes::from(vec![b's'; 16 * 1024]);
-
-    let mut proxy_task = tokio::spawn(proxy_websocket_streams(proxy_downstream, proxy_upstream));
-    let upstream_payload = payload.clone();
-    let mut upstream_task = tokio::spawn(async move {
-        for _ in 0..MESSAGE_COUNT {
-            upstream
-                .send(Message::Binary(upstream_payload.clone()))
-                .await
-                .expect("upstream eventually sends backpressured message");
+        let mut byte = [0_u8; 1];
+        if client_leaves {
+            drop(client);
+            assert_eq!(upstream.read(&mut byte).await.unwrap(), 0);
+            drop(upstream);
+        } else {
+            drop(upstream);
+            assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+            drop(client);
         }
-    });
 
-    tokio::task::yield_now().await;
-    assert!(
-        timeout(Duration::from_millis(25), &mut proxy_task)
-            .await
-            .is_err(),
-        "proxy should remain blocked while the downstream peer is not reading"
-    );
-    assert!(
-        timeout(Duration::from_millis(25), &mut upstream_task)
-            .await
-            .is_err(),
-        "bounded websocket path should apply backpressure to the upstream sender"
-    );
-
-    for _ in 0..MESSAGE_COUNT {
-        let message = timeout(TEST_TIMEOUT, downstream.next())
-            .await
-            .expect("downstream receives message after resuming reads")
-            .expect("downstream receives websocket message")
-            .expect("websocket message is valid");
-        assert_eq!(message, Message::Binary(payload.clone()));
+        let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
+        drain.wait_for_active_count(0).await;
     }
-
-    upstream_task.await.expect("upstream task completed");
-    let _ = timeout(TEST_TIMEOUT, downstream.next())
-        .await
-        .expect("downstream observes upstream completion after draining messages");
-    let error = proxy_task
-        .await
-        .expect("proxy task completed")
-        .expect_err("raw upstream disconnect is reported after slow downstream resumes");
-    assert!(matches!(error, TungsteniteError::Protocol(_)));
 }
 
 #[tokio::test]
-async fn websocket_proxy_forwards_large_binary_frame_backpressure_smoke() {
-    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("upstream listener binds");
-    let upstream_addr = upstream_listener
-        .local_addr()
-        .expect("upstream listener has address");
-    let upstream_url = format!("ws://{upstream_addr}");
-    let payload = WsBytes::from(vec![b'z'; 256 * 1024]);
+async fn a_quiet_session_outlives_the_write_deadline_and_ends_at_its_idle_policy() {
+    for idle_timeout in [None, Some(Duration::from_millis(300))] {
+        let (listener, upstream_addr) = upstream_listener().await;
+        let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+        let drain = drain();
+        let proxy = WebSocketProxy::with_config(
+            drain.clone(),
+            WebSocketProxyConfig {
+                write_timeout: Duration::from_millis(50),
+                idle_timeout,
+                ..WebSocketProxyConfig::default()
+            },
+        );
+        let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy, upstream_addr).await;
+        let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+        let mut upstream = upstream_task.await.unwrap();
 
-    let upstream_payload = payload.clone();
-    let upstream_task = tokio::spawn(async move {
-        let (stream, _) = upstream_listener
-            .accept()
-            .await
-            .expect("upstream accepts proxy connection");
-        let mut websocket = accept_async(stream)
-            .await
-            .expect("upstream accepts websocket");
+        // Longer than the write deadline, shorter than the idle deadline.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.write_all(b"ping").await.unwrap();
+        let mut bytes = [0_u8; 4];
+        upstream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping");
 
-        let message = websocket
-            .next()
-            .await
-            .expect("upstream receives large frame")
-            .expect("large frame is valid");
-        assert_eq!(message, Message::Binary(upstream_payload));
-
-        websocket
-            .send(Message::Close(Some(CloseFrame {
-                code: 1000.into(),
-                reason: "large done".into(),
-            })))
-            .await
-            .expect("upstream sends close");
-        let _ = websocket.next().await;
-    });
-
-    let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("proxy listener binds");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy listener address");
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    let proxy = WebSocketProxy::new(drain.clone());
-
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = proxy_listener
-            .accept()
-            .await
-            .expect("proxy accepts client connection");
-
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-
-    let (mut client, _) = connect_async(format!("ws://{proxy_addr}"))
-        .await
-        .expect("client connects to proxy websocket");
-    client
-        .send(Message::Binary(payload.clone()))
-        .await
-        .expect("client sends large binary frame");
-
-    let close = client
-        .next()
-        .await
-        .expect("client receives close")
-        .expect("close is valid");
-    assert!(matches!(close, Message::Close(Some(frame)) if frame.reason == "large done"));
-    client.flush().await.expect("client flushes close response");
-
-    let stats = proxy_task
-        .await
-        .expect("proxy task completed")
-        .expect("proxy completed successfully");
-    assert_eq!(stats.client_to_upstream_messages, 1);
-    assert_eq!(stats.client_to_upstream_bytes, payload.len() as u64);
-
-    upstream_task.await.expect("upstream task completed");
-    drain.wait_for_active_count(0).await;
-    assert_eq!(drain.active_count(), 0);
+        match idle_timeout {
+            None => {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                assert!(!proxy_task.is_finished(), "no idle deadline is configured");
+                drop((client, upstream));
+                let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
+            }
+            Some(_) => {
+                let error = timeout(TEST_TIMEOUT, proxy_task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect_err("the idle deadline ends a quiet session");
+                assert!(matches!(
+                    error,
+                    WebSocketProxyError::Proxy(error) if error.kind() == std::io::ErrorKind::TimedOut
+                ));
+            }
+        }
+        drain.wait_for_active_count(0).await;
+    }
 }
 
 #[tokio::test]
-async fn websocket_proxy_rejects_new_session_after_drain_starts() {
-    let drain = DrainTracker::new(Duration::from_secs(5));
-    drain.start_drain();
-    let proxy = WebSocketProxy::new(drain);
-    let (client, _server) = tokio::io::duplex(64);
+async fn a_blocked_write_ends_the_session_at_the_write_deadline() {
+    let (listener, upstream_addr) = upstream_listener().await;
+    let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+    let drain = drain();
+    let proxy = WebSocketProxy::with_config(
+        drain.clone(),
+        WebSocketProxyConfig {
+            write_timeout: Duration::from_millis(200),
+            ..WebSocketProxyConfig::default()
+        },
+    );
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy, upstream_addr).await;
+    let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+    // The app holds its socket open and never reads.
+    let _upstream = upstream_task.await.unwrap();
 
-    let error = proxy
-        .accept_and_proxy(client, "ws://127.0.0.1:1")
-        .await
-        .expect_err("draining proxy rejects websocket session");
-
+    let chunk = vec![1_u8; 64 * 1024];
+    let error = timeout(TEST_TIMEOUT, async move {
+        while !proxy_task.is_finished() && client.write_all(&chunk).await.is_ok() {}
+        proxy_task.await.unwrap()
+    })
+    .await
+    .expect("the write deadline ends the session")
+    .expect_err("a blocked write is an error");
     assert!(matches!(
         error,
-        WebSocketProxyError::Drain(DrainError::Draining)
+        WebSocketProxyError::Proxy(error) if error.kind() == std::io::ErrorKind::TimedOut
     ));
-}
-
-struct AssertForwardedHeaders {
-    headers_seen_tx: Option<oneshot::Sender<()>>,
-}
-
-impl Callback for AssertForwardedHeaders {
-    fn on_request(
-        mut self,
-        request: &WsRequest,
-        response: WsResponse,
-    ) -> Result<WsResponse, ErrorResponse> {
-        assert_eq!(
-            request
-                .headers()
-                .get("forwarded")
-                .expect("forwarded header"),
-            "for=203.0.113.10;proto=https"
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("x-forwarded-for")
-                .expect("x-forwarded-for header"),
-            "203.0.113.11"
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("x-forwarded-proto")
-                .expect("x-forwarded-proto header"),
-            "https"
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("x-forwarded-host")
-                .expect("x-forwarded-host header"),
-            "edge.example.com"
-        );
-        assert_eq!(
-            request
-                .headers()
-                .get("x-forwarded-prefix")
-                .expect("x-forwarded-prefix header"),
-            "/edge"
-        );
-        self.headers_seen_tx
-            .take()
-            .expect("headers signal unused")
-            .send(())
-            .expect("test waits for headers");
-        Ok(response)
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn websocket_blocked_frame_write_has_a_deadline_without_a_session_lifetime_limit() {
-    let (client_io, proxy_client) = duplex(1024);
-    let (upstream_io, proxy_upstream) = duplex(1024);
-    let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-    let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
-    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
-    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
-    let config = proxy_core::WebSocketProxyConfig {
-        write_timeout: Duration::from_secs(5),
-        ..proxy_core::WebSocketProxyConfig::default()
-    };
-    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
-        proxy_client,
-        proxy_upstream,
-        config,
-    ));
-    // An inactive but established WebSocket remains valid beyond write timeout.
-    tokio::time::advance(Duration::from_secs(30)).await;
-    assert!(!proxy.is_finished());
-    let writer = tokio::spawn(async move {
-        client
-            .send(Message::Binary(vec![7; 128 * 1024].into()))
-            .await
-    });
-    writer.await.unwrap().unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(config.write_timeout).await;
-    let result = timeout(Duration::from_secs(1), proxy)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(
-        matches!(result, TungsteniteError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
-    );
-    drop(upstream);
+    drain.wait_for_active_count(0).await;
 }
 
 #[tokio::test]
-async fn websocket_upstream_handshake_timeout_returns_504_and_releases_permit() {
-    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let upstream_url = format!("ws://{}", upstream.local_addr().unwrap());
+async fn draining_proxy_rejects_a_new_session_with_503() {
+    let drain = drain();
+    drain.start_drain();
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let task = tokio::spawn(proxy_websocket_connection(
+        proxy(&drain),
+        client,
+        "http://127.0.0.1:1".parse().unwrap(),
+    ));
+    peer.write_all(
+        format!(
+            "GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {CLIENT_KEY}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    assert!(read_head(&mut peer).await.starts_with("HTTP/1.1 503 "));
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(WebSocketProxyError::Drain(DrainError::Draining))
+    ));
+}
+
+#[tokio::test]
+async fn upstream_handshake_timeout_returns_504_and_releases_permit() {
+    let (listener, upstream_addr) = upstream_listener().await;
     let (accepted, accepted_rx) = oneshot::channel();
     let app_task = tokio::spawn(async move {
-        let (stream, _) = upstream.accept().await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
         accepted.send(()).unwrap();
         let _stream = stream;
         std::future::pending::<()>().await;
     });
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let drain = DrainTracker::new(Duration::from_secs(1));
     let proxy = WebSocketProxy::with_config(
         drain.clone(),
-        proxy_core::WebSocketProxyConfig {
+        WebSocketProxyConfig {
             handshake_timeout: Duration::from_millis(100),
-            ..proxy_core::WebSocketProxyConfig::default()
+            ..WebSocketProxyConfig::default()
         },
     );
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        proxy.accept_and_proxy(stream, &upstream_url).await
-    });
-    let client = tokio::spawn(connect_async(format!("ws://{addr}")));
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy, upstream_addr).await;
+    let client = tokio::spawn(connect_async(format!("ws://{proxy_addr}")));
     accepted_rx.await.unwrap();
     let error = timeout(TEST_TIMEOUT, client)
         .await
@@ -847,123 +527,72 @@ async fn websocket_upstream_handshake_timeout_returns_504_and_releases_permit() 
 }
 
 #[tokio::test]
-async fn websocket_cancelled_handshake_releases_upstream_connection_and_permit() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let url = format!("ws://{}", listener.local_addr().unwrap());
+async fn cancelled_handshake_releases_upstream_connection_and_permit() {
+    let (listener, upstream_addr) = upstream_listener().await;
     let drain = DrainTracker::new(Duration::from_secs(1));
-    let proxy = WebSocketProxy::new(drain.clone());
-    let task = tokio::spawn(async move {
-        proxy
-            .connect_accepted_upstream_with_headers(&url, &http::HeaderMap::new())
-            .await
-    });
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
+    let client = tokio::spawn(raw_upgrade(proxy_addr, ""));
     let (mut app, _) = listener.accept().await.unwrap();
+    read_head(&mut app).await;
     assert_eq!(drain.active_count(), 1);
-    task.abort();
-    let _ = task.await;
-    assert_eq!(drain.active_count(), 0);
+
+    proxy_task.abort();
+    let _ = proxy_task.await;
+    client.abort();
+    let _ = client.await;
+
     let mut bytes = Vec::new();
-    timeout(
-        TEST_TIMEOUT,
-        tokio::io::AsyncReadExt::read_to_end(&mut app, &mut bytes),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn websocket_blocked_close_write_uses_close_deadline() {
-    let (client_peer, proxy_client) = duplex(1);
-    let (upstream_peer, proxy_upstream) = duplex(64);
-    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
-    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
-    let mut upstream = WebSocketStream::from_raw_socket(upstream_peer, Role::Server, None).await;
-    let config = proxy_core::WebSocketProxyConfig {
-        close_timeout: Duration::from_secs(5),
-        write_timeout: Duration::from_secs(60),
-        ..proxy_core::WebSocketProxyConfig::default()
-    };
-    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
-        proxy_client,
-        proxy_upstream,
-        config,
-    ));
-    upstream.send(Message::Close(None)).await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(config.close_timeout).await;
-    let error = timeout(Duration::from_secs(1), proxy)
+    timeout(TEST_TIMEOUT, app.read_to_end(&mut bytes))
         .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-    assert!(
-        matches!(error, TungsteniteError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
-    );
-    drop(client_peer);
-}
-
-#[tokio::test(start_paused = true)]
-async fn websocket_close_reply_wait_is_bounded() {
-    let (client_peer, proxy_client) = duplex(64);
-    let (_upstream_peer, proxy_upstream) = duplex(64);
-    let proxy_client = WebSocketStream::from_raw_socket(proxy_client, Role::Server, None).await;
-    let proxy_upstream = WebSocketStream::from_raw_socket(proxy_upstream, Role::Client, None).await;
-    let mut client = WebSocketStream::from_raw_socket(client_peer, Role::Client, None).await;
-    let config = proxy_core::WebSocketProxyConfig {
-        close_timeout: Duration::from_secs(5),
-        ..proxy_core::WebSocketProxyConfig::default()
-    };
-    let proxy = tokio::spawn(proxy_core::proxy_websocket_streams_with_config(
-        proxy_client,
-        proxy_upstream,
-        config,
-    ));
-    client.send(Message::Close(None)).await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(config.close_timeout).await;
-    assert!(timeout(Duration::from_secs(1), proxy)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_ok());
+        .expect("the upstream connection closes")
+        .unwrap();
+    drain.wait_for_active_count(0).await;
 }
 
 #[tokio::test]
 async fn websocket_proxy_connects_to_an_ipv6_literal_upstream() {
-    let app = TcpListener::bind(("::1", 0))
-        .await
-        .expect("IPv6 loopback listener");
-    let url = format!("ws://{}/socket", app.local_addr().unwrap());
-    let app_task = tokio::spawn(async move {
-        let (stream, _) = app.accept().await.unwrap();
-        let mut socket = accept_async(stream).await.unwrap();
-        let message = socket.next().await.unwrap().unwrap();
-        socket.send(message).await.unwrap();
-        let close = socket.next().await.unwrap().unwrap();
-        assert!(close.is_close());
-        socket.flush().await.unwrap();
-    });
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let drain = DrainTracker::new(Duration::from_secs(1));
-    let proxy = WebSocketProxy::new(drain.clone());
-    let proxy_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        proxy.accept_and_proxy(stream, &url).await
-    });
-    let (mut client, _) = connect_async(format!("ws://{addr}/socket")).await.unwrap();
-    client
-        .send(Message::Text("ipv6 echo".into()))
-        .await
-        .unwrap();
-    assert_eq!(
-        client.next().await.unwrap().unwrap(),
-        Message::Text("ipv6 echo".into())
+    let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+        return;
+    };
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+    let drain = drain();
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy(&drain), upstream_addr).await;
+
+    let (response, client) = raw_upgrade(proxy_addr, "").await;
+    assert!(response.starts_with("HTTP/1.1 101 "));
+    drop((client, upstream_task.await.unwrap()));
+    let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_peer_that_keeps_its_stream_open_after_the_other_closed_is_released_at_the_close_timeout()
+{
+    let (listener, upstream_addr) = upstream_listener().await;
+    let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+    let drain = drain();
+    let proxy = WebSocketProxy::with_config(
+        drain.clone(),
+        WebSocketProxyConfig {
+            close_timeout: Duration::from_millis(200),
+            ..WebSocketProxyConfig::default()
+        },
     );
-    client.close(None).await.unwrap();
-    let _ = client.next().await;
-    proxy_task.await.unwrap().unwrap();
-    app_task.await.unwrap();
-    assert_eq!(drain.active_count(), 0);
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy, upstream_addr).await;
+    let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+
+    // The app closes. The client sees the end of the stream and stays connected.
+    drop(upstream_task.await.unwrap());
+    assert_eq!(client.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    assert_eq!(drain.active_count(), 1);
+
+    let started = tokio::time::Instant::now();
+    timeout(TEST_TIMEOUT, proxy_task)
+        .await
+        .expect("the close timeout ends the session")
+        .unwrap()
+        .expect("a session that ends at the close timeout is not an error");
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    drain.wait_for_active_count(0).await;
+    drop(client);
 }

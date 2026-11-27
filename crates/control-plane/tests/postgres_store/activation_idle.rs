@@ -42,7 +42,6 @@ async fn ready(
     let instance = store
         .create_instance(create_instance_request(
             name,
-            name,
             class.reference.clone(),
             vec![],
         ))

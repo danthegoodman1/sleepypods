@@ -33,6 +33,11 @@ macro_rules! unexpected_store_methods {
         unexpected_store_methods!($($rest),*);
     };
 
+    (reencrypt_certificates_sealed_by $(, $rest:ident)* $(,)?) => {
+        fn reencrypt_certificates_sealed_by(&self, _sealing_key_id: String) -> control_plane::StoreFuture<'_, control_plane::StoreResult<control_plane::certificate::SealingKeyReencryption>> { panic!("unexpected test store capability: reencrypt_certificates_sealed_by") }
+        unexpected_store_methods!($($rest),*);
+    };
+
     (snapshot_tls_bindings $(, $rest:ident)* $(,)?) => {
         fn snapshot_tls_bindings(&self, _: Vec<control_plane::certificate::TlsHostname>, _: Option<control_plane::certificate::CertificateRevision>) -> control_plane::StoreFuture<'_, control_plane::StoreResult<Option<control_plane::certificate::TlsBindingSnapshot>>> { panic!("unexpected test store capability: snapshot_tls_bindings") }
         unexpected_store_methods!($($rest),*);
@@ -417,15 +422,6 @@ macro_rules! unexpected_store_methods {
         _request: control_plane::DeleteHttp01ChallengeRequest,
     ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<bool>> {
         panic!("unexpected test store capability: delete_http01_challenge")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (expire_http01_challenges $(, $rest:ident)* $(,)?) => {
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        _request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<usize>> {
-        panic!("unexpected test store capability: expire_http01_challenges")
     }
         unexpected_store_methods!($($rest),*);
     };

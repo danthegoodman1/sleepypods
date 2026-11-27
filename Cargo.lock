@@ -1893,6 +1893,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "pin-project-lite",
  "sleepypods-observability",
  "socket2",

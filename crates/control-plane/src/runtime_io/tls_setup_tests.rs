@@ -153,7 +153,7 @@ async fn server_tls_total_setup_expires_during_trickled_write_flight() {
     let router = tonic::transport::Server::builder()
         .tls_config(identity.security.tls(setup).unwrap().unwrap())
         .unwrap()
-        .add_service(crate::api::operator_grpc_service());
+        .add_service(crate::runtime::tests::noop_operator_service());
     jobs.spawn(
         router.serve_with_incoming_shutdown(
             tonic::codegen::tokio_stream::iter([Ok::<_, io::Error>(incoming)])
@@ -238,7 +238,7 @@ async fn actual_native_tls_silent_peer_releases_capacity_and_healthy_rpc_recover
     let router = tonic::transport::Server::builder()
         .tls_config(identity.security.tls(setup).unwrap().unwrap())
         .unwrap()
-        .add_service(crate::api::operator_grpc_service());
+        .add_service(crate::runtime::tests::noop_operator_service());
     jobs.spawn(router.serve_with_incoming_shutdown(incoming, async {
         let _ = stopped.await;
     }));
@@ -273,7 +273,7 @@ async fn actual_native_tls_silent_peer_releases_capacity_and_healthy_rpc_recover
         .await
         .unwrap()
         .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert_eq!(status.code(), tonic::Code::Internal);
         drop(client);
     })
     .catch_unwind()

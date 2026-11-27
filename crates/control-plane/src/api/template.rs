@@ -40,6 +40,7 @@ fn workload_template_from_proto(
             "template.workload.app_container",
         )
         .and_then(container_template_from_proto)?,
+        termination_grace_period_seconds: template.termination_grace_period_seconds,
     })
 }
 
@@ -94,6 +95,12 @@ fn sidecar_template_from_proto(
             .and_then(template_text_from_proto)?,
         listen_port: u16_from_proto("template.sidecar.listen_port", template.listen_port)?,
         mode: template.mode,
+        app_protocol: match pb::AppProtocol::try_from(template.app_protocol)
+            .map_err(|_| Status::invalid_argument("template.sidecar.app_protocol is invalid"))?
+        {
+            pb::AppProtocol::Http1 => domain_manifest::AppProtocol::Http1,
+            pb::AppProtocol::H2c => domain_manifest::AppProtocol::H2c,
+        },
     })
 }
 
@@ -370,6 +377,7 @@ fn workload_template_to_proto(template: domain_manifest::WorkloadTemplate) -> pb
         name: Some(template_text_to_proto(template.name)),
         replicas: template.replicas,
         app_container: Some(container_template_to_proto(template.app_container)),
+        termination_grace_period_seconds: template.termination_grace_period_seconds,
     }
 }
 
@@ -414,6 +422,10 @@ fn sidecar_template_to_proto(template: domain_manifest::SidecarTemplate) -> pb::
         image: Some(template_text_to_proto(template.image)),
         listen_port: u32::from(template.listen_port),
         mode: template.mode,
+        app_protocol: match template.app_protocol {
+            domain_manifest::AppProtocol::Http1 => pb::AppProtocol::Http1,
+            domain_manifest::AppProtocol::H2c => pb::AppProtocol::H2c,
+        } as i32,
     }
 }
 

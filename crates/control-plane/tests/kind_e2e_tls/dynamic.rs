@@ -100,10 +100,8 @@ async fn instance(operator: &mut Operator, id: &str) -> TestResult<Instance> {
 async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "dynamic-class".into(),
             class_id: "dynamic-web".into(),
             version: 1,
-            default_values: HashMap::new(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".into(),
@@ -114,7 +112,6 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config, "http", None)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 1000,
@@ -128,13 +125,13 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
     for (index, id) in IDS.iter().enumerate() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("create-{id}"),
                 instance_id: (*id).into(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: "dynamic-web".into(),
                     version: 1,
                 }),
                 values: HashMap::from([("target".into(), (*id).into())]),
+                routes: Vec::new(),
             })
             .await?;
         let mut identity = http_route_identity(RouteHostKind::Exact as i32, HOST);
@@ -143,7 +140,6 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
         }
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("route-{id}"),
                 route_binding_id: format!("route-{id}"),
                 instance_id: (*id).into(),
                 identity: Some(identity),

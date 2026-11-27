@@ -15,8 +15,8 @@ below use request shapes.
 
 - `WorkloadClassVersion`: immutable template and policy bundle. It defines a
   single-replica `Deployment` or `StatefulSet`, app container, sidecar template,
-  Service, optional PV/PVC volume templates, value schema, default values, and
-  sleep policy.
+  Service, optional PV/PVC volume templates, a value schema with per-field
+  defaults, and sleep policy.
 - `Instance`: one workload created from a pinned workload class version plus
   validated string `values`. State is `Cold`, `Waking`, `Running`, `Draining`,
   `Failed`, `Deleting`, or `Deleted`, with a generation for stale-update
@@ -54,9 +54,10 @@ The V1 operator service is unary-only:
 - `CreateWorkloadClassVersion`, `GetWorkloadClassVersion`
 - `CreateInstance`, `GetInstance`, `DeleteInstance`
 - `CreateRouteBinding`, `GetRouteBinding`, `DeleteRouteBinding`
-- `PutHttp01Challenge`, `DeleteHttp01Challenge`, `ExpireHttp01Challenges`
+- `PutHttp01Challenge`, `DeleteHttp01Challenge`
 - `PublishCertificate`, `GetCertificateMetadata`, `RemoveCertificate`,
-  `ReencryptCertificate`, `SetTlsBinding`, `GetTlsBinding` (native TLS only)
+  `ReencryptCertificate`, `ReencryptCertificates`, `SetTlsBinding`,
+  `GetTlsBinding` (native TLS only)
 - `ReconcileMaterialization`, `ForceDeleteMaterialization`,
   `ForceReleaseExclusivityKey`
 
@@ -86,6 +87,20 @@ plane injects `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN`
 into rendered sidecars from runtime config; operators do not put this token in
 WorkloadClass templates. Browser/gRPC-Web and native operator clients send
 `Authorization: Bearer <operator-token>`.
+
+The gRPC-Web listener serves the platform TLS identity whenever
+`SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE` and
+`SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` are set, so the operator token crosses
+it encrypted; browsers negotiate HTTP/2 on it.
+`SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS` lists the origins whose pages may
+call the listener, comma-separated and written as a browser sends them: a
+lowercase `https://console.example.com`, with a port only when the page uses
+one. The list is empty by default, so name each console origin before its pages
+can call. A request whose `Origin` is outside the list receives HTTP 403 before
+authentication, and CORS responses name only listed origins. A request with no
+`Origin` header comes from a client other than a browser page, and its bearer
+token decides it. Startup fails on a malformed origin, and on an origin list
+without `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR`.
 
 `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` is for local development and tests
 only. It is explicit; omitting the auth mode or configuring malformed, missing,
@@ -165,16 +180,29 @@ failure. Read current metadata/binding state and compare versions and the desire
 certificate fingerprint before attempting another conditional write.
 
 Private keys are encrypted in Postgres using deployment-provided sealing keys.
-Back up those keys separately from the database. When changing sealing keys,
-first distribute the new read key to every control-plane replica, then switch
-every writer to the new active key. Use `ReencryptCertificate` with the current
-certificate version and sealing revision for each live certificate. Verify all
-live rows use the new key before retiring the old read key. Before that final
-check, settle in-flight and ambiguous database writes from old-key writers;
-disconnecting a caller or stopping its transport alone does not prove that a
-queued commit cannot still finish. Keep old read keys available through this
-settlement and retain keys required to restore older backups. Re-encryption
-preserves certificate versions and hostname views.
+Back up those keys separately from the database. To rotate a sealing key:
+
+1. Add the new key to the key ring of every control-plane replica and keep the
+   current `active_id`.
+2. Switch `active_id` to the new key on every replica. New publications seal
+   under it.
+3. Call `ReencryptCertificates({sealing_key_id: "<old key>"})` until `remaining`
+   is zero. Each call re-seals up to sixteen active certificates under the
+   active key and returns the number the old key still seals.
+   `ReencryptCertificate` re-seals one certificate at its current version and
+   sealing revision.
+4. Settle in-flight and ambiguous database writes from old-key writers, repeat
+   the call to confirm `remaining` is zero, then remove the old key from every
+   ring.
+
+At startup the control plane compares the sealing keys of active certificates
+with its ring. When a certificate is sealed under a key the ring lacks, the
+process exits and names the missing key IDs; restore those keys, or finish
+re-encryption on a replica that holds them, then start it again. Disconnecting
+a caller or stopping its transport alone does not prove that a queued commit
+cannot still finish, so keep the old key in the ring through settlement and
+retain the keys required to restore older backups. Re-encryption preserves
+certificate versions and hostname views.
 
 ## Frontline certificate cache
 
@@ -191,23 +219,43 @@ cache to disk. Restarting loses the cache; a subsequent TLS connection needs a
 successful resolution. The existing bounded control-plane connection setup still
 applies at startup. An empty cache alone does not prevent listener readiness.
 
-The cache admits at most 1,024 hostname entries, including misses and pending
-lookups, with 64 MiB of accounted memory and at most three simultaneous fetches.
-Memory accounting includes fetch scratch space and configurations still retained
-by handshakes or other references after cache eviction. It is an admission budget, not a
-process RSS limit; connection buffers and the runtime have separate costs.
-The worker reserves four MiB for structures, 32 MiB for watch decoding/state and
-eight MiB for each outstanding fetch. These conservative reservations cover
-malformed repeated protobuf fields as well as valid bundles; they do not imply
-that an idle process allocates that much physical memory. Entry and byte pressure
-can evict cached views before their leases expire.
+The cache holds at most 1,024 hostnames with a certificate. A separate budget
+holds at most 1,024 hostnames without one: authoritative misses, pending lookups
+and failed lookups. A full budget evicts its least recently handshaken hostname,
+choosing first among those with no handshake waiting. A hostname without a
+certificate therefore displaces only another hostname without one, and only a
+1,025th certificate evicts a cached one. At most three fetches run at once.
+
+Entry counts bound cache memory. Validation limits a bundle to 128 KiB and 100
+SANs, so a cached certificate retains at most about 160 KiB: 160 MiB for 1,024
+maximum-size certificates, and about 10 MiB when chains are a few KiB. A hostname
+without a certificate costs about 1 KiB at most. A resolve response is at most
+256 KiB on the wire and a watch snapshot 512 KiB; a malformed one expands to at
+most 8 MiB per fetch and 32 MiB for the watch while it is decoded and rejected.
+The worst case is about 220 MiB. A configuration that is rotated or evicted while
+connections still use it stays in memory until those connections close, so
+`SLEEPYPODS_PROXY_MAX_CONNECTIONS` bounds how many remain. Connection buffers
+and the runtime have separate costs.
+
 Identical misses share one fetch. Lookup has a three-second deadline within the
-overall five-second TLS setup bound; capacity exhaustion fails the handshake.
+overall five-second TLS setup bound. A lookup that finds all three fetch slots
+busy waits its turn in arrival order until that deadline. At most 64 handshakes
+wait on lookups at once, counting those that join a lookup already queued or in
+flight for the same hostname; a further lookup fails its handshake at once. The
+limit is half the default `SLEEPYPODS_PROXY_MAX_HANDSHAKES` of 128, so a flood
+of unknown names leaves handshake permits for hostnames whose certificates are
+cached, and those handshakes complete without waiting. Eviction passes over a
+hostname with a handshake waiting; with at most 64 waiting, a full budget always
+holds another to evict. A lookup whose handshakes have all left starts no fetch.
+Background refreshes wait for the same slots in their own queue. When both
+queues hold work the slots alternate between them, so a burst of unknown names
+leaves refreshes running and a wave of refreshes leaves new hostnames resolving.
 
 Positive views refresh after approximately 60 seconds with hostname jitter, or
-half the granted lease when that is sooner. The worker polls once per second;
-leases shorter than a poll or lookup cannot promise a completed refresh before
-expiry, and selection still fails closed at the original deadline.
+half the granted lease when that is sooner. The worker queues due refreshes once
+per second and starts them as fetch slots free up; leases shorter than a poll or
+lookup cannot promise a completed refresh before expiry, and selection still
+fails closed at the original deadline.
 Each successful authoritative resolution grants at most five minutes of service,
 capped by the effective validity of the entire chain and measured conservatively
 from the start of the RPC. Failed refreshes never extend that deadline. An
@@ -215,12 +263,16 @@ unchanged response can renew only the exact certificate view still held locally.
 Authoritative misses are cached for at most one second. During a control-plane
 outage, an existing valid view remains usable only until its original deadline.
 
-Frontline opens one native certificate watch when its cache first has interests.
-The watch pushes complete binding snapshots containing metadata only. Each
-registration supplies an ID and exact hostname list; the server acknowledges it
-with an atomic current snapshot. Eviction releases the hostname's interest;
-updates coalesce into a bounded complete replacement set. Reconnects synchronize
-all current interests through either control-plane replica.
+Frontline opens one native certificate watch when its cache first holds a
+certificate. The watch follows the hostnames that hold a certificate, so its
+interests fit the 1,024-host limit of one stream. A hostname without a
+certificate has nothing to rotate or revoke; its cached miss expires within one
+second, and the next handshake resolves it again. The watch pushes complete
+binding snapshots containing metadata only. Each registration supplies an ID and
+exact hostname list; the server acknowledges it with an atomic current snapshot.
+Eviction and removal release the hostname's interest; updates coalesce into a
+bounded complete replacement set. Reconnects synchronize all current interests
+through either control-plane replica.
 
 The server checks a private global revision and reads the requested bindings only
 when it changes, or when a new registration requires a snapshot. There is no
@@ -313,7 +365,8 @@ containing the following JSON shape. Each key is 32 random bytes encoded as
 
 The file is limited to 8 KiB and the key ring to eight distinct IDs. The active
 ID must exist in that ring. All other entries remain available for decryption
-during a coordinated key rotation. Sealing keys require authenticated native
+during a coordinated key rotation, and the ring must hold every key that seals
+an active certificate or startup fails. Sealing keys require authenticated native
 TLS. Do not put them in application templates, database rows, logs or source
 control. Database backups without the corresponding sealing keys cannot restore
 certificate service.
@@ -324,21 +377,21 @@ Create a workload class version:
 
 ```text
 CreateWorkloadClassVersion({
-  idempotency_key: "wc-web-v1-20260624",
   class_id: "web",
   version: 1,
-  default_values: {"image": "registry.example/web:2026-06-24"},
-  value_schema: {fields: {"tenant": {required: true}, "image": {required: true}},
+  value_schema: {fields: {"tenant": {required: true},
+      "image": {default_value: "registry.example/web:2026-06-24"}},
     allow_extra: false},
-  template_generation: 1,
   template: {
     workload: {
       kind: WORKLOAD_KIND_DEPLOYMENT,
       name: {parts: [{literal: "web-"}, {instance_value: "tenant"}]},
       app_container: {name: "app", image: {parts: [{instance_value: "image"}]},
-        ports: [{name: "http", container_port: 8080}]}
+        ports: [{name: "http", container_port: 8080}]},
+      termination_grace_period_seconds: 30
     },
-    sidecar: {name: "sleepypods-sidecar", image: {parts: [{literal: "sidecar:prod"}]}, listen_port: 15000},
+    sidecar: {name: "sleepypods-sidecar", image: {parts: [{literal: "sidecar:prod"}]},
+      listen_port: 15000, app_protocol: APP_PROTOCOL_HTTP1},
     service: {name: {parts: [{literal: "web-"}, {instance_value: "tenant"}]},
       ports: [{name: "http", port: 80, target_port: 8080}]},
     volumes: []
@@ -348,16 +401,72 @@ CreateWorkloadClassVersion({
 })
 ```
 
-Create an instance:
+A class version is immutable. Repeating an identical create returns the stored
+version; a different request for the same `class_id` and `version` returns
+`AlreadyExists`.
+
+Each schema field is `required`, carries a `default_value`, or is optional. An
+instance that omits a field with a default receives the default when it is
+created. Templates and exclusivity keys may read only fields that are required
+or defaulted, so every instance of the class carries each value its templates
+use. Field names starting with `sleepypods.` belong to the platform.
+
+`sidecar.app_protocol` names the protocol the sidecar speaks to the app
+container in HTTP mode: `APP_PROTOCOL_HTTP1` (the default) or `APP_PROTOCOL_H2C`
+for apps that serve HTTP/2 without TLS, such as gRPC servers. The control plane
+passes it to the sidecar as `SLEEPYPODS_APP_PROTOCOL=http1` or `h2c`. A sidecar
+in TCP mode forwards bytes and takes no app protocol.
+
+`workload.termination_grace_period_seconds` sets how long Kubernetes waits
+between SIGTERM and SIGKILL when the workload's Pod stops. It defaults to 30 and
+has a maximum of 300.
+
+Create an instance, with its routes if it has any:
 
 ```text
 CreateInstance({
-  idempotency_key: "instance-tenant-a-20260624",
   instance_id: "tenant-a",
   workload_class: {class_id: "web", version: 1},
-  values: {"tenant": "tenant-a", "image": "registry.example/web:2026-06-24"}
+  values: {"tenant": "tenant-a"},
+  routes: [{route_binding_id: "route-tenant-a-app",
+    identity: {http: {host: {kind: ROUTE_HOST_KIND_EXACT, host: "app.example.com"},
+      path_prefix: "/"}}}]
 })
 ```
+
+The instance and its `routes` commit in one transaction, so the instance is
+reachable as soon as the call returns.
+
+Create calls are safe to repeat. A `CreateInstance` whose class version, values
+and routes equal the stored instance's returns that instance in its current
+state, and a `CreateRouteBinding` that names the same instance and identity
+returns the stored binding. Any other request for an existing ID returns
+`AlreadyExists` and changes nothing. The comparison reads current state: once a
+route is added to or removed from an instance, the request that created it
+differs from it. After a delete completes, the same request creates the
+resource again, and a recreated instance starts above every generation its
+predecessor used, so a caller or sidecar holding an old generation is rejected.
+
+### Create-Time Validation
+
+A create call accepts only what a wake can render, so an error reaches the
+operator who sent the request and a wake meets no template error.
+
+`CreateWorkloadClassVersion` returns `InvalidArgument` when:
+
+- `class_id` is outside the Kubernetes label-value form: at most 63 characters
+  of letters, digits, `-`, `_` and `.`, starting and ending alphanumeric;
+- a template or exclusivity key reads a value the schema leaves optional or
+  undeclared;
+- the manifest fails to render for a trial instance that supplies every declared
+  value, for example a missing Service template, a duplicate volume, or a raw
+  object that fails to parse or uses a kind outside the supported list.
+
+`CreateInstance` returns `NotFound` when the class version is absent, and
+`InvalidArgument` when the instance's own values render an invalid manifest: a
+name that is not a DNS label, a StatefulSet or Service name outside the
+Kubernetes limits below, a hostPath outside its directory, or an empty
+exclusivity key.
 
 ### Kubernetes Naming Rules
 
@@ -374,7 +483,7 @@ suffix to every instance-scoped object name:
 <base-name-truncated-if-needed>-<instance-id-hash>
 ```
 
-The suffix is the first eight lowercase hexadecimal characters of SHA-256 over
+The suffix is the first sixteen lowercase hexadecimal characters of SHA-256 over
 the complete instance ID, including for short IDs. The suffix is preserved and the
 operator base name is truncated first so the final name remains a DNS label no
 longer than 63 characters. SleepyPods does not add the Kubernetes object kind to
@@ -389,6 +498,13 @@ Kubernetes apply. PersistentVolumes are cluster-scoped and are collision-checked
 with an empty namespace; namespaced objects are checked with their rendered
 namespace.
 
+Two kinds have tighter Kubernetes limits, and `CreateInstance` enforces both:
+
+- A StatefulSet's final name has at most 52 characters, because Kubernetes
+  appends a revision hash to it in a Pod label. That leaves 35 characters for
+  the rendered base name.
+- A Service's final name starts with a letter.
+
 Typed manifest templates are the preferred path for supported Kubernetes
 fields. Operators can use `ManifestTemplate.raw_objects` as an advanced escape
 hatch for unsupported fields that must be preserved exactly in applied
@@ -401,12 +517,24 @@ Raw objects are limited in V1 to `Deployment`, `StatefulSet`, `Service`, `Secret
 `PersistentVolume`, and `PersistentVolumeClaim`; standalone raw Pods are unsupported. After substitution, the
 control plane parses the manifest, validates `apiVersion`, `kind`,
 `metadata.name`, and namespace scope, injects the same SleepyPods ownership
-labels and template-generation annotations used by typed objects, and derives
+labels used by typed objects, and derives
 rendered refs before any Kubernetes apply. Conflicting SleepyPods identity
 labels are rejected. PersistentVolumes must be cluster-scoped; namespaced raw
 objects are applied in the materialization target namespace. Raw refs collide
 with typed refs, so a raw object cannot reuse the same
 apiVersion/kind/namespace/name as a typed-rendered object.
+
+A raw object's `metadata.name` ends with `-` and the instance suffix, so two
+instances of one class render distinct objects. The platform supplies the suffix
+as the instance value `sleepypods.instance_suffix`; raw manifests read it, and
+the schema leaves it undeclared:
+
+```text
+raw_objects: [{manifest: {parts: [
+  {literal: "apiVersion: v1\nkind: Secret\nmetadata:\n  name: web-config-"},
+  {instance_value: "sleepypods.instance_suffix"},
+  {literal: "\nstringData:\n  mode: production\n"}]}}]
+```
 
 Raw Deployment/StatefulSet Pod templates retain instance cleanup labels but do
 not receive the primary `sleepypods.io/workload-name` label. That label is
@@ -457,7 +585,6 @@ Add a route or custom domain:
 
 ```text
 CreateRouteBinding({
-  idempotency_key: "route-tenant-a-app",
   route_binding_id: "route-tenant-a-app",
   instance_id: "tenant-a",
   identity: {http: {host: {kind: ROUTE_HOST_KIND_EXACT, host: "app.example.com"},
@@ -469,6 +596,12 @@ Use `ROUTE_HOST_KIND_WILDCARD_SUFFIX` for wildcard suffix routing, for example
 `host: "*.apps.example.com"`. Use `identity.sni` for TLS/SNI passthrough
 routes; the identity kind selects the protocol.
 
+A route host is an ASCII DNS name or IPv4 address without a port or path, at
+most 253 characters long. Each dot-separated label has 1 to 63 letters, digits,
+hyphens or underscores and starts and ends without a hyphen. The control plane
+lowercases the host and rejects any other form with `InvalidArgument`, so every
+stored route names a host a request can carry.
+
 Add an HTTP-01 challenge token:
 
 ```text
@@ -479,9 +612,9 @@ PutHttp01Challenge({
 })
 ```
 
-After the ACME check finishes, call `DeleteHttp01Challenge`. Periodically call
-`ExpireHttp01Challenges` with the current Unix milliseconds to garbage-collect
-expired records.
+After the ACME check finishes, call `DeleteHttp01Challenge`. The frontline stops
+serving a challenge at `expires_at_unix_millis`, and control-plane maintenance
+removes expired records.
 
 Attach an existing volume:
 
@@ -490,6 +623,9 @@ Attach an existing volume:
 2. Reference those values from a `VolumeTemplate` `source.csi.volume_handle` or
    `source.host_path.path`, plus `pv_name`, `pvc_name`, `capacity`, access
    modes, reclaim policy, and optional storage class.
+   A hostPath template that reads instance values starts with a literal
+   absolute directory ending in `/`, such as `/srv/tenants/`, and the rendered
+   path has no `..` segment, so a value chooses a subdirectory of that directory.
    Static CSI volumes can also set typed secret refs on `source.csi`, including
    `controller_publish_secret_ref`, `node_stage_secret_ref`,
    `node_publish_secret_ref`, `controller_expand_secret_ref`, and
@@ -529,7 +665,8 @@ conflict until the owning materialization reaches `Deleted` or an operator uses
 an explicit force operation.
 
 `ReconcileMaterialization` is the first operator action for a stuck
-materialization. It loads the row by materialization id, returns current state,
+materialization. It takes the `instance_id`, loads that instance's
+materialization in this control plane's cluster and namespace, returns current state,
 lease metadata, recorded object refs, and live projection observations, and
 enqueues eligible `Pending`, `Deleting` or legacy `Failed` work through the same
 scheduler. `attempted` means enqueue accepted, not work completed. Set
@@ -556,7 +693,8 @@ retryable Kubernetes/API-access problem unless the bounded reason indicates a
 persistent permission or discovery issue.
 
 `ForceDeleteMaterialization` is an emergency cleanup tool for a materialization
-whose Kubernetes cleanup has already been inspected. The response includes the
+whose Kubernetes cleanup has already been inspected. It takes the `instance_id`,
+an operator name and an audit reason. The response includes the
 recorded object refs that were present before the row was cleared plus
 best-effort projection observations for those refs. Observation does not mutate
 Kubernetes objects. It also clears any unresolved effect barrier. Before using
@@ -691,9 +829,8 @@ public tonic/Hyper cannot reset an already queued final DATA frame individually,
 so other streams on that connection are also cancelled. Ordinary active
 subscriptions use their explicit lifetime, not the unary delivery deadline.
 
-Maintenance runs every five seconds in bounded batches for HTTP-01 expiry,
-opt-in idempotency expiry and event retention. Permanent idempotency tombstones
-and instance generation watermarks are preserved.
+Maintenance runs every five seconds in bounded batches for HTTP-01 expiry and
+event retention. Instance generation watermarks are preserved.
 
 ## Lifecycle Expectations
 
@@ -751,10 +888,10 @@ marks it `Failed` with an advanced revision. An explicit wake retry can then
 choose the configured target. Legacy failed projections are queued for cleanup
 before any new incarnation can replace their recorded inventory.
 
-Per-ID generation watermarks are permanent and independent of optional
-idempotency-key expiry. An ID deleted before watermarks existed is permanently
+Per-ID generation watermarks are permanent. An ID deleted before watermarks
+existed is permanently
 retired when deletion history is available; create a new ID. If historical
-idempotency/deletion records were manually erased before this migration, the
+deletion records were manually erased before this migration, the
 old incarnation is unknowable: use new instance IDs for those historical
 resources and quiesce incompatible clients during upgrade. Never restore a
 database without its generation watermarks while allowing old clients or
@@ -771,8 +908,9 @@ Run three production components:
 
 - Control plane: one native gRPC listener for the proxy and sidecar services,
   a second for the operator service, and an optional gRPC-Web listener for
-  operator unary APIs. Workloads reach the first; keep the operator listeners on
-  a network path pods have no route to.
+  operator unary APIs. All three serve the platform TLS identity when one is
+  configured. Workloads reach the first; keep the operator listeners on a
+  network path pods have no route to.
 - Frontline: always-on HTTP listener; optional TLS termination and TLS/SNI
   passthrough listeners; connects to the control plane.
 - Sidecar: injected into materialized workloads; proxies to the local app port
@@ -792,12 +930,12 @@ Important environment variables:
 | control plane | `SLEEPYPODS_CONTROL_PLANE_LISTEN_ADDR` carries the proxy and sidecar services |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR` carries the operator service |
 | control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR` optional |
+| control plane | `SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS` optional comma-separated browser origins for the gRPC-Web listener, empty by default |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_AUTH_MODE=no-auth` for local tests, or `static-bearer-token` for configured auth |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_OPERATOR_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN`, `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE`, `SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` for native platform TLS |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT` verified HTTPS endpoint for rendered sidecars when native TLS is enabled |
 | control plane | `SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE` external key ring for certificate storage |
-| control plane | `SLEEPYPODS_STORE_PROVIDER=postgres` |
 | control plane | `SLEEPYPODS_POSTGRES_URL` |
 | control plane | `SLEEPYPODS_CLUSTER_ID`, `SLEEPYPODS_NAMESPACE` |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
@@ -810,7 +948,7 @@ Important environment variables:
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
-| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
+| sidecar | rendered by the control plane: listen address, app port, instance ID, generation, downward-API `SLEEPYPODS_POD_UID`, control-plane endpoint, idle policy, `SLEEPYPODS_SIDECAR_MODE`, `SLEEPYPODS_APP_PROTOCOL` in HTTP mode, and runtime-injected `SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN` when static auth is enabled |
 | sidecar | `SLEEPYPODS_SIDECAR_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |
 
 Kubernetes permissions must allow create, conditional merge update, inspection
