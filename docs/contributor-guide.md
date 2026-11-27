@@ -113,9 +113,10 @@ output. Its checker supplements Cargo's exit status; callers must preserve both.
 
 Targeted gates live in `scripts/`:
 
-- `test-kind-e2e-stateless.sh`: stateless create/wake/hot-route/sleep/delete.
+- `test-kind-e2e-stateless.sh`: stateless create/wake/hot-route/sleep/delete,
+  then the wake-latency measurement.
 - `test-kind-e2e-stateful.sh`: StatefulSet plus static PV/PVC and data
-  continuity.
+  continuity, then the wake-latency measurement.
 - `test-kind-e2e-routing.sh`: exact/wildcard HTTP route and HTTP-01 behavior.
 - `test-kind-e2e-protocols.sh`: HTTP/2, h2c gRPC-shaped, and WebSockets.
 - `test-kind-e2e-tls.sh`: native certificate publication, TLS termination and SNI
@@ -131,6 +132,18 @@ Targeted gates live in `scripts/`:
 - `test-kind-e2e-restart.sh`: control-plane restart recovery.
 - `test-kind-e2e-lifecycle-races.sh`: concurrent wake/sleep/delete/stale
   lifecycle races.
+
+The stateless and stateful gates end by measuring wake latency. Each sample
+sends one cold request to a fresh instance and prints a `wake-latency:` line
+with the latency added on top of the Pod's own start (the request's whole
+duration minus the time from workload scale-up to Pod ready) and its phases:
+request to workload scaled up, Pod ready to ready endpoint, ready endpoint to
+`Running`, and `Running` to first byte. A summary line gives the mean and worst
+of each. `SLEEPYPODS_KIND_E2E_WAKE_LATENCY_ONLY=1` runs the measurement without
+the lifecycle test. `SLEEPYPODS_E2E_WAKE_LATENCY_SAMPLES` sets the sample count
+(default 10). `SLEEPYPODS_E2E_WAKE_LATENCY_MEAN_BUDGET_MS` and
+`SLEEPYPODS_E2E_WAKE_LATENCY_WORST_BUDGET_MS` fail the gate when the added
+latency exceeds them.
 
 ## Invariants
 

@@ -370,20 +370,26 @@ also requires the current generation's persisted Ready age to reach
 `max(190 seconds, resolved class idle timeout)`, alongside the sidecar's full
 quiet interval. The unconditional activation floor protects pending first
 requests even after another request finishes; a control-plane restart does not
-extend it. A wake with no application traffic still becomes eligible after this
-finite interval, and the default 300-second class idle timeout continues to
-dominate. The internal explicit `BeginSleep` operation can bypass the automatic
-floor; there is no deployed operator Sleep RPC. See the
+extend it, and a revive during drain restarts it. A wake with no application
+traffic still becomes eligible after this finite interval, and the default
+300-second class idle timeout continues to dominate. The internal explicit
+`BeginSleep` operation can bypass the automatic floor; there is no deployed
+operator Sleep RPC. See the
 [activation contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep).
 
 Other Kubernetes workload types are out of scope until these two are robust.
 
-On sleep, the control plane should first stop new routing by publishing a
-draining generation. Existing requests/connections get a configurable grace
-period before Kubernetes objects are deleted. The pinned workload class supplies
-the drain grace period, and sleep acceptance persists its fixed deadline. If active
-traffic remains after the grace period, the materialization is deleted anyway and
-the old backend generation is invalidated.
+On sleep, the control plane first stops new routing by publishing a draining
+generation. Existing requests/connections get a configurable grace period
+before Kubernetes objects are deleted. The pinned workload class supplies the
+drain grace period, and sleep acceptance persists its fixed deadline. A wake
+that arrives before that deadline revives the instance: it returns to Running
+on the same Pod and projection generation, with a new instance generation and
+backend generation, and nothing is torn down. The sidecar keeps reporting while
+idle, so a revived Pod sleeps again. If active traffic remains after the grace
+period, the materialization is deleted anyway and the old backend generation is
+invalidated; a wake that arrives after the deadline is queued until cleanup
+finishes.
 
 ## Instance State Machine
 
@@ -402,8 +408,10 @@ Running
   DeleteInstance -> Deleting
 
 Draining
-  drain grace elapsed and materialization deleted -> Cold
-  new wake requested before deletion completes -> Waking or Running after reconcile
+  WakeInstance before the drain deadline -> Running on the same Pod
+  WakeInstance after the drain deadline -> Waking once cleanup finishes
+  drain deadline elapsed and materialization deleted -> Cold
+  DeleteInstance -> Deleting
 
 Failed
   WakeInstance retry -> Waking
@@ -428,18 +436,20 @@ Create instance:
   keep instance Cold
 
 Wake:
-  render PV from WorkloadClass template and instance values
-  render PVC bound to PV
-  wait for PVC Bound
-  render Deployment/StatefulSet mounting PVC
-  wait for readiness
+  create PV from WorkloadClass template and instance values
+  create PVC bound to PV
+  create Deployment/StatefulSet mounting PVC with zero replicas
+  scale the workload up; the scheduler holds its Pod until the PVC is Bound
+  wait for a ready endpoint
   publish Running backend
 
 Sleep:
   mark Draining
   invalidate proxy routes for old generation
+  wait for the drain deadline; a wake before it revives the instance
   delete workload and Service
   delete PVC and PV
+  wait until every object and Pod is absent
   leave backing provider volume untouched
   mark Cold
 
