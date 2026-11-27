@@ -855,10 +855,9 @@ Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 | `POSITIVE_ROUTE_CACHE_TTL_MS` | 90000, at most 900000, and at least `SUBSCRIPTION_LIFETIME_MS` plus 10000 |
 
 Admission occurs before connection tasks or protobuf decoding. Each connection
-allows 32 H2 streams. The operator and sidecar services cap protobuf
-requests at 256 KiB and the proxy service at 512 KiB; responses are capped at
-1 MiB.
-A subscribed host is at most 253 bytes. Each stream runs 16 rule-set lookups at
+allows 32 H2 streams. The operator and sidecar services cap protobuf requests
+at 256 KiB and the proxy service at 512 KiB; responses are capped at 1 MiB. A
+subscribed host is at most 253 bytes. Each stream runs 16 rule-set lookups at
 once and queues 64 responses; it ends when a response waits for the response
 timeout to be queued. Transport capacity may remain held until the subscription
 lifetime plus the response timeout; it does not necessarily return within the
@@ -872,6 +871,13 @@ subscriptions use their explicit lifetime, not the unary delivery deadline.
 Maintenance runs every five seconds in bounded batches for HTTP-01 expiry and
 event retention. A failed pass is retried at the next interval. Instance
 generation watermarks are preserved.
+
+Frontline connects to a ready instance's Pod address before its Service, and
+`sleepypods_runtime_pod_route_connects_total` counts each attempt by outcome:
+`pod`, `refused`, `timeout`, `claim_rejected`, `error` or `known_failed` (see
+the [runbook](operator-runbook.md#metric-names)). Sustained `timeout` or
+`error` means frontline cannot reach Pod addresses, so each new upstream
+connection spends up to 250 ms before it uses the Service.
 
 ## Lifecycle Expectations
 
