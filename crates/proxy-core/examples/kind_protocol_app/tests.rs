@@ -55,7 +55,9 @@ async fn forwarder(
         let (stream, _) = listener.accept().await?;
         let admission = ProxyAdmission::new(ProxyResourceConfig::default());
         let handshake = admission.handshakes.try_acquire()?;
-        let stream = admission.admit_io(stream)?;
+        let stream = admission
+            .admit_io(stream)
+            .map_err(|_| "new admission has capacity")?;
         proxy_core::serve_http_connection_admitted(
             stream,
             Shutdown::new(),
