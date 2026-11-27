@@ -1,3 +1,0 @@
-   Compiling control-plane v0.1.0 (/private/tmp/sleepypods-cleanup-boundary-ro13u8e8/crates/control-plane)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
-  Executable tests/postgres_store.rs (/Users/dangoodman/code/sleepy-pods/target/debug/deps/postgres_store-fdc94126e3c8bb4a)

@@ -1,5 +1,0 @@
-2026-09-08T01:33:12.174084334Z observability.type=metric metric.name=sleepypods_runtime_control_plane_calls_total metric.value=1 metric.labels=operation=report_idle,outcome=success
-2026-09-08T01:33:12.174154667Z observability.type=event event.name=runtime.idle_report.event instance.id=e2e-stateless generation=18 active.count=0
-2026-09-08T01:33:13.276290126Z observability.type=event event.name=runtime.drain.started active.count=0
-2026-09-08T01:33:13.276364292Z observability.type=metric metric.name=sleepypods_runtime_drain_duration_seconds metric.value=0.000010041 metric.labels=outcome=success
-2026-09-08T01:33:13.276370417Z observability.type=event event.name=runtime.drain.completed active.count=0 duration.ms=0

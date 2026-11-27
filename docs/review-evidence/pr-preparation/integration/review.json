@@ -1,9 +1,0 @@
-{
-  "reviewed_utc": "2026-09-08T16:12:04.497918+00:00",
-  "status": "explicitly approved",
-  "scope": "16 staged remote-integration paths; exact staged/working hashes verified; no unresolved conflicts; only unchanged naming-function visibility/re-export touches runtime source",
-  "independent_checks": "four mock loader cases, three archive cleanups and twelve shell syntax checks; zero Docker/Kubernetes calls",
-  "focused_evidence": "10 local tests,4 deployed-only ignores, strict clippy/fmt",
-  "coverage_distinction": "Current deployed cache-hit proof retained; remote retrying no-Subscribe burst not copied verbatim. Existing strict image load separately proves zero hot Subscribe calls.",
-  "remaining_gate": "Final workspace/static run before merge commit and push."
-}

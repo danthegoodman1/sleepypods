@@ -1,4 +1,0 @@
-127.0.0.1 - "GET /direct HTTP/1.1" 200 -
-127.0.0.1 - "GET /fresh-0 HTTP/1.1" 200 -
-127.0.0.1 - "GET /fresh-1 HTTP/1.1" 200 -
-127.0.0.1 - "GET /fresh-2 HTTP/1.1" 200 -

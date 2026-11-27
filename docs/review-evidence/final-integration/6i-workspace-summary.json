@@ -1,9 +1,0 @@
-{
-  "reported_passed": 791,
-  "reported_failed": 0,
-  "reported_ignored": 16,
-  "source_hash_limitation": "Original check digest included crates and Cargo files, but omitted root tests/support. Supplement captured afterward; no edits to this file were reported during the check. Future helper digests include root tests.",
-  "root_test_support": {
-    "tests/support/runtime_shutdown.rs": "7333c964556ca7ff19be76d39e88544351ce65ed98b15e1ff52c62e3a77ce80b"
-  }
-}

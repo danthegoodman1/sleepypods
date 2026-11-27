@@ -1,3 +1,0 @@
-namespace "sleepypods-e2e-exclusivity-diagnose" deleted
-clusterrole.rbac.authorization.k8s.io "sleepypods-control-plane-sleepypods-e2e-exclusivity-diagnose" deleted
-clusterrolebinding.rbac.authorization.k8s.io "sleepypods-control-plane-sleepypods-e2e-exclusivity-diagnose" deleted

@@ -1,3 +1,0 @@
-Initial native Python app startup did not reach listen within 10 seconds. Controlled faulthandler capture:
-Thread main: socket.py:807 getfqdn -> http/server.py:138 server_bind -> socketserver.py:457 __init__ -> scripts/kind-routing-app.py:29 main.
-The subsequent wire experiment bypassed only this native getfqdn call and bound loopback, using the existing Handler unchanged. This is not evidence of the deployed warmup cause.

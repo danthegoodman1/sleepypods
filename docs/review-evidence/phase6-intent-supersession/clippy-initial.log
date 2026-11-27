@@ -1,5 +1,0 @@
-   Compiling sleepypods-api v0.1.0 (/private/tmp/sleepypods-6l-sd0eqyz3/crates/sleepypods-api)
-    Checking sleepypods-types v0.1.0 (/private/tmp/sleepypods-6l-sd0eqyz3/crates/sleepypods-types)
-    Checking sleepypods-observability v0.1.0 (/private/tmp/sleepypods-6l-sd0eqyz3/crates/sleepypods-observability)
-    Checking control-plane v0.1.0 (/private/tmp/sleepypods-6l-sd0eqyz3/crates/control-plane)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.50s

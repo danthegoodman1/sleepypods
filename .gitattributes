@@ -1,3 +1,0 @@
-# Preserve recorded evidence hashes, terminal output and patch context exactly.
-# Keep the generated audit bundle collapsed in GitHub's code-review diff.
-docs/review-evidence/** -text -whitespace linguist-generated=true

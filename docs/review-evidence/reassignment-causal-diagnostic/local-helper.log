@@ -1,5 +1,0 @@
-load-smoke backend listening on 127.0.0.1:61418
-load-smoke generated gRPC backend listening on 127.0.0.1:61419
-load-smoke frontline control plane listening on 127.0.0.1:61420
-load-smoke route host=app.example.test path=/ cold_path=/cold-smoke backend=http://127.0.0.1:61417 grpc_backend=http://127.0.0.1:61419
-load-smoke websocket stream bytes=262144 chunk_size=16384

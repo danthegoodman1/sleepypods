@@ -1,6 +1,0 @@
-2026-09-08T05:25:07.241935553Z frontline waiting for control-plane endpoint http://sleepypods-control-plane.sleepypods-e2e-membership-wire-20260908.svc.cluster.local:50051: transport error
-2026-09-08T05:25:09.560055679Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:2
-2026-09-08T05:25:12.028979680Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:25
-2026-09-08T05:25:12.050980013Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:26
-2026-09-08T05:25:12.298680555Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:27
-2026-09-08T05:26:09.447604262Z observability.type=event event.name=runtime.subscribe_stream.event error.reason=response_stream_closed

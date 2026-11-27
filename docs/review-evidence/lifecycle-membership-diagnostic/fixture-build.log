@@ -1,4 +1,0 @@
-   Compiling control-plane v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/control-plane)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.29s
-  Executable tests/deletion_observation.rs (target/debug/deps/deletion_observation-2350e6d45b4a48f3)
-  Executable tests/kind_e2e_lifecycle_races.rs (target/debug/deps/kind_e2e_lifecycle_races-34e0266a77682d40)

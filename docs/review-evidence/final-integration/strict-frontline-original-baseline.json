@@ -1,9 +1,0 @@
-{
-  "image": "sleepypods/frontline:baseline-dc7cac2",
-  "command": [
-    "./scripts/smoke-frontline-load.sh"
-  ],
-  "strict_budgets": true,
-  "seconds": 10.011127666919492,
-  "exit_code": 1
-}
