@@ -117,7 +117,8 @@ Targeted gates live in `scripts/`:
 - `test-kind-e2e-stateful.sh`: StatefulSet plus static PV/PVC and data
   continuity.
 - `test-kind-e2e-routing.sh`: exact/wildcard HTTP route and HTTP-01 behavior.
-- `test-kind-e2e-protocols.sh`: HTTP/2, h2c gRPC-shaped, and WebSockets.
+- `test-kind-e2e-protocols.sh`: HTTP/1.1, HTTP/2 and WebSocket clients against an
+  `http1` and an `h2c` app port, and h2c gRPC-shaped calls.
 - `test-kind-e2e-tls.sh`: native certificate publication, TLS termination and SNI
   passthrough, plus exact-replica certificate rotation/removal, live protocols,
   lifecycle, outage and restart checks. This explicit release gate includes real
