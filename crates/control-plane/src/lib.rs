@@ -48,13 +48,13 @@ pub use http01::{
     PutHttp01ChallengeRequest,
 };
 pub use ids::{
-    BackendGeneration, Generation, IdempotencyKey, InstanceId, MaterializationId, NonEmptyString,
-    RouteBindingId, WorkloadClassId,
+    materialization_id, BackendGeneration, Generation, IdempotencyKey, InstanceId,
+    MaterializationId, NonEmptyString, RouteBindingId, WorkloadClassId,
 };
 pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
     CreateInstanceValidationError, DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
-    InstanceState, InstanceValues, StateTransitionReason,
+    InstanceRoute, InstanceState, InstanceValues, StateTransitionReason,
 };
 pub use kube_materializer::{
     InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,

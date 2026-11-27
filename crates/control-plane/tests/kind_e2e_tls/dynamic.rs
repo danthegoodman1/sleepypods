@@ -132,6 +132,7 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
                     version: 1,
                 }),
                 values: HashMap::from([("target".into(), (*id).into())]),
+                routes: Vec::new(),
             })
             .await?;
         let mut identity = http_route_identity(RouteHostKind::Exact as i32, HOST);

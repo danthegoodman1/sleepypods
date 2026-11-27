@@ -100,6 +100,7 @@ async fn create_operator_resources(operator: &mut Operator, config: &E2eConfig) 
                 version: 1,
             }),
             values: HashMap::new(),
+            routes: Vec::new(),
         })
         .await?;
 

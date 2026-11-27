@@ -8,7 +8,7 @@ use crate::{
         CreateInstanceRequest, CreateInstanceResult, DeleteInstanceRequest, GetInstanceRequest,
         InstanceRecord, InstanceState,
     },
-    route::RouteBindingRecord,
+    route::{ProtocolRoute, RouteBindingRecord, RouteIdentity},
     store::{StoreError, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -21,10 +21,10 @@ use super::{
     error::map_postgres_error,
     idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
-        self, generation_to_i64, instance_from_row, instance_state_to_db,
-        manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
-        sleep_policy_to_json, value_schema_to_json, values_to_json,
-        workload_class_version_from_row, workload_exclusivity_keys_to_json,
+        generation_to_i64, instance_from_row, instance_state_to_db, manifest_template_to_json,
+        protocol_to_db, route_binding_from_row, route_identity_parts, sleep_policy_to_json,
+        value_schema_to_json, values_to_json, workload_class_version_from_row,
+        workload_exclusivity_keys_to_json,
     },
 };
 
@@ -394,12 +394,14 @@ async fn insert_route_bindings(
     request: &CreateInstanceRequest,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
-    for (index, spec) in request.route_bindings.iter().enumerate() {
-        mapping::validate_route_protocol(spec)?;
-        let route_binding_id = format!("{}:route:{}", request.instance_id.as_str(), index + 1);
+    for route in &request.route_bindings {
+        let route_binding_id = route.id.as_str();
         let instance_id = request.instance_id.as_str();
-        let parts = route_identity_parts(&spec.identity);
-        let protocol = protocol_to_db(spec.protocol);
+        let parts = route_identity_parts(&route.identity);
+        let protocol = protocol_to_db(match route.identity {
+            RouteIdentity::Http { .. } => ProtocolRoute::Http,
+            RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
+        });
         let path_prefix = parts.path_prefix.as_deref();
         let row = client
             .query_one(

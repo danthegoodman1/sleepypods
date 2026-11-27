@@ -48,6 +48,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         None,
@@ -63,6 +64,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         Some(&format!("Bearer {}", config.invalid_token)),
@@ -112,6 +114,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
     )?;
     assert_eq!(created_instance.instance_id, INSTANCE_ID);

@@ -17,8 +17,13 @@ pub(crate) fn create_instance_fingerprint(request: &CreateInstanceRequest) -> St
     let route_bindings = request
         .route_bindings
         .iter()
-        .map(route_binding_fingerprint)
-        .collect::<StoreResult<Vec<_>>>()?;
+        .map(|route| {
+            json!({
+                "route_binding_id": route.id.as_str(),
+                "identity": route_identity_fingerprint(&route.identity),
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "operation": CREATE_INSTANCE_OPERATION,
@@ -44,15 +49,6 @@ pub(crate) fn create_route_binding_fingerprint(
         "instance_id": request.instance_id.as_str(),
         "identity": route_identity_fingerprint(&request.identity),
         "protocol": protocol_fingerprint(request.protocol),
-    }))
-}
-
-fn route_binding_fingerprint(spec: &RouteBindingSpec) -> StoreResult<Value> {
-    mapping::validate_route_protocol(spec)?;
-
-    Ok(json!({
-        "identity": route_identity_fingerprint(&spec.identity),
-        "protocol": protocol_fingerprint(spec.protocol),
     }))
 }
 
@@ -146,11 +142,8 @@ mod tests {
     use super::{create_instance_fingerprint, create_route_binding_fingerprint};
     use crate::{
         ids::{Generation, IdempotencyKey, InstanceId, RouteBindingId, WorkloadClassId},
-        instance::CreateInstanceRequest,
-        route::{
-            CreateRouteBindingRequest, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost,
-            RouteIdentity,
-        },
+        instance::{CreateInstanceRequest, InstanceRoute},
+        route::{CreateRouteBindingRequest, PathPrefix, ProtocolRoute, RouteHost, RouteIdentity},
         workload::WorkloadClassVersionRef,
     };
 
@@ -164,13 +157,13 @@ mod tests {
                 Generation::new(1),
             ),
         )
-        .with_route_bindings(vec![RouteBindingSpec::new(
-            RouteIdentity::Http {
+        .with_route_bindings(vec![InstanceRoute {
+            id: RouteBindingId::new("route-1").expect("valid route ID"),
+            identity: RouteIdentity::Http {
                 host: RouteHost::exact("App.Example.COM.").expect("valid host"),
                 path: Some(PathPrefix::new("/api").expect("valid prefix")),
             },
-            ProtocolRoute::Http,
-        )]);
+        }]);
 
         let fingerprint = create_instance_fingerprint(&request).expect("fingerprint builds");
 

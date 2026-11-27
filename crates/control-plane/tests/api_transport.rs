@@ -24,7 +24,7 @@ use control_plane::api::{
         EnvVarTemplate, ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
         GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
         HostPathVolumeSourceTemplate, Http01Challenge, Http01ChallengeKey, HttpRouteIdentity,
-        IdleTimeoutOverridePolicy, Instance, InstanceState, ManifestTemplate,
+        IdleTimeoutOverridePolicy, Instance, InstanceRoute, InstanceState, ManifestTemplate,
         PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
         ProtocolRoute, PutHttp01ChallengeRequest, RawKubernetesManifestTemplate,
         ReconcileMaterializationRequest, ReconcileMaterializationResponse,
@@ -237,6 +237,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
         instance_id: "instance-1".to_owned(),
         workload_class: None,
         values: [("tenant".to_owned(), "acme".to_owned())].into(),
+        routes: Vec::new(),
     };
     let route_binding = CreateRouteBindingRequest {
         idempotency_key: "create-route-1".to_owned(),
@@ -321,6 +322,7 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
                 version: 7,
             }),
             values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes: Vec::new(),
         }))
         .await
         .expect("create instance succeeds")
@@ -377,6 +379,69 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 }
 
 #[tokio::test]
+async fn create_instance_creates_its_routes_with_the_instance() {
+    let store = Arc::new(FakeInstanceStore::default());
+    let service = store_operator_api(store.clone());
+    let request = |instance_id: &str, routes: Vec<InstanceRoute>| {
+        tonic::Request::new(CreateInstanceRequest {
+            idempotency_key: format!("create-{instance_id}"),
+            instance_id: instance_id.to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-1".to_owned(),
+                version: 7,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes,
+        })
+    };
+
+    service
+        .create_instance(request(
+            "routed",
+            vec![
+                InstanceRoute {
+                    route_binding_id: "routed-web".to_owned(),
+                    identity: Some(http_identity("App.Example.com", Some("/api"))),
+                },
+                InstanceRoute {
+                    route_binding_id: "routed-db".to_owned(),
+                    identity: Some(sni_identity("db.example.com")),
+                },
+            ],
+        ))
+        .await
+        .expect("create instance with routes succeeds");
+
+    for (route_binding_id, identity) in [
+        ("routed-web", http_identity("app.example.com", Some("/api"))),
+        ("routed-db", sni_identity("db.example.com")),
+    ] {
+        let route = service
+            .get_route_binding(tonic::Request::new(GetRouteBindingRequest {
+                route_binding_id: route_binding_id.to_owned(),
+            }))
+            .await
+            .expect("route created with the instance loads")
+            .into_inner();
+        assert_eq!(route.instance_id, "routed");
+        assert_eq!(route.identity, Some(identity));
+    }
+
+    let error = service
+        .create_instance(request(
+            "unrouted",
+            vec![InstanceRoute {
+                route_binding_id: "unrouted-web".to_owned(),
+                identity: None,
+            }],
+        ))
+        .await
+        .expect_err("a route without an identity is rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(!store.instance_exists("unrouted"));
+}
+
+#[tokio::test]
 async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
     let store = Arc::new(FakeInstanceStore::default());
     let service = store_operator_api(store);
@@ -390,6 +455,7 @@ async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
                 version: 7,
             }),
             values: [("tenant".to_owned(), "tenant-one".to_owned())].into(),
+            routes: Vec::new(),
         }))
         .await
         .expect_err("invalid instance IDs are rejected at the API boundary");
@@ -802,7 +868,7 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
 async fn reconcile_materialization_surfaces_inspect_failed_projection_observation() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-inspect-fails", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.fail_inspect();
@@ -811,7 +877,7 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response surfaces inspect error")
@@ -837,7 +903,7 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
 async fn reconcile_materialization_reports_ready_readiness_without_repairing_ready_row() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-ready-observed", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -856,7 +922,7 @@ async fn reconcile_materialization_reports_ready_readiness_without_repairing_rea
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response includes readiness observation")
@@ -896,7 +962,7 @@ async fn reconcile_materialization_reports_ready_readiness_without_repairing_rea
 async fn reconcile_materialization_reports_unready_readiness_without_repairing_ready_row() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-unready-observed", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -912,7 +978,7 @@ async fn reconcile_materialization_reports_unready_readiness_without_repairing_r
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response includes unready observation")
@@ -942,7 +1008,7 @@ async fn reconcile_materialization_reports_unready_readiness_without_repairing_r
 async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_without_repair() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-ready-drift", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -961,7 +1027,7 @@ async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_w
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization reports Ready metadata drift")
@@ -1002,7 +1068,7 @@ async fn force_delete_materialization_returns_projection_observations_without_ku
         target(),
         MaterializationState::Deleting,
     );
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -1011,7 +1077,7 @@ async fn force_delete_materialization_returns_projection_observations_without_ku
 
     let force_deleted = service
         .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
-            materialization_id,
+            instance_id,
             operator: "operator-a".to_owned(),
             reason: "manual cleanup already inspected".to_owned(),
         }))
@@ -1301,11 +1367,12 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         MaterializationState::Deleting,
     );
     let reconcile_materialization_id = reconcile_materialization.id.as_str().to_owned();
+    let reconcile_instance_id = reconcile_materialization.instance_id.as_str().to_owned();
     store.seed_materialization(reconcile_materialization);
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id: reconcile_materialization_id.clone(),
+            instance_id: reconcile_instance_id.clone(),
         }))
         .await
         .expect("reconcile materialization succeeds")
@@ -1334,10 +1401,11 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         MaterializationState::Deleting,
     );
     let force_materialization_id = force_materialization.id.as_str().to_owned();
+    let force_instance_id = force_materialization.instance_id.as_str().to_owned();
     store.seed_materialization(force_materialization);
     let force_deleted = service
         .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
-            materialization_id: force_materialization_id.clone(),
+            instance_id: force_instance_id.clone(),
             operator: "operator-a".to_owned(),
             reason: "inspected cleanup completed".to_owned(),
         }))
@@ -1795,6 +1863,7 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
                     version: 3,
                 }),
                 values: [("tenant".to_owned(), "transport".to_owned())].into(),
+                routes: Vec::new(),
             },
             "application/grpc",
             Version::HTTP_2,
@@ -2023,6 +2092,7 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
                 version: 11,
             }),
             values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes: Vec::new(),
         },
     )
     .await;
@@ -2189,6 +2259,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
                 version: 13,
             }),
             values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes: Vec::new(),
         },
     )
     .await;
@@ -2362,6 +2433,7 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
                     version: 1,
                 }),
                 values: Default::default(),
+                routes: Vec::new(),
             },
         ))
         .await
@@ -2440,6 +2512,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                     version: 1,
                 }),
                 values: Default::default(),
+                routes: Vec::new(),
             },
         ))
         .await
@@ -2458,6 +2531,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
     );
     missing_request.headers_mut().remove(header::AUTHORIZATION);
@@ -2489,6 +2563,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                         version: 1,
                     }),
                     values: Default::default(),
+                    routes: Vec::new(),
                 },
             ),
             "Bearer proxy-token",

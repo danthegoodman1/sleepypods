@@ -308,6 +308,7 @@ async fn create_tls_termination_resources(
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), TERMINATION_TARGET.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -343,6 +344,7 @@ async fn create_sni_passthrough_resources(
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 

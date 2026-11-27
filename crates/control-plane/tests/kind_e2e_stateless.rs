@@ -347,6 +347,7 @@ async fn create_operator_resources(
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -384,6 +385,7 @@ async fn begin_abandoned_wake(
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         })
         .await?
         .into_inner();

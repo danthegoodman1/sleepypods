@@ -382,22 +382,13 @@ async fn accepted_delete_survives_restart_without_another_mutation(
     let delete_generation = get_instance(operator, "restart-delete").await?.generation;
     let selector = format!("{INSTANCE_ID_LABEL}=restart-delete");
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &config.namespace);
-    let deployment = single_labeled_object(
+    single_labeled_object(
         "Deployment",
         "restart-delete",
         deployments
             .list(&ListParams::default().labels(&selector))
             .await?,
     )?;
-    let materialization_id = deployment
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| {
-            annotations.get(control_plane::projection::ANNOTATION_MATERIALIZATION_ID)
-        })
-        .ok_or("restart-delete workload has no materialization identity")?
-        .clone();
     let pods: Api<Pod> = Api::namespaced(kube.clone(), &config.namespace);
     let pod = single_labeled_object(
         "Pod",
@@ -450,7 +441,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pods,
             &pod_name,
             &pod_uid,
-            &materialization_id,
+            "restart-delete",
             FINALIZER,
             0,
         )
@@ -481,7 +472,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
         // baseline so the following increment proves a new controller pass.
         let restored = recovered_operator
             .reconcile_materialization(ReconcileMaterializationRequest {
-                materialization_id: materialization_id.clone(),
+                instance_id: "restart-delete".into(),
                 status_only: true,
             })
             .await?
@@ -494,7 +485,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pods,
             &pod_name,
             &pod_uid,
-            &materialization_id,
+            "restart-delete",
             FINALIZER,
             restored.failure_count,
         )
@@ -540,7 +531,7 @@ async fn wait_for_blocked_delete(
     pods: &Api<Pod>,
     name: &str,
     uid: &str,
-    materialization_id: &str,
+    instance_id: &str,
     finalizer: &str,
     previous_failures: u32,
 ) -> TestResult<ReconcileMaterializationResponse> {
@@ -549,7 +540,7 @@ async fn wait_for_blocked_delete(
         let pod = pods.get(name).await?;
         let status = operator
             .reconcile_materialization(ReconcileMaterializationRequest {
-                materialization_id: materialization_id.into(),
+                instance_id: instance_id.into(),
                 status_only: true,
             })
             .await?
@@ -1060,6 +1051,7 @@ async fn create_instance(
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), target.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 

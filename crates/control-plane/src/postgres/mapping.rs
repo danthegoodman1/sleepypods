@@ -473,13 +473,7 @@ pub(crate) fn materialization_id(
     instance_id: &InstanceId,
     target: &MaterializationTarget,
 ) -> StoreResult<MaterializationId> {
-    MaterializationId::new(format!(
-        "{}:{}:{}",
-        instance_id.as_str(),
-        target.cluster_id(),
-        target.namespace()
-    ))
-    .map_err(invalid_stored_data)
+    crate::ids::materialization_id(instance_id, target).map_err(invalid_stored_data)
 }
 
 pub(crate) fn instance_state_to_db(state: InstanceState) -> &'static str {

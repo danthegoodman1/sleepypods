@@ -21,17 +21,17 @@ use control_plane::{
     DeleteMaterializationReconciliationRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     FinalizeSleepReconciliationRequest, FinalizeSleepRequest, ForceReleaseExclusivityKeyRequest,
     Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey,
-    IdleTimeoutOverridePolicy, InstanceId, InstanceState,
+    IdleTimeoutOverridePolicy, InstanceId, InstanceRoute, InstanceState,
     ListMaterializationReconciliationCandidatesRequest, ManifestTemplate, MaterializationState,
     MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
-    ResolveRouteRequest, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
-    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    ResolveRouteRequest, RouteBindingId, RouteDependencyLookup, RouteHost, RouteIdentity,
+    RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
+    StoreError, TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion,
+    WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -258,8 +258,8 @@ async fn run_conformance(
         "instance-a",
         class.reference.clone(),
         vec![
-            http_route("app.example.com", Some("/api")),
-            sni_route("db.example.com"),
+            http_identity("app.example.com", Some("/api")),
+            sni_identity("db.example.com"),
         ],
     );
     let created = store.create_instance(create.clone()).await?;
@@ -344,7 +344,7 @@ async fn run_conformance(
             "idem-create-a",
             "instance-conflict",
             class.reference.clone(),
-            vec![http_route("conflict.example.com", None)],
+            vec![http_identity("conflict.example.com", None)],
         ))
         .await
         .expect_err("same idempotency key with a different payload conflicts");
@@ -355,7 +355,7 @@ async fn run_conformance(
             "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
-            vec![http_route("app.example.com", Some("/api"))],
+            vec![http_identity("app.example.com", Some("/api"))],
         ))
         .await
         .expect_err("duplicate route identity is rejected");
@@ -371,7 +371,7 @@ async fn run_conformance(
             "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
-            vec![http_route("rollback.example.com", None)],
+            vec![http_identity("rollback.example.com", None)],
         ))
         .await?;
     assert_eq!(
@@ -2479,7 +2479,7 @@ async fn exercise_complete_wake(
             "idem-complete-wake-success",
             "instance-complete-wake-success",
             workload_class.clone(),
-            vec![http_route("complete-wake.example.com", None)],
+            vec![http_identity("complete-wake.example.com", None)],
         ))
         .await?;
     let instance_id = success.instance.id.clone();
@@ -2862,7 +2862,7 @@ async fn exercise_complete_wake(
             "idem-complete-wake-rewind",
             "instance-complete-wake-rewind",
             workload_class,
-            vec![http_route("complete-wake-rewind.example.com", None)],
+            vec![http_identity("complete-wake-rewind.example.com", None)],
         ))
         .await?;
     let rewind_id = rewind.instance.id.clone();
@@ -3376,8 +3376,17 @@ fn create_instance_request(
     idempotency_key: &str,
     instance_id: &str,
     workload_class: WorkloadClassVersionRef,
-    route_bindings: Vec<RouteBindingSpec>,
+    route_identities: Vec<RouteIdentity>,
 ) -> CreateInstanceRequest {
+    let route_bindings = route_identities
+        .into_iter()
+        .enumerate()
+        .map(|(index, identity)| InstanceRoute {
+            id: RouteBindingId::new(format!("{instance_id}:route:{}", index + 1))
+                .expect("valid route binding ID"),
+            identity,
+        })
+        .collect();
     CreateInstanceRequest::new(
         IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         InstanceId::new(instance_id).expect("valid instance ID"),
@@ -3417,25 +3426,6 @@ fn sni_identity(host: &str) -> RouteIdentity {
     RouteIdentity::Sni {
         host: RouteHost::exact(host).expect("valid host"),
     }
-}
-
-fn http_route(host: &str, path: Option<&str>) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Http {
-            host: RouteHost::exact(host).expect("valid host"),
-            path: path.map(|path| PathPrefix::new(path).expect("valid path prefix")),
-        },
-        ProtocolRoute::Http,
-    )
-}
-
-fn sni_route(host: &str) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Sni {
-            host: RouteHost::exact(host).expect("valid host"),
-        },
-        ProtocolRoute::TlsSni,
-    )
 }
 
 fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {

@@ -421,10 +421,7 @@ async fn duplicate_volume_inventory_is_rejected_before_acceptance(
     }
     let status = operator
         .reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id: format!(
-                "{DUPLICATE_VOLUME_INSTANCE_ID}:kind-e2e-failures:{}",
-                config.namespace
-            ),
+            instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
             status_only: true,
         })
         .await?
@@ -606,6 +603,7 @@ async fn create_class_instance_and_route(
                 version: 1,
             }),
             values: HashMap::new(),
+            routes: Vec::new(),
         })
         .await?;
 

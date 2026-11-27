@@ -76,6 +76,12 @@ impl<C> StoreBackedOperatorApi<C>
 where
     C: KubernetesMaterializerClient,
 {
+    /// The instance's materialization in this control plane's target.
+    fn materialization_id(&self, instance_id: String) -> Result<MaterializationId, Status> {
+        crate::ids::materialization_id(&parse_instance_id(instance_id)?, &self.target)
+            .map_err(invalid_argument_status)
+    }
+
     async fn projection_observations(
         &self,
         materialization: &MaterializationRecord,
@@ -386,8 +392,7 @@ where
         request: Request<pb::ReconcileMaterializationRequest>,
     ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
         let request = request.into_inner();
-        let materialization_id =
-            MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?;
+        let materialization_id = self.materialization_id(request.instance_id)?;
         let before = self
             .store
             .load_materialization(LoadMaterializationRequest::new(materialization_id.clone()))
@@ -409,7 +414,7 @@ where
             }));
         };
 
-        let attempted = if request.status_only || before.target != self.target {
+        let attempted = if request.status_only {
             false
         } else {
             self.store
@@ -467,7 +472,12 @@ where
         &self,
         request: Request<pb::ForceDeleteMaterializationRequest>,
     ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
-        let request = force_delete_materialization_request_from_proto(request.into_inner())?;
+        let request = request.into_inner();
+        let request = ForceDeleteMaterializationRequest::new(
+            self.materialization_id(request.instance_id)?,
+            request.operator,
+            request.reason,
+        );
         let materialization_id = request.materialization_id.as_str().to_owned();
         let materialization = self
             .store
@@ -527,12 +537,27 @@ fn create_instance_request_from_proto(
         .ok_or_else(|| Status::invalid_argument("workload_class is required"))
         .and_then(workload_class_ref_from_proto)?;
 
+    let route_bindings = request
+        .routes
+        .into_iter()
+        .map(|route| {
+            Ok(domain_instance::InstanceRoute {
+                id: parse_route_binding_id(route.route_binding_id)?,
+                identity: route
+                    .identity
+                    .ok_or_else(|| Status::invalid_argument("routes.identity is required"))
+                    .and_then(route_identity_from_proto)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
     Ok(domain_instance::CreateInstanceRequest::new(
         parse_idempotency_key(request.idempotency_key)?,
         parse_instance_id(request.instance_id)?,
         workload_class,
     )
-    .with_values(request.values.into_iter().collect()))
+    .with_values(request.values.into_iter().collect())
+    .with_route_bindings(route_bindings))
 }
 
 fn create_workload_class_request_from_proto(
@@ -723,16 +748,6 @@ pub(super) fn http01_key_from_proto(
     key: pb::Http01ChallengeKey,
 ) -> Result<domain_http01::Http01ChallengeKey, Status> {
     domain_http01::Http01ChallengeKey::new(key.host, key.token).map_err(invalid_argument_status)
-}
-
-fn force_delete_materialization_request_from_proto(
-    request: pb::ForceDeleteMaterializationRequest,
-) -> Result<ForceDeleteMaterializationRequest, Status> {
-    Ok(ForceDeleteMaterializationRequest::new(
-        MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?,
-        request.operator,
-        request.reason,
-    ))
 }
 
 fn force_release_exclusivity_key_request_from_proto(

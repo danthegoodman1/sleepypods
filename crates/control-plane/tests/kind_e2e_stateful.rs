@@ -328,7 +328,7 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     let blocked_status = observer
         .reconcile_materialization(ReconcileMaterializationRequest {
             status_only: true,
-            materialization_id: config.materialization_id(EXCLUSIVE_BLOCKED_INSTANCE_ID),
+            instance_id: EXCLUSIVE_BLOCKED_INSTANCE_ID.to_owned(),
         })
         .await?
         .into_inner();
@@ -532,7 +532,7 @@ async fn run_projection_drift_and_finalizer_safety(
     assert_materialized_stateful_objects(kube.clone(), config).await?;
 
     let materialization_id = config.materialization_id(INSTANCE_ID);
-    let baseline = reconcile_materialization(operator, &materialization_id).await?;
+    let baseline = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&baseline, &materialization_id)?;
     assert_no_unowned_projection_observations(&baseline.projection_observations, "baseline")?;
     expect_projection_observation(
@@ -557,7 +557,7 @@ async fn run_projection_drift_and_finalizer_safety(
     )
     .await?;
 
-    let missing = reconcile_materialization(operator, &materialization_id).await?;
+    let missing = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&missing, &materialization_id)?;
     assert_no_unowned_projection_observations(&missing.projection_observations, "missing Service")?;
     expect_projection_observation(
@@ -595,7 +595,7 @@ async fn run_projection_drift_and_finalizer_safety(
 
     eprintln!("projection drift E2E: creating an unowned same-name Service collision");
     create_unowned_service_collision(kube.clone(), &config.namespace, &original_service).await?;
-    let unowned = reconcile_materialization(operator, &materialization_id).await?;
+    let unowned = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&unowned, &materialization_id)?;
     let unowned_service = expect_projection_observation(
         &unowned.projection_observations,
@@ -633,7 +633,7 @@ async fn run_projection_drift_and_finalizer_safety(
             "deletion must be durably accepted while the injected finalizer blocks cleanup".into(),
         );
     }
-    let blocked_collision = reconcile_materialization(operator, &materialization_id).await?;
+    let blocked_collision = reconcile_materialization(operator, INSTANCE_ID).await?;
     expect_projection_observation(
         &blocked_collision.projection_observations,
         "v1",
@@ -664,11 +664,11 @@ async fn run_projection_drift_and_finalizer_safety(
     eprintln!(
         "projection drift E2E: accepted cleanup now blocked by the owned StatefulSet finalizer"
     );
-    let _ = reconcile_materialization(operator, &materialization_id).await?;
+    let _ = reconcile_materialization(operator, INSTANCE_ID).await?;
 
     let blocked = wait_for_reconcile_observation(
         operator,
-        &materialization_id,
+        INSTANCE_ID,
         ReconcileObservationExpectation {
             api_version: "apps/v1",
             kind: "StatefulSet",
@@ -970,6 +970,7 @@ async fn create_stateful_operator_resources(
                 version: 1,
             }),
             values: HashMap::from([("tenant".to_owned(), TENANT_VALUE.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -1075,6 +1076,7 @@ async fn create_exclusive_instance_and_route(
                 ("tenant".to_owned(), tenant.to_owned()),
                 ("volume_handle".to_owned(), volume_handle.to_owned()),
             ]),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -1165,12 +1167,12 @@ async fn assert_instance_generation(
 
 async fn reconcile_materialization(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    materialization_id: &str,
+    instance_id: &str,
 ) -> TestResult<ReconcileMaterializationResponse> {
     Ok(operator
         .reconcile_materialization(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id: materialization_id.to_owned(),
+            instance_id: instance_id.to_owned(),
         })
         .await?
         .into_inner())
@@ -1266,13 +1268,13 @@ struct ReconcileObservationExpectation<'a> {
 
 async fn wait_for_reconcile_observation(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    materialization_id: &str,
+    instance_id: &str,
     expectation: ReconcileObservationExpectation<'_>,
     timeout: Duration,
 ) -> TestResult<ReconcileMaterializationResponse> {
     let deadline = Instant::now() + timeout;
     loop {
-        let response = reconcile_materialization(operator, materialization_id).await?;
+        let response = reconcile_materialization(operator, instance_id).await?;
         if expect_projection_observation(
             &response.projection_observations,
             expectation.api_version,

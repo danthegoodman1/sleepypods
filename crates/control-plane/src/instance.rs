@@ -3,8 +3,8 @@ pub use sleepypods_api::InstanceState;
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    ids::{Generation, IdempotencyKey, InstanceId},
-    route::{RouteBindingRecord, RouteBindingSpec},
+    ids::{Generation, IdempotencyKey, InstanceId, RouteBindingId},
+    route::{RouteBindingRecord, RouteIdentity},
     sleep_policy::SleepPolicyError,
     workload::{ValueSchemaError, WorkloadClassVersion, WorkloadClassVersionRef},
 };
@@ -26,7 +26,14 @@ pub struct CreateInstanceRequest {
     pub instance_id: InstanceId,
     pub workload_class: WorkloadClassVersionRef,
     pub values: InstanceValues,
-    pub route_bindings: Vec<RouteBindingSpec>,
+    pub route_bindings: Vec<InstanceRoute>,
+}
+
+/// A route binding created in the same transaction as its instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceRoute {
+    pub id: RouteBindingId,
+    pub identity: RouteIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,7 +192,7 @@ impl CreateInstanceRequest {
         self
     }
 
-    pub fn with_route_bindings(mut self, route_bindings: Vec<RouteBindingSpec>) -> Self {
+    pub fn with_route_bindings(mut self, route_bindings: Vec<InstanceRoute>) -> Self {
         self.route_bindings = route_bindings;
         self
     }

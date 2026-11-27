@@ -422,6 +422,13 @@ message CreateInstanceRequest {
   string instance_id = 2;
   WorkloadClassVersionRef workload_class = 3;
   map<string, string> values = 4;
+  // Route bindings created in the same transaction as the instance.
+  repeated InstanceRoute routes = 5;
+}
+
+message InstanceRoute {
+  string route_binding_id = 1;
+  RouteIdentity identity = 2;
 }
 
 message GetInstanceRequest {
@@ -535,8 +542,9 @@ message DeleteHttp01ChallengeResponse {
   bool deleted = 1;
 }
 
+// Addresses the instance's materialization in this control plane's target.
 message ReconcileMaterializationRequest {
-  string materialization_id = 1;
+  string instance_id = 1;
   bool status_only = 2;
 }
 
@@ -571,8 +579,9 @@ message UncertainMaterializationEffect {
   int64 started_at_unix_millis = 9;
 }
 
+// Addresses the instance's materialization in this control plane's target.
 message ForceDeleteMaterializationRequest {
-  string materialization_id = 1;
+  string instance_id = 1;
   string operator = 2;
   string reason = 3;
 }

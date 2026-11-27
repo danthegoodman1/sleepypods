@@ -276,6 +276,7 @@ async fn create_operator_resources(
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 

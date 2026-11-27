@@ -522,16 +522,9 @@ async fn delete_while_draining_cleans_deleting_materialization(
     .await?;
 
     let workloads: Api<StatefulSet> = Api::namespaced(kube.clone(), &config.namespace);
-    let workload = workloads
+    workloads
         .get("lifecycle-delete-draining-3cf19f0ede4c361d")
         .await?;
-    let materialization_id = workload
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get("sleepypods.io/materialization-id"))
-        .ok_or("current StatefulSet has no materialization identity")?
-        .clone();
     let mut removed_delete_permission = false;
     let blocked_result: TestResult<()> = async {
         // Record the owned change before dispatch so an ambiguous Role update
@@ -610,7 +603,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
         loop {
             let status = operator
                 .reconcile_materialization(ReconcileMaterializationRequest {
-                    materialization_id: materialization_id.clone(),
+                    instance_id: "lifecycle-delete-draining".to_owned(),
                     status_only: true,
                 })
                 .await?
@@ -671,7 +664,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
     // then observe completion without replaying DeleteInstance.
     let recovery = operator
         .reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id,
+            instance_id: "lifecycle-delete-draining".to_owned(),
             status_only: false,
         })
         .await?
@@ -1364,6 +1357,7 @@ async fn create_instance(
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), target.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
     Ok(())

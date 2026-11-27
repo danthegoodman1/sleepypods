@@ -291,10 +291,30 @@ impl ControlPlaneStore for TestStore {
                 .lock()
                 .expect("fake store lock is available")
                 .insert(instance.id.as_str().to_owned(), instance.clone());
+            let route_bindings = request
+                .route_bindings
+                .into_iter()
+                .map(|route| control_plane::RouteBindingRecord {
+                    id: route.id,
+                    instance_id: instance.id.clone(),
+                    protocol: match route.identity {
+                        RouteIdentity::Http { .. } => ProtocolRoute::Http,
+                        RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
+                    },
+                    identity: route.identity,
+                })
+                .collect::<Vec<_>>();
+            let mut stored = self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available");
+            for record in &route_bindings {
+                stored.insert(record.id.as_str().to_owned(), record.clone());
+            }
 
             Ok(CreateInstanceResult {
                 instance,
-                route_bindings: Vec::new(),
+                route_bindings,
                 idempotency_replayed: false,
             })
         })
