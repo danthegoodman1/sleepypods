@@ -301,13 +301,13 @@ async fn run_conformance(
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-69856ec0"),
+            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-69856ec0faae6daf"),
         "loaded workload class template should render durable instance Deployment, got {rendered_names:?}"
     );
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-69856ec0"),
+            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-69856ec0faae6daf"),
         "loaded workload class template should render durable instance Service, got {rendered_names:?}"
     );
 

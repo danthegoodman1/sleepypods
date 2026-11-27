@@ -54,9 +54,9 @@ const ROUTE_HOST: &str = "stateful.sleepypods.test";
 const TENANT_VALUE: &str = "stateful";
 const WORKLOAD_NAME: &str = "e2e-stateful-app";
 // Expected suffix: first eight SHA-256 hex digits of the complete INSTANCE_ID.
-const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c";
-const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c";
-const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c883bce91";
+const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c883bce91";
+const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c883bce91";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const CLUSTER_ID: &str = "kind-e2e-stateful";

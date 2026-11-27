@@ -375,7 +375,7 @@ suffix to every instance-scoped object name:
 <base-name-truncated-if-needed>-<instance-id-hash>
 ```
 
-The suffix is the first eight lowercase hexadecimal characters of SHA-256 over
+The suffix is the first sixteen lowercase hexadecimal characters of SHA-256 over
 the complete instance ID, including for short IDs. The suffix is preserved and the
 operator base name is truncated first so the final name remains a DNS label no
 longer than 63 characters. SleepyPods does not add the Kubernetes object kind to

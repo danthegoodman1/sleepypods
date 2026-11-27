@@ -98,7 +98,7 @@ fn renders_deployment_and_service_without_volumes() {
         KubernetesObject::Service(service) => service,
         other => panic!("expected Service, got {}", other.kind()),
     };
-    assert_eq!(service.metadata.name, "svc-acme-69856ec0");
+    assert_eq!(service.metadata.name, "svc-acme-69856ec0faae6daf");
     assert_eq!(service.spec.selector[LABEL_INSTANCE_ID], "instance-a");
     assert_eq!(service.spec.ports[0].port, 80);
     assert_eq!(service.spec.ports[0].target_port, 15000);
@@ -107,7 +107,7 @@ fn renders_deployment_and_service_without_volumes() {
         KubernetesObject::Deployment(deployment) => deployment,
         other => panic!("expected Deployment, got {}", other.kind()),
     };
-    assert_eq!(deployment.metadata.name, "app-acme-69856ec0");
+    assert_eq!(deployment.metadata.name, "app-acme-69856ec0faae6daf");
     assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_ID], "instance-a");
     assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_GENERATION], "7");
     assert_eq!(deployment.metadata.labels[LABEL_WORKLOAD_CLASS_ID], "web");
@@ -238,7 +238,10 @@ fn private_render_options_inject_sidecar_control_plane_token() {
             _ => None,
         })
         .expect("sidecar token Secret renders");
-    assert_eq!(secret.metadata.name, "sleepypods-sidecar-token-69856ec0");
+    assert_eq!(
+        secret.metadata.name,
+        "sleepypods-sidecar-token-69856ec0faae6daf"
+    );
     assert_eq!(secret.metadata.namespace.as_deref(), Some("apps"));
     assert_eq!(secret.string_data["token"], "sidecar-secret");
 
@@ -281,7 +284,7 @@ fn private_render_options_inject_sidecar_control_plane_token() {
     let super::EnvVarSource::SecretKeyRef(source) = source else {
         panic!("expected secret reference")
     };
-    assert_eq!(source.name, "sleepypods-sidecar-token-69856ec0");
+    assert_eq!(source.name, "sleepypods-sidecar-token-69856ec0faae6daf");
     assert_eq!(source.key, "token");
     assert_eq!(token_env.value, "");
 }
@@ -299,11 +302,11 @@ fn rendered_names_use_hash_suffix_for_short_instance_id() {
 
     assert_eq!(
         object_name(&rendered.objects[0].object),
-        "svc-acme-ba7816bf"
+        "svc-acme-ba7816bf8f01cfea"
     );
     assert_eq!(
         object_name(&rendered.objects[1].object),
-        "app-acme-ba7816bf"
+        "app-acme-ba7816bf8f01cfea"
     );
 }
 
@@ -320,11 +323,11 @@ fn rendered_names_hash_full_long_instance_id() {
 
     assert_eq!(
         object_name(&rendered.objects[0].object),
-        "svc-acme-ca2f2069"
+        "svc-acme-ca2f2069ea0c6e46"
     );
     assert_eq!(
         object_name(&rendered.objects[1].object),
-        "app-acme-ca2f2069"
+        "app-acme-ca2f2069ea0c6e46"
     );
 }
 
@@ -347,10 +350,10 @@ fn rendered_names_truncate_operator_base_before_instance_suffix() {
     let workload_name = object_name(&rendered.objects[1].object);
     assert_eq!(service_name.len(), 63);
     assert_eq!(workload_name.len(), 63);
-    assert!(service_name.ends_with("-69856ec0"));
-    assert!(workload_name.ends_with("-69856ec0"));
-    assert_eq!(&service_name[..54], "s".repeat(54));
-    assert_eq!(&workload_name[..54], "w".repeat(54));
+    assert!(service_name.ends_with("-69856ec0faae6daf"));
+    assert!(workload_name.ends_with("-69856ec0faae6daf"));
+    assert_eq!(&service_name[..46], "s".repeat(46));
+    assert_eq!(&workload_name[..46], "w".repeat(46));
 }
 
 #[test]
@@ -368,8 +371,14 @@ fn rendered_names_do_not_add_kubernetes_kind_tokens() {
     })
     .expect("deployment renders");
 
-    assert_eq!(object_name(&rendered.objects[0].object), "shared-69856ec0");
-    assert_eq!(object_name(&rendered.objects[1].object), "shared-69856ec0");
+    assert_eq!(
+        object_name(&rendered.objects[0].object),
+        "shared-69856ec0faae6daf"
+    );
+    assert_eq!(
+        object_name(&rendered.objects[1].object),
+        "shared-69856ec0faae6daf"
+    );
 }
 
 #[test]
@@ -390,7 +399,7 @@ fn rejects_invalid_custom_rendered_object_name() {
         error,
         ManifestRenderError::InvalidName {
             field: "workload.name",
-            value: "App-69856ec0".to_owned(),
+            value: "App-69856ec0faae6daf".to_owned(),
         }
     );
 }
@@ -443,7 +452,10 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     let service = &objects[0];
     assert_eq!(service["apiVersion"], json!("v1"));
     assert_eq!(service["kind"], json!("Service"));
-    assert_eq!(service["metadata"]["name"], json!("svc-acme-69856ec0"));
+    assert_eq!(
+        service["metadata"]["name"],
+        json!("svc-acme-69856ec0faae6daf")
+    );
     assert_eq!(service["metadata"]["namespace"], json!("apps"));
     assert_eq!(
         service["metadata"]["labels"][LABEL_INSTANCE_ID],
@@ -469,7 +481,10 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     let deployment = &objects[1];
     assert_eq!(deployment["apiVersion"], json!("apps/v1"));
     assert_eq!(deployment["kind"], json!("Deployment"));
-    assert_eq!(deployment["metadata"]["name"], json!("app-acme-69856ec0"));
+    assert_eq!(
+        deployment["metadata"]["name"],
+        json!("app-acme-69856ec0faae6daf")
+    );
     assert_eq!(deployment["metadata"]["namespace"], json!("apps"));
     assert_eq!(deployment["spec"]["replicas"], json!(1));
     assert_eq!(deployment["spec"]["strategy"]["type"], json!("Recreate"));
@@ -558,7 +573,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         KubernetesObject::PersistentVolume(pv) => pv,
         other => panic!("expected PersistentVolume, got {}", other.kind()),
     };
-    assert_eq!(pv.metadata.name, "pv-acme-2e1ac556");
+    assert_eq!(pv.metadata.name, "pv-acme-2e1ac556311afdd5");
     assert_eq!(pv.metadata.labels[LABEL_INSTANCE_ID], "postgres-a");
     assert_eq!(
         pv.spec.access_modes,
@@ -571,7 +586,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
     );
     assert_eq!(pv.spec.storage_class_name.as_deref(), Some("manual"));
     assert_eq!(pv.spec.claim_ref.namespace, "data");
-    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556");
+    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556311afdd5");
     assert_eq!(
         pv.spec.source,
         PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
@@ -592,17 +607,17 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         KubernetesObject::PersistentVolumeClaim(pvc) => pvc,
         other => panic!("expected PersistentVolumeClaim, got {}", other.kind()),
     };
-    assert_eq!(pvc.metadata.name, "pvc-acme-2e1ac556");
+    assert_eq!(pvc.metadata.name, "pvc-acme-2e1ac556311afdd5");
     assert_eq!(pvc.metadata.namespace.as_deref(), Some("data"));
-    assert_eq!(pvc.spec.volume_name, "pv-acme-2e1ac556");
+    assert_eq!(pvc.spec.volume_name, "pv-acme-2e1ac556311afdd5");
     assert_eq!(pvc.spec.resources.requests_storage, "10Gi");
 
     let stateful_set = match &rendered.objects[3].object {
         KubernetesObject::StatefulSet(stateful_set) => stateful_set,
         other => panic!("expected StatefulSet, got {}", other.kind()),
     };
-    assert_eq!(stateful_set.metadata.name, "db-acme-2e1ac556");
-    assert_eq!(stateful_set.spec.service_name, "db-acme-2e1ac556");
+    assert_eq!(stateful_set.metadata.name, "db-acme-2e1ac556311afdd5");
+    assert_eq!(stateful_set.spec.service_name, "db-acme-2e1ac556311afdd5");
     assert_eq!(stateful_set.spec.replicas, 1);
     assert_eq!(stateful_set.spec.template.spec.containers.len(), 2);
     assert_eq!(
@@ -626,7 +641,7 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         stateful_set.spec.template.spec.volumes[0]
             .persistent_volume_claim
             .claim_name,
-        "pvc-acme-2e1ac556"
+        "pvc-acme-2e1ac556311afdd5"
     );
     assert_eq!(
         stateful_set.spec.template.spec.containers[0].volume_mounts[0].name,
@@ -754,7 +769,7 @@ spec:
             ),
             (
                 ApplyOrder::Service,
-                object_ref("v1", "Service", "apps", "svc-acme-69856ec0")
+                object_ref("v1", "Service", "apps", "svc-acme-69856ec0faae6daf")
             ),
             (
                 ApplyOrder::Service,
@@ -762,7 +777,7 @@ spec:
             ),
             (
                 ApplyOrder::Workload,
-                object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0")
+                object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0faae6daf")
             ),
             (
                 ApplyOrder::Workload,
@@ -798,7 +813,7 @@ spec:
             .filter(|object| object.kind == "Service")
             .map(|object| object.name.as_str())
             .collect::<Vec<_>>(),
-        ["svc-acme-69856ec0", "raw-svc-acme"],
+        ["svc-acme-69856ec0faae6daf", "raw-svc-acme"],
         "stable apply ordering preserves the generated primary Service ahead of raw Services"
     );
     assert_eq!(
@@ -980,7 +995,7 @@ fn rejects_duplicate_raw_and_typed_rendered_object_refs() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: svc-acme-69856ec0
+  name: svc-acme-69856ec0faae6daf
 "#,
     )];
 
@@ -996,7 +1011,7 @@ metadata:
     assert_invalid_field(
         error,
         "template",
-        "duplicate rendered Kubernetes object ref v1 Service apps/svc-acme-69856ec0",
+        "duplicate rendered Kubernetes object ref v1 Service apps/svc-acme-69856ec0faae6daf",
     );
 }
 
@@ -1462,9 +1477,9 @@ metadata:
     assert_eq!(
         refs,
         vec![
-            object_ref("v1", "Service", "apps", "svc-acme-69856ec0"),
+            object_ref("v1", "Service", "apps", "svc-acme-69856ec0faae6daf"),
             object_ref("v1", "Service", "apps", "raw-svc"),
-            object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0"),
+            object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0faae6daf"),
         ]
     );
 }
@@ -1499,7 +1514,7 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
         PersistentVolumeReclaimPolicy::Retain
     );
     assert_eq!(pv.spec.claim_ref.namespace, "data");
-    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556");
+    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556311afdd5");
     assert_eq!(
         pv.spec.source,
         PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
@@ -1531,7 +1546,10 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
         objects[0]["spec"]["csi"]["volumeAttributes"]["region"],
         json!("us-west-2")
     );
-    assert_eq!(objects[1]["spec"]["volumeName"], json!("pv-acme-2e1ac556"));
+    assert_eq!(
+        objects[1]["spec"]["volumeName"],
+        json!("pv-acme-2e1ac556311afdd5")
+    );
 }
 
 #[test]
@@ -1645,7 +1663,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let pv = &objects[0];
     assert_eq!(pv["apiVersion"], json!("v1"));
     assert_eq!(pv["kind"], json!("PersistentVolume"));
-    assert_eq!(pv["metadata"]["name"], json!("pv-acme-2e1ac556"));
+    assert_eq!(pv["metadata"]["name"], json!("pv-acme-2e1ac556311afdd5"));
     assert!(
         pv["metadata"].get("namespace").is_none(),
         "PersistentVolumes are cluster-scoped"
@@ -1661,7 +1679,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
             "storageClassName": "manual",
             "claimRef": {
                 "namespace": "data",
-                "name": "pvc-acme-2e1ac556",
+                "name": "pvc-acme-2e1ac556311afdd5",
             },
             "csi": {
                 "driver": "csi.example.com",
@@ -1678,7 +1696,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let pvc = &objects[1];
     assert_eq!(pvc["apiVersion"], json!("v1"));
     assert_eq!(pvc["kind"], json!("PersistentVolumeClaim"));
-    assert_eq!(pvc["metadata"]["name"], json!("pvc-acme-2e1ac556"));
+    assert_eq!(pvc["metadata"]["name"], json!("pvc-acme-2e1ac556311afdd5"));
     assert_eq!(pvc["metadata"]["namespace"], json!("data"));
     assert_eq!(
         pvc["spec"],
@@ -1690,7 +1708,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
                 },
             },
             "storageClassName": "manual",
-            "volumeName": "pv-acme-2e1ac556",
+            "volumeName": "pv-acme-2e1ac556311afdd5",
         })
     );
 
@@ -1701,10 +1719,13 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     let stateful_set = &objects[3];
     assert_eq!(stateful_set["apiVersion"], json!("apps/v1"));
     assert_eq!(stateful_set["kind"], json!("StatefulSet"));
-    assert_eq!(stateful_set["metadata"]["name"], json!("db-acme-2e1ac556"));
+    assert_eq!(
+        stateful_set["metadata"]["name"],
+        json!("db-acme-2e1ac556311afdd5")
+    );
     assert_eq!(
         stateful_set["spec"]["serviceName"],
-        json!("db-acme-2e1ac556")
+        json!("db-acme-2e1ac556311afdd5")
     );
     assert_eq!(stateful_set["spec"]["replicas"], json!(1));
     assert_eq!(
@@ -1712,7 +1733,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
         json!({
             "name": "data",
             "persistentVolumeClaim": {
-                "claimName": "pvc-acme-2e1ac556",
+                "claimName": "pvc-acme-2e1ac556311afdd5",
             },
         })
     );
@@ -2879,7 +2900,8 @@ fn raw_auxiliaries_cannot_supply_reserved_primary_selector_labels_or_expressions
             *raw.pointer_mut(pointer).unwrap() =
                 json!([{"key":LABEL_WORKLOAD_NAME,"operator":"Exists"}]);
         } else {
-            raw.pointer_mut(pointer).unwrap()[LABEL_WORKLOAD_NAME] = json!("app-acme-69856ec0");
+            raw.pointer_mut(pointer).unwrap()[LABEL_WORKLOAD_NAME] =
+                json!("app-acme-69856ec0faae6daf");
         }
         let mut template = deployment_template();
         template.raw_objects = vec![raw_manifest(&raw.to_string())];

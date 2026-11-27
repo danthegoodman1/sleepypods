@@ -45,8 +45,8 @@ const ROUTE_ID: &str = "e2e-stateless-route";
 const ROUTE_HOST: &str = "e2e.sleepypods.test";
 const WORKLOAD_NAME: &str = "e2e-app";
 // Expected suffix: first eight SHA-256 hex digits of the complete INSTANCE_ID.
-const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd";
-const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd1378f0f8";
+const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd1378f0f8";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;

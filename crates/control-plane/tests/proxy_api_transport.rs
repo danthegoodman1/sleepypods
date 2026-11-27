@@ -165,7 +165,7 @@ async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend(
     assert_eq!(ready.instance_generation, 3);
     assert_eq!(
         ready.backend_uri,
-        "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
+        "http://svc-acme-69856ec0faae6daf.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
     assert_eq!(client.applied_objects_len(), 2);
@@ -181,7 +181,12 @@ async fn proxy_wake_unowned_live_ref_blocks_apply() {
     ));
     store.seed_workload_class(domain_workload_class());
     let client = FakeKubernetesClient::default();
-    client.set_unowned_live_object(object_ref("v1", "Service", "apps", "svc-acme-51c842a3"));
+    client.set_unowned_live_object(object_ref(
+        "v1",
+        "Service",
+        "apps",
+        "svc-acme-51c842a33d8cf7e8",
+    ));
     let service = proxy_api(store.clone(), client.clone());
 
     let response = service
@@ -2296,7 +2301,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 return Err(KubernetesClientError::new("not ready"));
             }
 
-            BackendEndpoint::new("http://svc-acme-69856ec0.apps.svc.cluster.local:80")
+            BackendEndpoint::new("http://svc-acme-69856ec0faae6daf.apps.svc.cluster.local:80")
                 .map_err(|error| KubernetesClientError::new(error.to_string()))
         })
     }
