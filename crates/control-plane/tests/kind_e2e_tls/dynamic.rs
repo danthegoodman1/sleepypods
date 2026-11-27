@@ -23,6 +23,8 @@ const HOST: &str = "dynamic.sleepypods.test";
 const IDS: [&str; 2] = ["dynamic-a", "dynamic-b"];
 const CP: &str = "sleepypods-control-plane";
 const FP: &str = "sleepypods-frontline";
+/// The control plane serves the operator service on its own listener.
+const OPERATOR_PORT: u16 = 50053;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -349,7 +351,7 @@ async fn dynamic_certificate_lifecycle_through_exact_replicas() -> TestResult<()
     Ok(())
 }
 async fn run(config: &E2eConfig, kube: Client, artifact: &mut Artifact) -> TestResult<()> {
-    let mut cp = peers(kube.clone(), &config.namespace, CP, 2, &[50051]).await?;
+    let mut cp = peers(kube.clone(), &config.namespace, CP, 2, &[OPERATOR_PORT]).await?;
     let mut fronts = peers(
         kube.clone(),
         &config.namespace,
@@ -374,10 +376,16 @@ async fn run(config: &E2eConfig, kube: Client, artifact: &mut Artifact) -> TestR
             .iter()
             .all(|v| !v.name.contains("TLS_TERMINATION_CERTS"))));
     }
-    let mut first =
-        connect_operator(&format!("https://localhost:{}", cp[0].addr(50051).port())).await?;
-    let mut second =
-        connect_operator(&format!("https://localhost:{}", cp[1].addr(50051).port())).await?;
+    let mut first = connect_operator(&format!(
+        "https://localhost:{}",
+        cp[0].addr(OPERATOR_PORT).port()
+    ))
+    .await?;
+    let mut second = connect_operator(&format!(
+        "https://localhost:{}",
+        cp[1].addr(OPERATOR_PORT).port()
+    ))
+    .await?;
     create(&mut first, config).await?;
     expect_state(&mut second, PbInstanceState::Cold, 0).await?;
     let challenge = pb::Http01ChallengeKey {
@@ -616,12 +624,20 @@ async fn run(config: &E2eConfig, kube: Client, artifact: &mut Artifact) -> TestR
     delivery_service(kube.clone(), &config.namespace, false).await?;
     scale(kube.clone(), &config.namespace, CP, 2).await?;
     let old_cp_uids = cp.iter().map(|p| p.uid().to_owned()).collect::<Vec<_>>();
-    cp = peers(kube.clone(), &config.namespace, CP, 2, &[50051]).await?;
+    cp = peers(kube.clone(), &config.namespace, CP, 2, &[OPERATOR_PORT]).await?;
     assert!(cp
         .iter()
         .all(|p| !old_cp_uids.iter().any(|uid| uid == p.uid())));
-    first = connect_operator(&format!("https://localhost:{}", cp[0].addr(50051).port())).await?;
-    second = connect_operator(&format!("https://localhost:{}", cp[1].addr(50051).port())).await?;
+    first = connect_operator(&format!(
+        "https://localhost:{}",
+        cp[0].addr(OPERATOR_PORT).port()
+    ))
+    .await?;
+    second = connect_operator(&format!(
+        "https://localhost:{}",
+        cp[1].addr(OPERATOR_PORT).port()
+    ))
+    .await?;
     no_delivery_endpoints(kube.clone(), &config.namespace).await?;
     publish(&mut second, "dynamic-cert-a", 3, &a4).await?;
     for front in &fronts {
@@ -768,7 +784,7 @@ async fn run(config: &E2eConfig, kube: Client, artifact: &mut Artifact) -> TestR
     );
     artifact.record("default-lease-outage-refusal",serde_json::json!({"elapsed_millis":outage.elapsed().as_millis(),"warm_pod_uid":fronts[0].uid()}))?;
     scale(kube.clone(), &config.namespace, CP, 2).await?;
-    cp = peers(kube.clone(), &config.namespace, CP, 2, &[50051]).await?;
+    cp = peers(kube.clone(), &config.namespace, CP, 2, &[OPERATOR_PORT]).await?;
     fronts = peers(
         kube.clone(),
         &config.namespace,
