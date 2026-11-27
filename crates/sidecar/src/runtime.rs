@@ -157,12 +157,17 @@ where
     let upgrades: Upgrades = Arc::new(Mutex::new(JoinSet::new()));
 
     let connections = serve_listener(listener, &shutdown, |stream, _| {
-        let stream = config.admission.admit_io(stream).ok()?;
-        let handshake = config.admission.handshakes.try_acquire().ok()?;
-        let initial_work = serving.drain.try_acquire().ok()?;
+        let Ok(handshake) = config.admission.handshakes.try_acquire() else {
+            return Err(stream);
+        };
+        let stream = config.admission.admit_io(stream)?;
+        // A refused socket is not activity, so drain work starts last.
+        let Ok(initial_work) = serving.drain.try_acquire() else {
+            return Err(stream.into_inner());
+        };
         let proxy = serving.proxy.clone();
         let upgrades = upgrades.clone();
-        Some(proxy_core::serve_http_connection_admitted(
+        Ok(proxy_core::serve_http_connection_admitted(
             stream,
             shutdown.clone(),
             config.admission.clone(),
@@ -189,10 +194,14 @@ where
     let serving = Serving::start(&config, client);
 
     let connections = serve_listener(listener, &shutdown, |stream, _| {
-        let connection = config.admission.connections.try_acquire().ok()?;
-        let request = config.admission.requests.try_acquire().ok()?;
+        let (Ok(connection), Ok(request)) = (
+            config.admission.connections.try_acquire(),
+            config.admission.requests.try_acquire(),
+        ) else {
+            return Err(stream);
+        };
         let proxy = serving.proxy.clone();
-        Some(async move {
+        Ok(async move {
             let (_connection, _request) = (connection, request);
             let _ = proxy.forward_tcp(stream).await;
         })
