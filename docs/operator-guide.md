@@ -876,8 +876,9 @@ Frontline connects to a ready instance's Pod address before its Service, and
 `sleepypods_runtime_pod_route_connects_total` counts each attempt by outcome:
 `pod`, `refused`, `timeout`, `claim_rejected`, `error` or `known_failed` (see
 the [runbook](operator-runbook.md#metric-names)). Sustained `timeout` or
-`error` means frontline cannot reach Pod addresses, so each new upstream
-connection spends up to 250 ms before it uses the Service.
+`error` means frontline cannot reach Pod addresses: each new backend
+generation then costs one attempt of up to 250 ms before frontline uses the
+Service.
 
 ## Lifecycle Expectations
 

@@ -216,9 +216,9 @@ Build dashboards from the exact names above:
 - Pod-first connects: rate of
   `sleepypods_runtime_pod_route_connects_total` by `outcome`. `pod` should
   dominate after cold wakes. Sustained `timeout` or `error` means frontline
-  cannot reach Pod addresses and every new connection pays up to 250 ms before
-  using the Service; `claim_rejected` means stale Pod addresses that another
-  instance's sidecar now holds.
+  cannot reach Pod addresses, so each new backend generation's first request
+  waits up to 250 ms before using the Service; `claim_rejected` means stale Pod
+  addresses that another instance's sidecar now holds.
 - Certificate delivery: inspect `sleepypods_runtime_certificate_events_total`
   by operation and outcome. Sustained refresh errors/timeouts together with
   increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
