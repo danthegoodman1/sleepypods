@@ -1,8 +1,12 @@
 use std::{
     error::Error,
-    fmt, io,
+    fmt,
+    future::{poll_fn, Future},
+    io,
     net::SocketAddr,
+    pin::{pin, Pin},
     sync::atomic::{AtomicU64, Ordering},
+    task::Poll,
     time::Duration,
 };
 
@@ -115,36 +119,49 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let idle = idle_timeout.map(IdleClock::new);
-    let to_upstream = copy_direction(
+    // Each future holds a 16 KiB buffer, so both are built in place.
+    let mut to_upstream = pin!(copy_direction(
         &mut client_read,
         &mut upstream_write,
         write_timeout,
         idle.as_ref(),
-    );
-    let to_client = copy_direction(
+    ));
+    let mut to_client = pin!(copy_direction(
         &mut upstream_read,
         &mut client_write,
         write_timeout,
         idle.as_ref(),
-    );
-    tokio::pin!(to_upstream, to_client);
+    ));
 
-    let upstream_closed_first = tokio::select! {
-        closed = &mut to_upstream => { closed?; false }
-        closed = &mut to_client => { closed?; true }
-    };
-    let other_half = async {
-        if upstream_closed_first {
-            to_upstream.await
-        } else {
-            to_client.await
+    // Poll both directions on every wake, in a fixed order.
+    let (mut upstream_closed, mut client_closed) = (false, false);
+    let mut linger: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    poll_fn(|cx| {
+        if !upstream_closed {
+            if let Poll::Ready(closed) = to_upstream.as_mut().poll(cx) {
+                closed?;
+                upstream_closed = true;
+            }
         }
-    };
-    match half_close_timeout {
-        None => other_half.await,
-        // The remaining side had its chance to finish; the session is over.
-        Some(limit) => timeout(limit, other_half).await.unwrap_or(Ok(())),
-    }
+        if !client_closed {
+            if let Poll::Ready(closed) = to_client.as_mut().poll(cx) {
+                closed?;
+                client_closed = true;
+            }
+        }
+        match (upstream_closed, client_closed, half_close_timeout) {
+            (true, true, _) => Poll::Ready(Ok(())),
+            (false, false, _) | (_, _, None) => Poll::Pending,
+            // One side closed. The other has `limit` to finish; then the
+            // session is over.
+            (_, _, Some(limit)) => linger
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)))
+                .as_mut()
+                .poll(cx)
+                .map(Ok),
+        }
+    })
+    .await
 }
 
 async fn copy_direction<R, W>(
@@ -198,7 +215,7 @@ fn record_activity(idle: Option<&IdleClock>) {
 
 async fn wait_for_progress<F, T>(future: F, idle: Option<&IdleClock>) -> io::Result<T>
 where
-    F: std::future::Future<Output = io::Result<T>>,
+    F: Future<Output = io::Result<T>>,
 {
     let Some(idle) = idle else {
         return future.await;

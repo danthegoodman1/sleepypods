@@ -564,3 +564,35 @@ async fn websocket_proxy_connects_to_an_ipv6_literal_upstream() {
     drop((client, upstream_task.await.unwrap()));
     let _ = timeout(TEST_TIMEOUT, proxy_task).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_peer_that_keeps_its_stream_open_after_the_other_closed_is_released_at_the_close_timeout()
+{
+    let (listener, upstream_addr) = upstream_listener().await;
+    let upstream_task = tokio::spawn(async move { accept_raw_upgrade(listener, "").await.1 });
+    let drain = drain();
+    let proxy = WebSocketProxy::with_config(
+        drain.clone(),
+        WebSocketProxyConfig {
+            close_timeout: Duration::from_millis(200),
+            ..WebSocketProxyConfig::default()
+        },
+    );
+    let (proxy_addr, proxy_task) = spawn_websocket_proxy(proxy, upstream_addr).await;
+    let (_, mut client) = raw_upgrade(proxy_addr, "").await;
+
+    // The app closes. The client sees the end of the stream and stays connected.
+    drop(upstream_task.await.unwrap());
+    assert_eq!(client.read(&mut [0_u8; 1]).await.unwrap(), 0);
+    assert_eq!(drain.active_count(), 1);
+
+    let started = tokio::time::Instant::now();
+    timeout(TEST_TIMEOUT, proxy_task)
+        .await
+        .expect("the close timeout ends the session")
+        .unwrap()
+        .expect("a session that ends at the close timeout is not an error");
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    drain.wait_for_active_count(0).await;
+    drop(client);
+}

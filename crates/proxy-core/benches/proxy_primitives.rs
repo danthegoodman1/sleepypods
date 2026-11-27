@@ -43,13 +43,17 @@ fn tcp_forwarding(c: &mut Criterion) {
                     let (mut client, proxy_client) = duplex(16 * 1024);
                     let (proxy_upstream, mut upstream) = duplex(16 * 1024);
 
-                    let proxy_task = tokio::spawn(proxy_streams_with_timeouts(
-                        proxy_client,
-                        proxy_upstream,
-                        idle_timeout,
-                        WRITE_TIMEOUT,
-                        None,
-                    ));
+                    // A session task builds its relay in place, as the listeners do.
+                    let proxy_task = tokio::spawn(async move {
+                        proxy_streams_with_timeouts(
+                            proxy_client,
+                            proxy_upstream,
+                            idle_timeout,
+                            WRITE_TIMEOUT,
+                            None,
+                        )
+                        .await
+                    });
 
                     client.write_all(&payload).await.expect("client writes");
                     client.shutdown().await.expect("client closes writes");
@@ -124,13 +128,16 @@ fn websocket_relay(c: &mut Criterion) {
                     WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
 
                 // The proxy relays the upgraded bytes; only the peers frame them.
-                let proxy_task = tokio::spawn(proxy_streams_with_timeouts(
-                    proxy_client_io,
-                    proxy_upstream_io,
-                    None,
-                    WRITE_TIMEOUT,
-                    None,
-                ));
+                let proxy_task = tokio::spawn(async move {
+                    proxy_streams_with_timeouts(
+                        proxy_client_io,
+                        proxy_upstream_io,
+                        None,
+                        WRITE_TIMEOUT,
+                        None,
+                    )
+                    .await
+                });
 
                 client
                     .send(Message::Binary(payload.clone()))
