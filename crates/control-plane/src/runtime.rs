@@ -29,7 +29,7 @@ use crate::{
         sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
-    config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
+    config::{ControlPlaneConfig, PostgresStoreConfig},
     materialization::{InvalidMaterializationTarget, MaterializationState, MaterializationTarget},
     materializer::{
         KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
@@ -49,7 +49,6 @@ pub const OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_OPERATOR_GRPC_WE
 /// Comma-separated origins whose pages may call the gRPC-Web listener.
 pub const OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV: &str =
     "SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS";
-pub const STORE_PROVIDER_ENV: &str = "SLEEPYPODS_STORE_PROVIDER";
 pub const POSTGRES_URL_ENV: &str = "SLEEPYPODS_POSTGRES_URL";
 pub const CLUSTER_ID_ENV: &str = "SLEEPYPODS_CLUSTER_ID";
 pub const NAMESPACE_ENV: &str = "SLEEPYPODS_NAMESPACE";
@@ -96,9 +95,6 @@ pub enum RuntimeConfigError {
         name: &'static str,
         value: String,
         source: AddrParseError,
-    },
-    InvalidStoreProvider {
-        value: String,
     },
     InvalidPostgresConfig(crate::ids::EmptyStringError),
     InvalidPostgresSetting {
@@ -153,71 +149,54 @@ impl RuntimeConfig {
             ));
         }
         let metrics_listen_addr = parse_optional_socket_addr(&values, METRICS_LISTEN_ADDR_ENV)?;
-        let provider = required_value(&values, STORE_PROVIDER_ENV)?;
-        let store = match provider.parse::<StoreProviderName>().map_err(|_| {
-            RuntimeConfigError::InvalidStoreProvider {
-                value: provider.to_owned(),
+        let mut store = PostgresStoreConfig::new(required_value(&values, POSTGRES_URL_ENV)?)
+            .map_err(RuntimeConfigError::InvalidPostgresConfig)?;
+        if let Some(value) =
+            postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")?
+        {
+            store.max_connections =
+                usize::try_from(value).map_err(|_| RuntimeConfigError::InvalidPostgresSetting {
+                    name: "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
+                })?;
+        }
+        for (name, setting) in [
+            (
+                "SLEEPYPODS_OPERATION_TIMEOUT_MS",
+                &mut store.operation_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
+                &mut store.pool_wait_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
+                &mut store.connection_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
+                &mut store.statement_timeout,
+            ),
+        ] {
+            if let Some(value) = postgres_positive_integer(&values, name)? {
+                *setting = std::time::Duration::from_millis(value);
             }
-        })? {
-            StoreProviderName::Postgres => {
-                let url = required_value(&values, POSTGRES_URL_ENV)?;
-                let mut config = PostgresStoreConfig::new(url)
-                    .map_err(RuntimeConfigError::InvalidPostgresConfig)?;
-                if let Some(value) =
-                    postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")?
-                {
-                    config.max_connections = usize::try_from(value).map_err(|_| {
-                        RuntimeConfigError::InvalidPostgresSetting {
-                            name: "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
-                        }
-                    })?;
-                }
-                for (name, setting) in [
-                    (
-                        "SLEEPYPODS_OPERATION_TIMEOUT_MS",
-                        &mut config.operation_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
-                        &mut config.pool_wait_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
-                        &mut config.connection_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
-                        &mut config.statement_timeout,
-                    ),
-                ] {
-                    if let Some(value) = postgres_positive_integer(&values, name)? {
-                        *setting = std::time::Duration::from_millis(value);
-                    }
-                }
-                config.idempotency_retention = postgres_positive_integer(
-                    &values,
-                    "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                )?
+        }
+        store.idempotency_retention =
+            postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS")?
                 .map(std::time::Duration::from_millis);
-                config
-                    .validate_limits()
-                    .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
-                StoreProviderConfig::Postgres(config)
-            }
-        };
+        store
+            .validate_limits()
+            .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
         let auth = parse_auth_config(&values)?;
         let security = crate::runtime_security::RuntimeSecurityConfig::parse(
             &values,
             !matches!(auth, AuthConfig::NoAuth),
         )
         .map_err(RuntimeConfigError::InvalidSecurity)?;
-        if security.sealing_keys_file.is_some() {
-            let StoreProviderConfig::Postgres(pg) = &store;
-            if pg.max_connections < 2 {
-                return Err(RuntimeConfigError::InvalidSecurity(
-                    "certificate delivery requires at least two PostgreSQL connections",
-                ));
-            }
+        if security.sealing_keys_file.is_some() && store.max_connections < 2 {
+            return Err(RuntimeConfigError::InvalidSecurity(
+                "certificate delivery requires at least two PostgreSQL connections",
+            ));
         }
         let target = MaterializationTarget::new(
             required_value(&values, CLUSTER_ID_ENV)?,
@@ -861,21 +840,17 @@ where
 }
 
 async fn connect_store(
-    config: &StoreProviderConfig,
+    config: &PostgresStoreConfig,
     sealer: Option<Arc<crate::certificate::CertificateSealer>>,
 ) -> Result<Arc<dyn ControlPlaneStore>, crate::StoreError> {
-    match config {
-        StoreProviderConfig::Postgres(config) => {
-            let mut store = PostgresStore::connect(config).await?;
-            if let Some(sealer) = sealer {
-                store = store.with_certificate_sealer(sealer);
-            }
-            let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
-            Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
-                store,
-            )))
-        }
+    let mut store = PostgresStore::connect(config).await?;
+    if let Some(sealer) = sealer {
+        store = store.with_certificate_sealer(sealer);
     }
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
+    Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
+        store,
+    )))
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -978,9 +953,6 @@ impl fmt::Display for RuntimeConfigError {
                 f,
                 "{name} value {value:?} is not a valid listen address: {source}"
             ),
-            Self::InvalidStoreProvider { value } => {
-                write!(f, "{STORE_PROVIDER_ENV} value {value:?} is not supported")
-            }
             Self::InvalidPostgresConfig(source) => source.fmt(f),
             Self::InvalidPostgresSetting { name } => write!(
                 f,
@@ -1004,7 +976,6 @@ impl Error for RuntimeConfigError {
             Self::InvalidAuthConfig(source) => Some(source),
             Self::MissingEnv { .. }
             | Self::InvalidPostgresSetting { .. }
-            | Self::InvalidStoreProvider { .. }
             | Self::InvalidAuthMode { .. }
             | Self::InvalidSecurity(_) => None,
         }
@@ -1059,7 +1030,7 @@ pub(crate) mod tests {
             ("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS", "60000"),
         ]);
         let config = RuntimeConfig::from_key_values(env).unwrap();
-        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
+        let config = config.control_plane.store;
         assert_eq!(config.max_connections, 1);
         assert_eq!(config.pool_wait_timeout.as_millis(), 123);
         assert_eq!(config.connection_timeout.as_millis(), 456);
@@ -1074,7 +1045,7 @@ pub(crate) mod tests {
             ));
         }
         let config = RuntimeConfig::from_key_values(valid_env()).unwrap();
-        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
+        let config = config.control_plane.store;
         assert_eq!(config.idempotency_retention, None);
     }
 
@@ -1258,28 +1229,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn env_config_rejects_unknown_store_provider() {
-        let error = RuntimeConfig::from_key_values(
-            valid_env()
-                .into_iter()
-                .map(|(key, value)| {
-                    if key == STORE_PROVIDER_ENV {
-                        (key, "sqlite")
-                    } else {
-                        (key, value)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-        .expect_err("unknown store provider is invalid");
-
-        assert!(matches!(
-            error,
-            RuntimeConfigError::InvalidStoreProvider { value } if value == "sqlite"
-        ));
-    }
-
-    #[test]
     fn env_config_rejects_invalid_native_listen_addr() {
         let error = RuntimeConfig::from_key_values(
             valid_env()
@@ -1402,8 +1351,8 @@ pub(crate) mod tests {
         assert_eq!(config.target.cluster_id(), "cluster-a");
         assert_eq!(config.target.namespace(), "apps");
         assert_eq!(
-            config.control_plane.store.provider_name(),
-            StoreProviderName::Postgres
+            config.control_plane.store.connection_url(),
+            "postgres://sleepypods@example.com/sleepypods"
         );
         assert_eq!(config.control_plane.auth, AuthConfig::NoAuth);
     }
@@ -1694,7 +1643,6 @@ pub(crate) mod tests {
         vec![
             (CONTROL_PLANE_LISTEN_ADDR_ENV, "127.0.0.1:50051"),
             (OPERATOR_LISTEN_ADDR_ENV, "127.0.0.1:50053"),
-            (STORE_PROVIDER_ENV, "postgres"),
             (
                 POSTGRES_URL_ENV,
                 "postgres://sleepypods@example.com/sleepypods",

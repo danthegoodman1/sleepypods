@@ -42,7 +42,7 @@ pub use auth::{
     ControlPlaneAuthInterceptor, InvalidBearerToken, InvalidStaticBearerTokens,
     OptionalBearerTokenInterceptor, StaticBearerAuthProvider, StaticBearerTokens,
 };
-pub use config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
+pub use config::{ControlPlaneConfig, PostgresStoreConfig};
 pub use http01::{
     DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
     PutHttp01ChallengeRequest,

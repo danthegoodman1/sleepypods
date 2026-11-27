@@ -768,7 +768,6 @@ Important environment variables:
 | control plane | `SLEEPYPODS_CONTROL_PLANE_TLS_CERT_FILE`, `SLEEPYPODS_CONTROL_PLANE_TLS_KEY_FILE` for native platform TLS |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_PUBLIC_ENDPOINT` verified HTTPS endpoint for rendered sidecars when native TLS is enabled |
 | control plane | `SLEEPYPODS_CERTIFICATE_SEALING_KEYS_FILE` external key ring for certificate storage |
-| control plane | `SLEEPYPODS_STORE_PROVIDER=postgres` |
 | control plane | `SLEEPYPODS_POSTGRES_URL` |
 | control plane | `SLEEPYPODS_CLUSTER_ID`, `SLEEPYPODS_NAMESPACE` |
 | control plane | `SLEEPYPODS_CONTROL_PLANE_METRICS_LISTEN_ADDR` optional Prometheus `/metrics` listener |

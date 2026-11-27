@@ -387,9 +387,9 @@ TLS termination or SNI passthrough fails:
 
 Postgres or database outage:
 
-1. Check control-plane process logs for store provider errors and runtime
+1. Check control-plane process logs for store errors and runtime
    control-plane call `outcome=error`.
-2. Verify `SLEEPYPODS_STORE_PROVIDER=postgres` and `SLEEPYPODS_POSTGRES_URL`.
+2. Verify `SLEEPYPODS_POSTGRES_URL`.
 3. Restore database availability before restarting frontlines aggressively;
    proxies can keep hot cached routes briefly but cold wakes and misses need the
    control plane.

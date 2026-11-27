@@ -326,8 +326,6 @@ spec:
               value: ${proxy_token}
             - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
               value: ${sidecar_token}
-            - name: SLEEPYPODS_STORE_PROVIDER
-              value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
             - name: SLEEPYPODS_CLUSTER_ID
