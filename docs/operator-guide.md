@@ -884,7 +884,11 @@ generation watermarks are preserved.
   once; another replica finds it at its next one-second scan. The driver
   creates the objects, scales the workload up from zero replicas, follows the
   Service's EndpointSlices by watch until an endpoint is ready, and publishes
-  the Service ClusterIP as the backend. The frontline
+  the Service ClusterIP and the ready endpoint's Pod address as the backend.
+  Frontline connects to the Pod address first, so the first request does not
+  wait for kube-proxy to program the Service; a frontline that cannot reach Pod
+  addresses spends at most 250 ms on one attempt per backend generation and
+  then uses the Service. The frontline
   waits within its bounded routing deadline until authoritative updates report a
   ready backend, preserving the first cold request through the asynchronous wake.
   The optional `backend_generation` request is a minimum; acceptance allocates a
