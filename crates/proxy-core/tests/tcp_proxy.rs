@@ -1,8 +1,7 @@
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 
 use proxy_core::{
-    proxy_streams, proxy_streams_with_idle_timeout, DrainError, DrainTracker, TcpProxy,
-    TcpProxyConfig, TcpProxyError, TcpProxyStats,
+    proxy_streams_with_timeouts, DrainError, DrainTracker, TcpProxy, TcpProxyConfig, TcpProxyError,
 };
 use socket2::SockRef;
 use tokio::{
@@ -91,18 +90,10 @@ async fn tcp_proxy_preserves_bytes_and_tracks_connection_lifecycle() {
 
     client.shutdown().await.expect("client half-closes");
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("proxy completed successfully");
-
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: REQUEST.len() as u64,
-            upstream_to_client: REQUEST.len() as u64,
-        }
-    );
 
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
@@ -266,12 +257,10 @@ async fn tcp_proxy_releases_lifecycle_after_client_disconnect() {
     drain.wait_for_active_count(1).await;
     drop(client);
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("proxy completes after client disconnect");
-    assert_eq!(stats.client_to_upstream, REQUEST.len() as u64);
-    assert_eq!(stats.upstream_to_client, 0);
 
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
@@ -335,18 +324,11 @@ async fn tcp_proxy_releases_lifecycle_after_upstream_disconnect() {
         .await
         .expect("client half-closes after propagated upstream eof");
 
-    let stats = timeout(Duration::from_secs(2), proxy_task)
+    timeout(Duration::from_secs(2), proxy_task)
         .await
         .expect("proxy task completes after client half-close")
         .expect("proxy task joined")
         .expect("proxy completes cleanly after upstream disconnect");
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: 0,
-            upstream_to_client: 0,
-        }
-    );
     upstream_task.await.expect("upstream task completed");
     drain.wait_for_active_count(0).await;
     assert_eq!(drain.active_count(), 0);
@@ -440,8 +422,14 @@ async fn tcp_proxy_stream_backpressure_stalls_until_upstream_reads() {
     let payload = vec![b'x'; 1024];
     let expected = payload.clone();
 
-    let mut proxy_task = tokio::spawn(proxy_streams(proxy_client, proxy_upstream));
-    let writer = tokio::spawn(async move {
+    let mut proxy_task = tokio::spawn(proxy_streams_with_timeouts(
+        proxy_client,
+        proxy_upstream,
+        None,
+        Duration::from_secs(3600),
+        None,
+    ));
+    let mut writer = tokio::spawn(async move {
         client
             .write_all(&payload)
             .await
@@ -449,13 +437,13 @@ async fn tcp_proxy_stream_backpressure_stalls_until_upstream_reads() {
         client.shutdown().await.expect("client half-closes");
     });
 
-    writer.await.expect("writer task completed");
     assert!(
-        timeout(Duration::from_millis(25), &mut proxy_task)
+        timeout(Duration::from_millis(25), &mut writer)
             .await
             .is_err(),
-        "bounded duplex should stall the proxy until upstream reads"
+        "the relay stops reading the client while the upstream is full"
     );
+    assert!(!proxy_task.is_finished());
 
     let mut received = vec![0; expected.len()];
     upstream
@@ -463,14 +451,13 @@ async fn tcp_proxy_stream_backpressure_stalls_until_upstream_reads() {
         .await
         .expect("upstream drains stalled payload");
     assert_eq!(received, expected);
+    writer.await.expect("writer task completed");
     upstream.shutdown().await.expect("upstream half-closes");
 
-    let stats = proxy_task
+    (&mut proxy_task)
         .await
         .expect("proxy task completed")
         .expect("proxy completes after both halves close");
-    assert_eq!(stats.client_to_upstream, expected.len() as u64);
-    assert_eq!(stats.upstream_to_client, 0);
 }
 
 #[tokio::test]
@@ -480,7 +467,13 @@ async fn tcp_proxy_stream_allows_reverse_bytes_after_client_half_close() {
     let request = b"request before half-close";
     let response = b"response after client half-close";
 
-    let proxy_task = tokio::spawn(proxy_streams(proxy_client, proxy_upstream));
+    let proxy_task = tokio::spawn(proxy_streams_with_timeouts(
+        proxy_client,
+        proxy_upstream,
+        None,
+        Duration::from_secs(3600),
+        None,
+    ));
     client
         .write_all(request)
         .await
@@ -515,12 +508,10 @@ async fn tcp_proxy_stream_allows_reverse_bytes_after_client_half_close() {
         .expect("client reads response after half-close");
     assert_eq!(echoed, response);
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("proxy completes after both halves close");
-    assert_eq!(stats.client_to_upstream, request.len() as u64);
-    assert_eq!(stats.upstream_to_client, response.len() as u64);
 }
 
 #[tokio::test(start_paused = true)]
@@ -531,10 +522,12 @@ async fn tcp_proxy_stream_idle_timeout_fires_when_both_directions_are_idle() {
 
     // With no bytes flowing either way, the shared stream idle timeout should
     // fail the session with the standard TimedOut taxonomy.
-    let proxy_task = tokio::spawn(proxy_streams_with_idle_timeout(
+    let proxy_task = tokio::spawn(proxy_streams_with_timeouts(
         proxy_client,
         proxy_upstream,
+        Some(idle_timeout),
         idle_timeout,
+        None,
     ));
 
     advance(idle_timeout).await;
@@ -554,10 +547,12 @@ async fn tcp_proxy_stream_one_way_activity_keeps_session_alive() {
 
     // Reverse-direction traffic is enough to refresh the shared idle clock, so
     // a quiet client-to-upstream half must not kill the whole stream.
-    let proxy_task = tokio::spawn(proxy_streams_with_idle_timeout(
+    let proxy_task = tokio::spawn(proxy_streams_with_timeouts(
         proxy_client,
         proxy_upstream,
+        Some(idle_timeout),
         idle_timeout,
+        None,
     ));
 
     for byte in *b"abc" {
@@ -665,10 +660,12 @@ async fn tcp_idle_deadline_terminates_both_directions_blocked_on_write() {
     let (mut client, proxy_client) = tokio::io::duplex(1024);
     let (mut upstream, proxy_upstream) = tokio::io::duplex(1024);
     let idle = Duration::from_secs(5);
-    let proxy = tokio::spawn(proxy_streams_with_idle_timeout(
+    let proxy = tokio::spawn(proxy_streams_with_timeouts(
         proxy_client,
         proxy_upstream,
+        Some(idle),
         idle,
+        None,
     ));
     let client_writer = tokio::spawn(async move { client.write_all(&vec![1; 128 * 1024]).await });
     let upstream_writer =

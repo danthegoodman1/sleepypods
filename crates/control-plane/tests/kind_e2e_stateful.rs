@@ -23,7 +23,7 @@ use control_plane::api::pb::{
     RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
     TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef,
     WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueSchema,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use control_plane::{render_instance_scoped_name, InstanceId};
@@ -56,9 +56,9 @@ const ROUTE_HOST: &str = "stateful.sleepypods.test";
 const TENANT_VALUE: &str = "stateful";
 const WORKLOAD_NAME: &str = "e2e-stateful-app";
 // Expected suffix: first eight SHA-256 hex digits of the complete INSTANCE_ID.
-const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c";
-const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c";
-const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-stateful-app-1b49ed6c883bce91";
+const RENDERED_PVC_NAME: &str = "e2e-stateful-pvc-1b49ed6c883bce91";
+const RENDERED_PV_NAME: &str = "e2e-stateful-pv-1b49ed6c883bce91";
 const VOLUME_NAME: &str = "data";
 const MOUNT_PATH: &str = "/data";
 const CLUSTER_ID: &str = "kind-e2e-stateful";
@@ -248,15 +248,12 @@ async fn stateful_wake_latency_through_deployed_platform() -> TestResult<()> {
     let mut operator = connect_operator(&config.operator_endpoint).await?;
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-create-wake-latency-class".to_owned(),
             class_id: LATENCY_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: true,
             }),
-            template_generation: 1,
             template: Some(manifest_template(&config)),
             // Samples stay awake until the driver deletes them.
             sleep_policy: Some(WorkloadSleepPolicy {
@@ -276,18 +273,17 @@ async fn stateful_wake_latency_through_deployed_platform() -> TestResult<()> {
         let host = format!("wake-latency-{index}.sleepypods.test");
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-create-{instance_id}"),
                 instance_id: instance_id.clone(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: LATENCY_CLASS_ID.to_owned(),
                     version: 1,
                 }),
                 values: HashMap::from([("tenant".to_owned(), format!("wl{index}"))]),
+                routes: Vec::new(),
             })
             .await?;
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-create-{instance_id}-route"),
                 route_binding_id: format!("{instance_id}-route"),
                 instance_id: instance_id.clone(),
                 identity: Some(RouteIdentity {
@@ -452,7 +448,7 @@ async fn stateful_exclusivity_keys_through_deployed_platform() -> TestResult<()>
     let blocked_status = observer
         .reconcile_materialization(ReconcileMaterializationRequest {
             status_only: true,
-            materialization_id: config.materialization_id(EXCLUSIVE_BLOCKED_INSTANCE_ID),
+            instance_id: EXCLUSIVE_BLOCKED_INSTANCE_ID.to_owned(),
         })
         .await?
         .into_inner();
@@ -656,7 +652,7 @@ async fn run_projection_drift_and_finalizer_safety(
     assert_materialized_stateful_objects(kube.clone(), config).await?;
 
     let materialization_id = config.materialization_id(INSTANCE_ID);
-    let baseline = reconcile_materialization(operator, &materialization_id).await?;
+    let baseline = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&baseline, &materialization_id)?;
     assert_no_unowned_projection_observations(&baseline.projection_observations, "baseline")?;
     expect_projection_observation(
@@ -681,7 +677,7 @@ async fn run_projection_drift_and_finalizer_safety(
     )
     .await?;
 
-    let missing = reconcile_materialization(operator, &materialization_id).await?;
+    let missing = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&missing, &materialization_id)?;
     assert_no_unowned_projection_observations(&missing.projection_observations, "missing Service")?;
     expect_projection_observation(
@@ -719,7 +715,7 @@ async fn run_projection_drift_and_finalizer_safety(
 
     eprintln!("projection drift E2E: creating an unowned same-name Service collision");
     create_unowned_service_collision(kube.clone(), &config.namespace, &original_service).await?;
-    let unowned = reconcile_materialization(operator, &materialization_id).await?;
+    let unowned = reconcile_materialization(operator, INSTANCE_ID).await?;
     assert_ready_reconcile_report_only(&unowned, &materialization_id)?;
     let unowned_service = expect_projection_observation(
         &unowned.projection_observations,
@@ -757,7 +753,7 @@ async fn run_projection_drift_and_finalizer_safety(
             "deletion must be durably accepted while the injected finalizer blocks cleanup".into(),
         );
     }
-    let blocked_collision = reconcile_materialization(operator, &materialization_id).await?;
+    let blocked_collision = reconcile_materialization(operator, INSTANCE_ID).await?;
     expect_projection_observation(
         &blocked_collision.projection_observations,
         "v1",
@@ -788,11 +784,11 @@ async fn run_projection_drift_and_finalizer_safety(
     eprintln!(
         "projection drift E2E: accepted cleanup now blocked by the owned StatefulSet finalizer"
     );
-    let _ = reconcile_materialization(operator, &materialization_id).await?;
+    let _ = reconcile_materialization(operator, INSTANCE_ID).await?;
 
     let blocked = wait_for_reconcile_observation(
         operator,
-        &materialization_id,
+        INSTANCE_ID,
         ReconcileObservationExpectation {
             api_version: "apps/v1",
             kind: "StatefulSet",
@@ -1050,33 +1046,26 @@ async fn create_operator_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_stateful_operator_resources(operator, config, "kind-e2e-stateful", 15_000).await
+    create_stateful_operator_resources(operator, config, 15_000).await
 }
 
 async fn create_projection_drift_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_stateful_operator_resources(operator, config, "kind-e2e-projection-drift", 900_000).await
+    create_stateful_operator_resources(operator, config, 900_000).await
 }
 
 async fn create_stateful_operator_resources(
     operator: &mut OperatorControlPlaneClient<Channel>,
     config: &E2eConfig,
-    idempotency_scope: &str,
     idle_timeout_ms: u64,
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("{idempotency_scope}-create-class"),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: true,
-            }),
-            template_generation: 1,
+            value_schema: Some(required_values(&["tenant"])),
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms,
@@ -1090,19 +1079,18 @@ async fn create_stateful_operator_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("{idempotency_scope}-create-instance"),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: HashMap::from([("tenant".to_owned(), TENANT_VALUE.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("{idempotency_scope}-create-route"),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -1127,15 +1115,9 @@ async fn create_exclusivity_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-exclusivity-create-class".to_owned(),
             class_id: EXCLUSIVE_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: true,
-            }),
-            template_generation: 1,
+            value_schema: Some(required_values(&["tenant", "volume_handle"])),
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -1152,7 +1134,6 @@ async fn create_exclusivity_resources(
 
     create_exclusive_instance_and_route(
         operator,
-        "owner",
         EXCLUSIVE_OWNER_INSTANCE_ID,
         EXCLUSIVE_OWNER_ROUTE_ID,
         EXCLUSIVE_OWNER_HOST,
@@ -1162,7 +1143,6 @@ async fn create_exclusivity_resources(
     .await?;
     create_exclusive_instance_and_route(
         operator,
-        "blocked",
         EXCLUSIVE_BLOCKED_INSTANCE_ID,
         EXCLUSIVE_BLOCKED_ROUTE_ID,
         EXCLUSIVE_BLOCKED_HOST,
@@ -1172,7 +1152,6 @@ async fn create_exclusivity_resources(
     .await?;
     create_exclusive_instance_and_route(
         operator,
-        "other",
         EXCLUSIVE_OTHER_INSTANCE_ID,
         EXCLUSIVE_OTHER_ROUTE_ID,
         EXCLUSIVE_OTHER_HOST,
@@ -1186,7 +1165,6 @@ async fn create_exclusivity_resources(
 
 async fn create_exclusive_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    suffix: &str,
     instance_id: &str,
     route_id: &str,
     route_host: &str,
@@ -1195,7 +1173,6 @@ async fn create_exclusive_instance_and_route(
 ) -> TestResult<()> {
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-exclusivity-create-{suffix}"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: EXCLUSIVE_CLASS_ID.to_owned(),
@@ -1205,12 +1182,12 @@ async fn create_exclusive_instance_and_route(
                 ("tenant".to_owned(), tenant.to_owned()),
                 ("volume_handle".to_owned(), volume_handle.to_owned()),
             ]),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-exclusivity-route-{suffix}"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(RouteIdentity {
@@ -1295,12 +1272,12 @@ async fn assert_instance_generation(
 
 async fn reconcile_materialization(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    materialization_id: &str,
+    instance_id: &str,
 ) -> TestResult<ReconcileMaterializationResponse> {
     Ok(operator
         .reconcile_materialization(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id: materialization_id.to_owned(),
+            instance_id: instance_id.to_owned(),
         })
         .await?
         .into_inner())
@@ -1396,13 +1373,13 @@ struct ReconcileObservationExpectation<'a> {
 
 async fn wait_for_reconcile_observation(
     operator: &mut OperatorControlPlaneClient<Channel>,
-    materialization_id: &str,
+    instance_id: &str,
     expectation: ReconcileObservationExpectation<'_>,
     timeout: Duration,
 ) -> TestResult<ReconcileMaterializationResponse> {
     let deadline = Instant::now() + timeout;
     loop {
-        let response = reconcile_materialization(operator, materialization_id).await?;
+        let response = reconcile_materialization(operator, instance_id).await?;
         if expect_projection_observation(
             &response.projection_observations,
             expectation.api_version,
@@ -2368,12 +2345,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text(WORKLOAD_NAME)),
@@ -2402,6 +2381,25 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
             }),
         }],
         raw_objects: vec![],
+    }
+}
+
+/// A schema that requires each value the class templates read.
+fn required_values(fields: &[&str]) -> WorkloadValueSchema {
+    WorkloadValueSchema {
+        fields: fields
+            .iter()
+            .map(|field| {
+                (
+                    (*field).to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )
+            })
+            .collect(),
+        allow_extra: true,
     }
 }
 

@@ -1,14 +1,14 @@
 use deadpool_postgres::GenericClient;
-use serde_json::Value;
+use tokio_postgres::IsolationLevel;
 
 use crate::{
     ids::Generation,
     instance::{
         validate_instance_state_transition, CompareAndSwapInstanceStateRequest,
         CreateInstanceRequest, CreateInstanceResult, DeleteInstanceRequest, GetInstanceRequest,
-        InstanceRecord, InstanceState,
+        InstanceRecord, InstanceRoute, InstanceState,
     },
-    route::RouteBindingRecord,
+    route::{ProtocolRoute, RouteBindingRecord, RouteIdentity},
     store::{StoreError, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -19,12 +19,11 @@ use crate::{
 use super::{
     connection::PostgresStore,
     error::map_postgres_error,
-    idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
-        self, generation_to_i64, instance_from_row, instance_state_to_db,
-        manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
-        sleep_policy_to_json, value_schema_to_json, values_to_json,
-        workload_class_version_from_row, workload_exclusivity_keys_to_json,
+        generation_to_i64, instance_from_row, instance_state_to_db, manifest_template_to_json,
+        protocol_to_db, route_binding_from_row, route_identity_parts, sleep_policy_to_json,
+        value_schema_to_json, values_to_json, workload_class_version_from_row,
+        workload_exclusivity_keys_to_json,
     },
 };
 
@@ -33,60 +32,82 @@ pub(crate) async fn create_instance(
     request: CreateInstanceRequest,
 ) -> StoreResult<CreateInstanceResult> {
     let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let workload_class =
-        load_workload_class_version_from_client(&transaction, &request.workload_class)
-            .await?
-            .ok_or(StoreError::NotFound {
-                resource: "workload class version",
-            })?;
+    let workload_class = load_workload_class_version_from_client(&client, &request.workload_class)
+        .await?
+        .ok_or(StoreError::NotFound {
+            resource: "workload class version",
+        })?;
     let request = request
         .validate_values_against(&workload_class)
         .map_err(|error| StoreError::invalid_argument(error.to_string()))?;
-    let fingerprint = idempotency::create_instance_fingerprint(&request)?;
-    let idempotency_key = request.idempotency_key.as_str();
     let instance_id = request.instance_id.as_str();
-    idempotency::expire_key(&transaction, idempotency_key).await?;
-    let inserted = transaction
-        .execute(
-            "
-            INSERT INTO idempotency_records (
-                idempotency_key,
-                operation,
-                request_fingerprint,
-                resource_id,
-                expires_at_unix_millis
-            )
-            VALUES ($1, $2, $3, $4, (extract(epoch from clock_timestamp()) * 1000)::bigint + $5::bigint)
-            ON CONFLICT (idempotency_key) DO NOTHING
-            ",
-            &[
-                &idempotency_key,
-                &CREATE_INSTANCE_OPERATION,
-                &fingerprint,
-                &instance_id,
-                &store.idempotency_retention_millis,
-            ],
-        )
+
+    let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    match insert_instance_and_routes(&transaction, &request).await {
+        Ok(created) => {
+            transaction.commit().await.map_err(map_postgres_error)?;
+            return Ok(created);
+        }
+        Err(StoreError::AlreadyExists {
+            resource: "instance",
+        }) => {}
+        Err(error) => return Err(error),
+    }
+    transaction.rollback().await.map_err(map_postgres_error)?;
+
+    // An instance holds this ID. It is the one this request describes when its
+    // class, values and routes equal the request's. One snapshot reads all
+    // three, so the answer describes a state the instance was in.
+    let snapshot = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
         .await
         .map_err(map_postgres_error)?;
-
-    if inserted == 0 {
-        let result = replay_create_instance(&transaction, idempotency_key, &fingerprint).await?;
-        transaction.commit().await.map_err(map_postgres_error)?;
-        return Ok(result);
+    let Some(instance) = load_instance(&snapshot, instance_id).await? else {
+        return Err(StoreError::unavailable(
+            "instance was deleted during its creation; retry request",
+        ));
+    };
+    let route_bindings = load_route_bindings_for_instance(&snapshot, instance_id).await?;
+    if instance.workload_class != request.workload_class
+        || instance.values != request.values
+        || !same_routes(&route_bindings, &request.route_bindings)
+    {
+        return Err(StoreError::AlreadyExists {
+            resource: "instance",
+        });
     }
-
-    let instance = insert_instance(&transaction, &request).await?;
-    let route_bindings = insert_route_bindings(&transaction, &request).await?;
-
-    transaction.commit().await.map_err(map_postgres_error)?;
 
     Ok(CreateInstanceResult {
         instance,
         route_bindings,
-        idempotency_replayed: false,
     })
+}
+
+async fn insert_instance_and_routes(
+    client: &impl GenericClient,
+    request: &CreateInstanceRequest,
+) -> StoreResult<CreateInstanceResult> {
+    Ok(CreateInstanceResult {
+        instance: insert_instance(client, request).await?,
+        route_bindings: insert_route_bindings(client, request).await?,
+    })
+}
+
+fn same_routes(stored: &[RouteBindingRecord], requested: &[InstanceRoute]) -> bool {
+    let mut stored = stored
+        .iter()
+        .map(|route| (route.id.as_str(), &route.identity))
+        .collect::<Vec<_>>();
+    let mut requested = requested
+        .iter()
+        .map(|route| (route.id.as_str(), &route.identity))
+        .collect::<Vec<_>>();
+    stored.sort_by_key(|(id, _)| *id);
+    requested.sort_by_key(|(id, _)| *id);
+    stored == requested
 }
 
 pub(crate) async fn create_workload_class_version(
@@ -100,9 +121,7 @@ pub(crate) async fn create_workload_class_version(
     let client = store.client().await?;
     let class_id = desired.reference.class_id.as_str();
     let version = generation_to_i64(desired.reference.version)?;
-    let template_generation = generation_to_i64(desired.template_generation)?;
     let manifest_template = manifest_template_to_json(&desired.template)?;
-    let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
     let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
     let exclusivity_keys = workload_exclusivity_keys_to_json(&desired.exclusivity_keys)?;
@@ -112,22 +131,18 @@ pub(crate) async fn create_workload_class_version(
             INSERT INTO workload_class_versions (
                 class_id,
                 version,
-                template_generation,
                 manifest_template,
-                default_values,
                 value_schema,
                 sleep_policy,
                 exclusivity_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
                 &class_id,
                 &version,
-                &template_generation,
                 &manifest_template,
-                &default_values,
                 &value_schema,
                 &sleep_policy,
                 &exclusivity_keys,
@@ -292,46 +307,6 @@ pub(crate) async fn load_instance(
     row.as_ref().map(instance_from_row).transpose()
 }
 
-async fn replay_create_instance(
-    client: &impl GenericClient,
-    idempotency_key: &str,
-    fingerprint: &Value,
-) -> StoreResult<CreateInstanceResult> {
-    let row = client
-        .query_opt(
-            "
-            SELECT operation, request_fingerprint, resource_id, resource_deleted_at_unix_millis
-            FROM idempotency_records
-            WHERE idempotency_key = $1
-            FOR UPDATE
-            ",
-            &[&idempotency_key],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .ok_or_else(|| {
-            StoreError::unavailable("idempotency key expired during replay; retry request")
-        })?;
-    let operation: String = row.get("operation");
-    let stored_fingerprint: Value = row.get("request_fingerprint");
-    let resource_id: String = row.get("resource_id");
-
-    if operation != CREATE_INSTANCE_OPERATION || stored_fingerprint != *fingerprint {
-        return Err(idempotency::idempotency_conflict());
-    }
-
-    if row
-        .get::<_, Option<i64>>("resource_deleted_at_unix_millis")
-        .is_some()
-    {
-        return Err(StoreError::IdempotencyResourceDeleted {
-            resource: "instance",
-        });
-    }
-
-    load_create_instance_result(client, &resource_id, true).await
-}
-
 async fn load_workload_class_version_from_client(
     client: &impl GenericClient,
     reference: &WorkloadClassVersionRef,
@@ -341,8 +316,8 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, manifest_template, default_values,
-                value_schema, sleep_policy, exclusivity_keys
+            SELECT class_id, version, manifest_template, value_schema, sleep_policy,
+                exclusivity_keys
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",
@@ -400,12 +375,14 @@ async fn insert_route_bindings(
     request: &CreateInstanceRequest,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
-    for (index, spec) in request.route_bindings.iter().enumerate() {
-        mapping::validate_route_protocol(spec)?;
-        let route_binding_id = format!("{}:route:{}", request.instance_id.as_str(), index + 1);
+    for route in &request.route_bindings {
+        let route_binding_id = route.id.as_str();
         let instance_id = request.instance_id.as_str();
-        let parts = route_identity_parts(&spec.identity);
-        let protocol = protocol_to_db(spec.protocol);
+        let parts = route_identity_parts(&route.identity);
+        let protocol = protocol_to_db(match route.identity {
+            RouteIdentity::Http { .. } => ProtocolRoute::Http,
+            RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
+        });
         let path_prefix = parts.path_prefix.as_deref();
         let row = client
             .query_one(
@@ -440,25 +417,6 @@ async fn insert_route_bindings(
     }
 
     Ok(route_bindings)
-}
-
-async fn load_create_instance_result(
-    client: &impl GenericClient,
-    instance_id: &str,
-    replayed: bool,
-) -> StoreResult<CreateInstanceResult> {
-    let instance = load_instance(client, instance_id)
-        .await?
-        .ok_or(StoreError::NotFound {
-            resource: "instance",
-        })?;
-    let route_bindings = load_route_bindings_for_instance(client, instance_id).await?;
-
-    Ok(CreateInstanceResult {
-        instance,
-        route_bindings,
-        idempotency_replayed: replayed,
-    })
 }
 
 async fn load_route_bindings_for_instance(

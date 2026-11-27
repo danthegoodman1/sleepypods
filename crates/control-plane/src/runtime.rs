@@ -13,12 +13,12 @@ use sleepypods_observability::{
     },
     prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
     recorder::{
-        CompositeObservabilitySink, MetricObservation, ObservabilityRecorder,
-        StderrObservabilitySink,
+        CompositeObservabilitySink, FilteredStderrObservabilitySink, MetricObservation,
+        ObservabilityRecorder,
     },
 };
 use tokio::{sync::watch, task::JoinSet};
-use tonic::transport::server::Router;
+use tonic::{codegen::http::HeaderValue, transport::server::Router};
 use tower::layer::util::{Identity, Stack};
 use tower_http::cors::CorsLayer;
 
@@ -29,7 +29,7 @@ use crate::{
         sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
-    config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
+    config::{ControlPlaneConfig, PostgresStoreConfig},
     materialization::{InvalidMaterializationTarget, MaterializationState, MaterializationTarget},
     materializer::{
         KubernetesMaterializer, KubernetesMaterializerClient, RetryingKubernetesMaterializerClient,
@@ -46,7 +46,9 @@ pub const CONTROL_PLANE_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_LISTEN
 /// to reach. Keeping the two apart lets a NetworkPolicy separate them.
 pub const OPERATOR_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR";
 pub const OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR";
-pub const STORE_PROVIDER_ENV: &str = "SLEEPYPODS_STORE_PROVIDER";
+/// Comma-separated origins whose pages may call the gRPC-Web listener.
+pub const OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV: &str =
+    "SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS";
 pub const POSTGRES_URL_ENV: &str = "SLEEPYPODS_POSTGRES_URL";
 pub const CLUSTER_ID_ENV: &str = "SLEEPYPODS_CLUSTER_ID";
 pub const NAMESPACE_ENV: &str = "SLEEPYPODS_NAMESPACE";
@@ -60,7 +62,10 @@ pub type NativeControlPlaneRouter =
     Router<Stack<crate::api::admission::RpcAdmissionLayer, Identity>>;
 pub type OperatorGrpcWebLayers = Stack<
     tonic_web::GrpcWebLayer,
-    Stack<crate::api::admission::RpcAdmissionLayer, Stack<CorsLayer, Identity>>,
+    Stack<
+        crate::api::admission::RpcAdmissionLayer,
+        Stack<CorsLayer, Stack<crate::api::grpc_web::OriginGuardLayer, Identity>>,
+    >,
 >;
 pub type OperatorGrpcWebRouter = Router<OperatorGrpcWebLayers>;
 pub type RuntimeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -70,6 +75,9 @@ pub struct RuntimeConfig {
     pub listen_addr: SocketAddr,
     pub operator_listen_addr: SocketAddr,
     pub operator_grpc_web_listen_addr: Option<SocketAddr>,
+    /// Origins whose pages may call the gRPC-Web listener. Empty admits no
+    /// browser page.
+    pub operator_grpc_web_allowed_origins: Vec<HeaderValue>,
     pub metrics_listen_addr: Option<SocketAddr>,
     pub control_plane: ControlPlaneConfig,
     pub target: MaterializationTarget,
@@ -80,6 +88,8 @@ pub struct RuntimeConfig {
 #[derive(Debug)]
 pub enum RuntimeConfigError {
     InvalidSecurity(&'static str),
+    /// Sealing key IDs that active certificates use and the key ring lacks.
+    MissingSealingKeys(Vec<String>),
     MissingEnv {
         name: &'static str,
     },
@@ -87,9 +97,6 @@ pub enum RuntimeConfigError {
         name: &'static str,
         value: String,
         source: AddrParseError,
-    },
-    InvalidStoreProvider {
-        value: String,
     },
     InvalidPostgresConfig(crate::ids::EmptyStringError),
     InvalidPostgresSetting {
@@ -122,72 +129,73 @@ impl RuntimeConfig {
         let operator_listen_addr = parse_required_socket_addr(&values, OPERATOR_LISTEN_ADDR_ENV)?;
         let operator_grpc_web_listen_addr =
             parse_optional_socket_addr(&values, OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV)?;
+        let operator_grpc_web_allowed_origins = values
+            .get(OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(|origin| {
+                crate::api::grpc_web::parse_allowed_origin(origin).ok_or(
+                    RuntimeConfigError::InvalidSecurity(
+                        "gRPC-Web allowed origins must each be scheme://host[:port]",
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !operator_grpc_web_allowed_origins.is_empty() && operator_grpc_web_listen_addr.is_none()
+        {
+            return Err(RuntimeConfigError::InvalidSecurity(
+                "gRPC-Web allowed origins require the gRPC-Web listener",
+            ));
+        }
         let metrics_listen_addr = parse_optional_socket_addr(&values, METRICS_LISTEN_ADDR_ENV)?;
-        let provider = required_value(&values, STORE_PROVIDER_ENV)?;
-        let store = match provider.parse::<StoreProviderName>().map_err(|_| {
-            RuntimeConfigError::InvalidStoreProvider {
-                value: provider.to_owned(),
+        let mut store = PostgresStoreConfig::new(required_value(&values, POSTGRES_URL_ENV)?)
+            .map_err(RuntimeConfigError::InvalidPostgresConfig)?;
+        if let Some(value) =
+            postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")?
+        {
+            store.max_connections =
+                usize::try_from(value).map_err(|_| RuntimeConfigError::InvalidPostgresSetting {
+                    name: "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
+                })?;
+        }
+        for (name, setting) in [
+            (
+                "SLEEPYPODS_OPERATION_TIMEOUT_MS",
+                &mut store.operation_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
+                &mut store.pool_wait_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
+                &mut store.connection_timeout,
+            ),
+            (
+                "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
+                &mut store.statement_timeout,
+            ),
+        ] {
+            if let Some(value) = postgres_positive_integer(&values, name)? {
+                *setting = std::time::Duration::from_millis(value);
             }
-        })? {
-            StoreProviderName::Postgres => {
-                let url = required_value(&values, POSTGRES_URL_ENV)?;
-                let mut config = PostgresStoreConfig::new(url)
-                    .map_err(RuntimeConfigError::InvalidPostgresConfig)?;
-                if let Some(value) =
-                    postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS")?
-                {
-                    config.max_connections = usize::try_from(value).map_err(|_| {
-                        RuntimeConfigError::InvalidPostgresSetting {
-                            name: "SLEEPYPODS_POSTGRES_MAX_CONNECTIONS",
-                        }
-                    })?;
-                }
-                for (name, setting) in [
-                    (
-                        "SLEEPYPODS_OPERATION_TIMEOUT_MS",
-                        &mut config.operation_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
-                        &mut config.pool_wait_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS",
-                        &mut config.connection_timeout,
-                    ),
-                    (
-                        "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
-                        &mut config.statement_timeout,
-                    ),
-                ] {
-                    if let Some(value) = postgres_positive_integer(&values, name)? {
-                        *setting = std::time::Duration::from_millis(value);
-                    }
-                }
-                config.idempotency_retention = postgres_positive_integer(
-                    &values,
-                    "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                )?
-                .map(std::time::Duration::from_millis);
-                config
-                    .validate_limits()
-                    .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
-                StoreProviderConfig::Postgres(config)
-            }
-        };
+        }
+        store
+            .validate_limits()
+            .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
         let auth = parse_auth_config(&values)?;
         let security = crate::runtime_security::RuntimeSecurityConfig::parse(
             &values,
             !matches!(auth, AuthConfig::NoAuth),
         )
         .map_err(RuntimeConfigError::InvalidSecurity)?;
-        if security.sealing_keys_file.is_some() {
-            let StoreProviderConfig::Postgres(pg) = &store;
-            if pg.max_connections < 2 {
-                return Err(RuntimeConfigError::InvalidSecurity(
-                    "certificate delivery requires at least two PostgreSQL connections",
-                ));
-            }
+        if security.sealing_keys_file.is_some() && store.max_connections < 2 {
+            return Err(RuntimeConfigError::InvalidSecurity(
+                "certificate delivery requires at least two PostgreSQL connections",
+            ));
         }
         let target = MaterializationTarget::new(
             required_value(&values, CLUSTER_ID_ENV)?,
@@ -288,6 +296,7 @@ impl RuntimeConfig {
             listen_addr,
             operator_listen_addr,
             operator_grpc_web_listen_addr,
+            operator_grpc_web_allowed_origins,
             metrics_listen_addr,
             control_plane: ControlPlaneConfig::new(store, auth),
             target,
@@ -385,35 +394,28 @@ fn grpc_server(
         .layer(route_events.admission.clone()))
 }
 
-pub fn operator_grpc_web_router<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-) -> OperatorGrpcWebRouter
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    operator_grpc_web_router_with_route_events(
-        store,
-        materializer,
-        target,
-        AuthConfig::NoAuth,
-        RouteSubscriptionBroker::new(),
-    )
-}
-
-fn operator_grpc_web_router_with_route_events<C>(
+/// The browser-facing listener: the operator service over gRPC-Web, behind the
+/// platform TLS identity when one is configured, for pages from
+/// `allowed_origins`.
+pub fn operator_grpc_web_router_with_tls<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     auth_config: AuthConfig,
     route_events: RouteSubscriptionBroker,
-) -> OperatorGrpcWebRouter
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    allowed_origins: &[HeaderValue],
+) -> RuntimeResult<OperatorGrpcWebRouter>
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
-    admitted_grpc_web_server_builder(route_events.admission.clone())
+    let mut server =
+        admitted_grpc_web_server_builder(route_events.admission.clone(), allowed_origins);
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    Ok(server
         .timeout(std::time::Duration::from_secs(10))
         .max_concurrent_streams(32)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
@@ -429,17 +431,20 @@ where
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
             ),
-        ))
+        )))
 }
 
-// CORS adds headers only; admission must wrap the gRPC-web body transformation,
-// including its newly allocated base64 output, to retain final delivery ownership.
+/// The gRPC-Web layer stack. The origin guard and CORS run first; admission
+/// wraps the gRPC-Web body transformation, including its newly allocated base64
+/// output, to retain final delivery ownership.
 pub(crate) fn admitted_grpc_web_server_builder(
     admission: crate::api::admission::RpcAdmissionLayer,
+    allowed_origins: &[HeaderValue],
 ) -> tonic::transport::Server<OperatorGrpcWebLayers> {
     tonic::transport::Server::builder()
         .accept_http1(true)
-        .layer(crate::api::server::operator_grpc_web_cors_layer())
+        .layer(crate::api::grpc_web::OriginGuardLayer::new(allowed_origins))
+        .layer(crate::api::operator_grpc_web_cors_layer(allowed_origins))
         .layer(admission)
         .layer(tonic_web::GrpcWebLayer::new())
 }
@@ -569,13 +574,15 @@ where
     });
 
     if let Some(web_incoming) = web_incoming {
-        let operator_grpc_web_router = operator_grpc_web_router_with_route_events(
+        let operator_grpc_web_router = operator_grpc_web_router_with_tls(
             Arc::clone(&store),
             materializer.clone(),
             config.target.clone(),
             config.control_plane.auth.clone(),
             route_events.clone(),
-        );
+            config.security.tls(config.api_limits.setup_timeout)?,
+            &config.operator_grpc_web_allowed_origins,
+        )?;
         let operator_grpc_web_shutdown = native_shutdown.clone();
         listeners.spawn(async move {
             operator_grpc_web_router
@@ -738,15 +745,18 @@ async fn maintain_runtime(
     }
 }
 
-fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
+/// Installs the process-wide sinks. Stderr carries lifecycle and error events;
+/// metric samples reach only the Prometheus sink, so a successful RPC writes
+/// no line.
+pub fn install_runtime_observability(metrics_enabled: bool) -> Option<PrometheusMetricsSink> {
     if !metrics_enabled {
-        let _ = ObservabilityRecorder::install_stderr_global();
+        let _ = ObservabilityRecorder::install_global(Arc::new(FilteredStderrObservabilitySink));
         return None;
     }
 
     let prometheus = PrometheusMetricsSink::new();
     let _ = ObservabilityRecorder::install_global(Arc::new(CompositeObservabilitySink::new(vec![
-        Arc::new(StderrObservabilitySink),
+        Arc::new(FilteredStderrObservabilitySink),
         Arc::new(prometheus.clone()),
     ])));
     Some(prometheus)
@@ -825,22 +835,25 @@ where
     materializer.with_sidecar_control_plane_token(auth_config.sidecar_bearer_token().cloned())
 }
 
-async fn connect_store(
-    config: &StoreProviderConfig,
+/// Connects the store the control plane serves from. Every sealing key an
+/// active certificate uses must be in the key ring, because a certificate
+/// sealed under an absent key cannot be served.
+pub async fn connect_store(
+    config: &PostgresStoreConfig,
     sealer: Option<Arc<crate::certificate::CertificateSealer>>,
-) -> Result<Arc<dyn ControlPlaneStore>, crate::StoreError> {
-    match config {
-        StoreProviderConfig::Postgres(config) => {
-            let mut store = PostgresStore::connect(config).await?;
-            if let Some(sealer) = sealer {
-                store = store.with_certificate_sealer(sealer);
-            }
-            let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
-            Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
-                store,
-            )))
-        }
+) -> RuntimeResult<Arc<dyn ControlPlaneStore>> {
+    let mut store = PostgresStore::connect(config).await?;
+    if let Some(sealer) = sealer {
+        store = store.with_certificate_sealer(sealer);
     }
+    let missing = store.missing_sealing_key_ids().await?;
+    if !missing.is_empty() {
+        return Err(RuntimeConfigError::MissingSealingKeys(missing).into());
+    }
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
+    Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
+        store,
+    )))
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -934,6 +947,11 @@ impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSecurity(reason) => f.write_str(reason),
+            Self::MissingSealingKeys(key_ids) => write!(
+                f,
+                "active certificates are sealed under keys missing from the sealing key ring: {}",
+                key_ids.join(", ")
+            ),
             Self::MissingEnv { name } => write!(f, "{name} is required"),
             Self::InvalidListenAddr {
                 name,
@@ -943,9 +961,6 @@ impl fmt::Display for RuntimeConfigError {
                 f,
                 "{name} value {value:?} is not a valid listen address: {source}"
             ),
-            Self::InvalidStoreProvider { value } => {
-                write!(f, "{STORE_PROVIDER_ENV} value {value:?} is not supported")
-            }
             Self::InvalidPostgresConfig(source) => source.fmt(f),
             Self::InvalidPostgresSetting { name } => write!(
                 f,
@@ -969,21 +984,21 @@ impl Error for RuntimeConfigError {
             Self::InvalidAuthConfig(source) => Some(source),
             Self::MissingEnv { .. }
             | Self::InvalidPostgresSetting { .. }
-            | Self::InvalidStoreProvider { .. }
             | Self::InvalidAuthMode { .. }
+            | Self::MissingSealingKeys(_)
             | Self::InvalidSecurity(_) => None,
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::{
         http01::{
-            DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-            Http01ChallengeRecord, PutHttp01ChallengeRequest,
+            DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+            PutHttp01ChallengeRequest,
         },
         instance::{
             CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
@@ -1021,15 +1036,13 @@ mod tests {
             ("SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS", "123"),
             ("SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS", "456"),
             ("SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS", "789"),
-            ("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS", "60000"),
         ]);
         let config = RuntimeConfig::from_key_values(env).unwrap();
-        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
+        let config = config.control_plane.store;
         assert_eq!(config.max_connections, 1);
         assert_eq!(config.pool_wait_timeout.as_millis(), 123);
         assert_eq!(config.connection_timeout.as_millis(), 456);
         assert_eq!(config.statement_timeout.as_millis(), 789);
-        assert_eq!(config.idempotency_retention.unwrap().as_millis(), 60000);
         for invalid in ["0", "-1", "abc", "18446744073709551615"] {
             let mut env = valid_env();
             env.push(("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS", invalid));
@@ -1038,9 +1051,6 @@ mod tests {
                 Err(RuntimeConfigError::InvalidPostgresSetting { .. })
             ));
         }
-        let config = RuntimeConfig::from_key_values(valid_env()).unwrap();
-        let StoreProviderConfig::Postgres(config) = config.control_plane.store;
-        assert_eq!(config.idempotency_retention, None);
     }
 
     #[test]
@@ -1061,10 +1071,6 @@ mod tests {
             (
                 "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
                 PostgresStoreConfig::MAX_TIMEOUT.as_millis(),
-            ),
-            (
-                "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                PostgresStoreConfig::MAX_IDEMPOTENCY_RETENTION.as_millis(),
             ),
         ] {
             for value in [1, maximum] {
@@ -1223,28 +1229,6 @@ mod tests {
     }
 
     #[test]
-    fn env_config_rejects_unknown_store_provider() {
-        let error = RuntimeConfig::from_key_values(
-            valid_env()
-                .into_iter()
-                .map(|(key, value)| {
-                    if key == STORE_PROVIDER_ENV {
-                        (key, "sqlite")
-                    } else {
-                        (key, value)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-        .expect_err("unknown store provider is invalid");
-
-        assert!(matches!(
-            error,
-            RuntimeConfigError::InvalidStoreProvider { value } if value == "sqlite"
-        ));
-    }
-
-    #[test]
     fn env_config_rejects_invalid_native_listen_addr() {
         let error = RuntimeConfig::from_key_values(
             valid_env()
@@ -1292,6 +1276,50 @@ mod tests {
     }
 
     #[test]
+    fn grpc_web_origins_default_to_none_and_parse_a_list() {
+        let mut values = valid_env();
+        values.push((OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV, "127.0.0.1:50052"));
+        let config = RuntimeConfig::from_key_values(values.clone()).expect("valid config");
+        assert!(config.operator_grpc_web_allowed_origins.is_empty());
+
+        values.push((
+            OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV,
+            "https://console.example, http://localhost:3000",
+        ));
+        let config = RuntimeConfig::from_key_values(values).expect("valid config");
+        assert_eq!(
+            config.operator_grpc_web_allowed_origins,
+            ["https://console.example", "http://localhost:3000"]
+        );
+    }
+
+    #[test]
+    fn grpc_web_origins_reject_wildcards_and_a_missing_listener() {
+        for origins in ["*", "https://console.example/", "console.example"] {
+            let mut values = valid_env();
+            values.push((OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV, "127.0.0.1:50052"));
+            values.push((OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV, origins));
+            assert!(
+                matches!(
+                    RuntimeConfig::from_key_values(values),
+                    Err(RuntimeConfigError::InvalidSecurity(_))
+                ),
+                "{origins:?} is not an origin"
+            );
+        }
+
+        let mut values = valid_env();
+        values.push((
+            OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV,
+            "https://console.example",
+        ));
+        assert!(matches!(
+            RuntimeConfig::from_key_values(values),
+            Err(RuntimeConfigError::InvalidSecurity(_))
+        ));
+    }
+
+    #[test]
     fn env_config_defaults_metrics_listener_to_absent() {
         let config = RuntimeConfig::from_key_values(valid_env())
             .expect("valid config without metrics listener");
@@ -1323,8 +1351,8 @@ mod tests {
         assert_eq!(config.target.cluster_id(), "cluster-a");
         assert_eq!(config.target.namespace(), "apps");
         assert_eq!(
-            config.control_plane.store.provider_name(),
-            StoreProviderName::Postgres
+            config.control_plane.store.connection_url(),
+            "postgres://sleepypods@example.com/sleepypods"
         );
         assert_eq!(config.control_plane.auth, AuthConfig::NoAuth);
     }
@@ -1492,7 +1520,16 @@ mod tests {
             None,
         )
         .expect("operator router");
-        let _operator_grpc_web = operator_grpc_web_router(store, materializer, target);
+        let _operator_grpc_web = operator_grpc_web_router_with_tls(
+            store,
+            materializer,
+            target,
+            AuthConfig::NoAuth,
+            RouteSubscriptionBroker::new(),
+            None,
+            &[],
+        )
+        .expect("operator gRPC-Web router");
     }
 
     #[tokio::test]
@@ -1606,7 +1643,6 @@ mod tests {
         vec![
             (CONTROL_PLANE_LISTEN_ADDR_ENV, "127.0.0.1:50051"),
             (OPERATOR_LISTEN_ADDR_ENV, "127.0.0.1:50053"),
-            (STORE_PROVIDER_ENV, "postgres"),
             (
                 POSTGRES_URL_ENV,
                 "postgres://sleepypods@example.com/sleepypods",
@@ -1643,7 +1679,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    pub(super) struct NoopKubernetesClient;
+    pub(crate) struct NoopKubernetesClient;
 
     impl KubernetesMaterializerClient for NoopKubernetesClient {
         fn apply_object<'a>(
@@ -1716,7 +1752,19 @@ mod tests {
     }
 
     #[derive(Debug)]
-    pub(super) struct NoopStore;
+    pub(crate) struct NoopStore;
+
+    /// The operator service over a store whose every operation fails, for
+    /// transport tests that need a real service behind the listener.
+    pub(crate) fn noop_operator_service(
+    ) -> crate::api::StoreBackedOperatorGrpcService<NoopKubernetesClient> {
+        operator_grpc_service_with_store_and_route_events(
+            Arc::new(NoopStore),
+            KubernetesMaterializer::new(NoopKubernetesClient),
+            MaterializationTarget::new("cluster-a", "apps").expect("valid target"),
+            RouteSubscriptionBroker::new(),
+        )
+    }
 
     #[derive(Debug)]
     struct OperationalMetricsStore;
@@ -1730,6 +1778,7 @@ mod tests {
             remove_certificate,
             resolve_tls_certificate,
             reencrypt_certificate,
+            reencrypt_certificates_sealed_by,
             snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
@@ -1769,8 +1818,7 @@ mod tests {
             lookup_route_dependencies,
             put_http01_challenge,
             resolve_http01_challenge,
-            delete_http01_challenge,
-            expire_http01_challenges
+            delete_http01_challenge
         );
 
         fn load_materialization_operational_metrics(
@@ -1814,6 +1862,7 @@ mod tests {
             remove_certificate,
             resolve_tls_certificate,
             reencrypt_certificate,
+            reencrypt_certificates_sealed_by,
             snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
@@ -1974,13 +2023,6 @@ mod tests {
             &'a self,
             _request: DeleteHttp01ChallengeRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
-        }
-
-        fn expire_http01_challenges<'a>(
-            &'a self,
-            _request: ExpireHttp01ChallengesRequest,
-        ) -> StoreFuture<'a, StoreResult<usize>> {
             not_implemented()
         }
     }

@@ -51,7 +51,12 @@ fn config(proxy: SocketAddr, app: SocketAddr, ready: SocketAddr) -> EnvConfig {
             app.port(),
             InstanceId::new("readiness-test").unwrap(),
             Generation::new(1),
-            IdleReportConfig::new(Duration::from_secs(300), Duration::from_secs(1)).unwrap(),
+            IdleReportConfig::new(
+                Duration::from_secs(300),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            )
+            .unwrap(),
             Duration::from_millis(100),
         )
         .unwrap(),
@@ -280,7 +285,12 @@ async fn sibling_failure_joins_an_in_progress_idle_report_before_returning() {
         app.port(),
         InstanceId::new("idle-supervision").unwrap(),
         Generation::new(1),
-        IdleReportConfig::new(Duration::from_millis(20), Duration::from_millis(20)).unwrap(),
+        IdleReportConfig::new(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
         Duration::from_millis(100),
     )
     .unwrap();

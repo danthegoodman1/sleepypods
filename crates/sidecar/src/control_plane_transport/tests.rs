@@ -334,3 +334,50 @@ fn report_idle_request(instance_id: &str, generation: u64) -> ReportIdleRequest 
 fn instance_id(value: &str) -> InstanceId {
     InstanceId::new(value).expect("instance ID")
 }
+
+/// A control plane whose host vanished: the connection stays open and nothing
+/// answers. The channel's keepalive ends the call, so the next report gets a
+/// new connection.
+#[tokio::test]
+async fn a_silent_control_plane_connection_fails_the_report_at_the_keepalive_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let silent = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // An empty SETTINGS frame and the acknowledgement of the client's.
+        stream
+            .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut discard = [0_u8; 4096];
+        while stream.read(&mut discard).await.is_ok_and(|read| read > 0) {}
+    });
+    let channel = sleepypods_api::transport::native_endpoint(format!("http://{addr}"), None)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = GrpcSidecarControlPlaneClient::new(SidecarControlPlaneClient::new(channel));
+
+    // The connection exists; from here only timers decide what happens.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result = client
+        .report_idle(report_idle_request("instance-a", 7))
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(GrpcSidecarControlPlaneError::Status(_))
+    ));
+    // One 30-second interval, then the 10-second acknowledgement timeout.
+    let elapsed = started.elapsed();
+    assert!(
+        (std::time::Duration::from_secs(30)..=std::time::Duration::from_secs(45))
+            .contains(&elapsed),
+        "{elapsed:?}"
+    );
+    silent.abort();
+}

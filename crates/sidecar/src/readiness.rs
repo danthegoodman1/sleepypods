@@ -1,61 +1,46 @@
 //! Private transport readiness, separate from proxy traffic and idle accounting.
 
-use std::{convert::Infallible, io, net::SocketAddr, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::Incoming;
-use proxy_core::{ProxyAdmission, ProxyResourceConfig, Shutdown};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
-};
+use proxy_core::{serve_listener, Accept, ProxyAdmission, ProxyResourceConfig, Shutdown};
+use tokio::net::TcpStream;
 
 const HEALTH_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const APP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The caller must bind its proxy listener and complete initial CP connection before
 /// binding this listener. No health request opens the proxy's public forwarding port.
-pub async fn serve_readiness(
-    listener: TcpListener,
-    app_addr: SocketAddr,
-    shutdown: Shutdown,
-) -> io::Result<()> {
+pub async fn serve_readiness(listener: impl Accept, app_addr: SocketAddr, shutdown: Shutdown) {
     let config = ProxyResourceConfig::default()
         .with_limits(8, 8, 8, 1)
         .expect("fixed health limits are valid")
         .with_timeouts(HEALTH_IO_TIMEOUT, HEALTH_IO_TIMEOUT, HEALTH_IO_TIMEOUT)
         .expect("fixed health deadlines are valid");
     let admission = ProxyAdmission::new(config);
-    let mut connections = JoinSet::new();
-    let result = loop {
-        while connections.try_join_next().is_some() {}
-        tokio::select! {
-            _ = shutdown.cancelled() => break Ok(()),
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
-                let io = match admission.admit_io(stream) { Ok(io) => io, Err(_) => continue };
-                let handshake = match admission.handshakes.try_acquire() { Ok(permit) => permit, Err(_) => continue };
-                let admission = admission.clone();
-                let shutdown = shutdown.clone();
-                connections.spawn(async move {
-                    // Health exchanges are tiny and have a total one-second budget, so
-                    // idle keepalive clients cannot occupy every health slot indefinitely.
-                    let _ = tokio::time::timeout(HEALTH_IO_TIMEOUT,
-                        proxy_core::serve_http_connection_admitted(
-                            io, shutdown, admission, handshake,
-        None,
-                            move |request| readiness_response(request, app_addr),
-                        ),
-                    ).await;
-                });
-            }
-        }
-    };
+    let mut connections = serve_listener(listener, &shutdown, |stream, _| {
+        let io = admission.admit_io(stream).ok()?;
+        let handshake = admission.handshakes.try_acquire().ok()?;
+        let connection = proxy_core::serve_http_connection_admitted(
+            io,
+            shutdown.clone(),
+            admission.clone(),
+            handshake,
+            None,
+            move |request| readiness_response(request, app_addr),
+        );
+        // Health exchanges are tiny and have a total one-second budget, so
+        // idle keepalive clients cannot occupy every health slot indefinitely.
+        Some(async move {
+            let _ = tokio::time::timeout(HEALTH_IO_TIMEOUT, connection).await;
+        })
+    })
+    .await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    result
 }
 
 async fn readiness_response(

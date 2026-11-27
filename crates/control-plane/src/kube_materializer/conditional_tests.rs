@@ -72,7 +72,6 @@ fn plan() -> ProjectionPlan {
         &record,
         &RenderedManifest {
             instance_generation: generation,
-            template_generation: None,
             objects: vec![RenderedManifestObject {
                 apply_order: ApplyOrder::Service,
                 object,
@@ -117,6 +116,7 @@ fn rendered_workload(kind: WorkloadKind) -> KubernetesObject {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal("svc"),
@@ -131,6 +131,7 @@ fn rendered_workload(kind: WorkloadKind) -> KubernetesObject {
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         volumes: Vec::new(),
         raw_objects: Vec::new(),
@@ -154,7 +155,6 @@ fn rendered_workload(kind: WorkloadKind) -> KubernetesObject {
             drain_grace_timeout_ms: 30_000,
         },
         namespace: "apps",
-        template_generation: None,
     })
     .unwrap()
     .objects

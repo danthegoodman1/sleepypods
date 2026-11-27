@@ -122,6 +122,7 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
     )
     .await?;
     assert_instance_response(&response, TERMINATION_TARGET, "http", &[TERMINATION_TARGET])?;
+    assert_app_saw_host(&response, TERMINATION_HOST)?;
     wait_for_instance_state(
         &mut operator,
         TERMINATION_INSTANCE_ID,
@@ -129,6 +130,21 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
         Duration::from_secs(30),
     )
     .await?;
+
+    // A browser negotiates HTTP/2 with frontline. The app serves HTTP/1.1
+    // only and receives the request as HTTP/1.1 with the client's host.
+    let response = tls_get_http2(
+        config.tls_termination_addr,
+        TERMINATION_HOST,
+        "/terminated-h2",
+        app.cert.der().clone(),
+    )
+    .await?;
+    assert_instance_response(&response, TERMINATION_TARGET, "http", &[TERMINATION_TARGET])?;
+    assert_app_saw_host(&response, TERMINATION_HOST)?;
+    if !response.body.contains("path=/terminated-h2\n") {
+        return Err(format!("HTTP/2 request path was not preserved: {:?}", response.body).into());
+    }
     assert_materialized_deployment_and_service(kube, &config, TERMINATION_TARGET, "http", None)
         .await?;
 
@@ -301,19 +317,18 @@ async fn create_tls_termination_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-tls-create-termination-instance".to_owned(),
             instance_id: TERMINATION_INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: TERMINATION_CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), TERMINATION_TARGET.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-tls-create-termination-route".to_owned(),
             route_binding_id: TERMINATION_ROUTE_ID.to_owned(),
             instance_id: TERMINATION_INSTANCE_ID.to_owned(),
             identity: Some(http_route_identity(
@@ -336,19 +351,18 @@ async fn create_sni_passthrough_resources(
     for spec in passthrough_specs() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-tls-create-instance-{}", spec.target),
                 instance_id: spec.instance_id.to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: PASSTHROUGH_CLASS_ID.to_owned(),
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-tls-create-route-{}", spec.target),
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(sni_route_identity(spec.host_kind, spec.host)),
@@ -369,10 +383,8 @@ async fn create_workload_class(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-tls-create-class-{class_id}"),
             class_id: class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -383,7 +395,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config, app_mode, sidecar_mode)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -610,6 +621,60 @@ fn tls_get_blocking(
     })
 }
 
+/// Sends one request over HTTP/2 negotiated by ALPN, as a browser does.
+async fn tls_get_http2(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    certificate: CertificateDer<'static>,
+) -> TestResult<HttpResponse> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate)?;
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from(host.to_owned())?, stream)
+        .await?;
+    if stream.get_ref().1.alpn_protocol() != Some(&b"h2"[..]) {
+        return Err(format!(
+            "frontline negotiated {:?}, expected h2",
+            stream.get_ref().1.alpn_protocol()
+        )
+        .into());
+    }
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await?;
+    let connection = tokio::spawn(connection);
+    let request = http::Request::builder()
+        .uri(format!("https://{host}{path}"))
+        .body(Empty::<bytes::Bytes>::new())?;
+    let response = tokio::time::timeout(Duration::from_secs(30), sender.send_request(request))
+        .await
+        .map_err(|_| "HTTP/2 request through TLS termination timed out")??;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    connection.abort();
+
+    Ok(HttpResponse {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+/// The app reports the Host it received. It must be the client's.
+fn assert_app_saw_host(response: &HttpResponse, host: &str) -> TestResult<()> {
+    if !response.body.contains(&format!("host={host}\n")) {
+        return Err(format!("app did not see host {host:?}: {:?}", response.body).into());
+    }
+    Ok(())
+}
+
 fn assert_instance_response(
     response: &HttpResponse,
     target: &str,
@@ -803,12 +868,14 @@ fn manifest_template(
                     },
                 ],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: sidecar_mode.map(str::to_owned),
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("e2e-tls-", "")),
@@ -849,9 +916,9 @@ fn sni_route_identity(host_kind: i32, host: &str) -> RouteIdentity {
 fn workload_name(target: &str) -> String {
     // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
     let suffix = match target {
-        "termination" => "f589b132",
-        "sni-exact" => "24c750bd",
-        "sni-wildcard" => "df3d5390",
+        "termination" => "f589b1325e571750",
+        "sni-exact" => "24c750bdaa8b61ab",
+        "sni-wildcard" => "df3d5390ba6fcf39",
         _ => panic!("unknown fixture target {target}"),
     };
     format!("e2e-tls-{target}-{suffix}")

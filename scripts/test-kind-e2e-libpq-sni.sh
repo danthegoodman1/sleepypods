@@ -16,7 +16,7 @@ operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19751}"
 route_host="${SLEEPYPODS_KIND_E2E_LIBPQ_SNI_HOST:-exact.sni.sleepypods.test}"
 miss_host="${SLEEPYPODS_KIND_E2E_LIBPQ_SNI_MISS_HOST:-passthrough.sleepypods.test}"
 # SHA-256(e2e-libpq-sni-postgres), first eight hex digits.
-workload_name="e2e-libpq-sni-postgres-56db3511"
+workload_name="e2e-libpq-sni-postgres-56db3511a0f9a188"
 kubeconfig="$(mktemp)"
 security_dir="$(mktemp -d)"
 artifact_dir="${SLEEPYPODS_E2E_ARTIFACT_DIR:-${repo_root}/.generated/test-kind-e2e-libpq-sni-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -468,8 +468,6 @@ spec:
             - name: SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN
               valueFrom:
                 secretKeyRef: {name: sleepypods-native-control-plane, key: sidecar.token}
-            - name: SLEEPYPODS_STORE_PROVIDER
-              value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
             - name: SLEEPYPODS_CLUSTER_ID

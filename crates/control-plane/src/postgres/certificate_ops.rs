@@ -396,6 +396,38 @@ pub(super) async fn resolve(
     })
 }
 
+/// Opens a certificate's sealed key and seals it again under the active key.
+fn reseal(
+    keyring: &CertificateSealer,
+    row: &Row,
+    meta: &CertificateMetadata,
+) -> StoreResult<SealedPrivateKey> {
+    let material = bundle(keyring, row, meta)?;
+    keyring
+        .seal(
+            &meta.id,
+            meta.version,
+            &chain_digest(material.chain_der()),
+            material.private_key_pkcs8_der(),
+        )
+        .map_err(|e| StoreError::internal(e.0))
+}
+async fn store_seal(
+    tx: &Transaction<'_>,
+    meta: &CertificateMetadata,
+    sealed: &SealedPrivateKey,
+) -> StoreResult<()> {
+    let sealing_revision = next(meta.sealing_revision)?;
+    tx.execute("UPDATE certificates SET seal_format=$2,seal_key_id=$3,seal_nonce=$4,sealed_private_key=$5,sealing_revision=$6 WHERE certificate_id=$1", &[&meta.id.as_str(),&(sealed.format_version as i16),&sealed.key_id,&&sealed.nonce[..],&sealed.ciphertext,&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
+    Ok(())
+}
+fn keyring(store: &PostgresStore) -> StoreResult<std::sync::Arc<CertificateSealer>> {
+    store
+        .certificate_sealer
+        .clone()
+        .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))
+}
+
 pub(super) async fn reencrypt(
     store: &PostgresStore,
     request: ReencryptCertificateRequest,
@@ -417,29 +449,94 @@ pub(super) async fn reencrypt(
             resource: "active certificate",
         });
     }
-    let keyring = store
-        .certificate_sealer
-        .clone()
-        .ok_or_else(|| StoreError::internal("certificate sealing keys are not configured"))?;
+    let keyring = keyring(store)?;
     let checked_meta = meta.clone();
     let sealed = work
-        .blocking(move || {
-            let material = bundle(&keyring, &row, &checked_meta)?;
-            keyring
-                .seal(
-                    &checked_meta.id,
-                    checked_meta.version,
-                    &chain_digest(material.chain_der()),
-                    material.private_key_pkcs8_der(),
-                )
-                .map_err(|e| StoreError::internal(e.0))
-        })
+        .blocking(move || reseal(&keyring, &row, &checked_meta))
         .await?;
-    let sealing_revision = next(meta.sealing_revision)?;
-    tx.execute("UPDATE certificates SET seal_format=$2,seal_key_id=$3,seal_nonce=$4,sealed_private_key=$5,sealing_revision=$6 WHERE certificate_id=$1", &[&request.id.as_str(),&(sealed.format_version as i16),&sealed.key_id,&&sealed.nonce[..],&sealed.ciphertext,&(sealing_revision.get() as i64)]).await.map_err(map_postgres_error)?;
+    store_seal(&tx, &meta, &sealed).await?;
     let result = metadata(&certificate(&tx, &request.id).await?.unwrap())?;
     tx.commit().await.map_err(map_postgres_error)?;
     Ok(result)
+}
+
+/// Certificates one bulk call re-seals. The call holds the certificate lock
+/// for the whole batch.
+const REENCRYPT_BATCH: i64 = 16;
+
+pub(super) async fn reencrypt_sealed_by(
+    store: &PostgresStore,
+    sealing_key_id: String,
+) -> StoreResult<SealingKeyReencryption> {
+    validate_key_id(&sealing_key_id).map_err(invalid)?;
+    let keyring = keyring(store)?;
+    if keyring.active_id() == sealing_key_id {
+        return Err(StoreError::invalid_argument(
+            "certificates under the active sealing key are current",
+        ));
+    }
+    if !keyring.holds(&sealing_key_id) {
+        return Err(StoreError::invalid_argument(
+            "the sealing key ring lacks this key",
+        ));
+    }
+    let work = store.certificate_work.acquire()?;
+    let mut client = work.client(store).await?;
+    let tx = client.transaction().await.map_err(map_postgres_error)?;
+    lock(&tx).await?;
+    let rows = tx
+        .query(
+            &format!("SELECT {CERT_COLUMNS} FROM certificates WHERE state='active' AND seal_key_id=$1 ORDER BY certificate_id LIMIT $2"),
+            &[&sealing_key_id, &REENCRYPT_BATCH],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    let resealed = work
+        .blocking(move || {
+            rows.iter()
+                .map(|row| {
+                    let meta = metadata(row)?;
+                    let sealed = reseal(&keyring, row, &meta)?;
+                    Ok((meta, sealed))
+                })
+                .collect::<StoreResult<Vec<_>>>()
+        })
+        .await?;
+    for (meta, sealed) in &resealed {
+        store_seal(&tx, meta, sealed).await?;
+    }
+    let remaining: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM certificates WHERE state='active' AND seal_key_id=$1",
+            &[&sealing_key_id],
+        )
+        .await
+        .map_err(map_postgres_error)?
+        .get(0);
+    tx.commit().await.map_err(map_postgres_error)?;
+    Ok(SealingKeyReencryption {
+        reencrypted: resealed.len() as u32,
+        remaining: remaining as u64,
+    })
+}
+
+/// Sealing key IDs that active certificates use and the configured ring lacks,
+/// up to the ring's capacity.
+pub(super) async fn missing_sealing_key_ids(store: &PostgresStore) -> StoreResult<Vec<String>> {
+    let held = store
+        .certificate_sealer
+        .as_ref()
+        .map(|keyring| keyring.key_ids())
+        .unwrap_or_default();
+    let client = store.client().await?;
+    let rows = client
+        .query(
+            "SELECT DISTINCT seal_key_id FROM certificates WHERE state='active' AND NOT (seal_key_id = ANY($1)) ORDER BY seal_key_id LIMIT 8",
+            &[&held],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
 // A single MVCC statement gates the scoped join on the private global revision.

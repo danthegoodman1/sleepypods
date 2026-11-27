@@ -3,8 +3,12 @@ pub use sleepypods_api::InstanceState;
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    ids::{Generation, IdempotencyKey, InstanceId},
-    route::{RouteBindingRecord, RouteBindingSpec},
+    ids::{Generation, InstanceId, RouteBindingId},
+    manifest::{
+        render_manifests_with_options, ManifestRenderError, RenderManifestOptions,
+        RenderManifestRequest,
+    },
+    route::{RouteBindingRecord, RouteIdentity},
     sleep_policy::SleepPolicyError,
     workload::{ValueSchemaError, WorkloadClassVersion, WorkloadClassVersionRef},
 };
@@ -22,18 +26,23 @@ pub struct InstanceRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateInstanceRequest {
-    pub idempotency_key: IdempotencyKey,
     pub instance_id: InstanceId,
     pub workload_class: WorkloadClassVersionRef,
     pub values: InstanceValues,
-    pub route_bindings: Vec<RouteBindingSpec>,
+    pub route_bindings: Vec<InstanceRoute>,
+}
+
+/// A route binding created in the same transaction as its instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceRoute {
+    pub id: RouteBindingId,
+    pub identity: RouteIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateInstanceResult {
     pub instance: InstanceRecord,
     pub route_bindings: Vec<RouteBindingRecord>,
-    pub idempotency_replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,13 +175,8 @@ impl fmt::Display for InvalidStateTransition {
 impl Error for InvalidStateTransition {}
 
 impl CreateInstanceRequest {
-    pub fn new(
-        idempotency_key: IdempotencyKey,
-        instance_id: InstanceId,
-        workload_class: WorkloadClassVersionRef,
-    ) -> Self {
+    pub fn new(instance_id: InstanceId, workload_class: WorkloadClassVersionRef) -> Self {
         Self {
-            idempotency_key,
             instance_id,
             workload_class,
             values: InstanceValues::new(),
@@ -185,7 +189,7 @@ impl CreateInstanceRequest {
         self
     }
 
-    pub fn with_route_bindings(mut self, route_bindings: Vec<RouteBindingSpec>) -> Self {
+    pub fn with_route_bindings(mut self, route_bindings: Vec<InstanceRoute>) -> Self {
         self.route_bindings = route_bindings;
         self
     }
@@ -201,6 +205,37 @@ impl CreateInstanceRequest {
         workload_class.sleep_policy.resolve(&self.values)?;
         Ok(self)
     }
+
+    /// Renders the instance as its first wake will. Call it on a request whose
+    /// values `validate_values_against` has completed.
+    pub(crate) fn validate_renders(
+        &self,
+        workload_class: &WorkloadClassVersion,
+        namespace: &str,
+        options: RenderManifestOptions<'_>,
+    ) -> Result<(), CreateInstanceValidationError> {
+        let instance = InstanceRecord {
+            id: self.instance_id.clone(),
+            workload_class: self.workload_class.clone(),
+            values: self.values.clone(),
+            state: InstanceState::Cold,
+            generation: Generation::new(1),
+        };
+        render_manifests_with_options(
+            RenderManifestRequest {
+                template: &workload_class.template,
+                instance: &instance,
+                sleep_policy: workload_class.sleep_policy.resolve(&self.values)?,
+                namespace,
+            },
+            options,
+        )
+        .map_err(CreateInstanceValidationError::Render)?;
+        workload_class
+            .render_exclusivity_keys(&self.values)
+            .map_err(CreateInstanceValidationError::Render)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +243,7 @@ pub enum CreateInstanceValidationError {
     WorkloadClass(crate::workload::WorkloadClassValidationError),
     ValueSchema(ValueSchemaError),
     SleepPolicy(SleepPolicyError),
+    Render(ManifestRenderError),
 }
 
 impl fmt::Display for CreateInstanceValidationError {
@@ -216,6 +252,7 @@ impl fmt::Display for CreateInstanceValidationError {
             Self::WorkloadClass(error) => error.fmt(f),
             Self::ValueSchema(error) => error.fmt(f),
             Self::SleepPolicy(error) => error.fmt(f),
+            Self::Render(error) => error.fmt(f),
         }
     }
 }
@@ -264,10 +301,8 @@ impl CompareAndSwapInstanceStateRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use crate::{
-        ids::{Generation, IdempotencyKey, InstanceId, WorkloadClassId},
+        ids::{Generation, InstanceId, WorkloadClassId},
         manifest::{
             ContainerPortTemplate, ContainerTemplate, ManifestTemplate, ServicePortTemplate,
             ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind, WorkloadTemplate,
@@ -557,7 +592,6 @@ mod tests {
 
     fn create_request() -> CreateInstanceRequest {
         CreateInstanceRequest::new(
-            IdempotencyKey::new("key-1").expect("valid key"),
             InstanceId::new("instance-1").expect("valid instance ID"),
             WorkloadClassVersionRef::new(
                 WorkloadClassId::new("class-1").expect("valid class ID"),
@@ -579,9 +613,7 @@ mod tests {
                 WorkloadClassId::new("class-1").expect("valid class ID"),
                 Generation::new(1),
             ),
-            template_generation: Generation::new(1),
             template: test_manifest_template(),
-            default_values: BTreeMap::new(),
             value_schema,
             sleep_policy,
             exclusivity_keys: vec![],
@@ -616,12 +648,14 @@ mod tests {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             sidecar: SidecarTemplate {
                 name: "sleepypods-sidecar".to_owned(),
                 image: TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             service: Some(ServiceTemplate {
                 name: TemplateText::literal("app"),

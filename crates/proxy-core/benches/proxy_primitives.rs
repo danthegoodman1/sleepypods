@@ -8,9 +8,8 @@ use proxy_core::{
     observability::{
         Operation, Outcome, Protocol, ProxyState, TlsClientHelloOutcome, TrafficDirection,
     },
-    parse_tls_client_hello_sni, prepare_reverse_proxy_request, proxy_streams,
-    proxy_streams_with_idle_timeout, proxy_websocket_streams, strip_hop_by_hop_headers,
-    ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloError,
+    parse_tls_client_hello_sni, prepare_reverse_proxy_request, proxy_streams_with_timeouts,
+    strip_hop_by_hop_headers, ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloError,
 };
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
@@ -21,15 +20,19 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn tcp_forwarding(c: &mut Criterion) {
     let runtime = runtime();
     let payload = Bytes::from_static(&[7; 4096]);
 
+    // Without an idle deadline the relay is a WebSocket session's; with one it
+    // is a TCP or SNI-passthrough session's.
     for (name, idle_timeout) in [
-        ("tcp/proxy_streams_duplex_4k_round_trip", false),
+        ("tcp/proxy_streams_duplex_4k_round_trip", None),
         (
             "tcp/proxy_streams_with_idle_timeout_duplex_4k_round_trip",
-            true,
+            Some(Duration::from_secs(3600)),
         ),
     ] {
         c.bench_function(name, |b| {
@@ -40,17 +43,16 @@ fn tcp_forwarding(c: &mut Criterion) {
                     let (mut client, proxy_client) = duplex(16 * 1024);
                     let (proxy_upstream, mut upstream) = duplex(16 * 1024);
 
+                    // A session task builds its relay in place, as the listeners do.
                     let proxy_task = tokio::spawn(async move {
-                        if idle_timeout {
-                            proxy_streams_with_idle_timeout(
-                                proxy_client,
-                                proxy_upstream,
-                                Duration::from_secs(3600),
-                            )
-                            .await
-                        } else {
-                            proxy_streams(proxy_client, proxy_upstream).await
-                        }
+                        proxy_streams_with_timeouts(
+                            proxy_client,
+                            proxy_upstream,
+                            idle_timeout,
+                            WRITE_TIMEOUT,
+                            None,
+                        )
+                        .await
                     });
 
                     client.write_all(&payload).await.expect("client writes");
@@ -70,12 +72,10 @@ fn tcp_forwarding(c: &mut Criterion) {
                     client.read_exact(&mut echoed).await.expect("client reads");
                     black_box(&echoed);
 
-                    black_box(
-                        proxy_task
-                            .await
-                            .expect("proxy task joins")
-                            .expect("proxy succeeds"),
-                    );
+                    proxy_task
+                        .await
+                        .expect("proxy task joins")
+                        .expect("proxy succeeds");
                 }
             })
         });
@@ -124,15 +124,19 @@ fn websocket_relay(c: &mut Criterion) {
 
                 let mut client =
                     WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-                let proxy_client =
-                    WebSocketStream::from_raw_socket(proxy_client_io, Role::Server, None).await;
-                let proxy_upstream =
-                    WebSocketStream::from_raw_socket(proxy_upstream_io, Role::Client, None).await;
                 let mut upstream =
                     WebSocketStream::from_raw_socket(upstream_io, Role::Server, None).await;
 
+                // The proxy relays the upgraded bytes; only the peers frame them.
                 let proxy_task = tokio::spawn(async move {
-                    proxy_websocket_streams(proxy_client, proxy_upstream).await
+                    proxy_streams_with_timeouts(
+                        proxy_client_io,
+                        proxy_upstream_io,
+                        None,
+                        WRITE_TIMEOUT,
+                        None,
+                    )
+                    .await
                 });
 
                 client
@@ -165,13 +169,9 @@ fn websocket_relay(c: &mut Criterion) {
                     .expect("close is valid");
                 black_box(close);
                 upstream.flush().await.expect("upstream flushes close");
+                drop((client, upstream));
 
-                black_box(
-                    proxy_task
-                        .await
-                        .expect("proxy task joins")
-                        .expect("proxy succeeds"),
-                );
+                let _ = black_box(proxy_task.await.expect("proxy task joins"));
             }
         })
     });

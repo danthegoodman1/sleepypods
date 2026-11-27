@@ -9,7 +9,7 @@ use proxy_core::{
 };
 use sidecar::{
     runtime::{serve_http_listener_with_idle, serve_tcp_listener_with_idle, SidecarRuntimeConfig},
-    GrpcSidecarControlPlaneClient, IdleReportConfig,
+    AppProtocol, GrpcSidecarControlPlaneClient, IdleReportConfig,
 };
 use sleepypods_api::{
     pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken,
@@ -84,7 +84,7 @@ async fn run_with_connection(
         Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
         None => None,
     };
-    let app_addr = env.runtime.proxy().tcp_upstream_addr();
+    let app_addr = env.runtime.proxy().app_addr();
     let active_streams = env.runtime.active_streams_collector();
     let proxy_shutdown = shutdown.clone();
     let metrics_shutdown = shutdown.clone();
@@ -132,7 +132,7 @@ async fn run_with_connection(
         }),
         finish_listener(&shutdown, &first_error, async {
             if let Some(listener) = readiness_listener {
-                sidecar::readiness::serve_readiness(listener, app_addr, shutdown.clone()).await?;
+                sidecar::readiness::serve_readiness(listener, app_addr, shutdown.clone()).await;
             }
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         }),
@@ -253,7 +253,13 @@ impl EnvConfig {
             }
         }
         let runtime_mode = SidecarRuntimeMode::from_env()?;
-        let idle_report = IdleReportConfig::new(idle_timeout, retry_backoff)?;
+        let app_protocol = match env::var("SLEEPYPODS_APP_PROTOCOL") {
+            Ok(value) => value.parse()?,
+            Err(_) => AppProtocol::default(),
+        };
+        let resources = proxy_core::ProxyResourceConfig::from_vars(|name| env::var(name).ok())?;
+        let idle_report =
+            IdleReportConfig::new(idle_timeout, retry_backoff, resources.setup_timeout())?;
         let runtime = SidecarRuntimeConfig::new(
             listen_addr,
             app_port,
@@ -262,9 +268,8 @@ impl EnvConfig {
             idle_report,
             drain_grace_timeout,
         )?
-        .with_resource_config(proxy_core::ProxyResourceConfig::from_vars(|name| {
-            env::var(name).ok()
-        })?);
+        .with_resource_config(resources)
+        .with_app_protocol(app_protocol);
 
         Ok(Self {
             runtime,

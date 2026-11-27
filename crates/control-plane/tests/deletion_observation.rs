@@ -149,7 +149,7 @@ async fn server(
                     } else if path.ends_with("/ReconcileMaterialization") {
                         let request: pb::ReconcileMaterializationRequest = decode(&bytes);
                         assert!(request.status_only, "observation must never enqueue");
-                        assert_eq!(request.materialization_id, "member:target:apps");
+                        assert_eq!(request.instance_id, "member");
                         scenario.statuses.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(scenario.status_delay).await;
                         if scenario.status_error {

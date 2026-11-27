@@ -568,6 +568,78 @@ async fn postgres_certificate_rotation_binding_races_and_atomic_views() -> TestR
         Ok(())
     }).await
 }
+/// Startup compares the sealing keys active certificates use with the key ring.
+#[tokio::test]
+async fn postgres_startup_requires_every_sealing_key_in_use() -> TestResult {
+    database_test(|store, _raw, config| async move {
+        let connect = |sealer: Option<Arc<CertificateSealer>>| {
+            let config = config.clone();
+            async move { control_plane::runtime::connect_store(&config, sealer).await }
+        };
+        // With no certificate stored, any key ring starts, and so does none.
+        connect(None).await?;
+        connect(Some(ring("b", &[("b", 8)]))).await?;
+
+        let request = publish("sealed", 0, &["sealed.example.test"]);
+        let key = request.bundle.private_key_pkcs8_der().to_vec();
+        store.publish_certificate(request).await?;
+        store
+            .set_tls_binding(bind("sealed.example.test", rev(0), Some("sealed")))
+            .await?;
+
+        for sealer in [None, Some(ring("b", &[("b", 8)]))] {
+            let error = connect(sealer)
+                .await
+                .err()
+                .expect("startup fails while a certificate's sealing key is missing");
+            assert_eq!(
+                error.to_string(),
+                "active certificates are sealed under keys missing from the sealing key ring: a"
+            );
+        }
+
+        let rotating = connect(Some(ring("b", &[("a", 7), ("b", 8)]))).await?;
+        assert_eq!(
+            rotating
+                .reencrypt_certificates_sealed_by("a".into())
+                .await?,
+            SealingKeyReencryption {
+                reencrypted: 1,
+                remaining: 0
+            }
+        );
+        let rotated = connect(Some(ring("b", &[("b", 8)]))).await?;
+        let resolved = rotated
+            .resolve_tls_certificate(ResolveTlsCertificateRequest {
+                hostname: host("sealed.example.test"),
+                known_view_revision: None,
+            })
+            .await?;
+        match resolved.value {
+            TlsCertificateValue::Found { bundle, .. } => {
+                assert!(bundle.private_key_pkcs8_der() == key)
+            }
+            _ => panic!("a re-sealed certificate resolves"),
+        }
+
+        // A removed certificate keeps no seal, so its key may leave the ring.
+        let removable = connect(Some(ring("c", &[("b", 8), ("c", 9)]))).await?;
+        removable
+            .publish_certificate(publish("removed", 0, &["removed.example.test"]))
+            .await?;
+        assert!(connect(Some(ring("b", &[("b", 8)]))).await.is_err());
+        removable
+            .remove_certificate(RemoveCertificateRequest {
+                id: id("removed"),
+                expected_version: rev(1),
+            })
+            .await?;
+        connect(Some(ring("b", &[("b", 8)]))).await?;
+        Ok(())
+    })
+    .await
+}
+
 fn ring_digest(bytes: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
@@ -585,6 +657,7 @@ struct LostCertificateResponse {
 impl ControlPlaneStore for LostCertificateResponse {
     unexpected_store_methods!(
         get_certificate_metadata,
+        reencrypt_certificates_sealed_by,
         get_tls_binding,
         resolve_tls_certificate,
         snapshot_tls_bindings,
@@ -628,7 +701,6 @@ impl ControlPlaneStore for LostCertificateResponse {
         put_http01_challenge,
         resolve_http01_challenge,
         delete_http01_challenge,
-        expire_http01_challenges,
     );
     fn publish_certificate(
         &self,

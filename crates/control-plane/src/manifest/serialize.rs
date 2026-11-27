@@ -238,6 +238,7 @@ fn pod_template_to_value(template: &PodTemplateSpec) -> Value {
             // beyond the container runtime's default set.
             "automountServiceAccountToken": false,
             "securityContext": { "seccompProfile": { "type": "RuntimeDefault" } },
+            "terminationGracePeriodSeconds": template.spec.termination_grace_period_seconds,
         },
     })
 }

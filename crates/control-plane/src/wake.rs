@@ -208,7 +208,6 @@ where
             instance: &projected,
             sleep_policy: policy,
             namespace: request.target.namespace(),
-            template_generation: Some(class.template_generation),
         },
         materializer.render_options(),
     )

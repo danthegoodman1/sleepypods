@@ -7,8 +7,7 @@ use std::{
 
 use http::Uri;
 use proxy_core::{
-    configure_tcp_keepalive, read_tls_client_hello_prefix, TcpProxyConfig, TcpProxyStats,
-    TlsClientHelloError, TlsClientHelloSni,
+    read_tls_client_hello_prefix, TcpProxyConfig, TlsClientHelloError, TlsClientHelloSni,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{
@@ -30,12 +29,6 @@ pub struct FrontlineTlsAdapter {
 pub struct TerminatedTls<IO> {
     pub identity: RouteRequestIdentity,
     pub stream: tokio_rustls::server::TlsStream<IO>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsPassthrough {
-    pub identity: RouteRequestIdentity,
-    pub stats: TcpProxyStats,
 }
 
 #[derive(Debug)]
@@ -87,10 +80,6 @@ impl FrontlineTlsAdapter {
         self
     }
 
-    pub fn certificates(&self) -> &TlsCertificateStore {
-        &self.certificates
-    }
-
     pub async fn terminate<IO>(&self, io: IO) -> Result<TerminatedTls<IO>, TlsTerminationError>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
@@ -130,19 +119,6 @@ impl FrontlineTlsAdapter {
         Ok(TerminatedTls { identity, stream })
     }
 
-    pub async fn passthrough<Client>(
-        &self,
-        ready: &ReadyBackend,
-        mut client: Client,
-    ) -> Result<TlsPassthrough, TlsPassthroughError>
-    where
-        Client: AsyncRead + AsyncWrite + Unpin,
-    {
-        let client_hello = self.read_passthrough_client_hello(&mut client).await?;
-
-        self.passthrough_prefixed(ready, client, client_hello).await
-    }
-
     pub async fn read_passthrough_client_hello<Client>(
         &self,
         client: &mut Client,
@@ -168,34 +144,31 @@ impl FrontlineTlsAdapter {
         })
     }
 
+    /// Relays the connection to the backend, starting with the ClientHello
+    /// bytes already read from the client.
     pub async fn passthrough_prefixed<Client>(
         &self,
         ready: &ReadyBackend,
         client: Client,
         client_hello: TlsPassthroughClientHello,
-    ) -> Result<TlsPassthrough, TlsPassthroughError>
+    ) -> Result<(), TlsPassthroughError>
     where
         Client: AsyncRead + AsyncWrite + Unpin,
     {
         let upstream = passthrough_backend_addr(ready)?;
-        let identity = client_hello.identity;
-
         let upstream = proxy_core::connect_tcp(upstream, self.resources.setup_timeout())
             .await
             .map_err(TlsPassthroughError::Connect)?;
-        configure_tcp_keepalive(&upstream, TcpProxyConfig::default().tcp_keepalive)
-            .map_err(TlsPassthroughError::Connect)?;
         let client = PrefixedStream::new(client_hello.bytes, client);
-        let stats = proxy_core::proxy_streams_with_timeouts(
+        proxy_core::proxy_streams_with_timeouts(
             client,
             upstream,
-            TcpProxyConfig::default().stream_idle_timeout,
+            Some(TcpProxyConfig::default().stream_idle_timeout),
             self.resources.write_idle_timeout(),
+            None,
         )
         .await
-        .map_err(TlsPassthroughError::Proxy)?;
-
-        Ok(TlsPassthrough { identity, stats })
+        .map_err(TlsPassthroughError::Proxy)
     }
 }
 

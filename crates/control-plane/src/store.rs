@@ -3,8 +3,8 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     http01::{
-        DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-        Http01ChallengeRecord, PutHttp01ChallengeRequest,
+        DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+        PutHttp01ChallengeRequest,
     },
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
@@ -72,6 +72,12 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         request: ReencryptCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
+    /// Re-seals a batch of the active certificates held under `sealing_key_id`
+    /// with the active key.
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>>;
 
     fn snapshot_tls_bindings(
         &self,
@@ -272,11 +278,6 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: DeleteHttp01ChallengeRequest,
     ) -> StoreFuture<'a, StoreResult<bool>>;
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>>;
 }
 
 #[derive(Clone)]
@@ -309,10 +310,6 @@ pub enum StoreError {
         key_name: String,
         owner_instance_id: Option<String>,
         owner_generation: Option<crate::ids::Generation>,
-    },
-    IdempotencyConflict,
-    IdempotencyResourceDeleted {
-        resource: &'static str,
     },
     LeaseConflict {
         message: String,
@@ -422,6 +419,12 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.inner.reencrypt_certificate(request)
     }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+        self.inner.reencrypt_certificates_sealed_by(sealing_key_id)
+    }
 
     fn snapshot_tls_bindings(
         &self,
@@ -505,7 +508,7 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         &'a self,
         request: CreateInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        // The idempotency retention window can expire during a retry; the wrapper cannot prove replay identity.
+        // Sent once: after a lost response and a delete, a retry would create the instance again.
         self.inner.create_instance(request)
     }
 
@@ -548,7 +551,7 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         &'a self,
         request: CreateRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
-        // Idempotency records can expire before replay; do not recreate a deleted binding automatically.
+        // Sent once: after a lost response and a delete, a retry would create the binding again.
         self.inner.create_route_binding(request)
     }
 
@@ -770,15 +773,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         // The same host/token may already contain a replacement challenge.
         self.inner.delete_http01_challenge(request)
     }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.expire_http01_challenges(request.clone())
-        })
-    }
 }
 
 fn retry_store_operation<'a, T, O, Fut>(
@@ -837,12 +831,6 @@ impl fmt::Display for StoreError {
             Self::LeaseConflict { message } => {
                 write!(f, "reconciliation ownership conflict: {message}")
             }
-            Self::IdempotencyResourceDeleted { resource } => {
-                write!(f, "idempotent replay refers to a deleted {resource}")
-            }
-            Self::IdempotencyConflict => {
-                f.write_str("idempotency key was already used for a different request")
-            }
             Self::Unavailable { message } => write!(f, "store unavailable: {message}"),
             Self::Internal { message } => write!(f, "internal store error: {message}"),
         }
@@ -874,13 +862,9 @@ mod tests {
     }
 
     #[test]
-    fn lease_conflicts_and_deleted_replays_are_not_retryable() {
+    fn lease_conflicts_are_not_retryable() {
         assert!(!StoreError::LeaseConflict {
             message: "ownership lost".to_owned()
-        }
-        .is_retryable());
-        assert!(!StoreError::IdempotencyResourceDeleted {
-            resource: "instance"
         }
         .is_retryable());
         assert!(StoreError::unavailable("connection interrupted").is_retryable());
@@ -978,6 +962,7 @@ mod tests {
             remove_certificate,
             resolve_tls_certificate,
             reencrypt_certificate,
+            reencrypt_certificates_sealed_by,
             snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
@@ -1150,13 +1135,6 @@ mod tests {
             &'a self,
             _request: DeleteHttp01ChallengeRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
-        }
-
-        fn expire_http01_challenges<'a>(
-            &'a self,
-            _request: ExpireHttp01ChallengesRequest,
-        ) -> StoreFuture<'a, StoreResult<usize>> {
             not_implemented()
         }
     }

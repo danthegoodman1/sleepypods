@@ -25,7 +25,7 @@ use crate::{
         passthrough_backend_addr, FrontlineTlsAdapter, TlsCertificateStore,
         TlsPassthroughBackendError, TlsPassthroughError, TlsTerminationError,
     },
-    FrontlineForwarder, ReadyBackend,
+    FrontlineForwarder, ReadyBackend, RouteRequestIdentity,
 };
 
 const REQUEST_BODY: &[u8] = b"tls request body";
@@ -223,7 +223,7 @@ async fn passthrough_extracts_sni_and_preserves_preread_prefix_and_tail() {
 
     let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled());
     let (mut client, proxy_side) = io::duplex(4096);
-    let proxy_task = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
+    let proxy_task = tokio::spawn(async move { passthrough(&adapter, &ready, proxy_side).await });
 
     client.write_all(&hello).await.expect("client writes hello");
     client.write_all(tail).await.expect("client writes tail");
@@ -238,22 +238,14 @@ async fn passthrough_extracts_sni_and_preserves_preread_prefix_and_tail() {
         .expect("client reads response");
 
     assert_eq!(response, upstream_response);
-    let passthrough = proxy_task
+    let identity = proxy_task
         .await
         .expect("proxy task completes")
         .expect("passthrough succeeds");
-    match passthrough.identity.into_identity() {
+    match identity.into_identity() {
         RouteIdentity::Sni { host } => assert_eq!(host.as_str(), "db.example.com"),
         RouteIdentity::Http { .. } => panic!("expected SNI identity"),
     }
-    assert_eq!(
-        passthrough.stats.client_to_upstream,
-        (hello.len() + tail.len()) as u64
-    );
-    assert_eq!(
-        passthrough.stats.upstream_to_client,
-        upstream_response.len() as u64
-    );
 
     upstream_task.await.expect("upstream task completes");
 }
@@ -276,7 +268,6 @@ async fn passthrough_waits_for_late_listener_after_refusal_and_sends_prefix_once
     let tail = b"opaque TLS bytes after ClientHello";
     let mut expected = hello.clone();
     expected.extend_from_slice(tail);
-    let expected_len = expected.len();
     let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled()).with_resource_config(
         proxy_core::ProxyResourceConfig::default()
             .with_timeouts(
@@ -290,7 +281,7 @@ async fn passthrough_waits_for_late_listener_after_refusal_and_sends_prefix_once
     client.write_all(&hello).await.unwrap();
     client.write_all(tail).await.unwrap();
     client.shutdown().await.unwrap();
-    let mut proxy = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
+    let mut proxy = tokio::spawn(async move { passthrough(&adapter, &ready, proxy_side).await });
 
     let early = tokio::time::timeout(Duration::from_millis(100), &mut proxy).await;
     assert!(
@@ -317,9 +308,7 @@ async fn passthrough_waits_for_late_listener_after_refusal_and_sends_prefix_once
         .unwrap()
         .unwrap();
     assert_eq!(response, b"single upstream response");
-    let result = proxy.await.unwrap().unwrap();
-    assert_eq!(result.stats.client_to_upstream, expected_len as u64);
-    assert_eq!(result.stats.upstream_to_client, response.len() as u64);
+    proxy.await.unwrap().unwrap();
     upstream.await.unwrap();
 }
 
@@ -342,8 +331,7 @@ async fn passthrough_rejects_bad_inputs_before_connecting() {
         .write_all(b"GET / HTTP/1.1\r\n\r\n")
         .await
         .expect("writes non-tls");
-    let error = adapter
-        .passthrough(&ready, proxy_side)
+    let error = passthrough(&adapter, &ready, proxy_side)
         .await
         .expect_err("non tls rejects");
     assert!(matches!(error, TlsPassthroughError::NotTls(_)));
@@ -353,8 +341,7 @@ async fn passthrough_rejects_bad_inputs_before_connecting() {
         .write_all(&client_hello(None))
         .await
         .expect("writes no-sni hello");
-    let error = adapter
-        .passthrough(&ready, proxy_side)
+    let error = passthrough(&adapter, &ready, proxy_side)
         .await
         .expect_err("missing sni rejects");
     assert!(matches!(error, TlsPassthroughError::MissingSni));
@@ -364,8 +351,7 @@ async fn passthrough_rejects_bad_inputs_before_connecting() {
         .write_all(&client_hello(Some(sni_extension(b"localhost"))))
         .await
         .expect("writes invalid sni hello");
-    let error = adapter
-        .passthrough(&ready, proxy_side)
+    let error = passthrough(&adapter, &ready, proxy_side)
         .await
         .expect_err("invalid sni rejects");
     assert!(matches!(error, TlsPassthroughError::InvalidSni(_)));
@@ -535,7 +521,7 @@ async fn passthrough_setup_timeout_and_cancellation_do_not_redial() {
             .await
             .unwrap();
         let started = tokio::time::Instant::now();
-        let task = tokio::spawn(async move { adapter.passthrough(&ready, proxy_side).await });
+        let task = tokio::spawn(async move { passthrough(&adapter, &ready, proxy_side).await });
         if cancel {
             tokio::time::sleep(Duration::from_millis(30)).await;
             task.abort();
@@ -572,9 +558,8 @@ async fn passthrough_does_not_replay_after_clienthello_dispatch() {
     let (mut client, proxy_side) = io::duplex(4096);
     client.write_all(&hello).await.unwrap();
     let task = tokio::spawn(async move {
-        FrontlineTlsAdapter::new(TlsCertificateStore::disabled())
-            .passthrough(&ready, proxy_side)
-            .await
+        let adapter = FrontlineTlsAdapter::new(TlsCertificateStore::disabled());
+        passthrough(&adapter, &ready, proxy_side).await
     });
     let (mut upstream, _) = listener.accept().await.unwrap();
     let mut actual = vec![0; expected.len()];
@@ -595,4 +580,21 @@ async fn passthrough_does_not_replay_after_clienthello_dispatch() {
             .await
             .is_err()
     );
+}
+
+/// The two steps the passthrough listener runs for one connection.
+async fn passthrough<Client>(
+    adapter: &FrontlineTlsAdapter,
+    ready: &ReadyBackend,
+    mut client: Client,
+) -> Result<RouteRequestIdentity, TlsPassthroughError>
+where
+    Client: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let client_hello = adapter.read_passthrough_client_hello(&mut client).await?;
+    let identity = client_hello.identity().clone();
+    adapter
+        .passthrough_prefixed(ready, client, client_hello)
+        .await?;
+    Ok(identity)
 }

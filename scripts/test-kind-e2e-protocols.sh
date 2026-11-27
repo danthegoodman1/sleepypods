@@ -10,6 +10,7 @@ keep_namespace="${SLEEPYPODS_KIND_E2E_KEEP_NAMESPACE:-0}"
 image_prefix="${SLEEPYPODS_IMAGE_PREFIX:-sleepypods}"
 image_tag="${SLEEPYPODS_IMAGE_TAG:-kind-e2e-protocols}"
 app_image="${SLEEPYPODS_KIND_E2E_APP_IMAGE:-${image_prefix}/protocol-app:${image_tag}}"
+grpc_app_image="${SLEEPYPODS_KIND_E2E_GRPC_APP_IMAGE:-${image_prefix}/grpc-app:${image_tag}}"
 postgres_image="${SLEEPYPODS_KIND_E2E_POSTGRES_IMAGE:-postgres:17-alpine}"
 operator_port="${SLEEPYPODS_KIND_E2E_OPERATOR_PORT:-19551}"
 frontline_port="${SLEEPYPODS_KIND_E2E_FRONTLINE_PORT:-19580}"
@@ -147,6 +148,12 @@ docker build \
   --file "${repo_root}/scripts/Dockerfile.kind-protocol-app" \
   "${repo_root}"
 
+echo "==> Building ${grpc_app_image}"
+docker build \
+  --tag "${grpc_app_image}" \
+  --file "${repo_root}/scripts/Dockerfile.kind-grpc-app" \
+  "${repo_root}"
+
 echo "==> Pulling ${postgres_image}"
 docker pull "${postgres_image}"
 
@@ -155,6 +162,7 @@ for image in \
   "${image_prefix}/frontline:${image_tag}" \
   "${image_prefix}/sidecar:${image_tag}" \
   "${app_image}" \
+  "${grpc_app_image}" \
   "${postgres_image}"; do
   echo "==> Loading ${image} into kind/${cluster_name}"
   kind_load_image "${cluster_name}" "${image}"
@@ -320,8 +328,6 @@ spec:
               value: 0.0.0.0:50053
             - name: SLEEPYPODS_CONTROL_PLANE_AUTH_MODE
               value: no-auth
-            - name: SLEEPYPODS_STORE_PROVIDER
-              value: postgres
             - name: SLEEPYPODS_POSTGRES_URL
               value: postgres://sleepypods:sleepypods@sleepypods-postgres:5432/sleepypods
             - name: SLEEPYPODS_CLUSTER_ID
@@ -419,6 +425,7 @@ KUBECONFIG="${kubeconfig}" \
   SLEEPYPODS_E2E_OPERATOR_ENDPOINT="http://127.0.0.1:${operator_port}" \
   SLEEPYPODS_E2E_FRONTLINE_ADDR="127.0.0.1:${frontline_port}" \
   SLEEPYPODS_E2E_APP_IMAGE="${app_image}" \
+  SLEEPYPODS_E2E_GRPC_APP_IMAGE="${grpc_app_image}" \
   SLEEPYPODS_E2E_SIDECAR_IMAGE="${image_prefix}/sidecar:${image_tag}" \
   cargo test -p control-plane --test kind_e2e_protocols -- --ignored --nocapture
 

@@ -55,7 +55,6 @@ fn class() -> WorkloadClassVersion {
             WorkloadClassId::new("class-a").expect("valid class id"),
             Generation::new(1),
         ),
-        template_generation: Generation::new(3),
         template: ManifestTemplate {
             workload: WorkloadTemplate {
                 kind: WorkloadKind::Deployment,
@@ -70,6 +69,7 @@ fn class() -> WorkloadClassVersion {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(ServiceTemplate {
                 name: TemplateText::literal("svc"),
@@ -84,11 +84,11 @@ fn class() -> WorkloadClassVersion {
                 image: TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        default_values: InstanceValues::new(),
         value_schema: WorkloadValueSchema::new(true),
         sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
         exclusivity_keys: vec![],
@@ -119,7 +119,6 @@ fn stamped_manifest(row: &MaterializationRecord) -> RenderedManifest {
             .resolve(&projected.values)
             .expect("sleep policy resolves"),
         namespace: "apps",
-        template_generation: Some(class.template_generation),
     })
     .expect("manifest renders");
     ProjectionPlan::from_manifest(row, &manifest)
@@ -308,6 +307,7 @@ impl ControlPlaneStore for FakeStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
+        reencrypt_certificates_sealed_by,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,
@@ -336,8 +336,7 @@ impl ControlPlaneStore for FakeStore {
         lookup_route_dependencies,
         put_http01_challenge,
         resolve_http01_challenge,
-        delete_http01_challenge,
-        expire_http01_challenges
+        delete_http01_challenge
     );
 
     fn list_route_bindings_for_instance<'a>(

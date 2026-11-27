@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "lifecycle_recovery",
         sql: include_str!("../../migrations/0013_lifecycle_recovery.sql"),
     },
+    Migration {
+        version: 14,
+        name: "api_cleanup",
+        sql: include_str!("../../migrations/0014_api_cleanup.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {

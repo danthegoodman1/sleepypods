@@ -849,7 +849,6 @@ where
                 instance,
                 sleep_policy,
                 namespace: materialization.target.namespace(),
-                template_generation: Some(workload_class.template_generation),
             },
             self.materializer.render_options(),
         )

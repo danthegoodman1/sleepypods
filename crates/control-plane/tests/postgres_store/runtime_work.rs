@@ -36,9 +36,8 @@ async fn ordered_notifications(
         store
             .create_instance(create_instance_request(
                 id,
-                id,
                 class.reference.clone(),
-                vec![http_route(&format!("{id}.example.test"), None)],
+                vec![http_identity(&format!("{id}.example.test"), None)],
             ))
             .await?;
     }
@@ -396,12 +395,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         let materializer = materializer.clone();
         async move {
             let cold = store
-                .create_instance(create_instance_request(
-                    &format!("create-{id}"),
-                    &id,
-                    class,
-                    vec![],
-                ))
+                .create_instance(create_instance_request(&id, class, vec![]))
                 .await?
                 .instance;
             StoreBackedProxyApi::new(store.clone(), materializer, target.clone())
@@ -529,7 +523,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
             isolated.clone(),
         )
         .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-            materialization_id: pending.id.as_str().into(),
+            instance_id: pending.instance_id.as_str().into(),
             status_only: true,
         }))
         .await?
@@ -699,7 +693,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         deadline_target,
     )
     .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-        materialization_id: deadline.id.as_str().into(),
+        instance_id: deadline.instance_id.as_str().into(),
         status_only: true,
     }))
     .await?
@@ -793,7 +787,7 @@ async fn delete_supersedes_pending_case(
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
     let cold = store
-        .create_instance(create_instance_request(&id, &id, class.reference, vec![]))
+        .create_instance(create_instance_request(&id, class.reference, vec![]))
         .await?
         .instance;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1046,7 +1040,7 @@ async fn deletion_and_failure_use_one_lock_order(
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
     let cold = store
-        .create_instance(create_instance_request(id, id, class.reference, vec![]))
+        .create_instance(create_instance_request(id, class.reference, vec![]))
         .await?
         .instance;
     let target = MaterializationTarget::new(id, "apps")?;
@@ -1243,7 +1237,6 @@ async fn failure_deadline_lock_boundary(
         .await?;
     let cold = store
         .create_instance(create_instance_request(
-            "lock-deadline",
             "lock-deadline",
             class.reference,
             vec![],

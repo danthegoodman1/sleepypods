@@ -1,7 +1,7 @@
 use crate::{
     http01::{
-        DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-        Http01ChallengeRecord, PutHttp01ChallengeRequest,
+        DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+        PutHttp01ChallengeRequest,
     },
     store::{StoreError, StoreResult},
 };
@@ -91,62 +91,31 @@ pub(crate) async fn delete_http01_challenge(
     Ok(deleted > 0)
 }
 
-/// Operator-driven expiry at an instant the caller chose.
-pub(crate) async fn expire_http01_challenges(
-    store: &PostgresStore,
-    request: ExpireHttp01ChallengesRequest,
-) -> StoreResult<usize> {
-    let cutoff = unix_millis_from_system_time(request.now)?;
-    delete_expired_http01_challenges(store, Some(cutoff), request.limit).await
-}
-
-/// Background collection, which has no instant of its own to honour and so
-/// leaves the cutoff to the database clock.
+/// Deletes up to `limit` challenges whose expiry has passed on the database
+/// clock, the clock every read of `expires_at_unix_millis` compares against.
 pub(crate) async fn collect_expired_http01_challenges(
     store: &PostgresStore,
     limit: usize,
 ) -> StoreResult<usize> {
-    delete_expired_http01_challenges(store, None, Some(limit)).await
-}
-
-/// `None` means "whatever the database calls now", which is also what every
-/// read of `expires_at_unix_millis` compares against.
-async fn delete_expired_http01_challenges(
-    store: &PostgresStore,
-    cutoff_unix_millis: Option<i64>,
-    limit: Option<usize>,
-) -> StoreResult<usize> {
-    const CUTOFF: &str = "COALESCE($1, (extract(epoch from clock_timestamp()) * 1000)::bigint)";
+    let limit = i64::try_from(limit).map_err(|_| {
+        StoreError::invalid_argument("HTTP-01 expire limit does not fit in Postgres bigint")
+    })?;
     let client = store.client().await?;
-    let deleted = if let Some(limit) = limit {
-        let limit = i64::try_from(limit).map_err(|_| {
-            StoreError::invalid_argument("HTTP-01 expire limit does not fit in Postgres bigint")
-        })?;
-        client
-            .execute(
-                &format!(
-                    "DELETE FROM http01_challenges
-                     WHERE (host, token) IN (
-                         SELECT host, token
-                         FROM http01_challenges
-                         WHERE expires_at_unix_millis <= {CUTOFF}
-                         ORDER BY expires_at_unix_millis, host, token
-                         LIMIT $2
-                     )"
-                ),
-                &[&cutoff_unix_millis, &limit],
-            )
-            .await
-            .map_err(map_postgres_error)?
-    } else {
-        client
-            .execute(
-                &format!("DELETE FROM http01_challenges WHERE expires_at_unix_millis <= {CUTOFF}"),
-                &[&cutoff_unix_millis],
-            )
-            .await
-            .map_err(map_postgres_error)?
-    };
+    let deleted = client
+        .execute(
+            "DELETE FROM http01_challenges
+             WHERE (host, token) IN (
+                 SELECT host, token
+                 FROM http01_challenges
+                 WHERE expires_at_unix_millis
+                     <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                 ORDER BY expires_at_unix_millis, host, token
+                 LIMIT $1
+             )",
+            &[&limit],
+        )
+        .await
+        .map_err(map_postgres_error)?;
 
     usize::try_from(deleted)
         .map_err(|_| StoreError::internal("deleted HTTP-01 count did not fit in usize"))

@@ -1,5 +1,8 @@
 use super::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 async fn request(addr: SocketAddr, path: &str) -> String {
     let mut socket = TcpStream::connect(addr).await.unwrap();
@@ -46,7 +49,6 @@ async fn readiness_waits_for_loopback_app_and_stops_on_shutdown() {
     shutdown.shutdown();
     tokio::time::timeout(Duration::from_secs(1), task)
         .await
-        .unwrap()
         .unwrap()
         .unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(1), owned_health.read(&mut byte))
@@ -97,7 +99,6 @@ async fn stalled_health_connections_are_bounded_and_recover() {
     tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
 }
 
@@ -140,7 +141,12 @@ async fn health_polling_does_not_create_tcp_proxy_streams_or_delay_idle_reportin
         app_addr.port(),
         InstanceId::new("tcp-health").unwrap(),
         Generation::new(1),
-        IdleReportConfig::new(Duration::from_millis(50), Duration::from_millis(10)).unwrap(),
+        IdleReportConfig::new(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
         Duration::from_millis(100),
     )
     .unwrap();
@@ -180,7 +186,6 @@ async fn health_polling_does_not_create_tcp_proxy_streams_or_delay_idle_reportin
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), health_task)
         .await
-        .unwrap()
         .unwrap()
         .unwrap();
     app_task.abort();

@@ -37,6 +37,7 @@ impl ControlPlaneStore for LostResponseStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
+        reencrypt_certificates_sealed_by,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,
@@ -65,8 +66,7 @@ impl ControlPlaneStore for LostResponseStore {
         finalize_sleep_reconciliation,
         delete_materialization_reconciliation,
         lookup_route_dependencies,
-        resolve_http01_challenge,
-        expire_http01_challenges
+        resolve_http01_challenge
     );
     fn record_materialization_failure(
         &self,
@@ -223,8 +223,7 @@ async fn postgres_retry_boundaries_preserve_real_replacements() -> TestResult {
     admin
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .await?;
-    let mut config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
-    config.idempotency_retention = Some(Duration::from_millis(1));
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
     let pg = PostgresStore::connect(&config).await?;
     let result = replacement_checks(&pg).await;
     drop(pg);
@@ -243,7 +242,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     let owner = pg
         .create_instance(create_instance_request(
             "retry-owner",
-            "retry-owner",
             class.reference.clone(),
             vec![],
         ))
@@ -256,7 +254,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     for operation in ["force-delete", "force-release", "record"] {
         let instance = pg
             .create_instance(create_instance_request(
-                operation,
                 operation,
                 class.reference.clone(),
                 vec![],
@@ -361,7 +358,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     }
 
     let original_route = create_route_binding_request(
-        "delete-route-old",
         "delete-route",
         owner.id.as_str(),
         http_identity("old.retry.example", None),
@@ -369,7 +365,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     );
     pg.create_route_binding(original_route.clone()).await?;
     let replacement_route = create_route_binding_request(
-        "delete-route-new",
         "delete-route",
         owner.id.as_str(),
         http_identity("new.retry.example", None),
@@ -453,7 +448,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     // new incarnation has independently entered Deleting as well.
     let old = pg
         .create_instance(create_instance_request(
-            "delete-old",
             "delete-reused",
             class.reference.clone(),
             vec![],
@@ -465,12 +459,7 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         expected_generation: old.generation,
     })
     .await?;
-    let replacement = create_instance_request(
-        "delete-new",
-        "delete-reused",
-        class.reference.clone(),
-        vec![],
-    );
+    let replacement = create_instance_request("delete-reused", class.reference.clone(), vec![]);
     let next = pg.clone();
     let (store, fault) = lossy(pg, move || {
         let db = next.clone();
@@ -498,15 +487,9 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     assert!(current.generation > old.generation);
     assert_eq!(current.state, InstanceState::Deleting);
 
-    // The configured one-millisecond idempotency retention is intentionally
-    // shorter than the response-loss window. Automatic create replay must not
-    // recreate a deleted resource once its original replay record has expired.
-    let create = create_instance_request(
-        "create-lost",
-        "create-lost",
-        class.reference.clone(),
-        vec![],
-    );
+    // A repeated create makes a deleted resource again, so the wrapper sends a
+    // create once: a delete that lands after a lost response stays in effect.
+    let create = create_instance_request("create-lost", class.reference.clone(), vec![]);
     let next = pg.clone();
     let id = create.instance_id.clone();
     let (store, fault) = lossy(pg, move || {
@@ -523,7 +506,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
             })
             .await?;
             db.delete_instance(DeleteInstanceRequest::new(id)).await?;
-            tokio::time::sleep(Duration::from_millis(5)).await;
             Ok(())
         })
     });
@@ -535,11 +517,10 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     let deliberately_recreated = pg.create_instance(create).await?.instance;
     assert!(
         deliberately_recreated.generation > Generation::new(0),
-        "expired replay really permits a new incarnation"
+        "a caller's own repeat starts a new incarnation"
     );
 
     let create = create_route_binding_request(
-        "create-route-lost",
         "create-route-lost",
         owner.id.as_str(),
         http_identity("create.retry.example", None),
@@ -553,7 +534,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         Box::pin(async move {
             db.delete_route_binding(DeleteRouteBindingRequest::new(id))
                 .await?;
-            tokio::time::sleep(Duration::from_millis(5)).await;
             Ok(())
         })
     });
@@ -565,7 +545,7 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
     assert_eq!(
         pg.create_route_binding(create.clone()).await?.id,
         create.route_binding_id,
-        "expired replay really permits recreation"
+        "a caller's own repeat binds the route again"
     );
     exact_fence_retries(pg, &class, &target).await?;
     Ok(())
@@ -578,7 +558,6 @@ async fn exact_fence_retries(
 ) -> TestResult {
     let instance = pg
         .create_instance(create_instance_request(
-            "retry-fenced",
             "retry-fenced",
             class.reference.clone(),
             vec![],

@@ -15,6 +15,7 @@ impl ControlPlaneStore for TestStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
+        reencrypt_certificates_sealed_by,
         load_route_changes,
         load_route_change_revision,
         load_materialization_work_status,
@@ -55,7 +56,6 @@ impl ControlPlaneStore for TestStore {
         put_http01_challenge,
         resolve_http01_challenge,
         delete_http01_challenge,
-        expire_http01_challenges,
     );
     fn snapshot_tls_bindings(
         &self,

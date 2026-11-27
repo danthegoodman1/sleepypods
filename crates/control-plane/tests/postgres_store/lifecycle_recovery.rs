@@ -17,6 +17,7 @@ use pb::{
 use std::{future::Future, sync::Arc};
 
 const LEASE: Duration = Duration::from_secs(60);
+const SESSIONS_PER_STORE: usize = 4;
 /// The ready Pod's own address, as a completed wake records it.
 const POD_BACKEND: &str = "http://10.244.0.7:15000";
 
@@ -41,8 +42,10 @@ where
         // a test can find them in pg_stat_activity.
         let url = connection_url_with_search_path(&base, &schema);
         let separator = if url.contains('?') { '&' } else { '?' };
-        let config =
+        let mut config =
             PostgresStoreConfig::new(format!("{url}{separator}application_name={schema}"))?;
+        // These tests share one database server with the rest of the suite.
+        config.max_connections = SESSIONS_PER_STORE;
         let store = PostgresStore::connect(&config).await?;
         let (raw, connection) =
             tokio_postgres::connect(&connection_url_with_search_path(&base, &schema), NoTls)
@@ -116,12 +119,7 @@ async fn accepted(
     id: &str,
 ) -> TestResult<MaterializationRecord> {
     let cold = store
-        .create_instance(create_instance_request(
-            id,
-            id,
-            class.reference.clone(),
-            vec![],
-        ))
+        .create_instance(create_instance_request(id, class.reference.clone(), vec![]))
         .await?
         .instance;
     wake(store, target, &cold).await?;
@@ -1248,10 +1246,11 @@ async fn postgres_reconciler_rides_out_a_thirty_second_outage() -> TestResult {
             .get(0);
 
         let relay = Relay::start(&base).await?;
-        let relayed = PostgresStoreConfig::new(connection_url_with_search_path(
+        let mut relayed = PostgresStoreConfig::new(connection_url_with_search_path(
             &relay.url(&base)?,
             &schema,
         ))?;
+        relayed.max_connections = SESSIONS_PER_STORE;
         let relayed: Arc<dyn ControlPlaneStore> =
             Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(
                 PostgresStore::connect(&relayed).await?,

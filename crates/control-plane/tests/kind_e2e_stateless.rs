@@ -48,8 +48,8 @@ const ROUTE_ID: &str = "e2e-stateless-route";
 const ROUTE_HOST: &str = "e2e.sleepypods.test";
 const WORKLOAD_NAME: &str = "e2e-app";
 // Expected suffix: first eight SHA-256 hex digits of the complete INSTANCE_ID.
-const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd";
-const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd";
+const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd1378f0f8";
+const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd1378f0f8";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
 const LATENCY_CLASS_ID: &str = "stateless-wake-latency";
 const SIDECAR_PORT: u32 = 15_000;
@@ -189,15 +189,12 @@ async fn stateless_wake_latency_through_deployed_platform() -> TestResult<()> {
     let mut operator = connect_operator(&config.operator_endpoint, &config.operator_token).await?;
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-create-wake-latency-class".to_owned(),
             class_id: LATENCY_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(&config)),
             // Samples stay awake until the driver deletes them.
             sleep_policy: Some(WorkloadSleepPolicy {
@@ -217,18 +214,17 @@ async fn stateless_wake_latency_through_deployed_platform() -> TestResult<()> {
         let host = format!("wake-latency-{index}.sleepypods.test");
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-create-{instance_id}"),
                 instance_id: instance_id.clone(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: LATENCY_CLASS_ID.to_owned(),
                     version: 1,
                 }),
                 values: Default::default(),
+                routes: Vec::new(),
             })
             .await?;
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-create-{instance_id}-route"),
                 route_binding_id: format!("{instance_id}-route"),
                 instance_id: instance_id.clone(),
                 identity: Some(RouteIdentity {
@@ -450,15 +446,12 @@ async fn create_operator_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 2_000,
@@ -472,19 +465,18 @@ async fn create_operator_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-create-instance".to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         })
         .await?;
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-create-route".to_owned(),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -509,13 +501,13 @@ async fn begin_abandoned_wake(
 ) -> TestResult<Instant> {
     let created = operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-create-abandoned-instance".to_owned(),
             instance_id: ABANDONED_INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         })
         .await?
         .into_inner();
@@ -1254,12 +1246,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text(WORKLOAD_NAME)),

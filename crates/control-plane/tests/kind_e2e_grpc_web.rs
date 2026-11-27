@@ -2,8 +2,9 @@ use std::{
     collections::HashMap,
     env,
     error::Error,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -21,7 +22,13 @@ use prost::Message;
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorControlPlane";
+/// The origin the gate lists in `SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS`.
 const ORIGIN: &str = "https://operator.example";
+const OTHER_ORIGIN: &str = "https://elsewhere.example";
+/// The platform certificate names `localhost`, which the port-forward serves.
+const SERVER_NAME: &str = "localhost";
+
+static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 const CLASS_ID: &str = "grpc-web-kind";
 const INSTANCE_ID: &str = "grpc-web-kind-instance";
 
@@ -35,19 +42,23 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
 
     let config = E2eConfig::from_env()?;
     let endpoint = config.grpc_web_endpoint;
+    TLS.set(config.tls.clone())
+        .map_err(|_| "TLS client configuration is set once")?;
 
+    assert_plaintext_refused(&endpoint)?;
+    assert_other_origin_refused(&endpoint, &config.invalid_token)?;
     assert_preflight(&endpoint, "CreateWorkloadClassVersion")?;
     grpc_web_unary_expect_status_with_authorization::<Instance, _>(
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-auth-missing".to_owned(),
             instance_id: "grpc-web-kind-auth-missing".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         None,
@@ -56,13 +67,13 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-auth-invalid".to_owned(),
             instance_id: "grpc-web-kind-auth-invalid".to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         Some(&format!("Bearer {}", config.invalid_token)),
@@ -72,15 +83,9 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateWorkloadClassVersion",
         CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-grpc-web-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: HashMap::from([(
-                "image".to_owned(),
-                "registry.k8s.io/pause:3.10".to_owned(),
-            )]),
             value_schema: None,
-            template_generation: 1,
             template: Some(manifest_template()),
             sleep_policy: Some(sleep_policy()),
             exclusivity_keys: vec![],
@@ -111,13 +116,13 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateInstance",
         CreateInstanceRequest {
-            idempotency_key: "kind-e2e-grpc-web-create-instance".to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
     )?;
     assert_eq!(created_instance.instance_id, INSTANCE_ID);
@@ -196,6 +201,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
 struct E2eConfig {
     grpc_web_endpoint: SocketAddr,
     invalid_token: String,
+    tls: Arc<rustls::ClientConfig>,
 }
 
 #[derive(Debug)]
@@ -220,8 +226,78 @@ impl E2eConfig {
                 .parse()?,
             invalid_token: env::var("SLEEPYPODS_E2E_INVALID_TOKEN")
                 .unwrap_or_else(|_| "invalid-token".to_owned()),
+            tls: tls_client_config(&env::var("SLEEPYPODS_E2E_GRPC_WEB_CA_FILE")?)?,
         })
     }
+}
+
+/// Trusts the platform certificate the gate generated. The client offers no
+/// ALPN protocol, so the listener serves it HTTP/1.1.
+fn tls_client_config(ca_file: &str) -> TestResult<Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_file_iter(ca_file)? {
+        roots.add(certificate?)?;
+    }
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    ))
+}
+
+fn assert_plaintext_refused(endpoint: &SocketAddr) -> TestResult<()> {
+    let mut stream = TcpStream::connect_timeout(endpoint, Duration::from_secs(10))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(&build_grpc_web_request(
+        endpoint,
+        "GetInstance",
+        ORIGIN,
+        &grpc_frame(GetInstanceRequest {
+            instance_id: INSTANCE_ID.to_owned(),
+        }),
+        None,
+    ))?;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    if response.starts_with(b"HTTP/") {
+        return Err("the gRPC-Web listener answered a plaintext request".into());
+    }
+    Ok(())
+}
+
+fn assert_other_origin_refused(endpoint: &SocketAddr, invalid_token: &str) -> TestResult<()> {
+    let operator_token =
+        env::var("SLEEPYPODS_E2E_OPERATOR_TOKEN").unwrap_or_else(|_| "operator-token".to_owned());
+    for token in [operator_token.as_str(), invalid_token] {
+        let response = http_request(
+            endpoint,
+            build_grpc_web_request(
+                endpoint,
+                "GetInstance",
+                OTHER_ORIGIN,
+                &grpc_frame(GetInstanceRequest {
+                    instance_id: INSTANCE_ID.to_owned(),
+                }),
+                Some(&format!("Bearer {token}")),
+            ),
+        )?;
+        if response.status != 403 {
+            return Err(format!(
+                "a page from {OTHER_ORIGIN} must be refused, got HTTP {}",
+                response.status
+            )
+            .into());
+        }
+        if header_first(&response.headers, "access-control-allow-origin").is_some() {
+            return Err("a refused origin must not be named as allowed".into());
+        }
+    }
+    Ok(())
 }
 
 impl<M> GrpcWebResponse<M> {
@@ -267,7 +343,7 @@ fn assert_preflight(endpoint: &SocketAddr, method: &'static str) -> TestResult<(
     if !(200..300).contains(&response.status) {
         return Err(format!("preflight returned HTTP {}", response.status).into());
     }
-    assert_header_eq(&response, "access-control-allow-origin", "*")?;
+    assert_header_eq(&response, "access-control-allow-origin", ORIGIN)?;
     assert_header_contains(&response, "access-control-allow-methods", "POST")?;
     assert_header_contains(&response, "access-control-allow-methods", "OPTIONS")?;
     for header in [
@@ -310,7 +386,7 @@ where
     );
     let response = http_request(
         endpoint,
-        build_grpc_web_request(endpoint, method, &body, Some(&authorization)),
+        build_grpc_web_request(endpoint, method, ORIGIN, &body, Some(&authorization)),
     )?;
     decode_grpc_web_response(endpoint, method, response, expected_status)
 }
@@ -329,7 +405,7 @@ where
     let body = grpc_frame(request);
     let response = http_request(
         endpoint,
-        build_grpc_web_request(endpoint, method, &body, authorization),
+        build_grpc_web_request(endpoint, method, ORIGIN, &body, authorization),
     )?;
     decode_grpc_web_response(endpoint, method, response, expected_status)
 }
@@ -347,7 +423,7 @@ where
         return Err(format!("{method} returned HTTP {}", response.status).into());
     }
     assert_header_contains(&response, "content-type", "application/grpc-web+proto")?;
-    assert_header_eq(&response, "access-control-allow-origin", "*")?;
+    assert_header_eq(&response, "access-control-allow-origin", ORIGIN)?;
     assert_header_contains(&response, "access-control-expose-headers", "grpc-status")?;
     assert_header_contains(&response, "access-control-expose-headers", "grpc-message")?;
 
@@ -373,6 +449,7 @@ where
 fn build_grpc_web_request(
     endpoint: &SocketAddr,
     method: &'static str,
+    origin: &str,
     body: &[u8],
     authorization: Option<&str>,
 ) -> Vec<u8> {
@@ -391,7 +468,7 @@ fn build_grpc_web_request(
         ),
         operator_path(method),
         endpoint,
-        ORIGIN,
+        origin,
         body.len()
     )
     .into_bytes();
@@ -404,14 +481,22 @@ fn build_grpc_web_request(
 }
 
 fn http_request(endpoint: &SocketAddr, request: Vec<u8>) -> TestResult<HttpResponse> {
-    let mut stream = TcpStream::connect_timeout(endpoint, Duration::from_secs(10))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let tcp = TcpStream::connect_timeout(endpoint, Duration::from_secs(10))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let tls = TLS.get().ok_or("TLS client configuration is missing")?;
+    let connection = rustls::ClientConnection::new(tls.clone(), SERVER_NAME.try_into()?)?;
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
     stream.write_all(&request)?;
-    stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes)?;
+    match stream.read_to_end(&mut bytes) {
+        Ok(_) => {}
+        // `Connection: close` ends the response; the peer may close the socket
+        // without a TLS close_notify.
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof && !bytes.is_empty() => {}
+        Err(error) => return Err(error.into()),
+    }
     parse_http_response(&bytes)
 }
 
@@ -605,12 +690,14 @@ fn manifest_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:kind-e2e-grpc-web")),
             listen_port: 15_000,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text("grpc-web-kind")),

@@ -72,7 +72,6 @@ async fn crash_boundary(
     let owner = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-crash-owner",
         "instance-crash-owner",
         "disk-crash",
         "license-crash",
@@ -156,7 +155,6 @@ async fn crash_boundary(
     let contender = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-crash-contender",
         "instance-crash-contender",
         "disk-crash",
         "license-contender",
@@ -556,7 +554,7 @@ async fn fault_recovery(
     for role in ["owner", "contender"] {
         let id = format!("fault-{number}-{role}");
         instances.push(
-            create_exclusive_instance(&pg, &class, &id, &id, &disk, &format!("license-{id}"))
+            create_exclusive_instance(&pg, &class, &id, &disk, &format!("license-{id}"))
                 .await?
                 .instance,
         );

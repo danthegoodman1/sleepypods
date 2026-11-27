@@ -2,16 +2,18 @@ use std::{
     convert::Infallible,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::Deref,
+    sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode, Uri};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use proxy_core::{
-    DrainError, DrainTracker, HttpProxyError, Shutdown, TcpProxyError, TcpProxyStats,
+    AppHttpProxyError, DrainError, DrainTracker, HttpProxyError, ProxyResourceConfig, TcpProxyError,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -35,15 +37,9 @@ fn config_rejects_zero_and_builds_loopback_targets() {
     );
 
     let config = SidecarProxyConfig::new(8080).expect("non-zero port is valid");
-    let expected_origin: Uri = "http://127.0.0.1:8080"
-        .parse()
-        .expect("expected origin parses");
 
-    assert_eq!(config.app_port(), 8080);
-    assert_eq!(config.http_upstream_origin(), &expected_origin);
-    assert_eq!(config.websocket_upstream_url(), "ws://127.0.0.1:8080");
     assert_eq!(
-        config.tcp_upstream_addr(),
+        config.app_addr(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
     );
 }
@@ -387,18 +383,10 @@ async fn tcp_forwarding_preserves_bidirectional_bytes_and_releases_active_count(
 
     client.shutdown().await.expect("client half-closes");
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("tcp forwarding succeeds");
-
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: TCP_REQUEST.len() as u64,
-            upstream_to_client: TCP_RESPONSE.len() as u64,
-        }
-    );
 
     upstream_task.await.expect("upstream task completed");
     sidecar.wait_for_active_count(0).await;
@@ -476,17 +464,10 @@ async fn tcp_active_count_remains_one_while_connection_is_open() {
         .expect("upstream release receiver is active");
     client.shutdown().await.expect("client half-closes");
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("tcp forwarding succeeds");
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: 1,
-            upstream_to_client: 0,
-        }
-    );
 
     upstream_task.await.expect("upstream task completed");
     sidecar.wait_for_active_count(0).await;
@@ -573,17 +554,10 @@ async fn drain_waits_for_active_tcp_connection_then_completes() {
         .expect("upstream release receiver is active");
     client.shutdown().await.expect("client half-closes");
 
-    let stats = proxy_task
+    proxy_task
         .await
         .expect("proxy task completed")
         .expect("tcp forwarding succeeds");
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: 1,
-            upstream_to_client: 0,
-        }
-    );
 
     upstream_task.await.expect("upstream task completed");
     assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
@@ -747,17 +721,10 @@ async fn drain_completes_after_active_tcp_client_disconnects() {
         .await
         .expect("upstream observes client eof");
 
-    let stats = expect_within(proxy_task, "TCP client disconnect proxy completion")
+    expect_within(proxy_task, "TCP client disconnect proxy completion")
         .await
         .expect("proxy task completed")
         .expect("tcp forwarding completes after client disconnect");
-    assert_eq!(
-        stats,
-        TcpProxyStats {
-            client_to_upstream: 1,
-            upstream_to_client: 0,
-        }
-    );
 
     expect_within(upstream_task, "TCP client disconnect upstream task")
         .await
@@ -802,54 +769,63 @@ async fn drain_grace_timeout_surfaces_active_work() {
     );
 }
 
-#[tokio::test]
-async fn shutdown_token_starts_drain_after_cancellation_and_completes_after_active_releases() {
-    let sidecar = sidecar_for_app_port(8080);
-    let permit = sidecar
-        .drain_tracker()
-        .try_acquire()
-        .expect("active work admitted");
-    let shutdown = Shutdown::new();
-
-    let drain_task = tokio::spawn({
-        let sidecar = sidecar.clone();
-        let shutdown = shutdown.clone();
-        async move { sidecar.drain_on_shutdown(shutdown).await }
-    });
-
-    tokio::task::yield_now().await;
-    assert!(!sidecar.is_draining());
-    assert!(!drain_task.is_finished());
-
-    shutdown.shutdown();
-    tokio::task::yield_now().await;
-    assert!(sidecar.is_draining());
-    assert!(!drain_task.is_finished());
-
-    drop(permit);
-    sidecar.wait_for_active_count(0).await;
-
-    assert_eq!(drain_task.await.expect("drain task completed"), Ok(()));
+/// A proxy and the drain tracker its runtime shares with it.
+#[derive(Clone)]
+struct Sidecar {
+    proxy: Arc<SidecarProxy>,
+    drain: DrainTracker,
 }
 
-#[tokio::test]
-async fn already_triggered_shutdown_drains_immediately() {
-    let sidecar = sidecar_for_app_port(8080);
-    let shutdown = Shutdown::new();
-    shutdown.shutdown();
+impl Deref for Sidecar {
+    type Target = SidecarProxy;
 
-    assert_eq!(sidecar.drain_on_shutdown(shutdown).await, Ok(()));
-    assert!(sidecar.is_draining());
+    fn deref(&self) -> &SidecarProxy {
+        &self.proxy
+    }
 }
 
-fn sidecar_for_app_port(app_port: u16) -> SidecarProxy {
+impl Sidecar {
+    fn start_drain(&self) {
+        self.drain.start_drain();
+    }
+
+    fn is_draining(&self) -> bool {
+        self.drain.is_draining()
+    }
+
+    fn active_count(&self) -> usize {
+        self.drain.active_count()
+    }
+
+    async fn wait_for_active_count(&self, expected: usize) {
+        self.drain.wait_for_active_count(expected).await;
+    }
+
+    fn drain_tracker(&self) -> &DrainTracker {
+        &self.drain
+    }
+}
+
+fn sidecar_for_app_port(app_port: u16) -> Sidecar {
     sidecar_for_app_port_with_grace(app_port, Duration::from_secs(5))
 }
 
-fn sidecar_for_app_port_with_grace(app_port: u16, grace_timeout: Duration) -> SidecarProxy {
-    let config = SidecarProxyConfig::with_tcp_connect_timeout(app_port, Duration::from_secs(1))
-        .expect("sidecar config builds");
-    SidecarProxy::new(config, DrainTracker::new(grace_timeout))
+fn sidecar_for_app_port_with_grace(app_port: u16, grace_timeout: Duration) -> Sidecar {
+    let resources = ProxyResourceConfig::default()
+        .with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .expect("test timeouts are valid");
+    let config = SidecarProxyConfig::new(app_port)
+        .expect("sidecar config builds")
+        .with_resource_config(resources);
+    let drain = DrainTracker::new(grace_timeout);
+    Sidecar {
+        proxy: Arc::new(SidecarProxy::new(config, drain.clone())),
+        drain,
+    }
 }
 
 fn empty_http_request() -> Request<Full<Bytes>> {
@@ -883,9 +859,9 @@ where
         .unwrap_or_else(|_| panic!("{label} timed out"))
 }
 
-fn assert_http_draining(error: HttpProxyError) {
+fn assert_http_draining(error: AppHttpProxyError) {
     match error {
-        HttpProxyError::Drain(DrainError::Draining) => {}
+        AppHttpProxyError::Proxy(HttpProxyError::Drain(DrainError::Draining)) => {}
         other => panic!("expected HTTP drain rejection, got {other:?}"),
     }
 }

@@ -88,7 +88,12 @@ async fn main() {
             app_addr.port(),
             InstanceId::new("bench").unwrap(),
             Generation::new(1),
-            IdleReportConfig::new(Duration::from_secs(3600), Duration::from_secs(1)).unwrap(),
+            IdleReportConfig::new(
+                Duration::from_secs(3600),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            )
+            .unwrap(),
             Duration::from_secs(1),
         )
         .unwrap();

@@ -157,12 +157,7 @@ async fn exercise(pg: PostgresStore, raw: &tokio_postgres::Client) -> TestResult
     let api = StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone());
     for id in instances {
         let cold = store
-            .create_instance(create_instance_request(
-                id,
-                id,
-                class.reference.clone(),
-                vec![],
-            ))
+            .create_instance(create_instance_request(id, class.reference.clone(), vec![]))
             .await?
             .instance;
         api.wake_instance(tonic::Request::new(pb::ProxyWakeInstanceRequest {
