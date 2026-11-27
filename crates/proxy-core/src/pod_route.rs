@@ -35,6 +35,7 @@ use std::{
 };
 
 use http::{uri::Authority, Uri};
+use sleepypods_api::ids::{is_dns_label, DNS_LABEL_MAX_LEN};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
@@ -48,9 +49,8 @@ pub const POD_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 /// with it.
 const CLAIM_MARK: u8 = 0;
 const CLAIM_PREFIX: &[u8] = b"\0sleepypods-instance ";
-/// The longest instance ID a claim carries: a DNS label.
-const MAX_INSTANCE_ID_BYTES: usize = 63;
-const MAX_CLAIM_BYTES: usize = CLAIM_PREFIX.len() + MAX_INSTANCE_ID_BYTES + 1;
+/// A claim carries an instance ID, which is a DNS label.
+const MAX_CLAIM_BYTES: usize = CLAIM_PREFIX.len() + DNS_LABEL_MAX_LEN + 1;
 /// Failed Pod routes one proxy remembers. A full memory starts over.
 const MAX_FAILED_POD_ROUTES: usize = 4096;
 
@@ -240,16 +240,6 @@ fn claim_line(instance_id: &str) -> Vec<u8> {
 
 fn invalid_claim(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn is_dns_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_INSTANCE_ID_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && !value.starts_with('-')
-        && !value.ends_with('-')
 }
 
 /// `host[:port]` of an authority.

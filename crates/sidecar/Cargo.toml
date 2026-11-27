@@ -13,7 +13,6 @@ hyper = { workspace = true, default-features = false, features = ["http1", "http
 hyper-util = { workspace = true, default-features = false, features = ["tokio", "http1", "http2"] }
 proxy-core = { workspace = true }
 sleepypods-api = { version = "0.1.0", path = "../sleepypods-api" }
-sleepypods-types = { workspace = true }
 tokio = { workspace = true, default-features = false, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tonic = { workspace = true, features = ["channel", "codegen"] }
 

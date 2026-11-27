@@ -107,7 +107,7 @@ async fn health_polling_does_not_create_tcp_proxy_streams_or_delay_idle_reportin
     use crate::{
         IdleReportConfig, ReportIdleClient, ReportIdleFuture, ReportIdleRequest, ReportIdleResponse,
     };
-    use sleepypods_types::{Generation, InstanceId};
+    use sleepypods_api::{Generation, InstanceId};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,

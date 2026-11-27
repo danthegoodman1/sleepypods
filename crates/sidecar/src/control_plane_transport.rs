@@ -1,7 +1,9 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
-use sleepypods_api::pb::{self, sidecar_control_plane_client::SidecarControlPlaneClient};
-use sleepypods_types::{Generation, InstanceId};
+use sleepypods_api::{
+    pb::{self, sidecar_control_plane_client::SidecarControlPlaneClient},
+    Generation, InstanceId,
+};
 use tonic::codegen::Body;
 
 use crate::ReportIdleRequest;

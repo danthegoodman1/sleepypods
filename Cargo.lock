@@ -368,7 +368,6 @@ dependencies = [
  "sleepypods-api",
  "sleepypods-certificate",
  "sleepypods-observability",
- "sleepypods-types",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
@@ -1895,6 +1894,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "pin-project-lite",
+ "sleepypods-api",
  "sleepypods-observability",
  "socket2",
  "tls-parser",
@@ -2370,7 +2370,6 @@ dependencies = [
  "hyper-util",
  "proxy-core",
  "sleepypods-api",
- "sleepypods-types",
  "tokio",
  "tokio-tungstenite",
  "tonic",
@@ -2404,7 +2403,6 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
- "sleepypods-types",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2433,10 +2431,6 @@ dependencies = [
  "hyper-util",
  "tokio",
 ]
-
-[[package]]
-name = "sleepypods-types"
-version = "0.1.0"
 
 [[package]]
 name = "smallvec"

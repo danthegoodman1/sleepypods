@@ -12,10 +12,9 @@ use sidecar::{
     AppProtocol, GrpcSidecarControlPlaneClient, IdleReportConfig,
 };
 use sleepypods_api::{
-    pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken,
-    OptionalBearerTokenInterceptor,
+    pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken, Generation,
+    InstanceId, OptionalBearerTokenInterceptor,
 };
-use sleepypods_types::{Generation, InstanceId};
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 

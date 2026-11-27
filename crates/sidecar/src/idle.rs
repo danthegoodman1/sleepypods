@@ -18,7 +18,7 @@ use proxy_core::{
     },
     DrainTracker,
 };
-use sleepypods_types::{Generation, InstanceId};
+use sleepypods_api::{Generation, InstanceId};
 use tokio::time::timeout;
 
 use crate::control_plane_transport::{ReportIdleClient, ReportIdleResponse};

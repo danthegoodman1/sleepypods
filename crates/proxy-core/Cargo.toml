@@ -12,6 +12,7 @@ http-body-util = { workspace = true, default-features = false, features = ["full
 hyper = { workspace = true, default-features = false, features = ["client", "http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "tokio"], default-features = false }
 pin-project-lite = { version = "0.2.17", default-features = false }
+sleepypods-api = { version = "0.1.0", path = "../sleepypods-api" }
 sleepypods-observability = { version = "0.1.0", path = "../sleepypods-observability" }
 socket2 = "0.6.4"
 tls-parser = { version = "0.12.2", default-features = false }

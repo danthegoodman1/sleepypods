@@ -10,23 +10,21 @@ pub const IDLE_RETRY_AFTER_METADATA: &str = "sleepypods-idle-retry-after-ms";
 pub mod auth;
 pub mod certificate;
 pub mod http01;
+pub mod ids;
 pub mod instance;
 pub mod materialization;
 pub mod route;
 pub mod transport;
-pub mod ids {
-    pub use sleepypods_types::*;
-}
 pub mod pb {
     tonic::include_proto!("sleepypods.controlplane.v1");
 }
 pub use auth::{BearerToken, InvalidBearerToken, OptionalBearerTokenInterceptor};
 pub use certificate::*;
 pub use http01::*;
+pub use ids::*;
 pub use instance::InstanceState;
 pub use materialization::{BackendEndpoint, MaterializationTarget};
 pub use route::*;
-pub use sleepypods_types::*;
 
 impl std::fmt::Debug for pb::CertificateBundle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

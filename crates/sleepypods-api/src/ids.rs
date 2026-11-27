@@ -1,4 +1,8 @@
+//! Resource identifiers and generation counters shared by every component.
 use std::{error::Error, fmt, str::FromStr};
+
+/// The longest Kubernetes DNS label (RFC 1123).
+pub const DNS_LABEL_MAX_LEN: usize = 63;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonEmptyString(String);
@@ -92,8 +96,6 @@ string_newtype!(MaterializationId);
 pub struct InstanceId(String);
 
 impl InstanceId {
-    pub const MAX_LEN: usize = 63;
-
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidInstanceIdError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -153,9 +155,11 @@ impl FromStr for InstanceId {
     }
 }
 
-fn is_dns_label(value: &str) -> bool {
+/// Whether `value` is a Kubernetes DNS label: lowercase letters, digits and
+/// `-`, starting and ending alphanumeric, at most [`DNS_LABEL_MAX_LEN`] bytes.
+pub fn is_dns_label(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= InstanceId::MAX_LEN
+        && value.len() <= DNS_LABEL_MAX_LEN
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -217,7 +221,20 @@ impl fmt::Display for BackendGeneration {
 
 #[cfg(test)]
 mod tests {
-    use super::{Generation, InstanceId, RouteBindingId};
+    use super::{is_dns_label, Generation, InstanceId, RouteBindingId, DNS_LABEL_MAX_LEN};
+
+    #[test]
+    fn dns_label_validation_matches_kubernetes_name_budget() {
+        assert!(is_dns_label("a"));
+        assert!(is_dns_label("tenant-123"));
+        assert!(is_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN)));
+
+        for value in ["", "A", "a_b", "a.b", "-a", "a-"] {
+            assert!(!is_dns_label(value), "{value:?} should be invalid");
+        }
+        let overlong = "a".repeat(DNS_LABEL_MAX_LEN + 1);
+        assert!(!is_dns_label(&overlong));
+    }
 
     #[test]
     fn string_ids_reject_blank_values() {

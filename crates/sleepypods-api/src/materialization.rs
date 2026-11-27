@@ -1,4 +1,4 @@
-use sleepypods_types::{EmptyStringError, NonEmptyString};
+use crate::ids::{EmptyStringError, NonEmptyString};
 use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

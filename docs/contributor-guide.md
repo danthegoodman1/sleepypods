@@ -16,15 +16,15 @@ status when a documented gap actually closes.
   `ReportIdle` client, and sidecar load-smoke helper.
 - `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
   accounting, drain, shutdown, timeout, proxy-specific metrics adapters, and hot-path benches.
-- `crates/sleepypods-api`: generated protobuf clients/services, shared routing and
-  HTTP-01/certificate contracts, state/backend/target values, and native transport
-  and client bearer authentication.
+- `crates/sleepypods-api`: generated protobuf clients/services, resource IDs and
+  generations with the shared DNS-label check, routing and HTTP-01/certificate
+  contracts, state/backend/target values, and native transport and client
+  bearer authentication.
 - `crates/sleepypods-certificate`: maintained-library certificate/key/chain and
   hostname validation shared by publication and Frontline installation, without
   persistence or sealing dependencies.
 - `crates/sleepypods-observability`: metric and tracing vocabulary, the single
   process-wide recorder, sinks, and Prometheus exporter.
-- `crates/sleepypods-types`: shared ID/value types.
 - `scripts`: production-image smokes, kind E2E gates, soak gates, load-budget
   helpers, and Criterion regression checker.
 - `docs`: north-star, development plan, operator docs, runbook, contributor
