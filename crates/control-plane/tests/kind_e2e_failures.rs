@@ -12,13 +12,13 @@ use control_plane::api::pb::{
     proxy_control_plane_client::ProxyControlPlaneClient, proxy_wake_instance_response,
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
-    HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance, InstanceState as PbInstanceState,
-    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSourceTemplate, ProtocolRoute, ProxyWakeInstanceRequest,
-    RawKubernetesManifestTemplate, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueSchema,
+    DeleteInstanceRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute,
+    ProxyWakeInstanceRequest, RawKubernetesManifestTemplate, ReconcileMaterializationRequest,
+    RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
+    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -100,8 +100,7 @@ async fn failure_paths_through_deployed_platform() -> TestResult<()> {
         &config,
     )
     .await?;
-    missing_pvc_binding_fails_materialization_without_ready_backend(&mut operator, kube, &config)
-        .await?;
+    unbound_auxiliary_claim_leaves_the_wake_to_readiness(&mut operator, kube, &config).await?;
 
     Ok(())
 }
@@ -454,7 +453,11 @@ async fn duplicate_volume_inventory_is_rejected_at_class_creation(
         .await
 }
 
-async fn missing_pvc_binding_fails_materialization_without_ready_backend(
+/// The workload is created without waiting for a claim to bind, and the wake
+/// completes when its Pod is ready. An auxiliary claim the Pod does not mount,
+/// reserved to an earlier claim so that it never binds, holds nothing up, and
+/// deleting the instance still removes it with the rest of the inventory.
+async fn unbound_auxiliary_claim_leaves_the_wake_to_readiness(
     operator: &mut OperatorControlPlaneClient<Channel>,
     kube: Client,
     config: &E2eConfig,
@@ -502,46 +505,74 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
     {
         return Err(format!("accepted unbound wake must identify exactly the next Waking generation: Cold={}, accepted={accepted:?}", created.generation).into());
     }
-    // Observe a real Kubernetes Pending claim before terminal cleanup can remove it.
+    // Observe a real Kubernetes Pending claim with the binding refused.
     wait_for_stale_claim_inventory(
         kube.clone(),
         &config.namespace,
         accepted.instance_generation,
     )
     .await?;
-    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
 
-    // One request waits on the accepted wake; it must never receive a ready backend.
-    let failed_response = tokio::time::timeout(
+    let served = tokio::time::timeout(
         Duration::from_secs(60),
         http_get(config.frontline_addr, UNBOUND_ROUTE_HOST, "/"),
     )
     .await??;
-    if failed_response.status != 503 || failed_response.body.contains(APP_RESPONSE) {
+    if served.status != 200 || !served.body.contains(APP_RESPONSE) {
         return Err(format!(
-            "unbound PVC must return HTTP 503 without backend body, got {} {:?}",
-            failed_response.status, failed_response.body
+            "an unbound auxiliary claim must leave the wake to its Pod, got {} {:?}",
+            served.status, served.body
         )
         .into());
     }
-    let failed = wait_for_instance_state(
+    let running = wait_for_instance_state(
         operator,
         UNBOUND_INSTANCE_ID,
-        PbInstanceState::Failed,
+        PbInstanceState::Running,
         Duration::from_secs(30),
     )
     .await?;
-    if failed.generation < accepted.instance_generation
-        || started.elapsed() > Duration::from_secs(90)
-    {
-        return Err(
-            "accepted PVC binding failure did not reach Failed within the bounded gate".into(),
-        );
+    if started.elapsed() > Duration::from_secs(90) {
+        return Err("the wake waited on a claim its Pod does not mount".into());
     }
-    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
-    wait_for_unbound_inventory_cleanup(kube, &config.namespace).await?;
+    wait_for_stale_claim_inventory(
+        kube.clone(),
+        &config.namespace,
+        accepted.instance_generation,
+    )
+    .await?;
 
-    Ok(())
+    operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: UNBOUND_INSTANCE_ID.to_owned(),
+            expected_generation: Some(running.generation),
+        })
+        .await?;
+    wait_for_unbound_inventory_cleanup(kube, &config.namespace).await?;
+    wait_for_instance_absent(operator, UNBOUND_INSTANCE_ID, Duration::from_secs(60)).await
+}
+
+async fn wait_for_instance_absent(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match operator
+            .get_instance(control_plane::api::pb::GetInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Err(status) if status.code() == Code::NotFound => return Ok(()),
+            Err(status) => return Err(status.into()),
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(format!("instance {instance_id} was not deleted").into())
+            }
+            Ok(_) => sleep(Duration::from_secs(1)).await,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1000,29 +1031,6 @@ fn assert_inventory_ownership_for_accepted_wake(
         return Err(format!(
             "{kind} ownership mismatch: accepted Waking generation={accepted_generation}, expected projection generation={projection_generation}, actual labels={labels:?}"
         ).into());
-    }
-    Ok(())
-}
-
-/// The workload is created without waiting for its claim, and the scheduler
-/// holds its Pod until the claim binds. A claim that never binds therefore
-/// leaves nothing of this instance running.
-async fn assert_no_stateful_backend(kube: Client, namespace: &str) -> TestResult<()> {
-    let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
-    let pods = Api::<k8s_openapi::api::core::v1::Pod>::namespaced(kube, namespace)
-        .list(&selector)
-        .await?;
-    if let Some(started) = pods.iter().find(|pod| {
-        pod.status
-            .as_ref()
-            .and_then(|status| status.phase.as_deref())
-            != Some("Pending")
-    }) {
-        return Err(format!(
-            "Pod {:?} left Pending although its claim never bound",
-            started.metadata.name
-        )
-        .into());
     }
     Ok(())
 }

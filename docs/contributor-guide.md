@@ -140,8 +140,9 @@ Targeted gates live in `scripts/`:
   plaintext request.
 - `test-kind-e2e-libpq-sni.sh`: real PostgreSQL/libpq 17 direct SNI
   passthrough.
-- `test-kind-e2e-failures.sh`: bad route, readiness failure, PVC binding
-  failure, bad volume template, and stale generation.
+- `test-kind-e2e-failures.sh`: bad route, readiness failure, an auxiliary
+  claim that never binds while the wake completes on readiness, bad volume
+  template, and stale generation.
 - `test-kind-e2e-restart.sh`: control-plane restart recovery.
 - `test-kind-e2e-lifecycle-races.sh`: concurrent wake/sleep/delete/stale
   lifecycle races.
