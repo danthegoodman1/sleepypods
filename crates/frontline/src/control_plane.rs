@@ -309,6 +309,7 @@ fn route_entry_from_proto(
         instance_state: instance_state_from_proto(route.instance_state)?,
         instance_generation: Generation::new(route.instance_generation),
         backend: route.backend_uri.map(backend_endpoint).transpose()?,
+        pod_backend: route.pod_backend_uri.map(backend_endpoint).transpose()?,
         backend_generation: route.backend_generation.map(BackendGeneration::new),
     })
 }

@@ -156,6 +156,8 @@ where
     let serving = Serving::start(&config, client);
     let upgrades: Upgrades = Arc::new(Mutex::new(JoinSet::new()));
 
+    let setup_timeout = config.admission.config().setup_timeout();
+    let instance_id: Arc<str> = config.instance_id.as_str().into();
     let connections = serve_listener(listener, &shutdown, |stream, _| {
         let Ok(handshake) = config.admission.handshakes.try_acquire() else {
             return Err(stream);
@@ -167,14 +169,35 @@ where
         };
         let proxy = serving.proxy.clone();
         let upgrades = upgrades.clone();
-        Ok(proxy_core::serve_http_connection_admitted(
-            stream,
-            shutdown.clone(),
-            config.admission.clone(),
-            handshake,
-            Some(initial_work),
-            move |request| forward_or_error(proxy.clone(), request, upgrades.clone()),
-        ))
+        let (admission, shutdown) = (config.admission.clone(), shutdown.clone());
+        let instance_id = instance_id.clone();
+        Ok(async move {
+            let mut stream = stream;
+            let claim = tokio::time::timeout(
+                setup_timeout,
+                proxy_core::read_instance_claim(&mut stream, &instance_id),
+            );
+            let opened = tokio::select! {
+                _ = shutdown.cancelled() => None,
+                opened = claim => opened.ok().and_then(Result::ok),
+            };
+            // A claim for another instance, a malformed or late one, or a
+            // shutdown closes the connection before any request reaches the
+            // app.
+            let Some(first) = opened else {
+                proxy_core::close_refused(stream.into_inner());
+                return;
+            };
+            proxy_core::serve_http_connection_admitted(
+                proxy_core::SidecarIo::new(stream, first),
+                shutdown,
+                admission,
+                handshake,
+                Some(initial_work),
+                move |request| forward_or_error(proxy.clone(), request, upgrades.clone()),
+            )
+            .await
+        })
     })
     .await;
 

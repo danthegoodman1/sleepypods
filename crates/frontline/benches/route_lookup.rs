@@ -156,6 +156,10 @@ fn route_entry(generation: u64) -> RouteEntry {
             BackendEndpoint::new(format!("http://127.0.0.1:{}", 10_000 + generation))
                 .expect("benchmark backend"),
         ),
+        pod_backend: Some(
+            BackendEndpoint::new(format!("http://10.244.0.{}:15000", generation % 250))
+                .expect("benchmark Pod backend"),
+        ),
         backend_generation: Some(BackendGeneration::new(generation)),
     }
 }

@@ -753,6 +753,7 @@ impl FakeProxyControlPlane {
             instance_state: pb::InstanceState::Running as i32,
             instance_generation: 1,
             backend_uri: Some(backend_uri.to_owned()),
+            pod_backend_uri: None,
             backend_generation: Some(1),
         }
     }
@@ -772,6 +773,7 @@ impl FakeProxyControlPlane {
             instance_state: pb::InstanceState::Cold as i32,
             instance_generation: 1,
             backend_uri: None,
+            pod_backend_uri: None,
             backend_generation: None,
         }
     }

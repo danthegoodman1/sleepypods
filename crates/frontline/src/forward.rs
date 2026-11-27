@@ -1,11 +1,15 @@
-use std::{error::Error, fmt, net::IpAddr};
+use std::{
+    error::Error,
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 use bytes::Bytes;
 use http::{uri::InvalidUri, Request, Response, Uri};
 use http_body::Body;
 use hyper::body::Incoming;
 use proxy_core::{
-    apply_forwarded_header_policy, DrainTracker, HttpProxy, HttpProxyError, TrackedBody,
+    apply_forwarded_header_policy, DrainTracker, HttpProxy, HttpProxyError, PodRoute, TrackedBody,
     WebSocketProxy, WebSocketProxyError,
 };
 
@@ -148,8 +152,15 @@ impl ForwardedProto {
     }
 }
 
+/// The Service origin of a ready backend, carrying its Pod route when the
+/// control plane recorded a Pod address. HTTP and WebSocket forwarding try
+/// the Pod first.
 pub fn http_upstream_origin(ready: &ReadyBackend) -> Result<Uri, BackendForwardError> {
-    let uri = parse_backend_uri(ready)?;
+    let uri: Uri = ready
+        .backend
+        .uri()
+        .parse()
+        .map_err(BackendForwardError::InvalidUri)?;
     let scheme = uri.scheme_str().ok_or(BackendForwardError::MissingScheme)?;
     if scheme != "http" {
         return Err(BackendForwardError::UnsupportedHttpScheme(
@@ -157,15 +168,24 @@ pub fn http_upstream_origin(ready: &ReadyBackend) -> Result<Uri, BackendForwardE
         ));
     }
     require_authority(&uri)?;
-    Ok(uri)
+    Ok(pod_route(ready)
+        .and_then(|route| route.origin(&uri).ok())
+        .unwrap_or(uri))
 }
 
-fn parse_backend_uri(ready: &ReadyBackend) -> Result<Uri, BackendForwardError> {
-    ready
-        .backend
-        .uri()
-        .parse()
-        .map_err(BackendForwardError::InvalidUri)
+/// The Pod route of a ready backend: an `http` Pod address with an IP host.
+fn pod_route(ready: &ReadyBackend) -> Option<PodRoute> {
+    let pod: Uri = ready.pod_backend.as_ref()?.uri().parse().ok()?;
+    if pod.scheme_str() != Some("http") {
+        return None;
+    }
+    let address = pod.authority()?.as_str().parse::<SocketAddr>().ok()?;
+    PodRoute::new(
+        ready.instance_id.as_str(),
+        ready.backend_generation?.get(),
+        address,
+    )
+    .ok()
 }
 
 fn require_authority(uri: &Uri) -> Result<&http::uri::Authority, BackendForwardError> {

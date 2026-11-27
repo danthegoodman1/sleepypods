@@ -319,6 +319,7 @@ fn ready_backend(uri: impl Into<String>) -> ReadyBackend {
         instance_id: InstanceId::new("instance-a").expect("instance id"),
         instance_generation: Generation::new(7),
         backend: BackendEndpoint::new(uri).expect("backend endpoint"),
+        pod_backend: None,
         backend_generation: Some(BackendGeneration::new(11)),
     }
 }

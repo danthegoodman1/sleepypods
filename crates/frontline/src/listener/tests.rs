@@ -1421,6 +1421,7 @@ fn route_entry(
         backend: backend_uri_and_generation
             .as_ref()
             .map(|(uri, _generation)| backend(uri.clone())),
+        pod_backend: None,
         backend_generation: backend_uri_and_generation
             .map(|(_uri, generation)| BackendGeneration::new(generation)),
     }
@@ -1615,5 +1616,7 @@ async fn listener_counts_one_cache_miss_then_one_hit_per_request() {
 mod protocol;
 
 mod admission;
+
+mod pod_route;
 
 mod tls_close;
