@@ -1,5 +1,7 @@
 //! Database round trips per lifecycle operation, counted at a relay in front
-//! of Postgres once the session has served each operation before.
+//! of Postgres once the session has served each operation before. Each budget
+//! is half the count the store took before it prepared its statements and
+//! folded its guards into the writes: 16, 20 and 14.
 use super::lifecycle_recovery::{accepted, class, running, target, with_store, LEASE};
 use super::*;
 use control_plane::{
@@ -47,6 +49,13 @@ impl KubernetesMaterializerClient for MemberPods {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// Round trips a proxy's wake of a Cold instance may take.
+const WAKE_BUDGET: u64 = 8;
+/// Round trips a sidecar's accepted idle report may take.
+const IDLE_BUDGET: u64 = 10;
+/// Round trips the lease check around one Kubernetes mutation may take.
+const FENCING_BUDGET: u64 = 7;
 
 /// Round trips `operation` takes on `relay`.
 async fn round_trips<T>(
@@ -168,6 +177,13 @@ async fn postgres_lifecycle_operations_fit_their_round_trip_budgets() -> TestRes
             counts.push((pass, wake, idle, renew));
         }
         eprintln!("round trips (wake acceptance, idle report, fencing one mutation): {counts:?}");
+        let (_, wake, idle, renew) = counts[1];
+        assert!(wake <= WAKE_BUDGET, "wake acceptance took {wake} round trips");
+        assert!(idle <= IDLE_BUDGET, "an idle report took {idle} round trips");
+        assert!(
+            renew <= FENCING_BUDGET,
+            "fencing one mutation took {renew} round trips"
+        );
         Ok(())
     })
     .await
