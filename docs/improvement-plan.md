@@ -228,10 +228,10 @@ Status ledger:
 | Incomplete | Work | 1D: Lossy ends clear authority; cursor before serving | Missing: terminal status on `Lagged`/`Reset`, streams kept on read failure, cursor load ahead of listeners. |
 | Incomplete | Work | 1E: Shared resilient accept helper | Missing: helper in `proxy_core` and its use by all six loops. |
 | Incomplete | Work | 1F: Outbound liveness | Missing: keepalive settings on both control-plane channels and upstream clients; `ReportIdle` deadline. |
-| Incomplete | Work | 1G: Count-bounded certificate cache | Missing: entry-count bound, negative budget, waiting fetch admission. |
+| Complete | Work | 1G: Count-bounded certificate cache | Commits `5da8ab7`, `9a4da04`, `e73bd7f`, `1e287de`: 1,024 certificates and 1,024 negative entries in separate budgets; lookups queue for a fetch slot, at most 64 handshakes waiting; worst-case memory about 220 MiB, stated in the operator guide. |
 | Incomplete | Work | 1H: WebSocket message cap | Missing: explicit `WebSocketConfig` limits. |
 | Incomplete | Gate | Unrelated cached routes keep serving through each fault | Missing: the composed regression tests above, passing. |
-| Incomplete | Test | 1,024 certificates across a refresh cycle | Missing: test with real certificates and concurrent fetches. |
+| Complete | Test | 1,024 certificates across a refresh cycle | `full_cache_stays_warm_through_a_refresh_cycle_with_three_fetches_in_flight` (the earlier code kept 407 of 1,024), `unknown_hostnames_leave_every_certificate_cached`, and `a_full_lookup_wait_serves_cached_hostnames_and_fails_further_lookups_at_once` in `crates/frontline/src/certificates/capacity_tests.rs`. |
 | Incomplete | Test | Routing kind gate | Missing: passing `scripts/test-kind-e2e-routing.sh` run. |
 
 ## Phase 2: Deliver Every Client Protocol to the App
