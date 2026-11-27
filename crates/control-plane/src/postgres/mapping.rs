@@ -18,10 +18,7 @@ use crate::{
         BackendEndpoint, MaterializationReconciliationLease, MaterializationRecord,
         MaterializationState, MaterializationTarget, RenderedObjectRef,
     },
-    route::{
-        CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteHost,
-        RouteHostKind, RouteIdentity,
-    },
+    route::{CachePolicy, PathPrefix, RouteBindingRecord, RouteHost, RouteHostKind, RouteIdentity},
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{StoreError, StoreResult},
     workload::{
@@ -35,7 +32,6 @@ pub(crate) struct RouteBindingRow {
     pub id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
-    pub protocol: ProtocolRoute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +94,6 @@ pub(crate) fn route_binding_from_row(row: &Row) -> StoreResult<RouteBindingRecor
         id: binding.id,
         instance_id: binding.instance_id,
         identity: binding.identity,
-        protocol: binding.protocol,
     })
 }
 
@@ -109,13 +104,11 @@ pub(crate) fn route_binding_row_from_row(row: &Row) -> StoreResult<RouteBindingR
     let host_kind: String = row.get("host_kind");
     let host: String = row.get("host");
     let path_prefix: Option<String> = row.get("path_prefix");
-    let protocol: String = row.get("protocol");
 
     Ok(RouteBindingRow {
         id: RouteBindingId::new(route_binding_id).map_err(invalid_stored_data)?,
         instance_id: InstanceId::new(instance_id).map_err(invalid_stored_data)?,
         identity: route_identity_from_parts(&identity_kind, &host_kind, &host, path_prefix)?,
-        protocol: protocol_from_db(&protocol)?,
     })
 }
 
@@ -460,19 +453,6 @@ pub(crate) fn route_identity_key(identity: &RouteIdentity) -> String {
     }
 }
 
-pub(crate) fn validate_route_protocol(spec: &RouteBindingSpec) -> StoreResult<()> {
-    match (&spec.identity, spec.protocol) {
-        (RouteIdentity::Http { .. }, ProtocolRoute::Http)
-        | (RouteIdentity::Sni { .. }, ProtocolRoute::TlsSni) => Ok(()),
-        (RouteIdentity::Http { .. }, ProtocolRoute::TlsSni) => Err(StoreError::invalid_argument(
-            "HTTP route identities must use the HTTP protocol route",
-        )),
-        (RouteIdentity::Sni { .. }, ProtocolRoute::Http) => Err(StoreError::invalid_argument(
-            "SNI route identities must use the TLS SNI protocol route",
-        )),
-    }
-}
-
 pub(crate) fn materialization_id(
     instance_id: &InstanceId,
     target: &MaterializationTarget,
@@ -505,13 +485,6 @@ pub(crate) fn materialization_state_to_db(state: MaterializationState) -> &'stat
         MaterializationState::Failed => "failed",
         MaterializationState::Deleting => "deleting",
         MaterializationState::Deleted => "deleted",
-    }
-}
-
-pub(crate) fn protocol_to_db(protocol: ProtocolRoute) -> &'static str {
-    match protocol {
-        ProtocolRoute::Http => "http",
-        ProtocolRoute::TlsSni => "tls_sni",
     }
 }
 
@@ -610,16 +583,6 @@ pub(crate) fn materialization_state_from_db(value: &str) -> StoreResult<Material
     }
 }
 
-fn protocol_from_db(value: &str) -> StoreResult<ProtocolRoute> {
-    match value {
-        "http" => Ok(ProtocolRoute::Http),
-        "tls_sni" => Ok(ProtocolRoute::TlsSni),
-        other => Err(StoreError::internal(format!(
-            "stored route protocol {other:?} is invalid"
-        ))),
-    }
-}
-
 pub(crate) fn generation_from_i64(value: i64) -> StoreResult<Generation> {
     u64::try_from(value)
         .map(Generation::new)
@@ -696,9 +659,7 @@ fn invalid_stored_data(error: impl std::fmt::Display) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::route_identity_key;
-    use crate::route::{
-        route_match_score, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity,
-    };
+    use crate::route::{route_match_score, PathPrefix, RouteHost, RouteIdentity};
 
     #[test]
     fn route_identity_key_uses_normalized_domain_parts() {
@@ -826,17 +787,5 @@ mod tests {
 
         assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
         assert!(route_match_score(&wildcard, &miss).is_none());
-    }
-
-    #[test]
-    fn route_protocol_validation_rejects_mismatched_identity() {
-        let spec = RouteBindingSpec::new(
-            RouteIdentity::Sni {
-                host: RouteHost::exact("db.example.com").expect("valid host"),
-            },
-            ProtocolRoute::Http,
-        );
-
-        assert!(super::validate_route_protocol(&spec).is_err());
     }
 }

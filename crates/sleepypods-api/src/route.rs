@@ -20,7 +20,6 @@ pub enum RouteIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteBindingSpec {
     pub identity: RouteIdentity,
-    pub protocol: ProtocolRoute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +27,6 @@ pub struct RouteBindingRecord {
     pub id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
-    pub protocol: ProtocolRoute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +35,6 @@ pub struct CreateRouteBindingRequest {
     pub route_binding_id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
-    pub protocol: ProtocolRoute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,12 +103,6 @@ pub struct RouteMatchScore {
     path: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ProtocolRoute {
-    Http,
-    TlsSni,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RouteHost {
     kind: RouteHostKind,
@@ -143,8 +134,8 @@ pub struct InvalidPathPrefix {
 }
 
 impl RouteBindingSpec {
-    pub fn new(identity: RouteIdentity, protocol: ProtocolRoute) -> Self {
-        Self { identity, protocol }
+    pub fn new(identity: RouteIdentity) -> Self {
+        Self { identity }
     }
 }
 
@@ -154,19 +145,17 @@ impl CreateRouteBindingRequest {
         route_binding_id: RouteBindingId,
         instance_id: InstanceId,
         identity: RouteIdentity,
-        protocol: ProtocolRoute,
     ) -> Self {
         Self {
             idempotency_key,
             route_binding_id,
             instance_id,
             identity,
-            protocol,
         }
     }
 
     pub fn spec(&self) -> RouteBindingSpec {
-        RouteBindingSpec::new(self.identity.clone(), self.protocol)
+        RouteBindingSpec::new(self.identity.clone())
     }
 }
 

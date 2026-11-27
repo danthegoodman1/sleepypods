@@ -38,7 +38,6 @@ struct ActiveRouteSubscription {
     instance_id: InstanceId,
     request_identity: domain_route::RouteIdentity,
     matched_identity: domain_route::RouteIdentity,
-    protocol: domain_route::ProtocolRoute,
 }
 
 #[derive(Clone)]
@@ -381,7 +380,6 @@ fn subscription_invalidated_by_event(
             route_binding_id,
             removed,
             identity,
-            protocol,
         } => {
             if subscription.route_binding_id == *route_binding_id {
                 return true;
@@ -389,12 +387,9 @@ fn subscription_invalidated_by_event(
             if *removed {
                 return false;
             }
-            let (Some(identity), Some(protocol)) = (identity, protocol) else {
+            let Some(identity) = identity else {
                 return false;
             };
-            if subscription.protocol != *protocol {
-                return false;
-            }
             let Some(new_score) =
                 domain_route::route_match_score(identity, &subscription.request_identity)
             else {
@@ -490,7 +485,6 @@ async fn subscribe_route(
                     instance_id: entry.instance_id.clone(),
                     request_identity: request_identity.clone(),
                     matched_identity: matched_identity.clone(),
-                    protocol: protocol_for_route_identity(&matched_identity),
                 },
             );
 
@@ -517,15 +511,6 @@ async fn subscribe_route(
                 },
             )),
         }),
-    }
-}
-
-fn protocol_for_route_identity(
-    identity: &domain_route::RouteIdentity,
-) -> domain_route::ProtocolRoute {
-    match identity {
-        domain_route::RouteIdentity::Http { .. } => domain_route::ProtocolRoute::Http,
-        domain_route::RouteIdentity::Sni { .. } => domain_route::ProtocolRoute::TlsSni,
     }
 }
 

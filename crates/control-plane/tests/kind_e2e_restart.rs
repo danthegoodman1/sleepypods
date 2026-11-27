@@ -17,12 +17,12 @@ use control_plane::api::pb::{
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteHttp01ChallengeRequest, DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     ExpireHttp01ChallengesRequest, GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute,
-    ProxyWakeInstanceRequest, PutHttp01ChallengeRequest, ReconcileMaterializationRequest,
-    ReconcileMaterializationResponse, ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProxyWakeInstanceRequest,
+    PutHttp01ChallengeRequest, ReconcileMaterializationRequest, ReconcileMaterializationResponse,
+    ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
+    WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
+    WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, ReplicaSet},
@@ -1105,7 +1105,6 @@ async fn create_route(
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 

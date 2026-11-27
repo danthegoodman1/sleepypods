@@ -163,7 +163,7 @@ async fn ordered_notifications(
     // Statement ranges preserve payload count without repeated counter-row updates.
     let baseline = store.load_route_change_revision().await?;
     let started = std::time::Instant::now();
-    first.execute("INSERT INTO route_bindings(route_binding_id,instance_id,identity_key,identity_kind,host_kind,host,path_prefix,protocol) SELECT 'bulk-' || n, 'order-a', 'bulk-key-' || n, 'http', 'exact', 'bulk-' || n || '.example.test', NULL, 'http' FROM generate_series(1,100003) n", &[]).await?;
+    first.execute("INSERT INTO route_bindings(route_binding_id,instance_id,identity_key,identity_kind,host_kind,host,path_prefix) SELECT 'bulk-' || n, 'order-a', 'bulk-key-' || n, 'http', 'exact', 'bulk-' || n || '.example.test', NULL FROM generate_series(1,100003) n", &[]).await?;
     assert_eq!(store.load_route_change_revision().await?, baseline + 100003);
     assert_eq!(
         first

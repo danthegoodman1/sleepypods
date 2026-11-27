@@ -531,7 +531,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             route.clone(),
             instance.clone(),
             identity.clone(),
-            ProtocolRoute::Http
         )
     );
     check!(

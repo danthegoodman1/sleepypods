@@ -5,10 +5,10 @@ use control_plane::api::pb::{
     operator_control_plane_client::OperatorControlPlaneClient, route_identity, template_text_part,
     ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
     CreateWorkloadClassVersionRequest, EnvVarTemplate, GetInstanceRequest, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost,
-    RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    Instance, InstanceState as PbInstanceState, ManifestTemplate, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderMap, Method, Request, StatusCode, Version};
@@ -288,7 +288,6 @@ async fn create_operator_resources(
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(http_route_identity(spec.host, Some(spec.path_prefix))),
-                protocol: ProtocolRoute::Http as i32,
             })
             .await?;
     }

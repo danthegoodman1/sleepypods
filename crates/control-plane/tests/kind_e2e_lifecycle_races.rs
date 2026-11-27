@@ -17,12 +17,12 @@ use control_plane::api::pb::{
     CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
     DeleteRouteBindingRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance,
     InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute,
-    ProxyRouteInvalidationReason, ProxySubscribeRequest, ProxySubscribeRouteRequest,
-    ProxyWakeInstanceRequest, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProxyRouteInvalidationReason,
+    ProxySubscribeRequest, ProxySubscribeRouteRequest, ProxyWakeInstanceRequest,
+    ReconcileMaterializationRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate, TemplateText, TemplateTextPart,
+    VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -1389,7 +1389,6 @@ async fn create_route(
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
     Ok(())

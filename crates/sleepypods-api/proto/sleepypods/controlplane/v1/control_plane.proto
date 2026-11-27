@@ -451,7 +451,6 @@ message CreateRouteBindingRequest {
   string route_binding_id = 2;
   string instance_id = 3;
   RouteIdentity identity = 4;
-  ProtocolRoute protocol = 5;
 }
 
 message GetRouteBindingRequest {
@@ -470,7 +469,6 @@ message RouteBinding {
   string route_binding_id = 1;
   string instance_id = 2;
   RouteIdentity identity = 3;
-  ProtocolRoute protocol = 4;
 }
 
 message RouteIdentity {
@@ -498,12 +496,6 @@ enum RouteHostKind {
   ROUTE_HOST_KIND_UNSPECIFIED = 0;
   ROUTE_HOST_KIND_EXACT = 1;
   ROUTE_HOST_KIND_WILDCARD_SUFFIX = 2;
-}
-
-enum ProtocolRoute {
-  PROTOCOL_ROUTE_UNSPECIFIED = 0;
-  PROTOCOL_ROUTE_HTTP = 1;
-  PROTOCOL_ROUTE_TLS_SNI = 2;
 }
 
 message Http01ChallengeKey {

@@ -21,10 +21,9 @@ use super::{
     error::map_postgres_error,
     idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
-        self, generation_to_i64, instance_from_row, instance_state_to_db,
-        manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
-        sleep_policy_to_json, value_schema_to_json, values_to_json,
-        workload_class_version_from_row, workload_exclusivity_keys_to_json,
+        generation_to_i64, instance_from_row, instance_state_to_db, manifest_template_to_json,
+        route_binding_from_row, route_identity_parts, sleep_policy_to_json, value_schema_to_json,
+        values_to_json, workload_class_version_from_row, workload_exclusivity_keys_to_json,
     },
 };
 
@@ -401,11 +400,9 @@ async fn insert_route_bindings(
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
     for (index, spec) in request.route_bindings.iter().enumerate() {
-        mapping::validate_route_protocol(spec)?;
         let route_binding_id = format!("{}:route:{}", request.instance_id.as_str(), index + 1);
         let instance_id = request.instance_id.as_str();
         let parts = route_identity_parts(&spec.identity);
-        let protocol = protocol_to_db(spec.protocol);
         let path_prefix = parts.path_prefix.as_deref();
         let row = client
             .query_one(
@@ -417,11 +414,10 @@ async fn insert_route_bindings(
                     identity_kind,
                     host_kind,
                     host,
-                    path_prefix,
-                    protocol
+                    path_prefix
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
                 ",
                 &[
                     &route_binding_id,
@@ -431,7 +427,6 @@ async fn insert_route_bindings(
                     &parts.host_kind,
                     &parts.host,
                     &path_prefix,
-                    &protocol,
                 ],
             )
             .await
@@ -468,7 +463,7 @@ async fn load_route_bindings_for_instance(
     let rows = client
         .query(
             "
-            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE instance_id = $1
             ORDER BY route_binding_id

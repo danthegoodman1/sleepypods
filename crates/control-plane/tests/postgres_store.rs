@@ -23,7 +23,7 @@ use control_plane::{
     ForceReleaseExclusivityKeyRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
     Http01ChallengeKey, IdempotencyKey, IdleTimeoutOverridePolicy, InstanceId, InstanceState,
     ListMaterializationReconciliationCandidatesRequest, ManifestTemplate, MaterializationState,
-    MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
+    MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig,
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
@@ -2975,7 +2975,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::exact("App.Routes.Example.COM.").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     assert_eq!(
@@ -2997,7 +2996,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::exact("app.routes.example.com").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     assert_eq!(replayed_exact, exact_root);
@@ -3008,7 +3006,6 @@ async fn exercise_route_bindings(
             "route-conflicting-replay",
             "instance-routes",
             http_identity("conflict.routes.example.com", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("same idempotency key with different route payload conflicts");
@@ -3023,7 +3020,6 @@ async fn exercise_route_bindings(
             "route-duplicate-identity",
             "instance-routes",
             http_identity("APP.ROUTES.EXAMPLE.COM.", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("duplicate normalized route identity is rejected");
@@ -3040,7 +3036,6 @@ async fn exercise_route_bindings(
             "route-exact-root",
             "instance-routes",
             http_identity("duplicate-id.routes.example.com", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("duplicate route binding ID is rejected");
@@ -3057,7 +3052,6 @@ async fn exercise_route_bindings(
             "route-missing-instance",
             "missing-instance",
             http_identity("missing.routes.example.com", None),
-            ProtocolRoute::Http,
         ))
         .await
         .expect_err("route binding must point at an existing instance");
@@ -3068,28 +3062,12 @@ async fn exercise_route_bindings(
         }
     ));
 
-    let protocol_mismatch = store
-        .create_route_binding(create_route_binding_request(
-            "idem-route-protocol-mismatch",
-            "route-protocol-mismatch",
-            "instance-routes",
-            http_identity("mismatch.routes.example.com", None),
-            ProtocolRoute::TlsSni,
-        ))
-        .await
-        .expect_err("route identity and protocol must be compatible");
-    assert!(matches!(
-        protocol_mismatch,
-        StoreError::InvalidArgument { .. }
-    ));
-
     let exact_api = store
         .create_route_binding(create_route_binding_request(
             "idem-route-exact-api",
             "route-exact-api",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api")),
-            ProtocolRoute::Http,
         ))
         .await?;
     let exact_api_v1 = store
@@ -3098,7 +3076,6 @@ async fn exercise_route_bindings(
             "route-exact-api-v1",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api/v1")),
-            ProtocolRoute::Http,
         ))
         .await?;
     let wildcard_broad = store
@@ -3110,7 +3087,6 @@ async fn exercise_route_bindings(
                 host: RouteHost::wildcard_suffix("routes.example.com").expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
     let wildcard_specific = store
@@ -3123,7 +3099,6 @@ async fn exercise_route_bindings(
                     .expect("valid host"),
                 path: None,
             },
-            ProtocolRoute::Http,
         ))
         .await?;
 
@@ -3170,7 +3145,6 @@ async fn exercise_route_bindings(
             "route-sni-exact",
             "instance-routes",
             sni_identity("DB.Routes.Example.COM."),
-            ProtocolRoute::TlsSni,
         ))
         .await?;
     let sni_wildcard = store
@@ -3181,7 +3155,6 @@ async fn exercise_route_bindings(
             RouteIdentity::Sni {
                 host: RouteHost::wildcard_suffix("routes.example.com").expect("valid host"),
             },
-            ProtocolRoute::TlsSni,
         ))
         .await?;
     let duplicate_sni = store
@@ -3190,7 +3163,6 @@ async fn exercise_route_bindings(
             "route-sni-duplicate",
             "instance-routes",
             sni_identity("db.routes.example.com"),
-            ProtocolRoute::TlsSni,
         ))
         .await
         .expect_err("duplicate normalized SNI identity is rejected");
@@ -3395,14 +3367,12 @@ fn create_route_binding_request(
     route_binding_id: &str,
     instance_id: &str,
     identity: RouteIdentity,
-    protocol: ProtocolRoute,
 ) -> CreateRouteBindingRequest {
     CreateRouteBindingRequest::new(
         IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         RouteBindingId::new(route_binding_id).expect("valid route binding ID"),
         InstanceId::new(instance_id).expect("valid instance ID"),
         identity,
-        protocol,
     )
 }
 
@@ -3420,22 +3390,16 @@ fn sni_identity(host: &str) -> RouteIdentity {
 }
 
 fn http_route(host: &str, path: Option<&str>) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Http {
-            host: RouteHost::exact(host).expect("valid host"),
-            path: path.map(|path| PathPrefix::new(path).expect("valid path prefix")),
-        },
-        ProtocolRoute::Http,
-    )
+    RouteBindingSpec::new(RouteIdentity::Http {
+        host: RouteHost::exact(host).expect("valid host"),
+        path: path.map(|path| PathPrefix::new(path).expect("valid path prefix")),
+    })
 }
 
 fn sni_route(host: &str) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Sni {
-            host: RouteHost::exact(host).expect("valid host"),
-        },
-        ProtocolRoute::TlsSni,
-    )
+    RouteBindingSpec::new(RouteIdentity::Sni {
+        host: RouteHost::exact(host).expect("valid host"),
+    })
 }
 
 fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
@@ -3786,7 +3750,6 @@ async fn phase5_idempotency_lifetime(
         "phase5-route",
         "phase5-permanent",
         http_identity("phase5.example.com", None),
-        ProtocolRoute::Http,
     );
     store.create_route_binding(route.clone()).await?;
     store
@@ -3862,7 +3825,7 @@ async fn phase5_route_scale_snapshot_and_target(
     );
     let instance = store.create_instance(request).await?.instance;
     let mut raw = raw_client(config).await?;
-    raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host, protocol) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net', 'http' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
+    raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
     let rules = [
         (
             "broad",
@@ -3899,7 +3862,6 @@ async fn phase5_route_scale_snapshot_and_target(
                 name,
                 instance.id.as_str(),
                 identity.clone(),
-                ProtocolRoute::Http,
             ))
             .await?;
     }

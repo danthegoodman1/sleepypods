@@ -93,7 +93,6 @@ impl TestStore {
             RouteBindingRecord {
                 id: entry.route_binding_id.clone(),
                 instance_id: entry.instance_id.clone(),
-                protocol: protocol_for_identity(&matched_identity),
                 identity: matched_identity.clone(),
             },
         );
@@ -230,12 +229,6 @@ enum FakeRouteResolution {
     Unavailable(String),
 }
 
-fn protocol_for_identity(identity: &RouteIdentity) -> ProtocolRoute {
-    match identity {
-        RouteIdentity::Http { .. } => ProtocolRoute::Http,
-        RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
-    }
-}
 fn fake_materialization_record(request: RecordMaterializationRequest) -> MaterializationRecord {
     MaterializationRecord {
         id: MaterializationId::new(format!(
@@ -363,7 +356,6 @@ impl ControlPlaneStore for TestStore {
                 id: request.route_binding_id,
                 instance_id: request.instance_id,
                 identity: request.identity,
-                protocol: request.protocol,
             };
             self.route_bindings
                 .lock()

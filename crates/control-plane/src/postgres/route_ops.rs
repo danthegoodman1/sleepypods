@@ -18,7 +18,7 @@ use super::{
     idempotency::{self, CREATE_ROUTE_BINDING_OPERATION},
     instance_ops::load_instance,
     mapping::{
-        default_negative_cache_policy, generation_to_i64, materialization_from_row, protocol_to_db,
+        default_negative_cache_policy, generation_to_i64, materialization_from_row,
         route_binding_from_row, route_binding_row_from_row, route_identity_parts, RouteBindingRow,
     },
 };
@@ -27,8 +27,6 @@ pub(crate) async fn create_route_binding(
     store: &PostgresStore,
     request: CreateRouteBindingRequest,
 ) -> StoreResult<RouteBindingRecord> {
-    super::mapping::validate_route_protocol(&request.spec())?;
-
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let fingerprint = idempotency::create_route_binding_fingerprint(&request)?;
@@ -106,7 +104,7 @@ pub(crate) async fn list_route_bindings_for_instance(
     let rows = client
         .query(
             "
-            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE instance_id = $1
             ORDER BY route_binding_id
@@ -123,7 +121,7 @@ pub(crate) async fn list_route_bindings_for_instance(
 // SQL matching mirrors route_match_score; literal prefix comparisons avoid LIKE escaping.
 pub(crate) const RESOLVE_ROUTE_SQL: &str = "
     WITH selected AS (
-        SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+        SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
         FROM route_bindings
         WHERE identity_kind = $1
             AND ((host_kind = 'exact' AND host = $2)
@@ -277,7 +275,6 @@ async fn insert_route_binding(
     let parts = route_identity_parts(&request.identity);
     let route_binding_id = request.route_binding_id.as_str();
     let instance_id = request.instance_id.as_str();
-    let protocol = protocol_to_db(request.protocol);
     let path_prefix = parts.path_prefix.as_deref();
     let row = client
         .query_one(
@@ -289,11 +286,10 @@ async fn insert_route_binding(
                 identity_kind,
                 host_kind,
                 host,
-                path_prefix,
-                protocol
+                path_prefix
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             ",
             &[
                 &route_binding_id,
@@ -303,7 +299,6 @@ async fn insert_route_binding(
                 &parts.host_kind,
                 &parts.host,
                 &path_prefix,
-                &protocol,
             ],
         )
         .await
@@ -319,7 +314,7 @@ async fn load_route_binding_record(
     let row = client
         .query_opt(
             "
-            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE route_binding_id = $1
             ",
@@ -338,7 +333,7 @@ async fn load_route_binding(
     let row = client
         .query_opt(
             "
-            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix, protocol
+            SELECT route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
             FROM route_bindings
             WHERE route_binding_id = $1
             ",

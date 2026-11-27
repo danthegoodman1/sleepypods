@@ -461,15 +461,14 @@ CreateRouteBinding({
   idempotency_key: "route-tenant-a-app",
   route_binding_id: "route-tenant-a-app",
   instance_id: "tenant-a",
-  protocol: PROTOCOL_ROUTE_HTTP,
   identity: {http: {host: {kind: ROUTE_HOST_KIND_EXACT, host: "app.example.com"},
     path_prefix: "/"}}
 })
 ```
 
 Use `ROUTE_HOST_KIND_WILDCARD_SUFFIX` for wildcard suffix routing, for example
-`host: "*.apps.example.com"`. Use `PROTOCOL_ROUTE_TLS_SNI` with `identity.sni`
-for TLS/SNI passthrough routes.
+`host: "*.apps.example.com"`. Use `identity.sni` for TLS/SNI passthrough
+routes; the identity kind selects the protocol.
 
 Add an HTTP-01 challenge token:
 

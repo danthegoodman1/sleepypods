@@ -373,7 +373,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         "delete-route",
         owner.id.as_str(),
         http_identity("old.retry.example", None),
-        ProtocolRoute::Http,
     );
     pg.create_route_binding(original_route.clone()).await?;
     let replacement_route = create_route_binding_request(
@@ -381,7 +380,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         "delete-route",
         owner.id.as_str(),
         http_identity("new.retry.example", None),
-        ProtocolRoute::Http,
     );
     let next = pg.clone();
     let replacement = replacement_route.clone();
@@ -551,7 +549,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         "create-route-lost",
         owner.id.as_str(),
         http_identity("create.retry.example", None),
-        ProtocolRoute::Http,
     );
     let next = pg.clone();
     let id = create.route_binding_id.clone();

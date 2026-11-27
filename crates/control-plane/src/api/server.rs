@@ -530,11 +530,8 @@ where
             )?)
             .await
             .map_err(store_error_to_status)?;
-        self.route_events.notify_route_changed(
-            route_binding.id.clone(),
-            route_binding.identity.clone(),
-            route_binding.protocol,
-        );
+        self.route_events
+            .notify_route_changed(route_binding.id.clone(), route_binding.identity.clone());
 
         Ok(Response::new(route_binding_to_proto(route_binding)))
     }
@@ -830,14 +827,12 @@ fn create_route_binding_request_from_proto(
         .identity
         .ok_or_else(|| Status::invalid_argument("identity is required"))
         .and_then(route_identity_from_proto)?;
-    let protocol = protocol_from_proto(request.protocol)?;
 
     Ok(domain_route::CreateRouteBindingRequest::new(
         parse_idempotency_key(request.idempotency_key)?,
         parse_route_binding_id(request.route_binding_id)?,
         parse_instance_id(request.instance_id)?,
         identity,
-        protocol,
     ))
 }
 
@@ -930,18 +925,6 @@ fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost,
         }
         pb::RouteHostKind::Unspecified => {
             Err(Status::invalid_argument("route host kind is required"))
-        }
-    }
-}
-
-fn protocol_from_proto(protocol: i32) -> Result<domain_route::ProtocolRoute, Status> {
-    match pb::ProtocolRoute::try_from(protocol)
-        .map_err(|_| Status::invalid_argument("protocol route is invalid"))?
-    {
-        pb::ProtocolRoute::Http => Ok(domain_route::ProtocolRoute::Http),
-        pb::ProtocolRoute::TlsSni => Ok(domain_route::ProtocolRoute::TlsSni),
-        pb::ProtocolRoute::Unspecified => {
-            Err(Status::invalid_argument("protocol route is required"))
         }
     }
 }
@@ -1127,7 +1110,6 @@ fn route_binding_to_proto(route_binding: domain_route::RouteBindingRecord) -> pb
         route_binding_id: route_binding.id.as_str().to_owned(),
         instance_id: route_binding.instance_id.as_str().to_owned(),
         identity: Some(route_identity_to_proto(route_binding.identity)),
-        protocol: protocol_to_proto(route_binding.protocol) as i32,
     }
 }
 
@@ -1160,13 +1142,6 @@ fn route_host_kind_to_proto(kind: domain_route::RouteHostKind) -> pb::RouteHostK
     match kind {
         domain_route::RouteHostKind::Exact => pb::RouteHostKind::Exact,
         domain_route::RouteHostKind::WildcardSuffix => pb::RouteHostKind::WildcardSuffix,
-    }
-}
-
-fn protocol_to_proto(protocol: domain_route::ProtocolRoute) -> pb::ProtocolRoute {
-    match protocol {
-        domain_route::ProtocolRoute::Http => pb::ProtocolRoute::Http,
-        domain_route::ProtocolRoute::TlsSni => pb::ProtocolRoute::TlsSni,
     }
 }
 

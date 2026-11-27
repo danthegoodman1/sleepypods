@@ -7,7 +7,7 @@ use control_plane::api::pb::{
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     EnvVarTemplate, GetInstanceRequest, Instance, InstanceState as PbInstanceState,
-    ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ManifestTemplate, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
     ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText, TemplateTextPart,
     WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
     WorkloadValueSchema,
@@ -119,7 +119,6 @@ async fn create_operator_resources(operator: &mut Operator, config: &E2eConfig) 
                     }),
                 })),
             }),
-            protocol: ProtocolRoute::TlsSni as i32,
         })
         .await?;
 

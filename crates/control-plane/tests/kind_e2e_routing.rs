@@ -13,11 +13,11 @@ use control_plane::api::pb::{
     ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest, CreateRouteBindingRequest,
     CreateWorkloadClassVersionRequest, DeleteHttp01ChallengeRequest, EnvVarTemplate,
     ExpireHttp01ChallengesRequest, GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute,
-    PutHttp01ChallengeRequest, ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    Instance, InstanceState as PbInstanceState, ManifestTemplate, PutHttp01ChallengeRequest,
+    ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
+    WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
+    WorkloadValueSchema,
 };
 use k8s_openapi::{
     api::{
@@ -303,7 +303,6 @@ async fn create_operator_resources(
                     spec.host,
                     spec.path_prefix,
                 )),
-                protocol: ProtocolRoute::Http as i32,
             })
             .await?;
     }

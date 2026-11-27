@@ -2,13 +2,9 @@ use serde_json::{json, Value};
 
 use crate::{
     instance::CreateInstanceRequest,
-    route::{
-        CreateRouteBindingRequest, ProtocolRoute, RouteBindingSpec, RouteHostKind, RouteIdentity,
-    },
+    route::{CreateRouteBindingRequest, RouteBindingSpec, RouteHostKind, RouteIdentity},
     store::{StoreError, StoreResult},
 };
-
-use super::mapping;
 
 pub(crate) const CREATE_INSTANCE_OPERATION: &str = "create_instance";
 pub(crate) const CREATE_ROUTE_BINDING_OPERATION: &str = "create_route_binding";
@@ -35,24 +31,17 @@ pub(crate) fn create_instance_fingerprint(request: &CreateInstanceRequest) -> St
 pub(crate) fn create_route_binding_fingerprint(
     request: &CreateRouteBindingRequest,
 ) -> StoreResult<Value> {
-    let spec = RouteBindingSpec::new(request.identity.clone(), request.protocol);
-    mapping::validate_route_protocol(&spec)?;
-
     Ok(json!({
         "operation": CREATE_ROUTE_BINDING_OPERATION,
         "route_binding_id": request.route_binding_id.as_str(),
         "instance_id": request.instance_id.as_str(),
         "identity": route_identity_fingerprint(&request.identity),
-        "protocol": protocol_fingerprint(request.protocol),
     }))
 }
 
 fn route_binding_fingerprint(spec: &RouteBindingSpec) -> StoreResult<Value> {
-    mapping::validate_route_protocol(spec)?;
-
     Ok(json!({
         "identity": route_identity_fingerprint(&spec.identity),
-        "protocol": protocol_fingerprint(spec.protocol),
     }))
 }
 
@@ -80,13 +69,6 @@ fn host_kind_fingerprint(kind: RouteHostKind) -> &'static str {
     match kind {
         RouteHostKind::Exact => "exact",
         RouteHostKind::WildcardSuffix => "wildcard_suffix",
-    }
-}
-
-fn protocol_fingerprint(protocol: ProtocolRoute) -> &'static str {
-    match protocol {
-        ProtocolRoute::Http => "http",
-        ProtocolRoute::TlsSni => "tls_sni",
     }
 }
 
@@ -148,8 +130,7 @@ mod tests {
         ids::{Generation, IdempotencyKey, InstanceId, RouteBindingId, WorkloadClassId},
         instance::CreateInstanceRequest,
         route::{
-            CreateRouteBindingRequest, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost,
-            RouteIdentity,
+            CreateRouteBindingRequest, PathPrefix, RouteBindingSpec, RouteHost, RouteIdentity,
         },
         workload::WorkloadClassVersionRef,
     };
@@ -164,13 +145,10 @@ mod tests {
                 Generation::new(1),
             ),
         )
-        .with_route_bindings(vec![RouteBindingSpec::new(
-            RouteIdentity::Http {
-                host: RouteHost::exact("App.Example.COM.").expect("valid host"),
-                path: Some(PathPrefix::new("/api").expect("valid prefix")),
-            },
-            ProtocolRoute::Http,
-        )]);
+        .with_route_bindings(vec![RouteBindingSpec::new(RouteIdentity::Http {
+            host: RouteHost::exact("App.Example.COM.").expect("valid host"),
+            path: Some(PathPrefix::new("/api").expect("valid prefix")),
+        })]);
 
         let fingerprint = create_instance_fingerprint(&request).expect("fingerprint builds");
 
@@ -190,7 +168,6 @@ mod tests {
                 host: RouteHost::exact("App.Example.COM.").expect("valid host"),
                 path: Some(PathPrefix::new("/api").expect("valid prefix")),
             },
-            ProtocolRoute::Http,
         );
         let second = CreateRouteBindingRequest::new(
             IdempotencyKey::new("key-1").expect("valid key"),
@@ -200,7 +177,6 @@ mod tests {
                 host: RouteHost::exact("app.example.com").expect("valid host"),
                 path: Some(PathPrefix::new("/api").expect("valid prefix")),
             },
-            ProtocolRoute::Http,
         );
 
         assert_eq!(

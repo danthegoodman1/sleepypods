@@ -19,7 +19,7 @@ use control_plane::api::{
         proxy_control_plane_server::ProxyControlPlane, proxy_subscribe_request,
         proxy_subscribe_response, proxy_wake_instance_response,
         sidecar_control_plane_server::SidecarControlPlane, sidecar_report_idle_response,
-        HttpRouteIdentity, InstanceState, ProtocolRoute, ProxyCachePolicy, ProxyRouteEntry,
+        HttpRouteIdentity, InstanceState, ProxyCachePolicy, ProxyRouteEntry,
         ProxyRouteInvalidatedResponse, ProxyRouteInvalidationReason, ProxyRouteMissResponse,
         ProxyRouteResolvedResponse, ProxySubscribeRequest, ProxySubscribeResponse,
         ProxySubscribeRouteRequest, ProxyWakeInstanceRequest, ProxyWakeInstanceResponse,
@@ -1066,7 +1066,6 @@ async fn operator_route_binding_reassignment_invalidates_old_route_before_resubs
                     "reassign-route.example.com",
                     None,
                 )),
-                protocol: ProtocolRoute::Http as i32,
             },
         ))
         .await
@@ -1134,7 +1133,6 @@ async fn operator_exact_http_host_create_invalidates_cached_wildcard_subscriptio
                     "app.example.com",
                     None,
                 )),
-                protocol: ProtocolRoute::Http as i32,
             },
         ))
         .await
@@ -1201,7 +1199,6 @@ async fn operator_longer_http_path_create_invalidates_cached_shorter_path_subscr
                     "path.example.com",
                     Some("/api/v1"),
                 )),
-                protocol: ProtocolRoute::Http as i32,
             },
         ))
         .await
@@ -1260,7 +1257,6 @@ async fn operator_exact_sni_create_invalidates_cached_wildcard_sni_subscription(
                 route_binding_id: "route-exact-sni".to_owned(),
                 instance_id: "instance-exact-sni".to_owned(),
                 identity: Some(proto_sni_identity(RouteHostKind::Exact, "db.example.com")),
-                protocol: ProtocolRoute::TlsSni as i32,
             },
         ))
         .await

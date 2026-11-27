@@ -1,5 +1,5 @@
 use super::admission::ApiLimits;
-use crate::{InstanceId, ProtocolRoute, RouteBindingId, RouteBindingRecord, RouteIdentity};
+use crate::{InstanceId, RouteBindingId, RouteBindingRecord, RouteIdentity};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 
@@ -21,7 +21,6 @@ pub enum RouteBindingChange {
         route_binding_id: RouteBindingId,
         removed: bool,
         identity: Option<RouteIdentity>,
-        protocol: Option<ProtocolRoute>,
     },
     Instance(InstanceId),
     Reset,
@@ -62,7 +61,6 @@ impl RouteSubscriptionBroker {
             route_binding_id,
             removed: true,
             identity: None,
-            protocol: None,
         });
     }
     pub fn notify_routes_removed(&self, bindings: &[RouteBindingRecord]) {
@@ -70,26 +68,16 @@ impl RouteSubscriptionBroker {
             self.notify_route_removed(binding.id.clone());
         }
     }
-    pub fn notify_route_changed(
-        &self,
-        route_binding_id: RouteBindingId,
-        identity: RouteIdentity,
-        protocol: ProtocolRoute,
-    ) {
+    pub fn notify_route_changed(&self, route_binding_id: RouteBindingId, identity: RouteIdentity) {
         let _ = self.sender.send(RouteBindingChange::Route {
             route_binding_id,
             removed: false,
             identity: Some(identity),
-            protocol: Some(protocol),
         });
     }
     pub fn notify_routes_changed(&self, bindings: &[RouteBindingRecord]) {
         for binding in bindings {
-            self.notify_route_changed(
-                binding.id.clone(),
-                binding.identity.clone(),
-                binding.protocol,
-            );
+            self.notify_route_changed(binding.id.clone(), binding.identity.clone());
         }
     }
     pub(crate) fn publish_durable(
@@ -118,17 +106,17 @@ impl RouteSubscriptionBroker {
                 _ => crate::RouteHost::wildcard_suffix(field("host")?),
             }
             .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-            let (identity, protocol) = if field("identity_kind")? == "http" {
+            let identity = if field("identity_kind")? == "http" {
                 let path = payload["path_prefix"]
                     .as_str()
                     .map(crate::PathPrefix::new)
                     .transpose()
                     .map_err(|error| crate::store::StoreError::internal(error.to_string()))?;
-                (RouteIdentity::Http { host, path }, ProtocolRoute::Http)
+                RouteIdentity::Http { host, path }
             } else {
-                (RouteIdentity::Sni { host }, ProtocolRoute::TlsSni)
+                RouteIdentity::Sni { host }
             };
-            self.notify_route_changed(id, identity, protocol);
+            self.notify_route_changed(id, identity);
         }
         Ok(())
     }

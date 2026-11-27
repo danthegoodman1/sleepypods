@@ -14,10 +14,10 @@ use control_plane::{
         template_text_part, ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest,
         CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, GetInstanceRequest,
         HttpRouteIdentity, Instance, InstanceState as PbInstanceState, ManifestTemplate,
-        ProtocolRoute, ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity,
-        ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
-        TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-        WorkloadTemplate, WorkloadValueSchema,
+        ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+        ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate, TemplateText, TemplateTextPart,
+        WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+        WorkloadValueSchema,
     },
     render_instance_scoped_name, BearerToken, InstanceId, OptionalBearerTokenInterceptor,
 };
@@ -367,7 +367,6 @@ async fn create_operator_resources(
                     path_prefix: None,
                 })),
             }),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 
