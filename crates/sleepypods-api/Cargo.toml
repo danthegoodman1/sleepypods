@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 prost = "0.14.4"
-sleepypods-types = { version = "0.1.0", path = "../sleepypods-types" }
 tonic = { workspace = true, features = ["channel", "codegen", "tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 zeroize = "1"

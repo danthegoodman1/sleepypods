@@ -24,6 +24,9 @@ Start here:
 - [Operator guide](docs/operator-guide.md)
 - [Operator runbook](docs/operator-runbook.md)
 - [Contributor and agent guide](docs/contributor-guide.md)
+- [Proxy protocol contract](docs/proxy-protocol-contract.md)
+- [Postgres store contract](docs/postgres-store-contract.md)
+- [Projection safety](docs/projection-safety.md)
 - [Proxy hot-path budgets](docs/proxy-hot-path-budgets.md)
 
 This workspace replaces the Go, DigitalOcean, Terraform and demo-script proof of

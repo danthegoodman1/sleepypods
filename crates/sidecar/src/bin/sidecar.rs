@@ -2,7 +2,7 @@ use std::{env, error::Error, net::SocketAddr, process, time::Duration};
 
 use proxy_core::{
     observability::{
-        prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
+        prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
         recorder::{CompositeObservabilitySink, ObservabilityRecorder, StderrObservabilitySink},
     },
     Shutdown,
@@ -12,10 +12,9 @@ use sidecar::{
     AppProtocol, GrpcSidecarControlPlaneClient, IdleReportConfig,
 };
 use sleepypods_api::{
-    pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken,
-    OptionalBearerTokenInterceptor,
+    pb::sidecar_control_plane_client::SidecarControlPlaneClient, BearerToken, Generation,
+    InstanceId, OptionalBearerTokenInterceptor,
 };
-use sleepypods_types::{Generation, InstanceId};
 
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -115,7 +114,7 @@ async fn run_with_connection(
         }),
         finish_listener(&shutdown, &first_error, async {
             if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr, prometheus) {
-                serve_prometheus_metrics_with_collector(
+                serve_prometheus_metrics(
                     metrics_addr,
                     prometheus,
                     metrics_shutdown.cancelled(),

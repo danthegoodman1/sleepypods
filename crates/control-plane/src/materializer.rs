@@ -4,7 +4,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 use crate::{
     auth::BearerToken,
-    kubernetes_name::is_dns_label,
+    ids::is_dns_label,
     manifest::{
         KubernetesObject, RenderedManifest, RenderedManifestObject, LABEL_INSTANCE_GENERATION,
     },

@@ -1415,10 +1415,10 @@ async fn http01_database_clock(pg: &PostgresStore, config: &PostgresStoreConfig)
     let raw = raw_client(config).await?;
     let key = Http01ChallengeKey::new("clock.example.com", "token-clock").expect("valid key");
     pg.put_http01_challenge(
-        PutHttp01ChallengeRequest::with_ttl(
+        PutHttp01ChallengeRequest::new(
             key.clone(),
             "key-auth-clock",
-            Duration::from_secs(3600),
+            SystemTime::now() + Duration::from_secs(3600),
             SystemTime::now(),
         )
         .expect("valid challenge"),

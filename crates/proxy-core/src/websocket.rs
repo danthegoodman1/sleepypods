@@ -101,6 +101,7 @@ impl WebSocketProxy {
         }
     }
 
+    #[cfg(test)]
     pub fn drain_tracker(&self) -> &DrainTracker {
         &self.drain
     }

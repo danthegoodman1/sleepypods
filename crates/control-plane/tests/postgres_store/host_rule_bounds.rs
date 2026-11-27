@@ -78,7 +78,7 @@ async fn rule_count(store: &PostgresStore, host: &str) -> TestResult<usize> {
             MaterializationTarget::new("test", "apps")?,
         ))
         .await?;
-    Ok(rules.len())
+    Ok(rules.rules().len())
 }
 
 #[track_caller]

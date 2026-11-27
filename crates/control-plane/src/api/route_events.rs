@@ -30,6 +30,7 @@ pub enum RouteBindingChange {
 }
 
 impl RouteSubscriptionBroker {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {
         Self::with_limits(ApiLimits::default())
     }
@@ -102,6 +103,7 @@ impl RouteSubscriptionBroker {
         Ok(())
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 impl Default for RouteSubscriptionBroker {
     fn default() -> Self {
         Self::new()

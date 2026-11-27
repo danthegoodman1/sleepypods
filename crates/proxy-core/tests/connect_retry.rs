@@ -96,7 +96,7 @@ async fn refused_http_connect(version: Version) {
     timeout(BOUND, drain.wait_for_active_count(0))
         .await
         .unwrap();
-    shutdown.cancel();
+    shutdown.shutdown();
     timeout(BOUND, server).await.unwrap().unwrap();
 }
 

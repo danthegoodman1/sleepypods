@@ -847,10 +847,10 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
     let now = SystemTime::now();
     let active_key =
         Http01ChallengeKey::new("Acme.Example.COM.", "token-a").expect("valid challenge key");
-    let active_put = PutHttp01ChallengeRequest::with_ttl(
+    let active_put = PutHttp01ChallengeRequest::new(
         active_key.clone(),
         "key-auth-a",
-        Duration::from_secs(60),
+        now + Duration::from_secs(60),
         now,
     )
     .expect("valid challenge");
@@ -870,10 +870,10 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
         Http01ChallengeKey::new("acme.example.com", "wrong-token").expect("valid challenge key");
     assert!(store.resolve_http01_challenge(wrong_token).await?.is_none());
 
-    let repeated_put = PutHttp01ChallengeRequest::with_ttl(
+    let repeated_put = PutHttp01ChallengeRequest::new(
         active_key.clone(),
         "key-auth-a",
-        Duration::from_secs(60),
+        now + Duration::from_secs(60),
         now,
     )
     .expect("valid repeated challenge");
@@ -885,10 +885,10 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
         .expect("repeated challenge resolves");
     assert_eq!(repeated_resolved.key_authorization(), "key-auth-a");
 
-    let overwrite_put = PutHttp01ChallengeRequest::with_ttl(
+    let overwrite_put = PutHttp01ChallengeRequest::new(
         active_key.clone(),
         "key-auth-overwritten",
-        Duration::from_secs(120),
+        now + Duration::from_secs(120),
         now,
     )
     .expect("valid overwrite challenge");

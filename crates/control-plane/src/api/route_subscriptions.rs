@@ -639,7 +639,7 @@ mod tests {
     use super::rules_response;
     use crate::{
         api::proxy::MAX_PROXY_RESPONSE_BYTES,
-        ids::{BackendGeneration, Generation, InstanceId, RouteBindingId},
+        ids::{BackendGeneration, Generation, InstanceId, RouteBindingId, DNS_LABEL_MAX_LEN},
         instance::InstanceState,
         materialization::BackendEndpoint,
         route::{
@@ -668,7 +668,7 @@ mod tests {
             "n".repeat(63)
         );
         let pod_backend = "http://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535";
-        let instance_id = "i".repeat(InstanceId::MAX_LEN);
+        let instance_id = "i".repeat(DNS_LABEL_MAX_LEN);
         for path_bytes in [1, 1024, 3000, MAX_ROUTE_PATH_BYTES] {
             let mut rules = Vec::new();
             let mut counted = 0;

@@ -21,7 +21,7 @@ use sidecar::{
     runtime::{serve_http_listener_with_idle, SidecarRuntimeConfig},
     IdleReportConfig, ReportIdleClient, ReportIdleFuture, ReportIdleRequest, ReportIdleResponse,
 };
-use sleepypods_types::{Generation, InstanceId};
+use sleepypods_api::{Generation, InstanceId};
 use std::{
     convert::Infallible,
     sync::Arc,

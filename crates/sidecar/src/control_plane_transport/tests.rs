@@ -4,12 +4,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use sleepypods_api::pb::{
-    self,
-    sidecar_control_plane_client::SidecarControlPlaneClient,
-    sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
+use sleepypods_api::{
+    pb::{
+        self,
+        sidecar_control_plane_client::SidecarControlPlaneClient,
+        sidecar_control_plane_server::{SidecarControlPlane, SidecarControlPlaneServer},
+    },
+    Generation, InstanceId,
 };
-use sleepypods_types::{Generation, InstanceId};
 use tonic::{
     codegen::{http, Service},
     Request, Response, Status,

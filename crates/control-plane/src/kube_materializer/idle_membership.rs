@@ -427,8 +427,7 @@ mod tests {
             ..Default::default()
         };
         let client =
-            KubeMaterializerClient::with_config(kube::Client::new(service, "apps"), config)
-                .unwrap();
+            KubeMaterializerClient::with_config(kube::Client::new(service, "apps"), config);
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             client.verify_idle_member(&[workload_ref("StatefulSet")], &identity()),

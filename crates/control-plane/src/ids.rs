@@ -1,5 +1,4 @@
-pub use sleepypods_types::*;
-
+pub use sleepypods_api::ids::*;
 use sleepypods_api::MaterializationTarget;
 
 /// The identifier of the one materialization an instance has in a target.

@@ -1,4 +1,4 @@
-use sleepypods_types::{EmptyStringError, NonEmptyString};
+use crate::ids::{EmptyStringError, NonEmptyString};
 use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,12 +61,6 @@ impl BackendEndpoint {
     }
 }
 
-impl InvalidMaterializationTarget {
-    pub fn field(&self) -> &'static str {
-        self.field
-    }
-}
-
 impl fmt::Display for InvalidMaterializationTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "materialization target {} must not be empty", self.field)
@@ -83,7 +77,10 @@ mod tests {
     fn target_requires_cluster_and_namespace() {
         let error = MaterializationTarget::new("cluster-a", "").expect_err("namespace required");
 
-        assert_eq!(error.field(), "namespace");
+        assert_eq!(
+            error.to_string(),
+            "materialization target namespace must not be empty"
+        );
     }
 
     #[test]

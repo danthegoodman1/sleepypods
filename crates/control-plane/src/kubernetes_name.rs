@@ -1,7 +1,6 @@
-use crate::ids::InstanceId;
+use crate::ids::{InstanceId, DNS_LABEL_MAX_LEN};
 use sha2::{Digest, Sha256};
 
-pub(crate) const DNS_LABEL_MAX_LEN: usize = 63;
 /// A StatefulSet stamps `<name>-<revision hash>` on its Pods as a label value,
 /// which leaves the name 52 of a label's 63 characters.
 pub(crate) const STATEFUL_SET_NAME_MAX_LEN: usize = 52;
@@ -14,22 +13,6 @@ pub fn render_instance_scoped_name(base: &str, instance_id: &InstanceId) -> Stri
     let base = truncate_to_byte_len(base, base_budget);
 
     format!("{base}-{suffix}")
-}
-
-pub(crate) fn is_dns_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= DNS_LABEL_MAX_LEN
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 /// The hash every instance-scoped object name ends in.
@@ -61,22 +44,9 @@ fn truncate_to_byte_len(value: &str, max_len: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use crate::ids::InstanceId;
+    use crate::ids::{is_dns_label, InstanceId, DNS_LABEL_MAX_LEN};
 
-    use super::{is_dns_label, render_instance_scoped_name, DNS_LABEL_MAX_LEN};
-
-    #[test]
-    fn dns_label_validation_matches_kubernetes_name_budget() {
-        assert!(is_dns_label("a"));
-        assert!(is_dns_label("tenant-123"));
-        assert!(is_dns_label(&"a".repeat(DNS_LABEL_MAX_LEN)));
-
-        for value in ["", "A", "a_b", "a.b", "-a", "a-"] {
-            assert!(!is_dns_label(value), "{value:?} should be invalid");
-        }
-        let overlong = "a".repeat(64);
-        assert!(!is_dns_label(&overlong));
-    }
+    use super::render_instance_scoped_name;
 
     #[test]
     fn instance_scoped_name_uses_stable_instance_id_hash_suffix() {

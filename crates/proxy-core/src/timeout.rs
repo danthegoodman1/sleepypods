@@ -13,6 +13,7 @@ impl TimeoutError {
         Self { timeout }
     }
 
+    #[cfg(test)]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }

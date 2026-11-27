@@ -11,7 +11,7 @@ use sleepypods_observability::{
         EXCLUSIVITY_KEYS_HELD, MATERIALIZATIONS_NONTERMINAL,
         MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS,
     },
-    prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
+    prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
     recorder::{
         CompositeObservabilitySink, FilteredStderrObservabilitySink, MetricObservation,
         ObservabilityRecorder,
@@ -597,7 +597,7 @@ where
         let metrics_shutdown = native_shutdown.clone();
         let store = Arc::clone(&store);
         listeners.spawn(async move {
-            serve_prometheus_metrics_with_collector(
+            serve_prometheus_metrics(
                 metrics_addr,
                 prometheus,
                 wait_for_shutdown(metrics_shutdown),
@@ -725,7 +725,7 @@ pub async fn dispatch_route_changes(
     }
 }
 
-/// Expires idempotency records, HTTP-01 challenges and route-change history.
+/// Expires HTTP-01 challenges and route-change history.
 /// A failed pass is retried at the next interval: the records only accumulate
 /// while the store is unavailable.
 async fn maintain_runtime(
@@ -1594,7 +1594,6 @@ pub(crate) mod tests {
             "0",
         );
         assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "ready", "3");
-        assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "failed", "1");
     }
 
     fn assert_state_sample(rendered: &str, metric: &str, state: &str, value: &str) {
@@ -1821,16 +1820,10 @@ pub(crate) mod tests {
                             Some(std::time::Duration::from_secs(7)),
                         ),
                     ],
-                    vec![
-                        MaterializationHeldKeysOperationalMetrics::new(
-                            MaterializationState::Ready,
-                            3,
-                        ),
-                        MaterializationHeldKeysOperationalMetrics::new(
-                            MaterializationState::Failed,
-                            1,
-                        ),
-                    ],
+                    vec![MaterializationHeldKeysOperationalMetrics::new(
+                        MaterializationState::Ready,
+                        3,
+                    )],
                 ))
             })
         }

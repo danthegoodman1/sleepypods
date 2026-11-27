@@ -2639,10 +2639,11 @@ where
     *request.uri_mut() = format!("/sleepypods.controlplane.v1.ProxyControlPlane/{method}")
         .parse()
         .unwrap();
-    let response = control_plane::api::proxy_grpc_service_with_store(
+    let response = control_plane::api::proxy_grpc_service_with_store_and_route_events(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
+        control_plane::api::RouteSubscriptionBroker::new(),
     )
     .oneshot(request)
     .await

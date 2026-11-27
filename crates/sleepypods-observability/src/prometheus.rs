@@ -208,18 +208,7 @@ impl MetricSeries {
     }
 }
 
-pub async fn serve_prometheus_metrics<ShutdownFuture>(
-    addr: SocketAddr,
-    sink: PrometheusMetricsSink,
-    shutdown: ShutdownFuture,
-) -> io::Result<()>
-where
-    ShutdownFuture: Future<Output = ()> + Send,
-{
-    serve_prometheus_metrics_with_collector(addr, sink, shutdown, |_| async {}).await
-}
-
-pub async fn serve_prometheus_metrics_with_collector<ShutdownFuture, Collect, CollectFuture>(
+pub async fn serve_prometheus_metrics<ShutdownFuture, Collect, CollectFuture>(
     addr: SocketAddr,
     sink: PrometheusMetricsSink,
     shutdown: ShutdownFuture,
@@ -231,21 +220,10 @@ where
     CollectFuture: Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::bind(addr).await?;
-    serve_prometheus_listener_with_collector(listener, sink, shutdown, collect).await
+    serve_prometheus_listener(listener, sink, shutdown, collect).await
 }
 
-pub async fn serve_prometheus_listener<ShutdownFuture>(
-    listener: TcpListener,
-    sink: PrometheusMetricsSink,
-    shutdown: ShutdownFuture,
-) -> io::Result<()>
-where
-    ShutdownFuture: Future<Output = ()> + Send,
-{
-    serve_prometheus_listener_with_collector(listener, sink, shutdown, |_| async {}).await
-}
-
-pub async fn serve_prometheus_listener_with_collector<ShutdownFuture, Collect, CollectFuture>(
+pub async fn serve_prometheus_listener<ShutdownFuture, Collect, CollectFuture>(
     listener: TcpListener,
     sink: PrometheusMetricsSink,
     shutdown: ShutdownFuture,
@@ -569,7 +547,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(serve_prometheus_listener_with_collector(
+        let task = tokio::spawn(serve_prometheus_listener(
             listener,
             PrometheusMetricsSink::new(),
             async {
@@ -616,9 +594,14 @@ mod tests {
             .expect("metrics listener binds");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(serve_prometheus_listener(listener, sink, async move {
-            let _ = shutdown_rx.await;
-        }));
+        let task = tokio::spawn(serve_prometheus_listener(
+            listener,
+            sink,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            |_| async {},
+        ));
 
         let metrics = raw_http_get(addr, "/metrics").await;
         let missing = raw_http_get(addr, "/not-metrics").await;

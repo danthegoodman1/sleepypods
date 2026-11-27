@@ -8,24 +8,13 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(max_attempts: usize, initial_backoff: Duration, max_backoff: Duration) -> Self {
         Self {
             max_attempts,
             initial_backoff,
             max_backoff,
         }
-    }
-
-    pub fn max_attempts(&self) -> usize {
-        self.max_attempts
-    }
-
-    pub fn initial_backoff(&self) -> Duration {
-        self.initial_backoff
-    }
-
-    pub fn max_backoff(&self) -> Duration {
-        self.max_backoff
     }
 
     pub async fn retry_if<T, E, O, Fut, P>(

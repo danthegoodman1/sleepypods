@@ -1,6 +1,6 @@
 use tokio_util::sync::CancellationToken;
 
-/// Cooperative shutdown signal with support for structured child tokens.
+/// Cooperative shutdown signal.
 #[derive(Clone, Debug)]
 pub struct Shutdown {
     token: CancellationToken,
@@ -13,18 +13,8 @@ impl Shutdown {
         }
     }
 
-    pub fn child_token(&self) -> Self {
-        Self {
-            token: self.token.child_token(),
-        }
-    }
-
     pub fn shutdown(&self) {
         self.token.cancel();
-    }
-
-    pub fn cancel(&self) {
-        self.shutdown();
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -86,40 +76,5 @@ mod tests {
         with_timeout(Duration::from_secs(1), shutdown.cancelled())
             .await
             .expect("already shutdown signal is observed immediately");
-    }
-
-    #[tokio::test]
-    async fn parent_shutdown_wakes_child_waiters() {
-        let parent = Shutdown::new();
-        let child = parent.child_token();
-        let (waiting_tx, waiting_rx) = oneshot::channel();
-
-        let waiter = tokio::spawn({
-            let child = child.clone();
-            async move {
-                waiting_tx
-                    .send(())
-                    .expect("test waits for child waiter setup");
-                child.cancelled().await;
-            }
-        });
-
-        waiting_rx.await.expect("child waiter is ready");
-        parent.shutdown();
-
-        waiter.await.expect("child waiter completed");
-        assert!(parent.is_shutdown());
-        assert!(child.is_shutdown());
-    }
-
-    #[test]
-    fn child_shutdown_does_not_cancel_parent() {
-        let parent = Shutdown::new();
-        let child = parent.child_token();
-
-        child.shutdown();
-
-        assert!(child.is_shutdown());
-        assert!(!parent.is_shutdown());
     }
 }

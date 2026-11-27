@@ -347,6 +347,7 @@ name = "control-plane"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "control-plane",
  "deadpool-postgres",
  "frontline",
  "futures-util",
@@ -368,7 +369,6 @@ dependencies = [
  "sleepypods-api",
  "sleepypods-certificate",
  "sleepypods-observability",
- "sleepypods-types",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
@@ -721,6 +721,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "criterion",
+ "frontline",
  "futures-util",
  "http",
  "http-body",
@@ -733,6 +734,7 @@ dependencies = [
  "sidecar",
  "sleepypods-api",
  "sleepypods-certificate",
+ "sleepypods-observability",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1895,6 +1897,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "pin-project-lite",
+ "proxy-core",
+ "sleepypods-api",
  "sleepypods-observability",
  "socket2",
  "tls-parser",
@@ -2370,7 +2374,7 @@ dependencies = [
  "hyper-util",
  "proxy-core",
  "sleepypods-api",
- "sleepypods-types",
+ "sleepypods-observability",
  "tokio",
  "tokio-tungstenite",
  "tonic",
@@ -2404,7 +2408,6 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
- "sleepypods-types",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2433,10 +2436,6 @@ dependencies = [
  "hyper-util",
  "tokio",
 ]
-
-[[package]]
-name = "sleepypods-types"
-version = "0.1.0"
 
 [[package]]
 name = "smallvec"

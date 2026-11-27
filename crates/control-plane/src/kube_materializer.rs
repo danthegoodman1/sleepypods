@@ -3,7 +3,7 @@ mod conditional_tests;
 
 mod idle_membership;
 
-use std::{error::Error, fmt, time::Duration};
+use std::time::Duration;
 
 use k8s_openapi::api::{
     core::v1::{PersistentVolumeClaim, Service},
@@ -44,18 +44,13 @@ pub struct KubeMaterializerClient {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KubeMaterializerClientConfig {
-    pub field_manager: String,
-    pub backend_scheme: String,
+pub(crate) struct KubeMaterializerClientConfig {
+    pub(crate) field_manager: String,
+    pub(crate) backend_scheme: String,
     /// Bounds one mutation or short read.
-    pub request_timeout: Duration,
+    pub(crate) request_timeout: Duration,
     /// Bounds one wait for a ready endpoint.
-    pub readiness_timeout: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidKubeMaterializerClientConfig {
-    field: &'static str,
+    pub(crate) readiness_timeout: Duration,
 }
 
 impl KubeMaterializerClient {
@@ -66,12 +61,9 @@ impl KubeMaterializerClient {
         }
     }
 
-    pub fn with_config(
-        client: Client,
-        config: KubeMaterializerClientConfig,
-    ) -> Result<Self, InvalidKubeMaterializerClientConfig> {
-        config.validate()?;
-        Ok(Self { client, config })
+    #[cfg(test)]
+    pub(crate) fn with_config(client: Client, config: KubeMaterializerClientConfig) -> Self {
+        Self { client, config }
     }
 
     pub async fn try_default() -> Result<Self, KubernetesClientError> {
@@ -79,10 +71,6 @@ impl KubeMaterializerClient {
             .await
             .map(Self::new)
             .map_err(kube_error)
-    }
-
-    pub fn config(&self) -> &KubeMaterializerClientConfig {
-        &self.config
     }
 
     fn dynamic_api(
@@ -566,50 +554,6 @@ impl Default for KubeMaterializerClientConfig {
     }
 }
 
-impl KubeMaterializerClientConfig {
-    pub fn validate(&self) -> Result<(), InvalidKubeMaterializerClientConfig> {
-        if self.field_manager.trim().is_empty() {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "field_manager",
-            });
-        }
-        if !is_valid_uri_scheme(&self.backend_scheme) {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "backend_scheme",
-            });
-        }
-        if self.request_timeout.is_zero() {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "request_timeout",
-            });
-        }
-        if self.readiness_timeout.is_zero() {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "readiness_timeout",
-            });
-        }
-        Ok(())
-    }
-}
-
-impl InvalidKubeMaterializerClientConfig {
-    pub fn field(&self) -> &'static str {
-        self.field
-    }
-}
-
-impl fmt::Display for InvalidKubeMaterializerClientConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Kubernetes materializer config {} is invalid",
-            self.field
-        )
-    }
-}
-
-impl Error for InvalidKubeMaterializerClientConfig {}
-
 fn api_resource_for_ref(object: &RenderedObjectRef) -> KubernetesClientResult<ApiResource> {
     let (group, version) = split_api_version(&object.api_version);
     let plural = match (
@@ -907,7 +851,7 @@ fn mutation_error(error: KubeError) -> KubernetesClientError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::collections::BTreeMap;
 
     use k8s_openapi::{
         api::{
@@ -1102,27 +1046,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_timeout_configuration() {
-        let request = KubeMaterializerClientConfig {
-            request_timeout: Duration::ZERO,
-            ..KubeMaterializerClientConfig::default()
-        };
-        let readiness = KubeMaterializerClientConfig {
-            readiness_timeout: Duration::ZERO,
-            ..KubeMaterializerClientConfig::default()
-        };
-
-        assert_eq!(
-            request.validate().expect_err("zero timeout").field(),
-            "request_timeout"
-        );
-        assert_eq!(
-            readiness.validate().expect_err("zero timeout").field(),
-            "readiness_timeout"
-        );
-    }
-
-    #[test]
     fn backend_uri_uses_the_service_cluster_ip() {
         let config = KubeMaterializerClientConfig::default();
         for (cluster_ip, expected) in [
@@ -1143,22 +1066,12 @@ mod tests {
     }
 
     #[test]
-    fn validates_backend_scheme_configuration() {
-        assert!(is_valid_uri_scheme("http"));
-        assert!(is_valid_uri_scheme("tcp"));
-        assert!(is_valid_uri_scheme("h2c+unix"));
-
-        for backend_scheme in ["", " ", "1http", "http://", "tcp:"] {
-            let config = KubeMaterializerClientConfig {
-                backend_scheme: backend_scheme.to_owned(),
-                ..KubeMaterializerClientConfig::default()
-            };
-
-            let error = config
-                .validate()
-                .expect_err("invalid backend scheme rejected");
-
-            assert_eq!(error.field(), "backend_scheme");
+    fn accepts_uri_schemes() {
+        for scheme in ["http", "tcp", "h2c+unix"] {
+            assert!(is_valid_uri_scheme(scheme));
+        }
+        for scheme in ["", " ", "1http", "http://", "tcp:"] {
+            assert!(!is_valid_uri_scheme(scheme));
         }
     }
 

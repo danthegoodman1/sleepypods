@@ -114,7 +114,8 @@ wake from the control-plane database.
 
 The control plane owns:
 
-- Instance creation, validation, idempotency, and audit logs.
+- Instance creation and validation; a repeated create returns the stored
+  resource. Force overrides leave audit records.
 - Route/domain registration and uniqueness.
 - PV/PVC manifest rendering from `WorkloadClass` templates and instance values.
 - Wake/sleep/delete state machines.
@@ -128,16 +129,15 @@ Example APIs:
 CreateInstance(workload_class, values, routes)
 DeleteInstance(instance_id, expected_generation) -> accepted
 WakeInstance(instance_id, expected_generation) -> StillWaking | Ready
-ReportIdle(instance_id, generation, sidecar_observation)
-PutHTTP01Challenge(host, token, key_authorization, expires_at)
-ResolveHTTP01Challenge(host, token)
-DeleteHTTP01Challenge(host, token)
+ReportIdle(instance_id, expected_generation, active_count, pod_uid)
+PutHttp01Challenge(host, token, key_authorization, expires_at)
+ResolveHttp01Challenge(host, token)
+DeleteHttp01Challenge(host, token)
 Subscribe bidi stream:
   proxy -> Subscribe(subscription_id, kind, host)
   proxy -> Unsubscribe(subscription_id)
   control plane -> Rules(subscription_id, rules, cache_policy)
   control plane -> Error(subscription_id, code, message)
-WatchMaterializations(cluster_id)
 ```
 
 The database is the source of truth for route bindings, instances, and
@@ -339,19 +339,19 @@ model.
 TLS and certificate state come from the control plane as part of route/listener
 identity. The control plane is responsible for creating and storing certificates
 for custom domains. Frontline proxies must support HTTP-01 challenge handling by
-calling `ResolveHTTP01Challenge(host, token)` for
+calling `ResolveHttp01Challenge(host, token)` for
 `/.well-known/acme-challenge/*` requests before normal route resolution. The
 control plane returns the challenge response body when the token is active, or a
 miss when the request should continue through normal routing or be rejected.
 
 HTTP-01 challenge records are short-lived control-plane entries keyed by
 `(host, token)`. When ACME issuance starts, the ACME owner inserts
-`(host, token, keyAuthorization, expiresAt)` through `PutHTTP01Challenge`. The
-frontline proxy resolves that pair through `ResolveHTTP01Challenge` and serves
+`(host, token, keyAuthorization, expiresAt)` through `PutHttp01Challenge`. The
+frontline proxy resolves that pair through `ResolveHttp01Challenge` and serves
 the returned `keyAuthorization` as `text/plain`. After the ACME authorization
-succeeds, fails, or is cancelled, the owner calls `DeleteHTTP01Challenge`.
-Expired challenge records should also be garbage-collected so stale tokens are
-not served indefinitely.
+succeeds, fails, or is cancelled, the owner calls `DeleteHttp01Challenge`.
+Frontline stops serving a challenge at its expiry, and control-plane
+maintenance deletes expired records.
 
 ## Workload Shape
 
@@ -379,10 +379,9 @@ also requires the current generation's persisted Ready age to reach
 quiet interval. The unconditional activation floor protects pending first
 requests even after another request finishes; a control-plane restart does not
 extend it, and a revive during drain restarts it. A wake with no application
-traffic still becomes eligible after this finite interval, and the default
-300-second class idle timeout continues to dominate. The internal explicit
-`BeginSleep` operation can bypass the automatic floor; there is no deployed
-operator Sleep RPC. See the
+traffic still becomes eligible after this finite interval; a class idle timeout
+longer than 190 seconds sets the minimum uptime instead. There is no operator
+Sleep RPC. See the
 [activation contract](proxy-protocol-contract.md#activation-and-automatic-idle-sleep).
 
 Other Kubernetes workload types are out of scope until these two are robust.
@@ -426,7 +425,8 @@ Failed
   DeleteInstance -> Deleting
 
 Deleting
-  routes removed, materialization deleted, instance tombstoned -> deleted
+  routes removed, materialization deleted, instance row deleted; its generation
+  watermark remains
 ```
 
 Materializations should also carry instance ID, instance generation, rendered
@@ -464,7 +464,7 @@ Sleep:
 Delete instance:
   remove routes/domains
   delete any active materialization
-  tombstone Instance
+  delete the Instance row, keeping its generation watermark
 ```
 
 This keeps Kubernetes object count tied to active workloads while preserving

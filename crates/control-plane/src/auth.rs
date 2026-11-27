@@ -104,10 +104,6 @@ impl CallerRole {
 }
 
 impl AuthConfig {
-    pub const fn no_auth() -> Self {
-        Self::NoAuth
-    }
-
     pub fn static_bearer_tokens(tokens: StaticBearerTokens) -> Self {
         Self::StaticBearerTokens(tokens)
     }
@@ -183,10 +179,6 @@ impl ControlPlaneAuth {
             mode,
             observability,
         }
-    }
-
-    pub fn no_auth_for_tests() -> Self {
-        Self::from_config(AuthConfig::NoAuth, ObservabilityRecorder::default())
     }
 
     pub fn interceptor(

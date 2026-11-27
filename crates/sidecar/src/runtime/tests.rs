@@ -28,7 +28,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use proxy_core::{DrainError, Shutdown};
-use sleepypods_types::{Generation, InstanceId};
+use sleepypods_api::{Generation, InstanceId};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

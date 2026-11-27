@@ -87,9 +87,9 @@ pub struct BeginSleepRequest {
     pub expected_running_generation: Generation,
     pub target: MaterializationTarget,
     pub drain_grace_timeout: Duration,
-    /// Automatic idle sleep only: elapsed time since this generation became
-    /// Ready, checked under the same transaction as the Running transition.
-    /// Explicit operator sleep leaves this unset.
+    /// The time since this generation became Ready that sleep requires,
+    /// checked in the same transaction as the Running transition. Idle reports
+    /// always set it; `None` requires no Ready age.
     pub minimum_ready_age: Option<Duration>,
 }
 
@@ -232,7 +232,6 @@ pub struct FinalizeSleepResult {
 pub enum MaterializationState {
     Pending,
     Ready,
-    Failed,
     Deleting,
     Deleted,
 }
@@ -538,14 +537,12 @@ impl ForceReleaseExclusivityKeyRequest {
 
 impl MaterializationState {
     pub const BACKLOG_STATES: &'static [Self] = &[Self::Pending, Self::Deleting];
-    pub const HELD_KEY_STATES: &'static [Self] =
-        &[Self::Pending, Self::Ready, Self::Failed, Self::Deleting];
+    pub const HELD_KEY_STATES: &'static [Self] = &[Self::Pending, Self::Ready, Self::Deleting];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Ready => "ready",
-            Self::Failed => "failed",
             Self::Deleting => "deleting",
             Self::Deleted => "deleted",
         }

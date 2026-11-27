@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[features]
+# The in-memory sink and other helpers for tests.
+test-support = []
+
 [dependencies]
 bytes.workspace = true
 http.workspace = true

@@ -747,7 +747,6 @@ fn materialization_state_name(state: MaterializationState) -> &'static str {
     match state {
         MaterializationState::Pending => "Pending",
         MaterializationState::Ready => "Ready",
-        MaterializationState::Failed => "Failed",
         MaterializationState::Deleting => "Deleting",
         MaterializationState::Deleted => "Deleted",
     }

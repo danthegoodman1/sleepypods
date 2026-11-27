@@ -477,7 +477,6 @@ pub(crate) fn materialization_state_to_db(state: MaterializationState) -> &'stat
     match state {
         MaterializationState::Pending => "pending",
         MaterializationState::Ready => "ready",
-        MaterializationState::Failed => "failed",
         MaterializationState::Deleting => "deleting",
         MaterializationState::Deleted => "deleted",
     }
@@ -565,7 +564,6 @@ pub(crate) fn materialization_state_from_db(value: &str) -> StoreResult<Material
     match value {
         "pending" => Ok(MaterializationState::Pending),
         "ready" => Ok(MaterializationState::Ready),
-        "failed" => Ok(MaterializationState::Failed),
         "deleting" => Ok(MaterializationState::Deleting),
         "deleted" => Ok(MaterializationState::Deleted),
         other => Err(StoreError::internal(format!(
