@@ -87,9 +87,9 @@ pub struct BeginSleepRequest {
     pub expected_running_generation: Generation,
     pub target: MaterializationTarget,
     pub drain_grace_timeout: Duration,
-    /// Automatic idle sleep only: elapsed time since this generation became
-    /// Ready, checked under the same transaction as the Running transition.
-    /// Explicit operator sleep leaves this unset.
+    /// The time since this generation became Ready that sleep requires,
+    /// checked in the same transaction as the Running transition. Idle reports
+    /// always set it; `None` requires no Ready age.
     pub minimum_ready_age: Option<Duration>,
 }
 

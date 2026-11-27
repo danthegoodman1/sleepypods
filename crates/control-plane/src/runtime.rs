@@ -725,7 +725,7 @@ pub async fn dispatch_route_changes(
     }
 }
 
-/// Expires idempotency records, HTTP-01 challenges and route-change history.
+/// Expires HTTP-01 challenges and route-change history.
 /// A failed pass is retried at the next interval: the records only accumulate
 /// while the store is unavailable.
 async fn maintain_runtime(
