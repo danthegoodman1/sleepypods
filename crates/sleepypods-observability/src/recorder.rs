@@ -15,6 +15,7 @@ pub const EVENT_MATERIALIZATION_FAILURE: &str = "runtime.materialization.failure
 pub const EVENT_IDLE_REPORT: &str = "runtime.idle_report.event";
 pub const EVENT_HTTP01: &str = "runtime.http01.event";
 pub const EVENT_CONTROL_PLANE_AUTH: &str = "control_plane.auth.decision";
+pub const EVENT_CONTROL_PLANE_STORE_ERROR: &str = "control_plane.store.error";
 
 pub const FIELD_INSTANCE_ID: &str = "instance.id";
 pub const FIELD_ROUTE_ID: &str = "route.id";

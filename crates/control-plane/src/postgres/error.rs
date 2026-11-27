@@ -46,9 +46,10 @@ pub(crate) fn map_postgres_error(error: tokio_postgres::Error) -> StoreError {
             SqlState::FOREIGN_KEY_VIOLATION => StoreError::NotFound {
                 resource: "referenced resource",
             },
-            SqlState::CHECK_VIOLATION => {
-                StoreError::invalid_argument(format!("Postgres check constraint failed: {error}"))
-            }
+            SqlState::CHECK_VIOLATION => StoreError::invalid_argument(format!(
+                "request violates stored constraint {}",
+                db_error.constraint().unwrap_or("unknown")
+            )),
             _ => StoreError::internal(format!(
                 "Postgres query failed: code={} message={}",
                 db_error.code().code(),

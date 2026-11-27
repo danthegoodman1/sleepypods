@@ -610,7 +610,7 @@ async fn report_idle_store_unavailable_returns_grpc_unavailable() {
         .expect_err("store unavailability is a transport error");
 
     assert_eq!(error.code(), Code::Unavailable);
-    assert_eq!(error.message(), "database is down");
+    assert_eq!(error.message(), "control-plane store is unavailable");
 }
 
 #[tokio::test]

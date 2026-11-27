@@ -11,13 +11,14 @@ use crate::{
     api::{
         pb::{self, proxy_control_plane_server::ProxyControlPlaneServer},
         route_events::{RouteBindingChange, RouteSubscriptionBroker},
+        store_error_to_status,
     },
     ids::{BackendGeneration, Generation, InstanceId},
     instance::{self as domain_instance, InstanceState},
     materialization::{MaterializationRecord, MaterializationTarget},
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     route::{self as domain_route},
-    store::{ControlPlaneStore, StoreError},
+    store::ControlPlaneStore,
     wake::{self, WakeInstanceError, WakeInstanceResult, WakeUnavailableReason},
 };
 
@@ -177,7 +178,7 @@ where
             .store
             .resolve_http01_challenge(key)
             .await
-            .map_err(super::server::store_error_to_status)?
+            .map_err(store_error_to_status)?
             .map(super::server::http01_to_proto)
             .transpose()?;
 
@@ -761,62 +762,6 @@ fn cache_policy_to_proto(policy: domain_route::CachePolicy) -> pb::ProxyCachePol
 
 fn invalid_argument_status(error: impl std::fmt::Display) -> Status {
     Status::invalid_argument(error.to_string())
-}
-
-fn store_error_to_status(error: StoreError) -> Status {
-    match error {
-        StoreError::SleepDeferred { retry_after } => {
-            let mut status = Status::failed_precondition(format!(
-                "automatic sleep deferred for {} ms after activation",
-                retry_after.as_millis()
-            ));
-            status.metadata_mut().insert(
-                sleepypods_api::IDLE_RETRY_AFTER_METADATA,
-                retry_after
-                    .as_millis()
-                    .min(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT.as_millis())
-                    .to_string()
-                    .parse()
-                    .expect("decimal metadata"),
-            );
-            status
-        }
-        StoreError::InvalidArgument { message } => Status::invalid_argument(message),
-        StoreError::NotFound { resource } => Status::not_found(format!("{resource} not found")),
-        StoreError::AlreadyExists { resource } => {
-            Status::already_exists(format!("{resource} already exists"))
-        }
-        StoreError::GenerationConflict { expected, actual } => Status::failed_precondition(
-            format!("generation conflict: expected generation {expected}, found {actual}"),
-        ),
-        StoreError::ExclusivityConflict {
-            cluster_id,
-            namespace,
-            key_name,
-            owner_instance_id,
-            owner_generation,
-        } => {
-            let mut message = format!(
-                "exclusivity key {key_name:?} is already held for target {cluster_id}/{namespace}"
-            );
-            if let Some(owner_instance_id) = owner_instance_id {
-                message.push_str(&format!(" by instance {owner_instance_id}"));
-            }
-            if let Some(owner_generation) = owner_generation {
-                message.push_str(&format!(" generation {owner_generation}"));
-            }
-            Status::failed_precondition(message)
-        }
-        StoreError::LeaseConflict { message } => Status::aborted(message),
-        StoreError::IdempotencyResourceDeleted { resource } => {
-            Status::failed_precondition(format!("idempotent replay refers to a deleted {resource}"))
-        }
-        StoreError::IdempotencyConflict => {
-            Status::already_exists("idempotency key was already used for a different request")
-        }
-        StoreError::Unavailable { message } => Status::unavailable(message),
-        StoreError::Internal { message } => Status::internal(message),
-    }
 }
 
 struct OwnedSubscriptionStream {
