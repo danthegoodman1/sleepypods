@@ -79,6 +79,7 @@ fn route_entry() -> RouteEntry {
         instance_state: InstanceState::Running,
         instance_generation: Generation::new(7),
         backend: Some(backend("http://10.0.0.7:8080")),
+        pod_backend: Some(backend("http://10.244.0.7:15000")),
         backend_generation: Some(BackendGeneration::new(3)),
     }
 }
@@ -90,6 +91,7 @@ fn pb_route_entry() -> pb::ProxyRouteEntry {
         instance_state: pb::InstanceState::Running as i32,
         instance_generation: 7,
         backend_uri: Some("http://10.0.0.7:8080".to_owned()),
+        pod_backend_uri: Some("http://10.244.0.7:15000".to_owned()),
         backend_generation: Some(3),
     }
 }
@@ -182,6 +184,7 @@ fn a_rule_set_reply_preserves_rules_order_and_cache_policy() {
                     instance_state: pb::InstanceState::Cold as i32,
                     instance_generation: 1,
                     backend_uri: None,
+                    pod_backend_uri: None,
                     backend_generation: None,
                 },
             ),
@@ -207,6 +210,7 @@ fn a_rule_set_reply_preserves_rules_order_and_cache_policy() {
                         instance_state: InstanceState::Cold,
                         instance_generation: Generation::new(1),
                         backend: None,
+                        pod_backend: None,
                         backend_generation: None,
                     },
                 },

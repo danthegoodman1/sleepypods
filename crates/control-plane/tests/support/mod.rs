@@ -747,6 +747,11 @@ impl ControlPlaneStore for TestStore {
                             instance_id: binding.instance_id.clone(),
                             instance_state,
                             instance_generation,
+                            pod_backend: backend.as_ref().and(
+                                ready.and_then(|materialization| {
+                                    materialization.pod_backend.clone()
+                                }),
+                            ),
                             backend_generation: backend
                                 .as_ref()
                                 .and(ready.map(|ready| ready.backend_generation)),

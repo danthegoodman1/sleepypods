@@ -336,6 +336,7 @@ pub(super) fn route_entry_to_proto(entry: domain_route::RouteEntry) -> pb::Proxy
         backend_generation: entry
             .backend_generation
             .map(|backend_generation| backend_generation.get()),
+        pod_backend_uri: entry.pod_backend.map(|backend| backend.uri().to_owned()),
     }
 }
 
