@@ -74,8 +74,10 @@ Service. This is a transport observation, not an application health guarantee.
 The published backend address is the Service ClusterIP, which is fixed for the
 Service's life. A headless Service publishes its DNS name. The driver creates
 and deletes the Service, so its address reaches only this projection's Pod.
-The completed wake also records the ready Pod's own address beside it
-(`pod_backend_uri`); routes do not use that address.
+The completed wake also records the ready Pod's own address, from the ready
+EndpointSlice endpoint and its target port, beside it (`pod_backend_uri`).
+Routes use the Service address. The Pod address is cleared with the Service
+address and kept across a revive, which keeps the same Pod.
 
 ## Cleanup
 
