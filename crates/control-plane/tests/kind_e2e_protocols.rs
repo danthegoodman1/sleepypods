@@ -37,15 +37,19 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const CLASS_ID: &str = "protocol-web";
 /// An app port declared `h2c`: the sidecar speaks prior-knowledge HTTP/2 to it.
 const H2C_CLASS_ID: &str = "protocol-h2c";
+/// An `h2c` app port served by grpcio, which runs gRPC C-core.
+const GRPCIO_CLASS_ID: &str = "protocol-grpcio";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
 const HTTP2_TARGET: &str = "http2";
 const GRPC_TARGET: &str = "grpc";
 const WEBSOCKET_TARGET: &str = "websocket";
-const TARGETS: &[&str] = &[HTTP2_TARGET, GRPC_TARGET, WEBSOCKET_TARGET];
+const GRPCIO_TARGET: &str = "grpcio";
+const TARGETS: &[&str] = &[HTTP2_TARGET, GRPC_TARGET, WEBSOCKET_TARGET, GRPCIO_TARGET];
 const HTTP2_HOST: &str = "h2.protocol.sleepypods.test";
 const GRPC_HOST: &str = "grpc.protocol.sleepypods.test";
 const WEBSOCKET_HOST: &str = "ws.protocol.sleepypods.test";
+const GRPCIO_HOST: &str = "grpcio.protocol.sleepypods.test";
 const GRPC_REQUEST_BODY: &[u8] = b"\0\0\0\0\x05world";
 
 #[tokio::test]
@@ -186,16 +190,19 @@ async fn http2_grpc_and_websocket_through_deployed_platform() -> TestResult<()> 
     )
     .await?;
 
+    grpcio_calls(&config, &mut operator).await?;
+
     for spec in route_specs() {
-        let app_protocol = if spec.class_id == H2C_CLASS_ID {
-            "h2c"
-        } else {
+        let app_protocol = if spec.class_id == CLASS_ID {
             "http1"
+        } else {
+            "h2c"
         };
         assert_materialized_deployment_and_service(
             kube.clone(),
             &config,
             spec.target,
+            app_image(&config, spec.class_id),
             app_protocol,
         )
         .await?;
@@ -220,6 +227,7 @@ struct E2eConfig {
     operator_endpoint: String,
     frontline_addr: SocketAddr,
     app_image: String,
+    grpc_app_image: String,
     sidecar_image: String,
 }
 
@@ -244,13 +252,15 @@ impl E2eConfig {
                 .parse()?,
             app_image: env::var("SLEEPYPODS_E2E_APP_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/protocol-app:kind-e2e-protocols".to_owned()),
+            grpc_app_image: env::var("SLEEPYPODS_E2E_GRPC_APP_IMAGE")
+                .unwrap_or_else(|_| "sleepypods/grpc-app:kind-e2e-protocols".to_owned()),
             sidecar_image: env::var("SLEEPYPODS_E2E_SIDECAR_IMAGE")
                 .unwrap_or_else(|_| "sleepypods/sidecar:kind-e2e-protocols".to_owned()),
         })
     }
 }
 
-fn route_specs() -> [RouteSpec; 3] {
+fn route_specs() -> [RouteSpec; 4] {
     [
         RouteSpec {
             class_id: CLASS_ID,
@@ -275,6 +285,14 @@ fn route_specs() -> [RouteSpec; 3] {
             route_id: "e2e-protocol-websocket-route",
             host: WEBSOCKET_HOST,
             path_prefix: "/socket",
+        },
+        RouteSpec {
+            class_id: GRPCIO_CLASS_ID,
+            target: GRPCIO_TARGET,
+            instance_id: "e2e-protocol-grpcio",
+            route_id: "e2e-protocol-grpcio-route",
+            host: GRPCIO_HOST,
+            path_prefix: "/",
         },
     ]
 }
@@ -305,6 +323,7 @@ async fn create_operator_resources(
     for (class_id, app_protocol) in [
         (CLASS_ID, AppProtocol::Http1),
         (H2C_CLASS_ID, AppProtocol::H2c),
+        (GRPCIO_CLASS_ID, AppProtocol::H2c),
     ] {
         operator
             .create_workload_class_version(CreateWorkloadClassVersionRequest {
@@ -320,7 +339,11 @@ async fn create_operator_resources(
                     )]),
                     allow_extra: false,
                 }),
-                template: Some(manifest_template(config, app_protocol)),
+                template: Some(manifest_template(
+                    config,
+                    app_image(config, class_id),
+                    app_protocol,
+                )),
                 sleep_policy: Some(WorkloadSleepPolicy {
                     idle_timeout_ms: 900_000,
                     idle_retry_backoff_ms: 500,
@@ -649,6 +672,155 @@ fn assert_grpc_response(
     Ok(())
 }
 
+/// gRPC through frontline and the sidecar to a C-core server, and gRPC to an
+/// `http1` app port.
+///
+/// C-core answers a request that lacks `te: trailers` with status UNKNOWN and
+/// "Missing :te header", so status 0 here means the header crossed both hops.
+async fn grpcio_calls(
+    config: &E2eConfig,
+    operator: &mut OperatorControlPlaneClient<Channel>,
+) -> TestResult<()> {
+    let instance = format!("e2e-protocol-{GRPCIO_TARGET}");
+    for (context, timeout) in [
+        ("cold C-core unary call", Duration::from_secs(140)),
+        ("hot C-core unary call", Duration::from_secs(30)),
+    ] {
+        let response = grpc_call(
+            config,
+            context,
+            GRPCIO_HOST,
+            "/sleepypods.e2e.Echo/Unary",
+            b"hello",
+            timeout,
+        )
+        .await?;
+        let messages = assert_grpc_ok(&response, context)?;
+        let expected = format!("unary:{GRPCIO_TARGET}:hello").into_bytes();
+        if messages != [expected] {
+            return Err(format!("{context} returned messages {messages:?}").into());
+        }
+        wait_for_instance_state(
+            operator,
+            &instance,
+            PbInstanceState::Running,
+            Duration::from_secs(30),
+        )
+        .await?;
+    }
+
+    let context = "C-core server-streaming call";
+    let response = grpc_call(
+        config,
+        context,
+        GRPCIO_HOST,
+        "/sleepypods.e2e.Echo/ServerStream",
+        b"3",
+        Duration::from_secs(30),
+    )
+    .await?;
+    let messages = assert_grpc_ok(&response, context)?;
+    let expected: Vec<Vec<u8>> = (0..3)
+        .map(|index| format!("stream:{GRPCIO_TARGET}:{index}").into_bytes())
+        .collect();
+    if messages != expected {
+        return Err(format!("{context} returned messages {messages:?}").into());
+    }
+
+    // An `http1` app port cannot serve gRPC. The sidecar answers in gRPC terms
+    // and the app never sees the call.
+    let context = "gRPC call to an http1 app port";
+    let response = grpc_call(
+        config,
+        context,
+        HTTP2_HOST,
+        "/h2/sleepypods.e2e.Echo/Unary",
+        b"hello",
+        Duration::from_secs(30),
+    )
+    .await?;
+    let header = |name: &str| response.headers.get(name).map(|value| value.as_bytes());
+    if response.status != StatusCode::OK
+        || header("grpc-status") != Some(&b"12"[..])
+        || header("grpc-message").is_none()
+        || !response.body.is_empty()
+    {
+        return Err(format!(
+            "{context} expected grpc-status 12 in the response headers, got HTTP {} headers {:?} body {:?}",
+            response.status, response.headers, response.body
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Sends one gRPC call as a client library frames it: a length-prefixed
+/// message, `content-type: application/grpc` and `te: trailers`.
+async fn grpc_call(
+    config: &E2eConfig,
+    context: &str,
+    host: &str,
+    path: &str,
+    message: &[u8],
+    timeout: Duration,
+) -> TestResult<H2Response> {
+    let mut body = vec![0];
+    body.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    body.extend_from_slice(message);
+    let request = h2_request(
+        config.frontline_addr,
+        Method::POST,
+        host,
+        path,
+        Some("application/grpc"),
+        Bytes::from(body),
+    );
+    tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| format!("{context} exceeded {timeout:?}"))?
+}
+
+/// Checks a successful gRPC response and returns its messages.
+fn assert_grpc_ok(response: &H2Response, context: &str) -> TestResult<Vec<Vec<u8>>> {
+    let status = response
+        .trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .map(|value| value.as_bytes());
+    if response.version != Version::HTTP_2
+        || response.status != StatusCode::OK
+        || status != Some(&b"0"[..])
+    {
+        return Err(format!(
+            "{context} failed: {:?} HTTP {} headers {:?} trailers {:?}",
+            response.version, response.status, response.headers, response.trailers
+        )
+        .into());
+    }
+    let instance = response
+        .trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("x-e2e-instance"));
+    if instance.map(|value| value.as_bytes()) != Some(GRPCIO_TARGET.as_bytes()) {
+        return Err(format!("{context} trailing metadata named instance {instance:?}").into());
+    }
+
+    let mut messages = Vec::new();
+    let mut body = &response.body[..];
+    while !body.is_empty() {
+        if body.len() < 5 || body[0] != 0 {
+            return Err(format!("{context} returned a malformed gRPC frame: {body:?}").into());
+        }
+        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        if body.len() < 5 + length {
+            return Err(format!("{context} returned a truncated gRPC frame: {body:?}").into());
+        }
+        messages.push(body[5..5 + length].to_vec());
+        body = &body[5 + length..];
+    }
+    Ok(messages)
+}
+
 fn grpc_payload_text(body: &[u8]) -> TestResult<String> {
     if body.len() < 5 {
         return Err(format!("gRPC body is too short: {body:?}").into());
@@ -766,6 +938,7 @@ async fn assert_materialized_deployment_and_service(
     kube: Client,
     config: &E2eConfig,
     target: &str,
+    app_image: &str,
     app_protocol: &str,
 ) -> TestResult<()> {
     let deployments: Api<Deployment> = Api::namespaced(kube.clone(), &config.namespace);
@@ -784,12 +957,8 @@ async fn assert_materialized_deployment_and_service(
         .ok_or_else(|| {
             format!("materialized Deployment {workload_name} is missing app container")
         })?;
-    if app.image.as_deref() != Some(config.app_image.as_str()) {
-        return Err(format!(
-            "expected app image {}, got {:?}",
-            config.app_image, app.image
-        )
-        .into());
+    if app.image.as_deref() != Some(app_image) {
+        return Err(format!("expected app image {app_image}, got {:?}", app.image).into());
     }
     assert_env(app, "SLEEPYPODS_E2E_INSTANCE", target)?;
 
@@ -848,7 +1017,19 @@ fn assert_env(container: &Container, name: &str, expected: &str) -> TestResult<(
     Ok(())
 }
 
-fn manifest_template(config: &E2eConfig, app_protocol: AppProtocol) -> ManifestTemplate {
+fn app_image<'a>(config: &'a E2eConfig, class_id: &str) -> &'a str {
+    if class_id == GRPCIO_CLASS_ID {
+        &config.grpc_app_image
+    } else {
+        &config.app_image
+    }
+}
+
+fn manifest_template(
+    config: &E2eConfig,
+    app_image: &str,
+    app_protocol: AppProtocol,
+) -> ManifestTemplate {
     ManifestTemplate {
         workload: Some(WorkloadTemplate {
             kind: WorkloadKind::Deployment as i32,
@@ -856,7 +1037,7 @@ fn manifest_template(config: &E2eConfig, app_protocol: AppProtocol) -> ManifestT
             replicas: Some(1),
             app_container: Some(ContainerTemplate {
                 name: "app".to_owned(),
-                image: Some(literal_text(&config.app_image)),
+                image: Some(literal_text(app_image)),
                 ports: vec![ContainerPortTemplate {
                     name: Some("http".to_owned()),
                     container_port: APP_PORT,
@@ -903,9 +1084,10 @@ fn http_route_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
 fn workload_name(target: &str) -> String {
     // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
     let suffix = match target {
-        "http2" => "ecdc9151",
-        "grpc" => "1e039054",
-        "websocket" => "64dd4c6b",
+        "http2" => "ecdc91511c9b986e",
+        "grpc" => "1e03905468da9734",
+        "websocket" => "64dd4c6b5648b019",
+        "grpcio" => "cd373d1d93902be7",
         _ => panic!("unknown fixture target {target}"),
     };
     format!("e2e-protocol-{target}-{suffix}")

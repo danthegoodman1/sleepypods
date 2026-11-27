@@ -279,9 +279,9 @@ Status ledger:
 | Complete | Work | 2B: Authority and `te: trailers` across hops | Commit `9603f06`: `h2c_app_receives_te_trailers_and_the_client_authority_from_either_client_version`, `forwarded_host_comes_from_the_request_target_when_host_is_absent`. |
 | Complete | Work | 2C: Separate keep-alive idle timeout | Commit `9603f06`: `SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS` (90 s); `http1_keepalive_connection_outlives_the_setup_timeout_and_ends_at_its_idle_timeout`, `upstream_pool_idle_must_stay_below_the_keepalive_idle_timeout`. |
 | Incomplete | Work | 2D: Resolved backend address | Missing: ClusterIP publication or resolve-once route entry. |
-| In Progress | Gate | Every client protocol reaches both app kinds | In process: `http1_http2_and_websocket_clients_reach_both_app_protocols_with_the_client_host` through frontline and sidecar. Missing: protocols and TLS kind gate runs. |
+| In Progress | Gate | Every client protocol reaches both app kinds | In process: `http1_http2_and_websocket_clients_reach_both_app_protocols_with_the_client_host`. Protocols kind gate passed at `b3f6848` with `http1` and `h2c` classes. Missing: TLS kind gate with an `h2` client on the merged branch. |
 | Complete | Test | HTTP/2 client to HTTP/1.1 upstream | `http2_request_reaches_an_http1_only_app_with_the_client_host` in `crates/proxy-core/tests/http_protocols.rs`. |
-| In Progress | Test | C-core gRPC through both proxies | `te: trailers` is asserted at the proxy and sidecar. Missing: grpcio fixture in the protocols gate. |
+| Complete | Test | C-core gRPC through both proxies | Commit `b288172`: the protocols kind gate deploys a grpcio server on an `h2c` class; unary and server-streaming calls return status 0 through frontline and the sidecar (C-core rejects a call without `te: trailers`), and gRPC to an `http1` class gets `grpc-status: 12`. Gate passed at `b3f6848`. |
 
 ## Phase 3: Route by Host Rule Set
 

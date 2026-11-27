@@ -7,6 +7,7 @@ use proxy_core::{
     Shutdown,
 };
 use tokio::{task::JoinSet, time::timeout};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 async fn backend(tasks: &mut JoinSet<AppResult<()>>, connections: usize) -> AppResult<SocketAddr> {
     let listener = Arc::new(TcpListener::bind(("127.0.0.1", 0)).await?);
@@ -207,4 +208,38 @@ async fn websocket_response_preserves_exact_instance_path_and_message() -> AppRe
     let cleanup = stop(&mut tasks).await;
     result??;
     cleanup
+}
+
+#[tokio::test]
+async fn websocket_close_frame_is_echoed_before_the_connection_ends() -> AppResult<()> {
+    let mut tasks = JoinSet::new();
+    let result = timeout(Duration::from_secs(5), async {
+        let address = backend(&mut tasks, 1).await?;
+        let stream = TcpStream::connect(address).await?;
+        let (mut websocket, _) =
+            tokio_tungstenite::client_async("ws://fixture.test/b/ws", stream).await?;
+        let sent = CloseFrame {
+            code: 1000.into(),
+            reason: "done".into(),
+        };
+        websocket.send(Message::Close(Some(sent.clone()))).await?;
+        // A tunnelling proxy relays the app's own close frame, so the app must send one.
+        match websocket
+            .next()
+            .await
+            .ok_or("closed without a close frame")??
+        {
+            Message::Close(Some(echoed)) if echoed == sent => {}
+            other => return Err(format!("unexpected close response: {other:?}").into()),
+        }
+        if websocket.next().await.is_some() {
+            return Err("the app kept the connection open after the close handshake".into());
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await;
+    // The app task ends on its own once the handshake completes.
+    let served = tasks.join_next().await.ok_or("app task missing")?;
+    result??;
+    served?
 }
