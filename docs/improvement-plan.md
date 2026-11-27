@@ -557,7 +557,7 @@ Status ledger:
 | Complete | Work | 6D: gRPC-Web TLS and configured origins | Commits `4cce567`, `8760681`: `grpc_web_listener_refuses_plaintext_when_tls_is_configured`, `grpc_web_listener_serves_allowed_origins_and_refuses_others`. |
 | Complete | Work | 6E: Sealing key completeness | Commits `1321320`, `cb36fc4`: `postgres_startup_requires_every_sealing_key_in_use` and `postgres_sealing_key_rotation_reencrypts_certificates_in_bulk` (`ReencryptCertificates`). |
 | Complete | Work | 6F: Quiet control-plane logging | Commit `833940b`: `successful_rpc_writes_no_stderr_line` and `accepted_decisions_are_counted_and_write_no_log_event`. |
-| In Progress | Gate | Accepted means renderable | Property test `every_accepted_instance_renders_at_wake` (175 accepted instances, all render) and the rejection tests pass; workspace 962 passed, real-Postgres target 28 passed at `42222f3`. Missing: the gRPC-Web kind gate over TLS. |
+| Complete | Gate | Accepted means renderable | Property test `every_accepted_instance_renders_at_wake` (175 accepted instances, all render) and the rejection tests pass; the gRPC-Web kind gate over TLS (plaintext refused, allowed and refused origins) passed at `093adbb`. |
 | Complete | Doc | Operator guide | Commit `7e0701b`. |
 
 ## Phase 7: Store Cost and Shape
@@ -661,7 +661,7 @@ Status ledger:
 | Complete | Work | 8A: One reconciler scheduler | Commit `1a2a6bd`: `run_once`, `reconcile_materialization` and the test-only materializer paths are deleted; tests drive `run_until_shutdown`. |
 | Complete | Work | 8B: Proxy test-only API and per-request bookkeeping | Commits `9603f06`, `7d424a3`: test-only serve, relay and idle entry points deleted; the delivery watchdog runs for HTTP/2 bodies only; each runtime sits behind one `Arc`. Criterion `proxy_primitives`: admission acquire and release 286 ns to 29 ns, accounting 266 ns to 24 ns, header preparation unchanged. |
 | Complete | Decision | 8C: Tunnel WebSockets | Accepted and implemented in `9603f06`, `c38541f`: `handshake_fields_and_upgraded_bytes_pass_through_unchanged` (Authorization, Cookie, subprotocol, permessage-deflate); `tokio-tungstenite` is a dev-dependency; WebSocket round trip 27.4 µs to 10.9 µs. |
-| Incomplete | Decision | 8D: `k8s-openapi` manifest types | Accepted by the owner. Missing: implementation, after Phase 5 merges. |
-| In Progress | Decision | 8E: Drop idempotency keys | Accepted by the owner. Missing: implementation and the replay edge-case tests. |
+| Complete | Decision | 8D: `k8s-openapi` manifest types | Accepted and implemented in `0d665aa`, `ca4649f`: one `KubernetesObject` wrapper over `k8s-openapi` types replaces `objects.rs` and `serialize.rs`; golden fixtures blessed against the old renderer are unchanged, so rendered hashes of structured classes are unchanged; raw Deployments and StatefulSets are rejected (`rejects_raw_workload_controllers`). `GetWorkloadClassVersion` keeps its mapping, because the template is a domain type of instance-value text parts. |
+| Complete | Decision | 8E: Drop idempotency keys | Accepted and implemented in `0f04eb0`: creates insert under the caller-chosen ID and compare with the stored resource; `postgres_create_after_delete_starts_a_fenced_incarnation`, `postgres_repeat_racing_the_first_create_returns_its_instance`, `postgres_operator_api_answers_repeated_creates`. |
 | Incomplete | Work | 8F: Evidence out of tree; crate and setting cleanup | Missing: moved evidence, folded crate, removed setting, README links. |
 | Incomplete | Gate | Production modules hold production code | Missing: caller audit and benches without regression. |

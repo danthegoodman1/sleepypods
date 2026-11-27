@@ -36,8 +36,9 @@ status when a documented gap actually closes.
 - Code generation: `crates/sleepypods-api/build.rs`
 - Store contract: `crates/control-plane/src/store.rs`
 - Postgres provider: `crates/control-plane/src/postgres/`
-- Manifest rendering: `crates/control-plane/src/manifest/`; instance-scoped
-  object names: `crates/control-plane/src/kubernetes_name.rs`
+- Manifest rendering: `crates/control-plane/src/manifest/`; rendered objects
+  are `k8s-openapi` types behind `KubernetesObject` in `manifest/object.rs`;
+  instance-scoped object names: `crates/control-plane/src/kubernetes_name.rs`
 - Create-time validation: `WorkloadClassVersion::validate_renderable` in
   `workload.rs` and `CreateInstanceRequest::validate_renders` in `instance.rs`,
   both called from `api/server.rs`
@@ -182,6 +183,12 @@ latency exceeds them.
   `manifest/render.rs`, where both the create call and the wake enforce it.
 - Instance values under the `sleepypods.` prefix belong to the platform. The
   renderer supplies them; schemas and requests cannot set them.
+- The fixtures in `crates/control-plane/src/manifest/golden/` pin the JSON the
+  control plane applies and each object's rendered hash. After an intended
+  change to rendered output, rewrite them with
+  `SLEEPYPODS_BLESS_GOLDEN=1 cargo test -p control-plane golden` and review the
+  diff. The rendered hash changes with the output, and a live object of the
+  same generation that carries the old hash is an ownership mismatch.
 - A store failure reaches a caller through `store_error_to_status`: backend
   text goes to the `control_plane.store.error` event and the status carries a
   fixed message.

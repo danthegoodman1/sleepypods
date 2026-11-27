@@ -61,17 +61,12 @@ pub use kube_materializer::{
 };
 pub use kubernetes_name::render_instance_scoped_name;
 pub use manifest::{
-    render_manifests, ApplyOrder, Container, ContainerPort, ContainerPortTemplate,
-    ContainerTemplate, CsiPersistentVolumeSource, Deployment, DeploymentSpec, EnvVar,
-    EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
-    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
-    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RenderManifestRequest, RenderedManifest,
-    RenderedManifestObject, Service, ServicePort, ServicePortTemplate, ServiceSpec,
-    ServiceTemplate, SidecarTemplate, StatefulSet, StatefulSetSpec, TemplateText, TemplateTextPart,
-    VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind, WorkloadTemplate,
+    render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate, EnvVarTemplate,
+    KubernetesObject, ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RenderManifestRequest,
+    RenderedManifest, RenderedManifestObject, ServicePortTemplate, ServiceTemplate,
+    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
+    WorkloadTemplate,
 };
 pub use materialization::{
     BackendEndpoint, BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
@@ -86,9 +81,8 @@ pub use materialization::{
     RenewMaterializationReconciliationLeaseRequest,
 };
 pub use materializer::{
-    rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
-    KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError,
-    RetryingKubernetesMaterializerClient,
+    KubernetesClientError, KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
+    KubernetesMaterializerClient, MaterializerError, RetryingKubernetesMaterializerClient,
 };
 pub use postgres::PostgresStore;
 pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig};

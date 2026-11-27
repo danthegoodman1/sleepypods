@@ -1,5 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use k8s_openapi::{
+    api::{
+        apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy, StatefulSet, StatefulSetSpec},
+        core::v1::{
+            CSIPersistentVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
+            HTTPGetAction, HostPathVolumeSource, ObjectFieldSelector, ObjectReference,
+            PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+            PersistentVolumeClaimVolumeSource, PersistentVolumeSpec, PodSecurityContext, PodSpec,
+            PodTemplateSpec, Probe, SeccompProfile, Secret, SecretKeySelector, SecretReference,
+            SecurityContext, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+            VolumeResourceRequirements,
+        },
+    },
+    apimachinery::pkg::{
+        api::resource::Quantity,
+        apis::meta::v1::{LabelSelector, ObjectMeta},
+        util::intstr::IntOrString,
+    },
+};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -10,19 +29,12 @@ use crate::{
 };
 
 use super::{
-    bind::PlaceholderDocument, AppProtocol, ApplyOrder, Container, ContainerPort,
-    ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference,
-    Deployment, DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject,
-    LabelSelector, ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
-    PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RawKubernetesManifestTemplate,
-    RawKubernetesObject, RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret,
-    SecretKeyRef, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet,
-    StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
-    WorkloadKind, INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    bind::PlaceholderDocument, AppProtocol, ApplyOrder, ContainerTemplate, CsiSecretRefTemplate,
+    KubernetesObject, ManifestRenderError, ManifestTemplate, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate, RenderManifestRequest,
+    RenderedManifest, RenderedManifestObject, ServiceTemplate, SidecarTemplate, TemplateText,
+    VolumeTemplate, WorkloadKind, INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION,
+    LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
 const CONTROL_PLANE_SERVICE_NAME: &str = "sleepypods-control-plane";
@@ -99,50 +111,55 @@ pub(crate) fn render_manifests_with_options(
         .map(|volume| render_volume(volume, instance, request.namespace))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let namespace = Some(request.namespace);
     let mut objects = Vec::new();
     for rendered in &rendered_volumes {
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::PersistentVolume,
-            object: KubernetesObject::PersistentVolume(Box::new(PersistentVolume {
-                metadata: ObjectMeta {
-                    name: rendered.pv_name.clone(),
-                    namespace: None,
-                    labels: metadata_labels.clone(),
-                    annotations: BTreeMap::new(),
-                },
-                spec: PersistentVolumeSpec {
-                    capacity: rendered.capacity.clone(),
-                    access_modes: rendered.access_modes.clone(),
-                    persistent_volume_reclaim_policy: rendered.reclaim_policy,
+            object: PersistentVolume {
+                metadata: object_meta(&rendered.pv_name, None, &metadata_labels, BTreeMap::new()),
+                spec: Some(PersistentVolumeSpec {
+                    capacity: Some(storage(&rendered.capacity)),
+                    access_modes: Some(rendered.access_modes.clone()),
+                    persistent_volume_reclaim_policy: Some(
+                        rendered.reclaim_policy.as_str().to_owned(),
+                    ),
                     storage_class_name: rendered.storage_class_name.clone(),
-                    claim_ref: PersistentVolumeClaimRef {
-                        namespace: request.namespace.to_owned(),
-                        name: rendered.pvc_name.clone(),
-                    },
-                    source: rendered.source.clone(),
-                },
-            })),
+                    claim_ref: Some(ObjectReference {
+                        namespace: Some(request.namespace.to_owned()),
+                        name: Some(rendered.pvc_name.clone()),
+                        ..ObjectReference::default()
+                    }),
+                    ..rendered.source.clone()
+                }),
+                status: None,
+            }
+            .into(),
         });
     }
     for rendered in &rendered_volumes {
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::PersistentVolumeClaim,
-            object: KubernetesObject::PersistentVolumeClaim(PersistentVolumeClaim {
-                metadata: ObjectMeta {
-                    name: rendered.pvc_name.clone(),
-                    namespace: Some(request.namespace.to_owned()),
-                    labels: metadata_labels.clone(),
-                    annotations: BTreeMap::new(),
-                },
-                spec: PersistentVolumeClaimSpec {
-                    access_modes: rendered.access_modes.clone(),
-                    resources: VolumeResourceRequirements {
-                        requests_storage: rendered.capacity.clone(),
-                    },
+            object: PersistentVolumeClaim {
+                metadata: object_meta(
+                    &rendered.pvc_name,
+                    namespace,
+                    &metadata_labels,
+                    BTreeMap::new(),
+                ),
+                spec: Some(PersistentVolumeClaimSpec {
+                    access_modes: Some(rendered.access_modes.clone()),
+                    resources: Some(VolumeResourceRequirements {
+                        requests: Some(storage(&rendered.capacity)),
+                        limits: None,
+                    }),
                     storage_class_name: rendered.storage_class_name.clone(),
-                    volume_name: rendered.pv_name.clone(),
-                },
-            }),
+                    volume_name: Some(rendered.pv_name.clone()),
+                    ..PersistentVolumeClaimSpec::default()
+                }),
+                status: None,
+            }
+            .into(),
         });
     }
 
@@ -154,18 +171,21 @@ pub(crate) fn render_manifests_with_options(
 
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::Service,
-            object: KubernetesObject::Service(Service {
-                metadata: ObjectMeta {
-                    name: service_name.clone().expect("service name was rendered"),
-                    namespace: Some(request.namespace.to_owned()),
-                    labels: metadata_labels.clone(),
-                    annotations: service_annotations,
-                },
-                spec: ServiceSpec {
-                    selector: selector_labels.clone(),
-                    ports: render_service_ports(service, sidecar.listen_port)?,
-                },
-            }),
+            object: Service {
+                metadata: object_meta(
+                    service_name.as_deref().expect("service name was rendered"),
+                    namespace,
+                    &metadata_labels,
+                    service_annotations,
+                ),
+                spec: Some(ServiceSpec {
+                    selector: Some(selector_labels.clone()),
+                    ports: Some(render_service_ports(service, sidecar.listen_port)?),
+                    ..ServiceSpec::default()
+                }),
+                status: None,
+            }
+            .into(),
         });
     }
 
@@ -173,19 +193,16 @@ pub(crate) fn render_manifests_with_options(
         let name = render_instance_scoped_name("sleepypods-sidecar-token", &instance.id);
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::Secret,
-            object: KubernetesObject::Secret(Secret {
-                metadata: ObjectMeta {
-                    name: name.clone(),
-                    namespace: Some(request.namespace.to_owned()),
-                    labels: metadata_labels.clone(),
-                    annotations: BTreeMap::new(),
-                },
-                type_: "Opaque".to_owned(),
-                string_data: BTreeMap::from([(
+            object: Secret {
+                metadata: object_meta(&name, namespace, &metadata_labels, BTreeMap::new()),
+                type_: Some("Opaque".to_owned()),
+                string_data: Some(BTreeMap::from([(
                     SIDECAR_TOKEN_SECRET_KEY.to_owned(),
                     token.as_secret_str().to_owned(),
-                )]),
-            }),
+                )])),
+                ..Secret::default()
+            }
+            .into(),
         });
         Some(name)
     } else {
@@ -193,11 +210,12 @@ pub(crate) fn render_manifests_with_options(
     };
 
     let pod_template = PodTemplateSpec {
-        metadata: PodTemplateMetadata {
-            labels: metadata_labels.clone(),
-            annotations: BTreeMap::new(),
-        },
-        spec: PodSpec {
+        metadata: Some(ObjectMeta {
+            labels: Some(metadata_labels.clone()),
+            annotations: Some(BTreeMap::new()),
+            ..ObjectMeta::default()
+        }),
+        spec: Some(PodSpec {
             containers: vec![
                 render_app_container(
                     &request.template.workload.app_container,
@@ -214,67 +232,82 @@ pub(crate) fn render_manifests_with_options(
                     options,
                 )?,
             ],
-            volumes: rendered_volumes
-                .iter()
-                .map(|volume| PodVolume {
-                    name: volume.volume_name.clone(),
-                    persistent_volume_claim: PersistentVolumeClaimVolumeSource {
-                        claim_name: volume.pvc_name.clone(),
-                    },
-                })
-                .collect(),
-            termination_grace_period_seconds,
-        },
+            volumes: Some(
+                rendered_volumes
+                    .iter()
+                    .map(|volume| Volume {
+                        name: volume.volume_name.clone(),
+                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                            claim_name: volume.pvc_name.clone(),
+                            read_only: None,
+                        }),
+                        ..Volume::default()
+                    })
+                    .collect(),
+            ),
+            // A workload talks to the control plane over gRPC with the sidecar's
+            // own credential, so it needs no ServiceAccount token and no syscalls
+            // beyond the container runtime's default set.
+            automount_service_account_token: Some(false),
+            security_context: Some(PodSecurityContext {
+                seccomp_profile: Some(SeccompProfile {
+                    type_: "RuntimeDefault".to_owned(),
+                    localhost_profile: None,
+                }),
+                ..PodSecurityContext::default()
+            }),
+            termination_grace_period_seconds: Some(i64::from(termination_grace_period_seconds)),
+            ..PodSpec::default()
+        }),
     };
 
-    let replicas = request.template.workload.replicas.unwrap_or(1);
-    match request.template.workload.kind {
-        WorkloadKind::Deployment => {
-            objects.push(RenderedManifestObject {
-                apply_order: ApplyOrder::Workload,
-                object: KubernetesObject::Deployment(Deployment {
-                    metadata: ObjectMeta {
-                        name: workload_name,
-                        namespace: Some(request.namespace.to_owned()),
-                        labels: metadata_labels.clone(),
-                        annotations: BTreeMap::new(),
-                    },
-                    spec: DeploymentSpec {
-                        replicas,
-                        selector: LabelSelector {
-                            match_labels: selector_labels,
-                        },
-                        template: pod_template,
-                    },
+    let workload_metadata =
+        object_meta(&workload_name, namespace, &metadata_labels, BTreeMap::new());
+    let selector = LabelSelector {
+        match_labels: Some(selector_labels),
+        match_expressions: None,
+    };
+    // validate_replicas admits exactly one replica.
+    let replicas = Some(1);
+    let workload: KubernetesObject = match request.template.workload.kind {
+        WorkloadKind::Deployment => Deployment {
+            metadata: workload_metadata,
+            spec: Some(DeploymentSpec {
+                replicas,
+                strategy: Some(DeploymentStrategy {
+                    type_: Some("Recreate".to_owned()),
+                    rolling_update: None,
                 }),
-            });
+                selector,
+                template: pod_template,
+                ..DeploymentSpec::default()
+            }),
+            status: None,
         }
+        .into(),
         WorkloadKind::StatefulSet => {
             let service_name = service_name.ok_or_else(|| ManifestRenderError::InvalidField {
                 field: "stateful_set.service_name",
                 message: "StatefulSet rendering requires a service template".to_owned(),
             })?;
-            objects.push(RenderedManifestObject {
-                apply_order: ApplyOrder::Workload,
-                object: KubernetesObject::StatefulSet(StatefulSet {
-                    metadata: ObjectMeta {
-                        name: workload_name,
-                        namespace: Some(request.namespace.to_owned()),
-                        labels: metadata_labels.clone(),
-                        annotations: BTreeMap::new(),
-                    },
-                    spec: StatefulSetSpec {
-                        replicas,
-                        service_name,
-                        selector: LabelSelector {
-                            match_labels: selector_labels,
-                        },
-                        template: pod_template,
-                    },
+            StatefulSet {
+                metadata: workload_metadata,
+                spec: Some(StatefulSetSpec {
+                    replicas,
+                    service_name: Some(service_name),
+                    selector,
+                    template: pod_template,
+                    ..StatefulSetSpec::default()
                 }),
-            });
+                status: None,
+            }
+            .into()
         }
-    }
+    };
+    objects.push(RenderedManifestObject {
+        apply_order: ApplyOrder::Workload,
+        object: workload,
+    });
 
     let mut auxiliary_labels = metadata_labels.clone();
     auxiliary_labels.remove(LABEL_WORKLOAD_NAME);
@@ -361,10 +394,7 @@ fn render_raw_object(
 
     let effective_namespace = raw_effective_namespace(metadata, namespace, namespaced)?;
     if namespaced {
-        metadata.insert(
-            "namespace".to_owned(),
-            Value::String(effective_namespace.clone()),
-        );
+        metadata.insert("namespace".to_owned(), Value::String(effective_namespace));
     } else {
         metadata.remove("namespace");
     }
@@ -375,41 +405,30 @@ fn render_raw_object(
         metadata_labels,
         "raw_objects.manifest.metadata.labels",
     )?;
-    let object_metadata = ObjectMeta {
-        name,
-        namespace: namespaced.then_some(effective_namespace),
-        labels: string_map(metadata, "labels", "raw_objects.manifest.metadata.labels")?,
-        annotations: string_map(
-            metadata,
-            "annotations",
-            "raw_objects.manifest.metadata.annotations",
-        )?,
-    };
+    require_string_map(metadata, "labels", "raw_objects.manifest.metadata.labels")?;
+    require_string_map(
+        metadata,
+        "annotations",
+        "raw_objects.manifest.metadata.annotations",
+    )?;
 
-    let pod_template_metadata = if matches!(kind.as_str(), "Deployment" | "StatefulSet") {
-        Some(raw_pod_template_metadata(&mut value, metadata_labels)?)
-    } else {
-        None
-    };
-
+    let object = KubernetesObject::from_kubernetes_json(value).map_err(|error| {
+        ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest",
+            message: format!("{api_version} {kind} does not match its Kubernetes schema: {error}"),
+        }
+    })?;
     Ok(RenderedManifestObject {
         apply_order,
-        object: KubernetesObject::Raw(RawKubernetesObject {
-            api_version,
-            kind,
-            metadata: object_metadata,
-            pod_template_metadata,
-            value,
-        }),
+        object,
     })
 }
 
-// The generated Service selector is reserved for the structured primary workload.
-// Raw auxiliaries keep instance ownership for cleanup, but may not join that Service.
+// The workload-name label marks the structured workload and its Pods, which the
+// generated Service selects. A raw object neither carries it nor selects by it.
 fn reject_raw_primary_selector(value: &Value) -> Result<(), ManifestRenderError> {
     let explicit_label = [
         "/metadata/labels",
-        "/spec/template/metadata/labels",
         "/spec/selector",
         "/spec/selector/matchLabels",
     ]
@@ -459,7 +478,14 @@ fn raw_apply_order(api_version: &str, kind: &str) -> Result<ApplyOrder, Manifest
         ("v1", "PersistentVolumeClaim") => Ok(ApplyOrder::PersistentVolumeClaim),
         ("v1", "Secret") => Ok(ApplyOrder::Secret),
         ("v1", "Service") => Ok(ApplyOrder::Service),
-        ("apps/v1", "Deployment") | ("apps/v1", "StatefulSet") => Ok(ApplyOrder::Workload),
+        (_, "Deployment" | "StatefulSet") => Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.kind",
+            message: format!(
+                "raw object {api_version} {kind} is not allowed: a class runs one workload, \
+                 declared in template.workload, which carries the sidecar, Pod hardening \
+                 and automatic sleep"
+            ),
+        }),
         _ => Err(ManifestRenderError::InvalidField {
             field: "raw_objects.manifest.kind",
             message: format!("raw object {api_version} {kind} is not in the V1 allow-list"),
@@ -511,59 +537,6 @@ fn raw_effective_namespace(
     Ok(effective.to_owned())
 }
 
-fn raw_pod_template_metadata(
-    value: &mut Value,
-    metadata_labels: &BTreeMap<String, String>,
-) -> Result<PodTemplateMetadata, ManifestRenderError> {
-    let object = value
-        .as_object_mut()
-        .expect("raw Kubernetes object already validated as object");
-    let spec = object
-        .entry("spec")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| ManifestRenderError::InvalidField {
-            field: "raw_objects.manifest.spec",
-            message: "spec must be an object".to_owned(),
-        })?;
-    let template = spec
-        .entry("template")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| ManifestRenderError::InvalidField {
-            field: "raw_objects.manifest.spec.template",
-            message: "workload template must be an object".to_owned(),
-        })?;
-    let metadata = template
-        .entry("metadata")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| ManifestRenderError::InvalidField {
-            field: "raw_objects.manifest.spec.template.metadata",
-            message: "workload template metadata must be an object".to_owned(),
-        })?;
-
-    merge_required_string_map(
-        metadata,
-        "labels",
-        metadata_labels,
-        "raw_objects.manifest.spec.template.metadata.labels",
-    )?;
-
-    Ok(PodTemplateMetadata {
-        labels: string_map(
-            metadata,
-            "labels",
-            "raw_objects.manifest.spec.template.metadata.labels",
-        )?,
-        annotations: string_map(
-            metadata,
-            "annotations",
-            "raw_objects.manifest.spec.template.metadata.annotations",
-        )?,
-    })
-}
-
 fn merge_required_string_map(
     metadata: &mut Map<String, Value>,
     key: &'static str,
@@ -603,13 +576,14 @@ fn merge_required_string_map(
     Ok(())
 }
 
-fn string_map(
+/// Requires `metadata[key]`, when present, to map strings to strings.
+fn require_string_map(
     metadata: &Map<String, Value>,
     key: &'static str,
     field: &'static str,
-) -> Result<BTreeMap<String, String>, ManifestRenderError> {
+) -> Result<(), ManifestRenderError> {
     let Some(value) = metadata.get(key) else {
-        return Ok(BTreeMap::new());
+        return Ok(());
     };
     let map = value
         .as_object()
@@ -617,17 +591,14 @@ fn string_map(
             field,
             message: format!("{key} must be an object"),
         })?;
-    map.iter()
-        .map(|(key, value)| {
-            value
-                .as_str()
-                .map(|value| (key.clone(), value.to_owned()))
-                .ok_or_else(|| ManifestRenderError::InvalidField {
-                    field,
-                    message: "all values must be strings".to_owned(),
-                })
+    if map.values().all(Value::is_string) {
+        Ok(())
+    } else {
+        Err(ManifestRenderError::InvalidField {
+            field,
+            message: "all values must be strings".to_owned(),
         })
-        .collect()
+    }
 }
 
 fn validate_unique_rendered_refs(
@@ -636,20 +607,10 @@ fn validate_unique_rendered_refs(
     let mut refs = BTreeSet::new();
     for rendered in objects {
         let object = &rendered.object;
-        let namespace = match object {
-            KubernetesObject::Deployment(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::StatefulSet(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::Service(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::Secret(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::PersistentVolume(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::PersistentVolumeClaim(object) => object.metadata.namespace.as_deref(),
-            KubernetesObject::Raw(object) => object.metadata.namespace.as_deref(),
-        }
-        .unwrap_or_default();
         let key = (
             object.api_version(),
             object.kind(),
-            namespace,
+            object.namespace(),
             object.name(),
         );
         if !refs.insert(key) {
@@ -657,10 +618,7 @@ fn validate_unique_rendered_refs(
                 field: "template",
                 message: format!(
                     "duplicate rendered Kubernetes object ref {} {} {}/{}",
-                    object.api_version(),
-                    object.kind(),
-                    namespace,
-                    object.name()
+                    key.0, key.1, key.2, key.3
                 ),
             });
         }
@@ -673,11 +631,12 @@ struct RenderedVolume {
     mount_path: String,
     pv_name: String,
     pvc_name: String,
-    access_modes: Vec<PersistentVolumeAccessMode>,
+    access_modes: Vec<String>,
     capacity: String,
     reclaim_policy: PersistentVolumeReclaimPolicy,
     storage_class_name: Option<String>,
-    source: PersistentVolumeSource,
+    /// A PersistentVolume spec that sets only the volume source.
+    source: PersistentVolumeSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -864,61 +823,69 @@ fn render_volume(
                     ))
                 })
                 .collect::<Result<BTreeMap<_, _>, ManifestRenderError>>()?;
-            PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
-                driver: render_non_empty("volume.source.csi.driver", driver, instance)?,
-                volume_handle: render_non_empty(
-                    "volume.source.csi.volume_handle",
-                    volume_handle,
-                    instance,
-                )?,
-                fs_type: fs_type
-                    .as_ref()
-                    .map(|value| render_non_empty("volume.source.csi.fs_type", value, instance))
-                    .transpose()?,
-                read_only: *read_only,
-                volume_attributes: rendered_attributes,
-                controller_publish_secret_ref: render_csi_secret_ref(
-                    "volume.source.csi.controller_publish_secret_ref.name",
-                    "volume.source.csi.controller_publish_secret_ref.namespace",
-                    controller_publish_secret_ref.as_deref(),
-                    instance,
-                )?,
-                node_stage_secret_ref: render_csi_secret_ref(
-                    "volume.source.csi.node_stage_secret_ref.name",
-                    "volume.source.csi.node_stage_secret_ref.namespace",
-                    node_stage_secret_ref.as_deref(),
-                    instance,
-                )?,
-                node_publish_secret_ref: render_csi_secret_ref(
-                    "volume.source.csi.node_publish_secret_ref.name",
-                    "volume.source.csi.node_publish_secret_ref.namespace",
-                    node_publish_secret_ref.as_deref(),
-                    instance,
-                )?,
-                controller_expand_secret_ref: render_csi_secret_ref(
-                    "volume.source.csi.controller_expand_secret_ref.name",
-                    "volume.source.csi.controller_expand_secret_ref.namespace",
-                    controller_expand_secret_ref.as_deref(),
-                    instance,
-                )?,
-                node_expand_secret_ref: render_csi_secret_ref(
-                    "volume.source.csi.node_expand_secret_ref.name",
-                    "volume.source.csi.node_expand_secret_ref.namespace",
-                    node_expand_secret_ref.as_deref(),
-                    instance,
-                )?,
-            }))
+            PersistentVolumeSpec {
+                csi: Some(CSIPersistentVolumeSource {
+                    driver: render_non_empty("volume.source.csi.driver", driver, instance)?,
+                    volume_handle: render_non_empty(
+                        "volume.source.csi.volume_handle",
+                        volume_handle,
+                        instance,
+                    )?,
+                    fs_type: fs_type
+                        .as_ref()
+                        .map(|value| render_non_empty("volume.source.csi.fs_type", value, instance))
+                        .transpose()?,
+                    read_only: Some(*read_only),
+                    volume_attributes: Some(rendered_attributes),
+                    controller_publish_secret_ref: render_csi_secret_ref(
+                        "volume.source.csi.controller_publish_secret_ref.name",
+                        "volume.source.csi.controller_publish_secret_ref.namespace",
+                        controller_publish_secret_ref.as_deref(),
+                        instance,
+                    )?,
+                    node_stage_secret_ref: render_csi_secret_ref(
+                        "volume.source.csi.node_stage_secret_ref.name",
+                        "volume.source.csi.node_stage_secret_ref.namespace",
+                        node_stage_secret_ref.as_deref(),
+                        instance,
+                    )?,
+                    node_publish_secret_ref: render_csi_secret_ref(
+                        "volume.source.csi.node_publish_secret_ref.name",
+                        "volume.source.csi.node_publish_secret_ref.namespace",
+                        node_publish_secret_ref.as_deref(),
+                        instance,
+                    )?,
+                    controller_expand_secret_ref: render_csi_secret_ref(
+                        "volume.source.csi.controller_expand_secret_ref.name",
+                        "volume.source.csi.controller_expand_secret_ref.namespace",
+                        controller_expand_secret_ref.as_deref(),
+                        instance,
+                    )?,
+                    node_expand_secret_ref: render_csi_secret_ref(
+                        "volume.source.csi.node_expand_secret_ref.name",
+                        "volume.source.csi.node_expand_secret_ref.namespace",
+                        node_expand_secret_ref.as_deref(),
+                        instance,
+                    )?,
+                }),
+                ..PersistentVolumeSpec::default()
+            }
         }
         PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
             let rendered = render_non_empty("volume.source.host_path.path", path, instance)?;
             validate_host_path(path, &rendered)?;
-            PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
-                path: rendered,
-                type_: type_
-                    .as_ref()
-                    .map(|value| render_non_empty("volume.source.host_path.type", value, instance))
-                    .transpose()?,
-            })
+            PersistentVolumeSpec {
+                host_path: Some(HostPathVolumeSource {
+                    path: rendered,
+                    type_: type_
+                        .as_ref()
+                        .map(|value| {
+                            render_non_empty("volume.source.host_path.type", value, instance)
+                        })
+                        .transpose()?,
+                }),
+                ..PersistentVolumeSpec::default()
+            }
         }
     };
 
@@ -929,7 +896,11 @@ fn render_volume(
         mount_path,
         pv_name,
         pvc_name,
-        access_modes: template.access_modes.clone(),
+        access_modes: template
+            .access_modes
+            .iter()
+            .map(|mode| mode.as_str().to_owned())
+            .collect(),
         capacity,
         reclaim_policy: template.reclaim_policy,
         storage_class_name,
@@ -942,7 +913,7 @@ fn render_csi_secret_ref(
     namespace_field: &'static str,
     template: Option<&CsiSecretRefTemplate>,
     instance: &InstanceRecord,
-) -> Result<Option<CsiSecretReference>, ManifestRenderError> {
+) -> Result<Option<SecretReference>, ManifestRenderError> {
     let Some(template) = template else {
         return Ok(None);
     };
@@ -950,7 +921,10 @@ fn render_csi_secret_ref(
     let namespace = render_non_empty(namespace_field, &template.namespace, instance)?;
     validate_dns_label(name_field, &name)?;
     validate_dns_label(namespace_field, &namespace)?;
-    Ok(Some(CsiSecretReference { name, namespace }))
+    Ok(Some(SecretReference {
+        name: Some(name),
+        namespace: Some(namespace),
+    }))
 }
 
 fn render_app_container(
@@ -960,38 +934,37 @@ fn render_app_container(
 ) -> Result<Container, ManifestRenderError> {
     validate_dns_label("container.name", &template.name)?;
     Ok(Container {
-        name: template.name.clone(),
-        image: render_non_empty("container.image", &template.image, instance)?,
-        ports: template
-            .ports
-            .iter()
-            .map(|port| {
-                validate_port("container.ports.container_port", port.container_port)?;
-                Ok(ContainerPort {
-                    name: port.name.clone(),
-                    container_port: port.container_port,
+        ports: Some(
+            template
+                .ports
+                .iter()
+                .map(|port| {
+                    validate_port("container.ports.container_port", port.container_port)?;
+                    Ok(container_port(port.name.clone(), port.container_port))
                 })
-            })
-            .collect::<Result<Vec<_>, ManifestRenderError>>()?,
-        env: template
-            .env
-            .iter()
-            .map(|env| {
-                Ok(EnvVar {
-                    name: env.name.clone(),
-                    value: env.value.render(&instance.values)?,
-                    value_from: None,
+                .collect::<Result<Vec<_>, ManifestRenderError>>()?,
+        ),
+        env: Some(
+            template
+                .env
+                .iter()
+                .map(|env| Ok(env_value(&env.name, env.value.render(&instance.values)?)))
+                .collect::<Result<Vec<_>, ManifestRenderError>>()?,
+        ),
+        volume_mounts: Some(
+            volumes
+                .iter()
+                .map(|volume| VolumeMount {
+                    name: volume.volume_name.clone(),
+                    mount_path: volume.mount_path.clone(),
+                    ..VolumeMount::default()
                 })
-            })
-            .collect::<Result<Vec<_>, ManifestRenderError>>()?,
-        volume_mounts: volumes
-            .iter()
-            .map(|volume| VolumeMount {
-                name: volume.volume_name.clone(),
-                mount_path: volume.mount_path.clone(),
-            })
-            .collect(),
-        readiness_probe: None,
+                .collect(),
+        ),
+        ..hardened_container(
+            template.name.clone(),
+            render_non_empty("container.image", &template.image, instance)?,
+        )
     })
 }
 
@@ -1005,119 +978,139 @@ fn render_sidecar_container(
     options: super::RenderManifestOptions<'_>,
 ) -> Result<Container, ManifestRenderError> {
     let mut env = vec![
-        EnvVar {
-            name: "SLEEPYPODS_POD_UID".to_owned(),
-            value: String::new(),
-            value_from: Some(super::EnvVarSource::FieldRef { field_path: "metadata.uid".to_owned() }),
-        },
-        EnvVar {
-            name: ENV_LISTEN_PORT.to_owned(),
-            value: config.listen_port.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_SIDECAR_LISTEN_ADDR.to_owned(),
-            value: format!("0.0.0.0:{}", config.listen_port),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_SIDECAR_READINESS_LISTEN_ADDR.to_owned(),
-            value: format!("0.0.0.0:{}", config.readiness_port),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_APP_PORT.to_owned(),
-            value: config.app_port.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_INSTANCE_ID.to_owned(),
-            value: instance.id.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_INSTANCE_GENERATION.to_owned(),
-            value: instance.generation.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_CONTROL_PLANE_ENDPOINT.to_owned(),
-            value: options.sidecar_control_plane_endpoint.map(str::to_owned).unwrap_or_else(||format!(
-                "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
-            )),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_IDLE_TIMEOUT_MS.to_owned(),
-            value: sleep_policy.idle_timeout_ms.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_IDLE_RETRY_BACKOFF_MS.to_owned(),
-            value: sleep_policy.idle_retry_backoff_ms.to_string(),
-            value_from: None,
-        },
-        EnvVar {
-            name: ENV_DRAIN_GRACE_TIMEOUT_MS.to_owned(),
-            value: sleep_policy.drain_grace_timeout_ms.to_string(),
-            value_from: None,
-        },
+        env_from(
+            "SLEEPYPODS_POD_UID",
+            EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_owned()),
+                    field_path: "metadata.uid".to_owned(),
+                }),
+                ..EnvVarSource::default()
+            },
+        ),
+        env_value(ENV_LISTEN_PORT, config.listen_port.to_string()),
+        env_value(
+            ENV_SIDECAR_LISTEN_ADDR,
+            format!("0.0.0.0:{}", config.listen_port),
+        ),
+        env_value(
+            ENV_SIDECAR_READINESS_LISTEN_ADDR,
+            format!("0.0.0.0:{}", config.readiness_port),
+        ),
+        env_value(ENV_APP_PORT, config.app_port.to_string()),
+        env_value(ENV_INSTANCE_ID, instance.id.to_string()),
+        env_value(ENV_INSTANCE_GENERATION, instance.generation.to_string()),
+        env_value(
+            ENV_CONTROL_PLANE_ENDPOINT,
+            options
+                .sidecar_control_plane_endpoint
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "http://{CONTROL_PLANE_SERVICE_NAME}.{namespace}.svc.cluster.local:{CONTROL_PLANE_GRPC_PORT}"
+                    )
+                }),
+        ),
+        env_value(ENV_IDLE_TIMEOUT_MS, sleep_policy.idle_timeout_ms.to_string()),
+        env_value(
+            ENV_IDLE_RETRY_BACKOFF_MS,
+            sleep_policy.idle_retry_backoff_ms.to_string(),
+        ),
+        env_value(
+            ENV_DRAIN_GRACE_TIMEOUT_MS,
+            sleep_policy.drain_grace_timeout_ms.to_string(),
+        ),
     ];
     if let Some(ca) = options.sidecar_control_plane_ca {
-        env.push(EnvVar {
-            name: sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV.to_owned(),
-            value: ca.to_owned(),
-            value_from: None,
-        });
+        env.push(env_value(
+            sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV,
+            ca,
+        ));
     }
     if let Some(mode) = &config.mode {
-        env.push(EnvVar {
-            name: ENV_SIDECAR_MODE.to_owned(),
-            value: mode.clone(),
-            value_from: None,
-        });
+        env.push(env_value(ENV_SIDECAR_MODE, mode.clone()));
     }
     if let Some(app_protocol) = config.app_protocol {
-        env.push(EnvVar {
-            name: ENV_APP_PROTOCOL.to_owned(),
-            value: app_protocol.as_str().to_owned(),
-            value_from: None,
-        });
+        env.push(env_value(ENV_APP_PROTOCOL, app_protocol.as_str()));
     }
     if let Some(secret_name) = sidecar_token_secret_name {
-        env.push(EnvVar {
-            name: ENV_CONTROL_PLANE_SIDECAR_TOKEN.to_owned(),
-            value: String::new(),
-            value_from: Some(super::EnvVarSource::SecretKeyRef(SecretKeyRef {
-                name: secret_name.to_owned(),
-                key: SIDECAR_TOKEN_SECRET_KEY.to_owned(),
-            })),
-        });
+        env.push(env_from(
+            ENV_CONTROL_PLANE_SIDECAR_TOKEN,
+            EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: secret_name.to_owned(),
+                    key: SIDECAR_TOKEN_SECRET_KEY.to_owned(),
+                    optional: None,
+                }),
+                ..EnvVarSource::default()
+            },
+        ));
     }
 
     Ok(Container {
-        name: template.name.clone(),
-        image: render_non_empty("sidecar.image", &template.image, instance)?,
-        ports: vec![
-            ContainerPort {
-                name: config.proxy_port_name.clone(),
-                container_port: config.listen_port,
-            },
-            ContainerPort {
-                name: None,
-                container_port: config.readiness_port,
-            },
-        ],
-        env,
-        volume_mounts: Vec::new(),
-        readiness_probe: Some(super::HttpReadinessProbe {
-            path: "/ready".to_owned(),
-            port: config.readiness_port,
-            period_seconds: 1,
-            timeout_seconds: 1,
-            failure_threshold: 1,
+        ports: Some(vec![
+            container_port(config.proxy_port_name.clone(), config.listen_port),
+            container_port(None, config.readiness_port),
+        ]),
+        env: Some(env),
+        readiness_probe: Some(Probe {
+            http_get: Some(HTTPGetAction {
+                path: Some("/ready".to_owned()),
+                port: IntOrString::Int(i32::from(config.readiness_port)),
+                ..HTTPGetAction::default()
+            }),
+            period_seconds: Some(1),
+            timeout_seconds: Some(1),
+            failure_threshold: Some(1),
+            ..Probe::default()
         }),
+        ..hardened_container(
+            template.name.clone(),
+            render_non_empty("sidecar.image", &template.image, instance)?,
+        )
     })
+}
+
+/// A container with no ports, environment or mounts yet. It starts with the
+/// privileges its image needs and gains none after that, so a setuid binary
+/// inside it stays at the same level.
+fn hardened_container(name: String, image: String) -> Container {
+    Container {
+        name,
+        image: Some(image),
+        ports: Some(Vec::new()),
+        env: Some(Vec::new()),
+        volume_mounts: Some(Vec::new()),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..SecurityContext::default()
+        }),
+        ..Container::default()
+    }
+}
+
+fn container_port(name: Option<String>, port: u16) -> ContainerPort {
+    ContainerPort {
+        name,
+        container_port: i32::from(port),
+        ..ContainerPort::default()
+    }
+}
+
+fn env_value(name: &str, value: impl Into<String>) -> EnvVar {
+    EnvVar {
+        name: name.to_owned(),
+        value: Some(value.into()),
+        value_from: None,
+    }
+}
+
+fn env_from(name: &str, source: EnvVarSource) -> EnvVar {
+    EnvVar {
+        name: name.to_owned(),
+        value: None,
+        value_from: Some(source),
+    }
 }
 
 fn render_service_ports(
@@ -1132,11 +1125,31 @@ fn render_service_ports(
             validate_port("service.ports.target_port", port.target_port)?;
             Ok(ServicePort {
                 name: port.name.clone(),
-                port: port.port,
-                target_port: sidecar_listen_port,
+                port: i32::from(port.port),
+                target_port: Some(IntOrString::Int(i32::from(sidecar_listen_port))),
+                ..ServicePort::default()
             })
         })
         .collect()
+}
+
+fn object_meta(
+    name: &str,
+    namespace: Option<&str>,
+    labels: &BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name.to_owned()),
+        namespace: namespace.map(str::to_owned),
+        labels: Some(labels.clone()),
+        annotations: Some(annotations),
+        ..ObjectMeta::default()
+    }
+}
+
+fn storage(capacity: &str) -> BTreeMap<String, Quantity> {
+    BTreeMap::from([("storage".to_owned(), Quantity(capacity.to_owned()))])
 }
 
 fn render_object_name(

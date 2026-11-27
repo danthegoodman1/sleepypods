@@ -8,15 +8,15 @@ use std::{
 
 use control_plane::{
     projection::{ProjectionPlan, ProjectionReconciler},
-    render_manifests, rendered_object_ref, BackendGeneration, ContainerPortTemplate,
-    ContainerTemplate, Generation, InstanceId, InstanceRecord, InstanceState, InstanceValues,
-    KubeMaterializerClient, KubeMaterializerClientConfig, KubernetesMaterializer,
-    KubernetesMaterializerClient, ManifestTemplate, MaterializationId, MaterializationRecord,
-    MaterializationState, MaterializationTarget, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RenderManifestRequest,
-    RenderedManifest, RenderedObjectRef, ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate,
-    SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassId,
-    WorkloadClassVersionRef, WorkloadKind, WorkloadTemplate,
+    render_manifests, BackendGeneration, ContainerPortTemplate, ContainerTemplate, Generation,
+    InstanceId, InstanceRecord, InstanceState, InstanceValues, KubeMaterializerClient,
+    KubeMaterializerClientConfig, KubernetesMaterializer, KubernetesMaterializerClient,
+    ManifestTemplate, MaterializationId, MaterializationRecord, MaterializationState,
+    MaterializationTarget, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
+    PersistentVolumeSourceTemplate, RenderManifestRequest, RenderedManifest, RenderedObjectRef,
+    ResolvedSleepPolicy, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassId, WorkloadClassVersionRef, WorkloadKind,
+    WorkloadTemplate,
 };
 use k8s_openapi::api::{
     apps::v1::StatefulSet,
@@ -25,6 +25,7 @@ use k8s_openapi::api::{
         PersistentVolumeClaimVolumeSource, Pod, PodSpec, Service, Volume, VolumeMount,
     },
 };
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::{
     api::{DeleteParams, ListParams, LogParams, ObjectMeta, Patch, PatchParams, PostParams},
     Api, Client, Error as KubeError,
@@ -267,14 +268,21 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
     // readiness probe against that fixture's listener. Production sidecar/app
     // readiness (including the private health port) belongs to the cold E2E gates.
     for object in &mut manifest.objects {
-        if let control_plane::KubernetesObject::StatefulSet(workload) = &mut object.object {
-            let probe = workload.spec.template.spec.containers[1]
-                .readiness_probe
-                .as_mut()
-                .ok_or("rendered sidecar readiness missing")?;
-            probe.path = "/".to_owned();
-            probe.port = 80;
+        if object.object.kind() != "StatefulSet" {
+            continue;
         }
+        let mut workload: StatefulSet = serde_json::from_value(object.object.to_kubernetes_json())?;
+        let probe = workload
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.template.spec.as_mut())
+            .and_then(|pod| pod.containers.get_mut(1))
+            .and_then(|sidecar| sidecar.readiness_probe.as_mut())
+            .and_then(|probe| probe.http_get.as_mut())
+            .ok_or("rendered sidecar readiness missing")?;
+        probe.path = Some("/".to_owned());
+        probe.port = IntOrString::Int(80);
+        object.object = workload.into();
     }
     Ok(manifest)
 }
@@ -600,7 +608,7 @@ fn rendered_refs(manifest: &RenderedManifest) -> Vec<RenderedObjectRef> {
     manifest
         .objects
         .iter()
-        .map(|object| rendered_object_ref(&object.object))
+        .map(|object| object.object.object_ref())
         .collect()
 }
 
@@ -638,17 +646,18 @@ async fn conditional_secret_mutations_preserve_same_name_replacements() -> TestR
     create_namespace(client.clone(), &namespace).await?;
     let result: TestResult<()> = async {
         let kube = KubeMaterializerClient::new(client.clone());
-        let object = control_plane::KubernetesObject::Secret(control_plane::manifest::Secret {
-            metadata: control_plane::manifest::ObjectMeta {
-                name: "conditional-secret".into(),
+        let object: control_plane::KubernetesObject = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some("conditional-secret".into()),
                 namespace: Some(namespace.clone()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
+                ..ObjectMeta::default()
             },
-            type_: "Opaque".into(),
-            string_data: BTreeMap::from([("token".into(), "test-only".into())]),
-        });
-        let object_ref = rendered_object_ref(&object);
+            type_: Some("Opaque".into()),
+            string_data: Some(BTreeMap::from([("token".into(), "test-only".into())])),
+            ..Default::default()
+        }
+        .into();
+        let object_ref = object.object_ref();
         kube.apply_object(&object, None).await?;
         let control_plane::projection::ProjectionObjectInspection::Present(old) =
             kube.inspect_object(&object_ref).await?

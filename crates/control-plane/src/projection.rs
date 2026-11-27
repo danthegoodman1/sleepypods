@@ -1,12 +1,14 @@
 use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
 use crate::{
     ids::{Generation, InstanceId, MaterializationId},
-    manifest::{KubernetesObject, ObjectMeta, PodTemplateMetadata, RenderedManifest},
+    manifest::{KubernetesObject, RenderedManifest},
     materialization::{BackendEndpoint, MaterializationRecord, RenderedObjectRef},
     materializer::{
-        delete_order, rendered_object_ref, rendered_object_refs, KubernetesClientError,
-        KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError,
+        delete_order, rendered_object_refs, KubernetesClientError, KubernetesMaterializer,
+        KubernetesMaterializerClient, MaterializerError,
     },
 };
 
@@ -26,7 +28,7 @@ pub const ABSENCE_WAIT: Duration = Duration::from_secs(60);
 const ABSENCE_POLL_MIN: Duration = Duration::from_millis(100);
 const ABSENCE_POLL_MAX: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionPlan {
     materialization_id: MaterializationId,
     instance_id: InstanceId,
@@ -156,9 +158,13 @@ impl ProjectionPlan {
         let rendered_refs = rendered_object_refs(&manifest)?;
         let mut expected = BTreeMap::new();
         for rendered in &manifest.objects {
-            let object_ref = rendered_object_ref(&rendered.object);
-            let rendered_hash = object_annotations(&rendered.object)
-                .get(ANNOTATION_RENDERED_HASH)
+            let object_ref = rendered.object.object_ref();
+            let rendered_hash = rendered
+                .object
+                .metadata()
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(ANNOTATION_RENDERED_HASH))
                 .cloned();
             expected.insert(
                 ref_key(&object_ref),
@@ -301,8 +307,8 @@ impl LiveObjectMetadata {
                 uid: "test-uid".into(),
                 resource_version: "1".into(),
             },
-            labels: object_labels(object).clone(),
-            annotations: object_annotations(object).clone(),
+            labels: object.metadata().labels.clone().unwrap_or_default(),
+            annotations: object.metadata().annotations.clone().unwrap_or_default(),
             deleting: false,
             finalizers: Vec::new(),
         }
@@ -866,92 +872,60 @@ fn ownership_mismatch_reason(
 }
 
 fn stamp_object_base(object: &mut KubernetesObject, materialization: &MaterializationRecord) {
-    stamp_metadata_base(
-        object_metadata_mut(object),
-        &materialization.id,
-        &materialization.instance_id,
-        materialization.projection_generation,
-    );
-    if let Some(metadata) = pod_template_metadata_mut(object) {
-        stamp_pod_template_base(
-            metadata,
-            &materialization.id,
-            &materialization.instance_id,
-            materialization.projection_generation,
-        );
+    stamp_metadata_base(object.metadata_mut(), materialization);
+    if let Some(metadata) = object.pod_template_metadata_mut() {
+        stamp_metadata_base(metadata, materialization);
     }
 }
 
 fn stamp_rendered_hash(object: &mut KubernetesObject, rendered_hash: &str) {
-    object_metadata_mut(object).annotations.insert(
-        ANNOTATION_RENDERED_HASH.to_owned(),
-        rendered_hash.to_owned(),
-    );
-    if let Some(metadata) = pod_template_metadata_mut(object) {
-        metadata.annotations.insert(
-            ANNOTATION_RENDERED_HASH.to_owned(),
-            rendered_hash.to_owned(),
-        );
+    let stamp = |metadata: &mut ObjectMeta| {
+        metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                ANNOTATION_RENDERED_HASH.to_owned(),
+                rendered_hash.to_owned(),
+            );
+    };
+    stamp(object.metadata_mut());
+    if let Some(metadata) = object.pod_template_metadata_mut() {
+        stamp(metadata);
     }
 }
 
-fn stamp_metadata_base(
-    metadata: &mut ObjectMeta,
-    materialization_id: &MaterializationId,
-    instance_id: &InstanceId,
-    instance_generation: Generation,
-) {
-    metadata.labels.insert(
+fn stamp_metadata_base(metadata: &mut ObjectMeta, materialization: &MaterializationRecord) {
+    let labels = metadata.labels.get_or_insert_with(BTreeMap::new);
+    labels.insert(
         LABEL_MANAGED_BY.to_owned(),
         LABEL_MANAGED_BY_VALUE.to_owned(),
     );
-    metadata.labels.insert(
+    labels.insert(
         crate::manifest::LABEL_INSTANCE_ID.to_owned(),
-        instance_id.as_str().to_owned(),
+        materialization.instance_id.as_str().to_owned(),
     );
-    metadata.labels.insert(
+    labels.insert(
         crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
-        instance_generation.to_string(),
+        materialization.projection_generation.to_string(),
     );
-    metadata.annotations.insert(
+    let annotations = metadata.annotations.get_or_insert_with(BTreeMap::new);
+    annotations.insert(
         ANNOTATION_MATERIALIZATION_ID.to_owned(),
-        materialization_id.as_str().to_owned(),
+        materialization.id.as_str().to_owned(),
     );
-    metadata.annotations.remove(ANNOTATION_RENDERED_HASH);
-}
-
-fn stamp_pod_template_base(
-    metadata: &mut PodTemplateMetadata,
-    materialization_id: &MaterializationId,
-    instance_id: &InstanceId,
-    instance_generation: Generation,
-) {
-    metadata.labels.insert(
-        LABEL_MANAGED_BY.to_owned(),
-        LABEL_MANAGED_BY_VALUE.to_owned(),
-    );
-    metadata.labels.insert(
-        crate::manifest::LABEL_INSTANCE_ID.to_owned(),
-        instance_id.as_str().to_owned(),
-    );
-    metadata.labels.insert(
-        crate::manifest::LABEL_INSTANCE_GENERATION.to_owned(),
-        instance_generation.to_string(),
-    );
-    metadata.annotations.insert(
-        ANNOTATION_MATERIALIZATION_ID.to_owned(),
-        materialization_id.as_str().to_owned(),
-    );
-    metadata.annotations.remove(ANNOTATION_RENDERED_HASH);
+    annotations.remove(ANNOTATION_RENDERED_HASH);
 }
 
 fn rendered_hash_for_object(object: &KubernetesObject) -> String {
     let mut object = object.clone();
-    object_metadata_mut(&mut object)
-        .annotations
-        .remove(ANNOTATION_RENDERED_HASH);
-    if let Some(metadata) = pod_template_metadata_mut(&mut object) {
-        metadata.annotations.remove(ANNOTATION_RENDERED_HASH);
+    let unstamp = |metadata: &mut ObjectMeta| {
+        if let Some(annotations) = &mut metadata.annotations {
+            annotations.remove(ANNOTATION_RENDERED_HASH);
+        }
+    };
+    unstamp(object.metadata_mut());
+    if let Some(metadata) = object.pod_template_metadata_mut() {
+        unstamp(metadata);
     }
     format!(
         "{:016x}",
@@ -1043,54 +1017,6 @@ fn readiness_observation_ref(plan: &ProjectionPlan) -> RenderedObjectRef {
         .unwrap_or_else(|| fallback_observation_ref(plan))
 }
 
-fn object_metadata_mut(object: &mut KubernetesObject) -> &mut ObjectMeta {
-    match object {
-        KubernetesObject::Deployment(object) => &mut object.metadata,
-        KubernetesObject::StatefulSet(object) => &mut object.metadata,
-        KubernetesObject::Service(object) => &mut object.metadata,
-        KubernetesObject::Secret(object) => &mut object.metadata,
-        KubernetesObject::PersistentVolume(object) => &mut object.metadata,
-        KubernetesObject::PersistentVolumeClaim(object) => &mut object.metadata,
-        KubernetesObject::Raw(object) => &mut object.metadata,
-    }
-}
-
-fn pod_template_metadata_mut(object: &mut KubernetesObject) -> Option<&mut PodTemplateMetadata> {
-    match object {
-        KubernetesObject::Deployment(object) => Some(&mut object.spec.template.metadata),
-        KubernetesObject::StatefulSet(object) => Some(&mut object.spec.template.metadata),
-        KubernetesObject::Service(_)
-        | KubernetesObject::Secret(_)
-        | KubernetesObject::PersistentVolume(_)
-        | KubernetesObject::PersistentVolumeClaim(_) => None,
-        KubernetesObject::Raw(object) => object.pod_template_metadata.as_mut(),
-    }
-}
-
-fn object_labels(object: &KubernetesObject) -> &BTreeMap<String, String> {
-    match object {
-        KubernetesObject::Deployment(object) => &object.metadata.labels,
-        KubernetesObject::StatefulSet(object) => &object.metadata.labels,
-        KubernetesObject::Service(object) => &object.metadata.labels,
-        KubernetesObject::Secret(object) => &object.metadata.labels,
-        KubernetesObject::PersistentVolume(object) => &object.metadata.labels,
-        KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.labels,
-        KubernetesObject::Raw(object) => &object.metadata.labels,
-    }
-}
-
-fn object_annotations(object: &KubernetesObject) -> &BTreeMap<String, String> {
-    match object {
-        KubernetesObject::Deployment(object) => &object.metadata.annotations,
-        KubernetesObject::StatefulSet(object) => &object.metadata.annotations,
-        KubernetesObject::Service(object) => &object.metadata.annotations,
-        KubernetesObject::Secret(object) => &object.metadata.annotations,
-        KubernetesObject::PersistentVolume(object) => &object.metadata.annotations,
-        KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.annotations,
-        KubernetesObject::Raw(object) => &object.metadata.annotations,
-    }
-}
-
 fn ref_key(object_ref: &RenderedObjectRef) -> (String, String, String, String) {
     (
         object_ref.api_version.clone(),
@@ -1144,7 +1070,7 @@ mod tests {
 
         let manifest = plan.manifest().expect("stamped manifest");
         for rendered in &manifest.objects {
-            let metadata = object_metadata(&rendered.object);
+            let metadata = LiveObjectMetadata::from_rendered_object(&rendered.object);
             assert_eq!(metadata.labels[LABEL_MANAGED_BY], LABEL_MANAGED_BY_VALUE);
             assert_eq!(
                 metadata.labels[crate::manifest::LABEL_INSTANCE_ID],
@@ -1687,7 +1613,7 @@ mod tests {
         fn insert_owned(&self, plan: &ProjectionPlan) {
             for rendered in &plan.manifest().expect("stamped manifest").objects {
                 self.insert(
-                    &rendered_object_ref(&rendered.object),
+                    &rendered.object.object_ref(),
                     LiveObjectMetadata::from_rendered_object(&rendered.object),
                 );
             }
@@ -1741,7 +1667,7 @@ mod tests {
             precondition: Option<&'a LiveObjectIdentity>,
         ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
             Box::pin(async move {
-                let object_ref = rendered_object_ref(object);
+                let object_ref = object.object_ref();
                 let key = ref_key(&object_ref);
                 let mut state = self.state();
                 state.calls.push(match precondition {
@@ -1885,18 +1811,6 @@ mod tests {
     fn plan() -> ProjectionPlan {
         ProjectionPlan::from_manifest(&materialization_record(), &manifest())
             .expect("projection plan")
-    }
-
-    fn object_metadata(object: &KubernetesObject) -> &ObjectMeta {
-        match object {
-            KubernetesObject::Deployment(object) => &object.metadata,
-            KubernetesObject::StatefulSet(object) => &object.metadata,
-            KubernetesObject::Service(object) => &object.metadata,
-            KubernetesObject::Secret(object) => &object.metadata,
-            KubernetesObject::PersistentVolume(object) => &object.metadata,
-            KubernetesObject::PersistentVolumeClaim(object) => &object.metadata,
-            KubernetesObject::Raw(object) => &object.metadata,
-        }
     }
 
     fn materialization_record() -> MaterializationRecord {

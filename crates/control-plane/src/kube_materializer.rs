@@ -23,8 +23,8 @@ use crate::{
     manifest::KubernetesObject,
     materialization::{BackendEndpoint, RenderedObjectRef},
     materializer::{
-        is_workload_ref, rendered_object_ref, KubernetesClientError, KubernetesClientFuture,
-        KubernetesClientResult, KubernetesMaterializerClient,
+        is_workload_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
+        KubernetesMaterializerClient,
     },
     projection::{LiveObjectMetadata, ProjectionObjectInspection, ProjectionReadinessInspection},
 };
@@ -178,14 +178,13 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         precondition: Option<&'a crate::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            let object_ref = rendered_object_ref(object);
+            let object_ref = object.object_ref();
             let api = self.dynamic_api(&object_ref)?;
             let mut body = object.to_kubernetes_json();
-            let workload = is_workload_ref(&object_ref);
             let operation = async {
                 match precondition {
                     None => {
-                        if workload {
+                        if is_workload_ref(&object_ref) {
                             body["spec"]["replicas"] = 0.into();
                         }
                         let object: DynamicObject = serde_json::from_value(body)
@@ -203,12 +202,6 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                     }
                     Some(identity) => {
                         validate_identity(identity)?;
-                        // A raw template may leave the count to the API
-                        // server's default, which a merge patch would not
-                        // restore from zero.
-                        if workload && body["spec"]["replicas"].is_null() {
-                            body["spec"]["replicas"] = 1.into();
-                        }
                         body["metadata"]["uid"] = identity.uid.clone().into();
                         body["metadata"]["resourceVersion"] =
                             identity.resource_version.clone().into();
@@ -240,15 +233,11 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
             validate_identity(identity)?;
-            let object_ref = rendered_object_ref(object);
+            let object_ref = object.object_ref();
             let api = self.dynamic_api(&object_ref)?;
-            let replicas = match &object.to_kubernetes_json()["spec"]["replicas"] {
-                serde_json::Value::Null => 1.into(),
-                replicas => replicas.clone(),
-            };
             let body = serde_json::json!({
                 "metadata": { "uid": identity.uid },
-                "spec": { "replicas": replicas },
+                "spec": { "replicas": object.to_kubernetes_json()["spec"]["replicas"] },
             });
             let params = PatchParams {
                 field_manager: Some(self.config.field_manager.clone()),

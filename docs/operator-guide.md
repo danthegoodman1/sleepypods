@@ -507,22 +507,26 @@ Two kinds have tighter Kubernetes limits, and `CreateInstance` enforces both:
 
 Typed manifest templates are the preferred path for supported Kubernetes
 fields. Operators can use `ManifestTemplate.raw_objects` as an advanced escape
-hatch for unsupported fields that must be preserved exactly in applied
-Kubernetes objects. Each raw object is a YAML or JSON manifest held in
+hatch for auxiliary objects and fields the typed templates do not cover. Each
+raw object is a YAML or JSON manifest held in
 `RawKubernetesManifestTemplate.manifest`, and that text uses only the same
 limited `TemplateText` instance-value substitution model as typed fields. It is
 not an executable templating engine.
 
-Raw objects are limited in V1 to `Deployment`, `StatefulSet`, `Service`, `Secret`,
-`PersistentVolume`, and `PersistentVolumeClaim`; standalone raw Pods are unsupported. After substitution, the
-control plane parses the manifest, validates `apiVersion`, `kind`,
-`metadata.name`, and namespace scope, injects the same SleepyPods ownership
-labels used by typed objects, and derives
-rendered refs before any Kubernetes apply. Conflicting SleepyPods identity
-labels are rejected. PersistentVolumes must be cluster-scoped; namespaced raw
-objects are applied in the materialization target namespace. Raw refs collide
-with typed refs, so a raw object cannot reuse the same
-apiVersion/kind/namespace/name as a typed-rendered object.
+Raw objects are limited in V1 to `v1` `Service`, `Secret`, `PersistentVolume`,
+and `PersistentVolumeClaim`. A class runs one workload, declared in
+`template.workload`, which carries the sidecar, Pod hardening and automatic
+sleep; class creation rejects a raw `Deployment` or `StatefulSet`, and raw Pods
+are unsupported. After substitution, the control plane parses the manifest,
+validates `apiVersion`, `kind`, `metadata.name`, and namespace scope, injects
+the same SleepyPods ownership labels used by typed objects, and derives
+rendered refs before any Kubernetes apply. It reads each raw object as its
+Kubernetes kind: a field of the wrong type, such as a port given as a string,
+fails the render, and a field the kind does not define is dropped. Conflicting
+SleepyPods identity labels are rejected. PersistentVolumes must be
+cluster-scoped; namespaced raw objects are applied in the materialization
+target namespace. Raw refs collide with typed refs, so a raw object cannot
+reuse the same apiVersion/kind/namespace/name as a typed-rendered object.
 
 A raw object's `metadata.name` ends with `-` and the instance suffix, so two
 instances of one class render distinct objects. The platform supplies the suffix
@@ -536,13 +540,10 @@ raw_objects: [{manifest: {parts: [
   {literal: "\nstringData:\n  mode: production\n"}]}}]
 ```
 
-Raw Deployment/StatefulSet Pod templates retain instance cleanup labels but do
-not receive the primary `sleepypods.io/workload-name` label. That label is
-reserved: raw metadata, Pod-template labels and selectors may not set it.
-Consequently the generated primary Service selects only the structured workload
-with its injected sidecar. Auxiliary workloads keep their own labels/selectors
-and may use separate raw Services; they do not receive the injected sidecar or
-its readiness probe.
+Raw objects do not receive the primary `sleepypods.io/workload-name` label.
+That label is reserved: raw metadata labels and selectors may not set it, so
+the generated primary Service selects only the structured workload with its
+injected sidecar.
 
 The generated sidecar exposes a separate HTTP `GET /ready` listener. The renderer
 chooses an unused unprivileged port, starting at 15001 and scanning upward (then
@@ -1070,9 +1071,8 @@ accepting an idle report, the control plane verifies the pinned class, current
 Ready materialization, workload ownership and desired replica count, and exactly
 one ready, non-terminating Pod with that UID and incarnation. Deployment pods must
 belong to a ReplicaSet owned by the observed Deployment; StatefulSet pods must
-belong to that StatefulSet. Unknown membership, extra Pods (including old,
-terminating or unready Pods), and extra raw workload controllers refuse sleep.
-Auxiliary raw workloads do not participate in an aggregate idle protocol.
+belong to that StatefulSet. Unknown membership and extra Pods (including old,
+terminating or unready Pods) refuse sleep.
 
 The control plane owns the managed workloads, their selectors, replica counts,
 and Pod templates. Do not attach an HPA, scale them externally, mutate their Pod
@@ -1086,18 +1086,16 @@ replacement Pod is admitted to traffic. Normal control-plane lifecycle changes
 remain guarded by instance generation.
 
 Before upgrading, audit pinned class versions for explicit `replicas: 0` or
-`replicas > 1`, and raw objects that add Deployment/StatefulSet controllers.
-Existing classes with unsupported replica counts remain readable and deletable,
-but cannot accept new instances, render a new activation, or authorize automatic
-sleep. Auxiliary raw Deployment/StatefulSet manifests remain supported for
-creation and rendering, but their instances cannot authorize automatic sleep;
-there is no aggregate observation of their activity. Running instances are left
-awake; migration is explicit, without scaling or deleting active peers
-automatically. Create a new immutable class version with one
-replica, move consumers to a new instance through the operator API, and retire
-the old instance after its activity has drained. Existing RollingUpdate
-Deployments must be rematerialized through the control plane to acquire the
-Recreate strategy and downward-API Pod UID.
+`replicas > 1`, and for raw Deployment or StatefulSet objects. Existing classes
+with unsupported replica counts or raw workload controllers remain readable and
+deletable, but cannot accept new instances, render a new activation, or
+authorize automatic sleep. Running instances are left awake; migration is
+explicit, without scaling or deleting active peers automatically. Create a new
+immutable class version with one replica and no raw workload controller, move
+consumers to a new instance through the operator API, and retire the old
+instance after its activity has drained. Existing RollingUpdate Deployments
+must be rematerialized through the control plane to acquire the Recreate
+strategy and downward-API Pod UID.
 
 Deploy the upgraded control plane and required read permissions first. Old
 sidecars omit `pod_uid`; their idle requests receive `FailedPrecondition` and

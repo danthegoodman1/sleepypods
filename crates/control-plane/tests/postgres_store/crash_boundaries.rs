@@ -287,7 +287,7 @@ impl FaultyKubernetes {
         object: &control_plane::KubernetesObject,
         precondition: Option<&control_plane::projection::LiveObjectIdentity>,
     ) -> control_plane::KubernetesClientResult<()> {
-        let object_ref = control_plane::rendered_object_ref(object);
+        let object_ref = object.object_ref();
         let key = lifecycle_object_key(&object_ref);
         let mut objects = self.objects.lock().unwrap();
         let mut metadata =
@@ -372,7 +372,7 @@ impl control_plane::KubernetesMaterializerClient for FaultyKubernetes {
         precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> control_plane::KubernetesClientFuture<'a, control_plane::KubernetesClientResult<()>> {
         Box::pin(async move {
-            if !Self::is_workload(&control_plane::rendered_object_ref(object)) {
+            if !Self::is_workload(&object.object_ref()) {
                 return self.create_or_patch(object, precondition);
             }
             let mutation = if precondition.is_some() {
