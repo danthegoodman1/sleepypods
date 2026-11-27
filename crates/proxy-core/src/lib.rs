@@ -25,8 +25,8 @@ pub use http::{
     strip_hop_by_hop_headers, upstream_request_uri, AppHttpProxy, AppHttpProxyError, AppProtocol,
     HttpProxy, HttpProxyError, InvalidAppProtocol, ReverseProxyRequestError, TrackedBody,
 };
-pub use listener::{configure_socket, serve_listener, Accept};
-pub use pod_route::{accept_instance_claim, InvalidPodRoute, PodRoute, SidecarIo};
+pub use listener::{close_refused, configure_socket, serve_listener, Accept};
+pub use pod_route::{read_instance_claim, InvalidPodRoute, PodRoute, SidecarIo};
 pub use resources::{AdmittedIo, InvalidProxyResourceConfig, ProxyAdmission, ProxyResourceConfig};
 pub use shutdown::Shutdown;
 pub use tcp::{proxy_streams_with_timeouts, TcpProxy, TcpProxyConfig, TcpProxyError};

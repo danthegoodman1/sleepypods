@@ -14,7 +14,16 @@ use tokio::{
     time::{timeout, Instant},
 };
 
-use super::{accept_instance_claim, claim_line, PodRoute, PodRoutes, POD_ATTEMPT_TIMEOUT};
+use super::{claim_line, read_instance_claim, PodRoute, PodRoutes, SidecarIo, POD_ATTEMPT_TIMEOUT};
+
+/// A sidecar's view of a connection after its claim.
+async fn accept_instance_claim<IO>(mut io: IO, instance_id: &str) -> std::io::Result<SidecarIo<IO>>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let first = read_instance_claim(&mut io, instance_id).await?;
+    Ok(SidecarIo::new(io, first))
+}
 
 fn route(instance: &str, address: &str) -> PodRoute {
     PodRoute::new(instance, 9, address.parse().unwrap()).unwrap()

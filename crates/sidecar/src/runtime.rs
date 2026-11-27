@@ -159,29 +159,37 @@ where
     let setup_timeout = config.admission.config().setup_timeout();
     let instance_id: Arc<str> = config.instance_id.as_str().into();
     let connections = serve_listener(listener, &shutdown, |stream, _| {
-        let stream = config.admission.admit_io(stream).ok()?;
-        let handshake = config.admission.handshakes.try_acquire().ok()?;
-        let initial_work = serving.drain.try_acquire().ok()?;
+        let Ok(handshake) = config.admission.handshakes.try_acquire() else {
+            return Err(stream);
+        };
+        let stream = config.admission.admit_io(stream)?;
+        // A refused socket is not activity, so drain work starts last.
+        let Ok(initial_work) = serving.drain.try_acquire() else {
+            return Err(stream.into_inner());
+        };
         let proxy = serving.proxy.clone();
         let upgrades = upgrades.clone();
         let (admission, shutdown) = (config.admission.clone(), shutdown.clone());
         let instance_id = instance_id.clone();
-        Some(async move {
-            // A connection that claims another instance closes before any
-            // request reaches the app.
-            let claimed = tokio::time::timeout(
+        Ok(async move {
+            let mut stream = stream;
+            let claim = tokio::time::timeout(
                 setup_timeout,
-                proxy_core::accept_instance_claim(stream, &instance_id),
+                proxy_core::read_instance_claim(&mut stream, &instance_id),
             );
-            let stream = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                claimed = claimed => match claimed {
-                    Ok(Ok(stream)) => stream,
-                    _ => return,
-                },
+            let opened = tokio::select! {
+                _ = shutdown.cancelled() => None,
+                opened = claim => opened.ok().and_then(Result::ok),
+            };
+            // A claim for another instance, a malformed or late one, or a
+            // shutdown closes the connection before any request reaches the
+            // app.
+            let Some(first) = opened else {
+                proxy_core::close_refused(stream.into_inner());
+                return;
             };
             proxy_core::serve_http_connection_admitted(
-                stream,
+                proxy_core::SidecarIo::new(stream, first),
                 shutdown,
                 admission,
                 handshake,
@@ -209,10 +217,14 @@ where
     let serving = Serving::start(&config, client);
 
     let connections = serve_listener(listener, &shutdown, |stream, _| {
-        let connection = config.admission.connections.try_acquire().ok()?;
-        let request = config.admission.requests.try_acquire().ok()?;
+        let (Ok(connection), Ok(request)) = (
+            config.admission.connections.try_acquire(),
+            config.admission.requests.try_acquire(),
+        ) else {
+            return Err(stream);
+        };
         let proxy = serving.proxy.clone();
-        Some(async move {
+        Ok(async move {
             let (_connection, _request) = (connection, request);
             let _ = proxy.forward_tcp(stream).await;
         })

@@ -22,8 +22,10 @@ pub async fn serve_readiness(listener: impl Accept, app_addr: SocketAddr, shutdo
         .expect("fixed health deadlines are valid");
     let admission = ProxyAdmission::new(config);
     let mut connections = serve_listener(listener, &shutdown, |stream, _| {
-        let io = admission.admit_io(stream).ok()?;
-        let handshake = admission.handshakes.try_acquire().ok()?;
+        let Ok(handshake) = admission.handshakes.try_acquire() else {
+            return Err(stream);
+        };
+        let io = admission.admit_io(stream)?;
         let connection = proxy_core::serve_http_connection_admitted(
             io,
             shutdown.clone(),
@@ -34,7 +36,7 @@ pub async fn serve_readiness(listener: impl Accept, app_addr: SocketAddr, shutdo
         );
         // Health exchanges are tiny and have a total one-second budget, so
         // idle keepalive clients cannot occupy every health slot indefinitely.
-        Some(async move {
+        Ok(async move {
             let _ = tokio::time::timeout(HEALTH_IO_TIMEOUT, connection).await;
         })
     })

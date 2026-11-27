@@ -58,11 +58,12 @@ sidecar -> frontline   the same line
 
 - The sidecar echoes a claim that names its own `SLEEPYPODS_INSTANCE_ID` and
   then serves the connection as HTTP/1.1 or HTTP/2. It closes a connection
-  whose claim names another instance, is malformed, or is followed by other
-  bytes before the echo, so its app never sees a request meant for another
-  instance. A connection whose first byte is not `\0` is plain HTTP; Service
-  connections are plain HTTP. The claim has the setup deadline, and the first
-  request's headers then have their own.
+  whose claim names another instance, is malformed, is followed by other bytes
+  before the echo, or misses the setup deadline, so its app never sees a
+  request meant for another instance. The close is the one an excess socket
+  gets: FIN, then the unread input discarded. A connection whose first byte is
+  not `\0` is plain HTTP; Service connections are plain HTTP. The first
+  request's headers have their own setup deadline after the claim.
 - Frontline sends no request byte until it has read the exact echo. The TCP
   connect and the echo share a 250 ms deadline, or the remaining setup budget
   when that is shorter. A refused connection, a missing or different echo, or
@@ -296,12 +297,14 @@ termination and SNI passthrough listeners.
 | `SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS` | 60000 | Response-header wait without upload-byte progress |
 | `SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS` | 60000 | Pending socket/stream delivery writes, including TCP/SNI |
 
-Admission has no wait queue: excess accepted sockets are closed before spawning
-connection work; excess HTTP requests return 503 with Retry-After: 1. Hyper also
-limits h2 streams before service dispatch. Pooled HTTP upstream saturation returns
-503 until an active socket closes or idle eviction frees a slot. WS/TCP/SNI
-upstream sockets follow their admitted active sessions and are separate from the
-HTTP pool cap.
+Admission has no wait queue. An excess accepted socket closes before any
+connection work starts: it sends FIN, then discards up to 64 KiB the client has
+already sent, such as a ClientHello, so the client and any relay in front of the
+proxy, such as `kubectl port-forward`, read end of stream. Excess HTTP requests
+return 503 with Retry-After: 1. Hyper also limits h2 streams before service
+dispatch. Pooled HTTP upstream saturation returns 503 until an active socket
+closes or idle eviction frees a slot. WS/TCP/SNI upstream sockets follow their
+admitted active sessions and are separate from the HTTP pool cap.
 
 Both the upload body and produced response buffers retain request admission and
 drain activity until their queued bytes are delivered or canceled, even for a

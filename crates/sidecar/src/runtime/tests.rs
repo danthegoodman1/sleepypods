@@ -235,14 +235,31 @@ async fn a_claim_for_another_instance_closes_before_the_app_and_a_claim_for_this
     )
     .await;
 
-    let mut stale = TcpStream::connect(runtime_addr).await.unwrap();
-    stale
-        .write_all(b"\0sleepypods-instance other-instance\n")
-        .await
-        .unwrap();
-    let mut reply = Vec::new();
-    let _ = stale.read_to_end(&mut reply).await;
-    assert!(reply.is_empty(), "{reply:?}");
+    // A refused claim ends in a clean end of stream, even with a request
+    // still unread behind it.
+    let request = format!(
+        "GET /keepalive-one HTTP/1.1\r\nx-padding: {}\r\n\r\n",
+        "a".repeat(8192)
+    );
+    for opening in [
+        b"\0sleepypods-instance other-instance\n".to_vec(),
+        [
+            &b"\0sleepypods-instance other-instance\n"[..],
+            request.as_bytes(),
+        ]
+        .concat(),
+        [
+            &b"\0sleepypods-instance test-instance\n"[..],
+            request.as_bytes(),
+        ]
+        .concat(),
+    ] {
+        let mut stale = TcpStream::connect(runtime_addr).await.unwrap();
+        stale.write_all(&opening).await.unwrap();
+        let mut reply = Vec::new();
+        stale.read_to_end(&mut reply).await.unwrap();
+        assert!(reply.is_empty(), "{reply:?}");
+    }
     assert_eq!(upstream_connections.load(Ordering::Acquire), 0);
 
     let claim = b"\0sleepypods-instance test-instance\n";

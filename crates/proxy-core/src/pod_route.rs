@@ -184,10 +184,12 @@ async fn claim(stream: &mut TcpStream, line: &[u8]) -> io::Result<()> {
 }
 
 /// Reads a connection's instance claim, if it opens with one, and echoes it
-/// when it names `instance_id`. A claim for another instance, or a malformed
-/// one, is an error and the caller closes the connection. A connection that
-/// opens with any other byte is returned with that byte unread.
-pub async fn accept_instance_claim<IO>(mut io: IO, instance_id: &str) -> io::Result<SidecarIo<IO>>
+/// when it names `instance_id`. Returns `None` after the echo, or the first
+/// byte of a connection that opens with anything else, which is plain HTTP;
+/// [`SidecarIo::new`] then serves the connection. A claim for another
+/// instance, or a malformed one, is an error, and the caller closes the
+/// connection without serving a request.
+pub async fn read_instance_claim<IO>(io: &mut IO, instance_id: &str) -> io::Result<Option<u8>>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -196,10 +198,7 @@ where
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     if line[0] != CLAIM_MARK {
-        return Ok(SidecarIo {
-            first: Some(line[0]),
-            io,
-        });
+        return Ok(Some(line[0]));
     }
     let mut length = 1;
     // The client sends nothing after its claim until the echo arrives.
@@ -228,7 +227,7 @@ where
     }
     io.write_all(&expected).await?;
     io.flush().await?;
-    Ok(SidecarIo { first: None, io })
+    Ok(None)
 }
 
 fn claim_line(instance_id: &str) -> Vec<u8> {
@@ -259,12 +258,19 @@ pub(crate) fn authority_without_userinfo(authority: &Authority) -> &str {
     value.rsplit_once('@').map_or(value, |(_, host)| host)
 }
 
-/// A sidecar connection after [`accept_instance_claim`]: a plain HTTP
+/// A sidecar connection after [`read_instance_claim`]: a plain HTTP
 /// connection yields its first byte again.
 #[derive(Debug)]
 pub struct SidecarIo<IO> {
     first: Option<u8>,
     io: IO,
+}
+
+impl<IO> SidecarIo<IO> {
+    /// `io` after [`read_instance_claim`] returned `first`.
+    pub fn new(io: IO, first: Option<u8>) -> Self {
+        Self { first, io }
+    }
 }
 
 impl<IO: AsyncRead + Unpin> AsyncRead for SidecarIo<IO> {
