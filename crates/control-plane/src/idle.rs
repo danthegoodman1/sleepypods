@@ -203,7 +203,7 @@ where
 {
     if request.pod_uid.trim().is_empty() {
         return Err(ReportIdleError::UnsupportedSleep(
-            "pod_uid is required; legacy sidecars cannot authorize automatic sleep".to_owned(),
+            "pod_uid is required to authorize automatic sleep".to_owned(),
         ));
     }
     let class = store
