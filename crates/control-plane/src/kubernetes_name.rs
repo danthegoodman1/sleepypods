@@ -2,11 +2,14 @@ use crate::ids::InstanceId;
 use sha2::{Digest, Sha256};
 
 pub(crate) const DNS_LABEL_MAX_LEN: usize = 63;
+/// A StatefulSet stamps `<name>-<revision hash>` on its Pods as a label value,
+/// which leaves the name 52 of a label's 63 characters.
+pub(crate) const STATEFUL_SET_NAME_MAX_LEN: usize = 52;
 const INSTANCE_ID_HASH_HEX_LEN: usize = 16;
 const INSTANCE_ID_SEPARATOR_LEN: usize = 1;
 
 pub fn render_instance_scoped_name(base: &str, instance_id: &InstanceId) -> String {
-    let suffix = instance_id_suffix(instance_id);
+    let suffix = instance_suffix(instance_id);
     let base_budget = DNS_LABEL_MAX_LEN - INSTANCE_ID_SEPARATOR_LEN - suffix.len();
     let base = truncate_to_byte_len(base, base_budget);
 
@@ -29,7 +32,8 @@ pub(crate) fn is_dns_label(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
-fn instance_id_suffix(instance_id: &InstanceId) -> String {
+/// The hash every instance-scoped object name ends in.
+pub(crate) fn instance_suffix(instance_id: &InstanceId) -> String {
     let digest = Sha256::digest(instance_id.as_str().as_bytes());
     digest
         .iter()

@@ -205,11 +205,14 @@ where
         &self,
         request: Request<pb::CreateWorkloadClassVersionRequest>,
     ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
+        let request = create_workload_class_request_from_proto(request.into_inner())?;
+        request
+            .workload_class_version
+            .validate_renderable(self.target.namespace())
+            .map_err(invalid_argument_status)?;
         let workload_class = self
             .store
-            .create_workload_class_version(create_workload_class_request_from_proto(
-                request.into_inner(),
-            )?)
+            .create_workload_class_version(request)
             .await
             .map_err(store_error_to_status)?;
 
@@ -241,9 +244,28 @@ where
         &self,
         request: Request<pb::CreateInstanceRequest>,
     ) -> Result<Response<pb::Instance>, Status> {
+        let request = create_instance_request_from_proto(request.into_inner())?;
+        let workload_class = self
+            .store
+            .load_workload_class_version(domain_workload::LoadWorkloadClassVersionRequest::new(
+                request.workload_class.clone(),
+            ))
+            .await
+            .map_err(store_error_to_status)?
+            .ok_or_else(|| Status::not_found("workload class version not found"))?;
+        let request = request
+            .validate_values_against(&workload_class)
+            .map_err(invalid_argument_status)?;
+        request
+            .validate_renders(
+                &workload_class,
+                self.target.namespace(),
+                self.materializer.render_options(),
+            )
+            .map_err(invalid_argument_status)?;
         let result = self
             .store
-            .create_instance(create_instance_request_from_proto(request.into_inner())?)
+            .create_instance(request)
             .await
             .map_err(store_error_to_status)?;
 
@@ -587,8 +609,6 @@ fn create_workload_class_request_from_proto(
             .map(workload_exclusivity_key_from_proto)
             .collect::<Result<_, _>>()?,
     };
-    workload_class.validate().map_err(invalid_argument_status)?;
-
     Ok(domain_workload::CreateWorkloadClassVersionRequest::new(
         workload_class,
     ))
@@ -700,8 +720,11 @@ fn route_identity_from_proto(
     }
 }
 
+/// A binding's host is a DNS name a request can carry: frontline looks up the
+/// lowercased `Host` or SNI name without its port, so any other spelling would
+/// store a route that matches nothing.
 fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost, Status> {
-    match pb::RouteHostKind::try_from(host.kind)
+    let host = match pb::RouteHostKind::try_from(host.kind)
         .map_err(|_| Status::invalid_argument("route host kind is invalid"))?
     {
         pb::RouteHostKind::Exact => {
@@ -713,7 +736,21 @@ fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost,
         pb::RouteHostKind::Unspecified => {
             Err(Status::invalid_argument("route host kind is required"))
         }
+    }?;
+    let is_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+            })
+    };
+    if host.as_str().len() > 253 || !host.as_str().split('.').all(is_label) {
+        return Err(Status::invalid_argument(
+            "route host must be an ASCII DNS name or IPv4 address without a port or path",
+        ));
     }
+    Ok(host)
 }
 
 fn protocol_from_proto(protocol: i32) -> Result<domain_route::ProtocolRoute, Status> {

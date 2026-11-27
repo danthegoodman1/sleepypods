@@ -10,8 +10,9 @@ use super::{
     PersistentVolumeSource, PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate,
     RawKubernetesObject, RenderManifestOptions, RenderManifestRequest, RenderedManifest,
     ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadKind, WorkloadTemplate, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    VolumeTemplate, WorkloadKind, WorkloadTemplate, INSTANCE_SUFFIX_VALUE,
+    LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
+    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 use crate::materializer::{rendered_object_ref, rendered_object_refs};
 use crate::{
@@ -643,7 +644,7 @@ fn renders_valid_raw_pv_pvc_service_and_stateful_set() {
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: raw-pv-acme
+  name: raw-pv-acme-{suffix}
 spec:
   capacity:
     storage: 1Gi
@@ -651,7 +652,7 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   claimRef:
     namespace: apps
-    name: raw-pvc-acme
+    name: raw-pvc-acme-{suffix}
   hostPath:
     path: /tmp/raw-acme
 "#,
@@ -661,27 +662,26 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: raw-pvc-acme
+  name: raw-pvc-acme-{suffix}
 spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
       storage: 1Gi
-  volumeName: raw-pv-acme
+  volumeName: raw-pv-acme-{suffix}
 "#,
         ),
-        RawKubernetesManifestTemplate {
-            manifest: TemplateText::from_parts([
-                TemplateTextPart::literal(
-                    r#"
+        raw_manifest_parts([
+            TemplateTextPart::literal(
+                r#"
 apiVersion: v1
 kind: Service
 metadata:
   name: raw-svc-"#,
-                ),
-                TemplateTextPart::instance_value("tenant"),
-                TemplateTextPart::literal(
-                    r#"
+            ),
+            TemplateTextPart::instance_value("tenant"),
+            TemplateTextPart::literal(
+                r#"-{suffix}
   finalizers:
     - raw.example.com/protect
 spec:
@@ -693,18 +693,17 @@ spec:
       port: 8080
       targetPort: 8080
 "#,
-                ),
-            ]),
-        },
+            ),
+        ]),
         raw_manifest(
             r#"
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: raw-db-acme
+  name: raw-db-acme-{suffix}
 spec:
   podManagementPolicy: Parallel
-  serviceName: raw-svc-acme
+  serviceName: raw-svc-acme-{suffix}
   selector:
     matchLabels:
       app: raw
@@ -738,11 +737,16 @@ spec:
         vec![
             (
                 ApplyOrder::PersistentVolume,
-                object_ref("v1", "PersistentVolume", "", "raw-pv-acme")
+                object_ref("v1", "PersistentVolume", "", "raw-pv-acme-69856ec0faae6daf")
             ),
             (
                 ApplyOrder::PersistentVolumeClaim,
-                object_ref("v1", "PersistentVolumeClaim", "apps", "raw-pvc-acme")
+                object_ref(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    "apps",
+                    "raw-pvc-acme-69856ec0faae6daf"
+                )
             ),
             (
                 ApplyOrder::Service,
@@ -750,7 +754,7 @@ spec:
             ),
             (
                 ApplyOrder::Service,
-                object_ref("v1", "Service", "apps", "raw-svc-acme")
+                object_ref("v1", "Service", "apps", "raw-svc-acme-69856ec0faae6daf")
             ),
             (
                 ApplyOrder::Workload,
@@ -758,7 +762,12 @@ spec:
             ),
             (
                 ApplyOrder::Workload,
-                object_ref("apps/v1", "StatefulSet", "apps", "raw-db-acme")
+                object_ref(
+                    "apps/v1",
+                    "StatefulSet",
+                    "apps",
+                    "raw-db-acme-69856ec0faae6daf"
+                )
             ),
         ]
     );
@@ -766,7 +775,7 @@ spec:
     let raw_service = rendered
         .objects
         .iter()
-        .find(|object| object_name(&object.object) == "raw-svc-acme")
+        .find(|object| object_name(&object.object) == "raw-svc-acme-69856ec0faae6daf")
         .expect("raw service rendered")
         .to_kubernetes_json();
     let materialization = crate::materialization::MaterializationRecord {
@@ -790,7 +799,7 @@ spec:
             .filter(|object| object.kind == "Service")
             .map(|object| object.name.as_str())
             .collect::<Vec<_>>(),
-        ["svc-acme-69856ec0faae6daf", "raw-svc-acme"],
+        ["svc-acme-69856ec0faae6daf", "raw-svc-acme-69856ec0faae6daf"],
         "stable apply ordering preserves the generated primary Service ahead of raw Services"
     );
     assert_eq!(
@@ -807,7 +816,7 @@ spec:
     let raw_stateful_set = rendered
         .objects
         .iter()
-        .find(|object| object_name(&object.object) == "raw-db-acme")
+        .find(|object| object_name(&object.object) == "raw-db-acme-69856ec0faae6daf")
         .expect("raw stateful set rendered")
         .to_kubernetes_json();
     assert_eq!(
@@ -836,7 +845,7 @@ fn rejects_raw_manifest_with_disallowed_kind() {
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: raw-job
+  name: raw-job-{suffix}
 "#,
     )];
 
@@ -909,7 +918,7 @@ fn rejects_raw_manifest_non_string_namespace() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   namespace: 123
 "#,
     )];
@@ -937,7 +946,7 @@ fn rejects_raw_persistent_volume_with_namespace_key() {
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: raw-pv
+  name: raw-pv-{suffix}
   namespace: apps
 spec:
   persistentVolumeReclaimPolicy: Retain
@@ -994,7 +1003,7 @@ fn rejects_conflicting_raw_sleepypods_labels() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   labels:
     sleepypods.io/instance-id: other-instance
 "#,
@@ -1023,7 +1032,7 @@ fn rejects_non_string_raw_sleepypods_labels() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   labels:
     sleepypods.io/instance-id: 7
 "#,
@@ -1052,7 +1061,7 @@ fn rejects_non_string_raw_annotations() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   annotations:
     example.com/revision: [3]
 "#,
@@ -1086,7 +1095,7 @@ metadata:
         ),
         TemplateTextPart::instance_value("tenant"),
         TemplateTextPart::literal(
-            r#"
+            r#"-{suffix}
 spec:
   capacity:
     storage: 1Gi
@@ -1121,7 +1130,7 @@ fn rejects_a_raw_persistent_volume_whose_reclaim_policy_an_instance_chooses() {
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: raw-pv
+  name: raw-pv-{suffix}
 spec:
   capacity:
     storage: 1Gi
@@ -1165,7 +1174,7 @@ metadata:
         ),
         TemplateTextPart::instance_value("tenant"),
         TemplateTextPart::literal(
-            r#"
+            r#"-{suffix}
 spec:
   capacity:
     storage: 1Gi
@@ -1182,7 +1191,10 @@ spec:
     })
     .expect("a templated raw PV declaring Retain renders");
 
-    assert_eq!(raw_object(&rendered).metadata.name, "raw-pv-acme");
+    assert_eq!(
+        raw_object(&rendered).metadata.name,
+        "raw-pv-acme-69856ec0faae6daf"
+    );
 }
 
 #[test]
@@ -1194,7 +1206,7 @@ fn raw_manifest_binds_an_instance_value_that_spells_a_placeholder_once() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   annotations:
     example.com/first: ""#,
         ),
@@ -1250,7 +1262,7 @@ fn raw_manifest_keeps_literal_text_that_looks_like_a_placeholder() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   annotations:
     example.com/author: "sleepypodsInstanceValue0-"
     example.com/tenant: ""#,
@@ -1292,7 +1304,7 @@ fn raw_manifest_binds_an_instance_value_used_as_a_key() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
   annotations:
     example.com/"#,
         ),
@@ -1346,10 +1358,114 @@ fn rejects_host_path_whose_root_an_instance_value_chooses() {
         error,
         ManifestRenderError::InvalidField {
             field: "volume.source.host_path.path",
-            message: "hostPath path \"/\" must start with a literal absolute directory, so that \
-                      an instance value chooses a subdirectory rather than the root"
+            message: "hostPath path \"/\" must start with a literal absolute directory ending \
+                      in \"/\", so that an instance value chooses a subdirectory of it"
                 .to_owned(),
         }
+    );
+}
+
+#[test]
+fn rejects_host_path_whose_literal_prefix_leaves_its_last_segment_open() {
+    // Without the closing slash the value extends the author's directory name
+    // into a sibling directory.
+    for (prefix, value) in [
+        ("/var/local/sleepypods", "-backup/other-tenant"),
+        ("/", "etc"),
+    ] {
+        let mut template = host_path_stateful_template();
+        template.volumes[0].source = PersistentVolumeSourceTemplate::HostPath {
+            path: TemplateText::from_parts([
+                TemplateTextPart::literal(prefix),
+                TemplateTextPart::instance_value("data_dir"),
+            ]),
+            type_: None,
+        };
+
+        let error = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance(
+                "postgres-a",
+                2,
+                values([("tenant", "acme"), ("data_dir", value)]),
+            ),
+            sleep_policy: sleep_policy(),
+            namespace: "data",
+        })
+        .expect_err("an instance value may not extend the author's directory name");
+
+        assert!(matches!(
+            error,
+            ManifestRenderError::InvalidField {
+                field: "volume.source.host_path.path",
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn raw_object_names_end_with_the_instance_suffix() {
+    let render = |name: &str| {
+        let mut template = deployment_template();
+        template.raw_objects = vec![raw_manifest(&format!(
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: {name}\n"
+        ))];
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+        })
+    };
+
+    let rendered = render("settings-{suffix}").expect("a suffixed raw name renders");
+    assert_eq!(
+        raw_object(&rendered).metadata.name,
+        "settings-69856ec0faae6daf"
+    );
+    for name in ["settings", "settings-acme", "settings{suffix}", "{suffix}"] {
+        assert_invalid_field(
+            render(name).expect_err("a raw name needs the instance suffix"),
+            "raw_objects.manifest.metadata.name",
+            "instance suffix",
+        );
+    }
+}
+
+#[test]
+fn stateful_set_and_service_names_follow_their_kubernetes_limits() {
+    let render = |kind: WorkloadKind, workload: &str, service: &str| {
+        let mut template = stateful_template();
+        template.volumes.clear();
+        template.workload.kind = kind;
+        template.workload.name = TemplateText::literal(workload);
+        template.service.as_mut().expect("service").name = TemplateText::literal(service);
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "data",
+        })
+    };
+    // The suffix takes 17 of a StatefulSet name's 52 characters.
+    let fits = "d".repeat(35);
+    let overlong = "d".repeat(36);
+
+    render(WorkloadKind::StatefulSet, &fits, "db").expect("a 52-character name renders");
+    assert_invalid_field(
+        render(WorkloadKind::StatefulSet, &overlong, "db")
+            .expect_err("a StatefulSet name over 52 characters is rejected"),
+        "workload.name",
+        "52 characters",
+    );
+    render(WorkloadKind::Deployment, &overlong, "db")
+        .expect("a Deployment keeps the full DNS label length");
+    assert_invalid_field(
+        render(WorkloadKind::Deployment, "db", "9db")
+            .expect_err("a Service name starts with a letter"),
+        "service.name",
+        "must start with a letter",
     );
 }
 
@@ -1418,7 +1534,7 @@ fn raw_rendered_object_refs_are_available_without_applying() {
 apiVersion: v1
 kind: Service
 metadata:
-  name: raw-svc
+  name: raw-svc-{suffix}
 "#,
     )];
 
@@ -1436,7 +1552,7 @@ metadata:
         refs,
         vec![
             object_ref("v1", "Service", "apps", "svc-acme-69856ec0faae6daf"),
-            object_ref("v1", "Service", "apps", "raw-svc"),
+            object_ref("v1", "Service", "apps", "raw-svc-69856ec0faae6daf"),
             object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0faae6daf"),
         ]
     );
@@ -2553,14 +2669,26 @@ fn composed(prefix: &str, field: &str) -> TemplateText {
 }
 
 fn raw_manifest(manifest: &str) -> RawKubernetesManifestTemplate {
-    RawKubernetesManifestTemplate {
-        manifest: TemplateText::literal(manifest),
-    }
+    raw_manifest_parts([TemplateTextPart::literal(manifest)])
 }
 
+/// `{suffix}` in a literal part reads the platform's instance suffix value.
 fn raw_manifest_parts(parts: impl Into<Vec<TemplateTextPart>>) -> RawKubernetesManifestTemplate {
+    let mut expanded = Vec::new();
+    for part in parts.into() {
+        let TemplateTextPart::Literal(literal) = part else {
+            expanded.push(part);
+            continue;
+        };
+        let mut pieces = literal.split("{suffix}");
+        expanded.push(TemplateTextPart::literal(pieces.next().unwrap_or_default()));
+        for piece in pieces {
+            expanded.push(TemplateTextPart::instance_value(INSTANCE_SUFFIX_VALUE));
+            expanded.push(TemplateTextPart::literal(piece));
+        }
+    }
     RawKubernetesManifestTemplate {
-        manifest: TemplateText::from_parts(parts),
+        manifest: TemplateText::from_parts(expanded),
     }
 }
 
@@ -2761,7 +2889,7 @@ fn raw_auxiliary_workloads_never_match_primary_service_selector() {
 apiVersion: apps/v1
 kind: {kind}
 metadata:
-  name: auxiliary
+  name: auxiliary-{{suffix}}
 spec:
   selector:
     matchLabels:
@@ -2871,7 +2999,7 @@ fn raw_service_named_proxy_target_remains_compatible_when_app_name_does_not_coll
 apiVersion: v1
 kind: Service
 metadata:
-  name: primary-alias
+  name: primary-alias-{suffix}
 spec:
   selector:
     sleepypods.io/instance-id: instance-a

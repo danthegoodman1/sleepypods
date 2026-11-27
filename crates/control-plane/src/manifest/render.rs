@@ -4,7 +4,9 @@ use serde_json::{Map, Value};
 
 use crate::{
     instance::InstanceRecord,
-    kubernetes_name::{is_dns_label, render_instance_scoped_name},
+    kubernetes_name::{
+        instance_suffix, is_dns_label, render_instance_scoped_name, STATEFUL_SET_NAME_MAX_LEN,
+    },
 };
 
 use super::{
@@ -19,8 +21,8 @@ use super::{
     RawKubernetesObject, RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret,
     SecretKeyRef, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet,
     StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
-    WorkloadKind, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
-    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    WorkloadKind, INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
 const CONTROL_PLANE_SERVICE_NAME: &str = "sleepypods-control-plane";
@@ -54,26 +56,42 @@ pub(crate) fn render_manifests_with_options(
     request.template.validate_storage_retention()?;
     validate_namespace(request.namespace)?;
 
-    let workload_name = render_object_name(
+    let suffix = instance_suffix(&request.instance.id);
+    let mut instance = request.instance.clone();
+    instance
+        .values
+        .insert(INSTANCE_SUFFIX_VALUE.to_owned(), suffix.clone());
+    let instance = &instance;
+
+    let workload_name =
+        render_object_name("workload.name", &request.template.workload.name, instance)?;
+    validate_kind_name(
         "workload.name",
-        &request.template.workload.name,
-        request.instance,
+        match request.template.workload.kind {
+            WorkloadKind::Deployment => "Deployment",
+            WorkloadKind::StatefulSet => "StatefulSet",
+        },
+        &workload_name,
     )?;
     let service_name = request
         .template
         .service
         .as_ref()
-        .map(|service| render_object_name("service.name", &service.name, request.instance))
+        .map(|service| {
+            let name = render_object_name("service.name", &service.name, instance)?;
+            validate_kind_name("service.name", "Service", &name)?;
+            Ok(name)
+        })
         .transpose()?;
-    let selector_labels = selector_labels(request.instance, &workload_name)?;
-    let metadata_labels = metadata_labels(request.instance, &workload_name)?;
-    let sidecar = render_sidecar_config(request.template, request.instance)?;
+    let selector_labels = selector_labels(instance, &workload_name)?;
+    let metadata_labels = metadata_labels(instance, &workload_name)?;
+    let sidecar = render_sidecar_config(request.template, instance)?;
 
     let rendered_volumes = request
         .template
         .volumes
         .iter()
-        .map(|volume| render_volume(volume, request.instance, request.namespace))
+        .map(|volume| render_volume(volume, instance, request.namespace))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut objects = Vec::new();
@@ -147,7 +165,7 @@ pub(crate) fn render_manifests_with_options(
     }
 
     let sidecar_token_secret_name = if let Some(token) = options.sidecar_control_plane_token {
-        let name = render_instance_scoped_name("sleepypods-sidecar-token", &request.instance.id);
+        let name = render_instance_scoped_name("sleepypods-sidecar-token", &instance.id);
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::Secret,
             object: KubernetesObject::Secret(Secret {
@@ -178,12 +196,12 @@ pub(crate) fn render_manifests_with_options(
             containers: vec![
                 render_app_container(
                     &request.template.workload.app_container,
-                    request.instance,
+                    instance,
                     &rendered_volumes,
                 )?,
                 render_sidecar_container(
                     &request.template.sidecar,
-                    request.instance,
+                    instance,
                     &sidecar,
                     request.namespace,
                     request.sleep_policy,
@@ -257,7 +275,8 @@ pub(crate) fn render_manifests_with_options(
     for raw in &request.template.raw_objects {
         objects.push(render_raw_object(
             raw,
-            request.instance,
+            instance,
+            &suffix,
             request.namespace,
             &auxiliary_labels,
         )?);
@@ -276,6 +295,7 @@ pub(crate) fn render_manifests_with_options(
 fn render_raw_object(
     template: &RawKubernetesManifestTemplate,
     instance: &InstanceRecord,
+    suffix: &str,
     namespace: &str,
     metadata_labels: &BTreeMap<String, String>,
 ) -> Result<RenderedManifestObject, ManifestRenderError> {
@@ -319,6 +339,19 @@ fn render_raw_object(
         })?;
     let name = required_string_field(metadata, "name", "raw_objects.manifest.metadata.name")?;
     validate_dns_label("raw_objects.manifest.metadata.name", &name)?;
+    validate_kind_name("raw_objects.manifest.metadata.name", &kind, &name)?;
+    if !name
+        .strip_suffix(suffix)
+        .is_some_and(|base| base.ends_with('-'))
+    {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata.name",
+            message: format!(
+                "name {name:?} must end with \"-\" and the instance suffix; \
+                 read it from instance value {INSTANCE_SUFFIX_VALUE:?}"
+            ),
+        });
+    }
 
     let effective_namespace = raw_effective_namespace(metadata, namespace, namespaced)?;
     if namespaced {
@@ -1118,12 +1151,14 @@ fn validate_host_path(template: &TemplateText, rendered: &str) -> Result<(), Man
             message: format!("hostPath path {rendered:?} must be absolute"),
         });
     }
-    if !template.literal_prefix().starts_with('/') {
+    let prefix = template.literal_prefix();
+    let reads_values = template.referenced_values().next().is_some();
+    if !prefix.starts_with('/') || (reads_values && (prefix == "/" || !prefix.ends_with('/'))) {
         return Err(ManifestRenderError::InvalidField {
             field: "volume.source.host_path.path",
             message: format!(
-                "hostPath path {rendered:?} must start with a literal absolute directory, \
-                 so that an instance value chooses a subdirectory rather than the root"
+                "hostPath path {rendered:?} must start with a literal absolute directory \
+                 ending in \"/\", so that an instance value chooses a subdirectory of it"
             ),
         });
     }
@@ -1136,6 +1171,26 @@ fn validate_host_path(template: &TemplateText, rendered: &str) -> Result<(), Man
         });
     }
     Ok(())
+}
+
+/// Applies the name rules Kubernetes adds for a kind on top of a DNS label.
+fn validate_kind_name(
+    field: &'static str,
+    kind: &str,
+    name: &str,
+) -> Result<(), ManifestRenderError> {
+    let message = match kind {
+        "StatefulSet" if name.len() > STATEFUL_SET_NAME_MAX_LEN => format!(
+            "StatefulSet name {name:?} has {} characters; Kubernetes allows \
+             {STATEFUL_SET_NAME_MAX_LEN} characters so that Pod labels fit",
+            name.len()
+        ),
+        "Service" if !name.starts_with(|first: char| first.is_ascii_lowercase()) => {
+            format!("Service name {name:?} must start with a letter")
+        }
+        _ => return Ok(()),
+    };
+    Err(ManifestRenderError::InvalidField { field, message })
 }
 
 fn validate_namespace(namespace: &str) -> Result<(), ManifestRenderError> {

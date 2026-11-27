@@ -1,9 +1,12 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    ids::{Generation, WorkloadClassId},
-    instance::InstanceValues,
-    manifest::{ManifestRenderError, ManifestTemplate, TemplateText, TemplateTextPart},
+    ids::{Generation, InstanceId, WorkloadClassId},
+    instance::{InstanceRecord, InstanceState, InstanceValues},
+    manifest::{
+        render_manifests, ManifestRenderError, ManifestTemplate, RenderManifestRequest,
+        TemplateText, TemplateTextPart, INSTANCE_SUFFIX_VALUE, RESERVED_VALUE_PREFIX,
+    },
     sleep_policy::{SleepPolicyError, WorkloadSleepPolicy},
 };
 
@@ -62,6 +65,8 @@ pub enum ValueSchemaError {
     UnknownField { field: String },
     ControlCharacter { field: String, character: char },
     TooLong { field: String, length: usize },
+    ReservedField { field: String },
+    UndeclaredReference { field: String },
 }
 
 /// An instance value fills one scalar of a manifest, so it stays printable text
@@ -90,6 +95,8 @@ pub enum WorkloadClassValidationError {
     ReplicaContract(ManifestRenderError),
     StorageContract(ManifestRenderError),
     ExclusivityKey(WorkloadExclusivityKeyError),
+    ValueSchema(ValueSchemaError),
+    Render(ManifestRenderError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +143,66 @@ impl WorkloadClassVersion {
             key.validate(index)
                 .map_err(WorkloadClassValidationError::ExclusivityKey)?;
         }
+
+        Ok(())
+    }
+
+    /// Checks that instances of this class can render in `namespace`: the
+    /// schema declares every value a template reads, and the manifest renders
+    /// for an instance that supplies each declared value. `CreateInstance`
+    /// renders again with the instance's own values.
+    pub fn validate_renderable(&self, namespace: &str) -> Result<(), WorkloadClassValidationError> {
+        self.validate()?;
+        self.value_schema
+            .validate_declarations()
+            .map_err(WorkloadClassValidationError::ValueSchema)?;
+        let manifest_values = self.template.referenced_values();
+        let key_values = self
+            .exclusivity_keys
+            .iter()
+            .flat_map(|key| key.value.referenced_values());
+        for field in manifest_values
+            .iter()
+            .copied()
+            .filter(|field| *field != INSTANCE_SUFFIX_VALUE)
+            .chain(key_values)
+        {
+            if !self.value_schema.supplies(field) {
+                return Err(WorkloadClassValidationError::ValueSchema(
+                    ValueSchemaError::UndeclaredReference {
+                        field: field.to_owned(),
+                    },
+                ));
+            }
+        }
+
+        let defaults = self.value_schema.defaults();
+        let sleep_policy = self
+            .sleep_policy
+            .resolve(&defaults)
+            .map_err(WorkloadClassValidationError::SleepPolicy)?;
+        let mut values = defaults;
+        for (index, field) in self.value_schema.fields.keys().enumerate() {
+            values
+                .entry(field.clone())
+                .or_insert_with(|| format!("v{index}"));
+        }
+        let instance = InstanceRecord {
+            id: InstanceId::new("instance").expect("literal instance ID is valid"),
+            workload_class: self.reference.clone(),
+            values,
+            state: InstanceState::Cold,
+            generation: Generation::new(1),
+        };
+        render_manifests(RenderManifestRequest {
+            template: &self.template,
+            instance: &instance,
+            sleep_policy,
+            namespace,
+        })
+        .map_err(WorkloadClassValidationError::Render)?;
+        self.render_exclusivity_keys(&instance.values)
+            .map_err(WorkloadClassValidationError::Render)?;
 
         Ok(())
     }
@@ -187,10 +254,47 @@ impl WorkloadValueSchema {
         self
     }
 
+    /// Field names under the platform's prefix are supplied by the platform.
+    fn validate_declarations(&self) -> Result<(), ValueSchemaError> {
+        match self
+            .fields
+            .keys()
+            .find(|field| field.starts_with(RESERVED_VALUE_PREFIX))
+        {
+            Some(field) => Err(ValueSchemaError::ReservedField {
+                field: field.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether every instance of the class carries `field`.
+    fn supplies(&self, field: &str) -> bool {
+        self.fields
+            .get(field)
+            .is_some_and(|rule| rule.required || rule.default.is_some())
+    }
+
+    fn defaults(&self) -> InstanceValues {
+        self.fields
+            .iter()
+            .filter_map(|(field, rule)| Some((field.clone(), rule.default.clone()?)))
+            .collect()
+    }
+
     pub fn validate_values(
         &self,
         values: &InstanceValues,
     ) -> Result<InstanceValues, ValueSchemaError> {
+        if let Some(field) = values
+            .keys()
+            .find(|field| field.starts_with(RESERVED_VALUE_PREFIX))
+        {
+            return Err(ValueSchemaError::ReservedField {
+                field: field.clone(),
+            });
+        }
+
         if !self.allow_extra {
             for field in values.keys() {
                 if !self.fields.contains_key(field) {
@@ -334,6 +438,16 @@ impl fmt::Display for ValueSchemaError {
                 "instance value {field:?} is {length} bytes, over the \
                  {MAX_INSTANCE_VALUE_LENGTH} byte limit"
             ),
+            Self::ReservedField { field } => write!(
+                f,
+                "instance value {field:?} is reserved; names starting with \
+                 {RESERVED_VALUE_PREFIX:?} belong to the platform"
+            ),
+            Self::UndeclaredReference { field } => write!(
+                f,
+                "a template reads instance value {field:?}; declare it in the value schema \
+                 as required or with a default"
+            ),
         }
     }
 }
@@ -354,8 +468,11 @@ impl fmt::Display for WorkloadClassValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SleepPolicy(error) => write!(f, "{error}"),
-            Self::ReplicaContract(error) | Self::StorageContract(error) => write!(f, "{error}"),
+            Self::ReplicaContract(error) | Self::StorageContract(error) | Self::Render(error) => {
+                write!(f, "{error}")
+            }
             Self::ExclusivityKey(error) => write!(f, "{error}"),
+            Self::ValueSchema(error) => write!(f, "{error}"),
         }
     }
 }
@@ -364,8 +481,11 @@ impl Error for WorkloadClassValidationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SleepPolicy(error) => Some(error),
-            Self::ReplicaContract(error) | Self::StorageContract(error) => Some(error),
+            Self::ReplicaContract(error) | Self::StorageContract(error) | Self::Render(error) => {
+                Some(error)
+            }
             Self::ExclusivityKey(error) => Some(error),
+            Self::ValueSchema(error) => Some(error),
         }
     }
 }

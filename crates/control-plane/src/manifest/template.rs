@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,65 @@ pub struct ManifestTemplate {
 }
 
 impl ManifestTemplate {
+    /// Every instance value the manifest's template texts read.
+    pub fn referenced_values(&self) -> BTreeSet<&str> {
+        let mut texts = vec![
+            &self.workload.name,
+            &self.workload.app_container.image,
+            &self.sidecar.image,
+        ];
+        texts.extend(self.workload.app_container.env.iter().map(|env| &env.value));
+        texts.extend(self.service.iter().map(|service| &service.name));
+        for volume in &self.volumes {
+            texts.extend([
+                &volume.mount_path,
+                &volume.pv_name,
+                &volume.pvc_name,
+                &volume.capacity,
+            ]);
+            texts.extend(&volume.storage_class_name);
+            match &volume.source {
+                PersistentVolumeSourceTemplate::Csi {
+                    driver,
+                    volume_handle,
+                    fs_type,
+                    read_only: _,
+                    volume_attributes,
+                    controller_publish_secret_ref,
+                    node_stage_secret_ref,
+                    node_publish_secret_ref,
+                    controller_expand_secret_ref,
+                    node_expand_secret_ref,
+                } => {
+                    texts.extend([driver, volume_handle]);
+                    texts.extend(fs_type);
+                    texts.extend(volume_attributes.values());
+                    for secret in [
+                        controller_publish_secret_ref,
+                        node_stage_secret_ref,
+                        node_publish_secret_ref,
+                        controller_expand_secret_ref,
+                        node_expand_secret_ref,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        texts.extend([&secret.name, &secret.namespace]);
+                    }
+                }
+                PersistentVolumeSourceTemplate::HostPath { path, type_ } => {
+                    texts.push(path);
+                    texts.extend(type_);
+                }
+            }
+        }
+        texts.extend(self.raw_objects.iter().map(|raw| &raw.manifest));
+        texts
+            .into_iter()
+            .flat_map(TemplateText::referenced_values)
+            .collect()
+    }
+
     pub fn validate_storage_retention(&self) -> Result<(), ManifestRenderError> {
         if self
             .volumes
@@ -220,6 +279,14 @@ impl TemplateText {
 
     pub fn parts(&self) -> &[TemplateTextPart] {
         &self.parts
+    }
+
+    /// The instance values this text reads.
+    pub fn referenced_values(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|part| match part {
+            TemplateTextPart::InstanceValue(field) => Some(field.as_str()),
+            TemplateTextPart::Literal(_) => None,
+        })
     }
 
     /// The text the class author fixed at the front, which renders the same for

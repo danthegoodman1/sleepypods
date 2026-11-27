@@ -1,6 +1,8 @@
 #[macro_use]
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
+#[path = "api_transport/create_validation.rs"]
+mod create_validation;
 mod support;
 use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
 use support::TestStore as FakeInstanceStore;
@@ -249,17 +251,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
     let workload_class = CreateWorkloadClassVersionRequest {
         class_id: "class-1".to_owned(),
         version: 1,
-        value_schema: Some(WorkloadValueSchema {
-            fields: [(
-                "tenant".to_owned(),
-                WorkloadValueFieldRule {
-                    required: true,
-                    default_value: None,
-                },
-            )]
-            .into(),
-            allow_extra: false,
-        }),
+        value_schema: Some(stateful_value_schema()),
         template: Some(stateful_manifest_template_proto()),
         sleep_policy: Some(sleep_policy_proto()),
         exclusivity_keys: vec![],
@@ -310,7 +302,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
 
 #[tokio::test]
 async fn store_backed_instance_methods_create_get_and_delete_instances() {
-    let store = Arc::new(FakeInstanceStore::default());
+    let store = store_with_class("class-1", 7);
     let service = store_operator_api(store.clone());
 
     let created = service
@@ -380,7 +372,7 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 
 #[tokio::test]
 async fn create_instance_creates_its_routes_with_the_instance() {
-    let store = Arc::new(FakeInstanceStore::default());
+    let store = store_with_class("class-1", 7);
     let service = store_operator_api(store.clone());
     let request = |instance_id: &str, routes: Vec<InstanceRoute>| {
         tonic::Request::new(CreateInstanceRequest {
@@ -1182,17 +1174,7 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
             class_id: "class-1".to_owned(),
             version: 1,
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1459,7 +1441,7 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
             class_id: "host-path-class".to_owned(),
             version: 1,
-            value_schema: None,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1502,7 +1484,7 @@ async fn store_backed_workload_class_api_round_trips_csi_secret_refs() {
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
             class_id: "csi-secret-ref-class".to_owned(),
             version: 1,
-            value_schema: None,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1556,6 +1538,14 @@ async fn store_backed_workload_class_api_round_trips_raw_manifest_templates() {
                 TemplateTextPart {
                     kind: Some(template_text_part::Kind::InstanceValue("tenant".to_owned())),
                 },
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::Literal("-".to_owned())),
+                },
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::InstanceValue(
+                        control_plane::manifest::INSTANCE_SUFFIX_VALUE.to_owned(),
+                    )),
+                },
             ],
         }),
     }];
@@ -1564,7 +1554,7 @@ async fn store_backed_workload_class_api_round_trips_raw_manifest_templates() {
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
             class_id: "raw-manifest-class".to_owned(),
             version: 1,
-            value_schema: None,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1615,17 +1605,7 @@ async fn store_backed_workload_class_api_round_trips_exclusivity_keys() {
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
             class_id: "exclusive-class".to_owned(),
             version: 1,
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "volume_handle".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
+            value_schema: Some(value_schema(&["tenant", "volume", "volume_handle"])),
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![key.clone()],
@@ -1853,7 +1833,7 @@ async fn store_backed_workload_class_api_rejects_incomplete_raw_manifest_templat
 
 #[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
-    let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
+    let response = store_operator_grpc_service(store_with_class("class-transport", 3))
         .oneshot(grpc_create_instance_request(
             CreateInstanceRequest {
                 idempotency_key: "create-instance-transport".to_owned(),
@@ -2050,17 +2030,7 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         CreateWorkloadClassVersionRequest {
             class_id: "class-grpc-web".to_owned(),
             version: 11,
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -2091,7 +2061,11 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
                 class_id: "class-grpc-web".to_owned(),
                 version: 11,
             }),
-            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            values: [
+                ("tenant".to_owned(), "acme".to_owned()),
+                ("volume".to_owned(), "vol-1".to_owned()),
+            ]
+            .into(),
             routes: Vec::new(),
         },
     )
@@ -2217,17 +2191,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         CreateWorkloadClassVersionRequest {
             class_id: "class-native".to_owned(),
             version: 13,
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -2258,7 +2222,11 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
                 class_id: "class-native".to_owned(),
                 version: 13,
             }),
-            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            values: [
+                ("tenant".to_owned(), "acme".to_owned()),
+                ("volume".to_owned(), "vol-1".to_owned()),
+            ]
+            .into(),
             routes: Vec::new(),
         },
     )
@@ -2493,7 +2461,7 @@ async fn grpc_web_store_backed_errors_return_structured_status() {
 #[tokio::test]
 async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failures_without_mutation(
 ) {
-    let store = Arc::new(FakeInstanceStore::default());
+    let store = store_with_class("class-auth", 1);
     let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
 
     let valid_response = operator_grpc_web_cors_layer()
@@ -2911,6 +2879,42 @@ fn sni_identity(host: &str) -> RouteIdentity {
             }),
         })),
     }
+}
+
+/// A schema that requires each named value.
+fn value_schema(fields: &[&str]) -> WorkloadValueSchema {
+    WorkloadValueSchema {
+        fields: fields
+            .iter()
+            .map(|field| {
+                (
+                    (*field).to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )
+            })
+            .collect(),
+        allow_extra: false,
+    }
+}
+
+/// The values `stateful_manifest_template_proto` reads.
+fn stateful_value_schema() -> WorkloadValueSchema {
+    value_schema(&["tenant", "volume"])
+}
+
+/// A store holding one class whose instances render with any values.
+fn store_with_class(class_id: &str, version: u64) -> Arc<FakeInstanceStore> {
+    let store = FakeInstanceStore::default();
+    let mut class = support::workload_class();
+    class.reference = control_plane::WorkloadClassVersionRef::new(
+        control_plane::WorkloadClassId::new(class_id).expect("valid class ID"),
+        Generation::new(version),
+    );
+    store.seed_workload_class(class);
+    Arc::new(store)
 }
 
 fn stateful_manifest_template_proto() -> ManifestTemplate {

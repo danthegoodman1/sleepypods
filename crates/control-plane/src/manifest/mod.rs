@@ -31,6 +31,13 @@ pub use template::{
     WorkloadTemplate,
 };
 
+/// Instance value names with this prefix belong to the platform.
+pub const RESERVED_VALUE_PREFIX: &str = "sleepypods.";
+/// The platform value a manifest template reads to end a name with the
+/// instance's suffix. Raw object names end with it, which keeps the objects of
+/// two instances of one class apart.
+pub const INSTANCE_SUFFIX_VALUE: &str = "sleepypods.instance_suffix";
+
 pub(crate) const LABEL_INSTANCE_ID: &str = "sleepypods.io/instance-id";
 pub(crate) const LABEL_INSTANCE_GENERATION: &str = "sleepypods.io/instance-generation";
 pub(crate) const LABEL_WORKLOAD_CLASS_ID: &str = "sleepypods.io/workload-class-id";

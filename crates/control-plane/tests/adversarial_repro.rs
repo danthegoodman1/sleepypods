@@ -32,7 +32,7 @@ fn instance_value_cannot_inject_pod_spec_structure_into_a_raw_manifest() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: raw-app
+  name: raw-app-{suffix}
 spec:
   selector:
     matchLabels:
@@ -118,7 +118,7 @@ metadata:
         ),
         TemplateTextPart::instance_value("tenant"),
         TemplateTextPart::literal(
-            r#"
+            r#"-{suffix}
   annotations:
     example.com/owner: "team-"#,
         ),
@@ -154,7 +154,7 @@ spec:
         })
         .expect("raw object was rendered");
 
-    assert_eq!(raw.metadata.name, "raw-svc-acme");
+    assert_eq!(raw.metadata.name, "raw-svc-acme-80a707af7dc77ee1");
     assert_eq!(
         raw.value["metadata"]["annotations"]["example.com/owner"],
         "team-acme"
@@ -174,7 +174,7 @@ fn raw_workload_manifest_is_applied_with_no_pod_security_validation() {
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: raw-db
+  name: raw-db-{suffix}
 spec:
   serviceName: raw-db
   selector:
@@ -340,7 +340,7 @@ fn instance_values_bind_as_strings_even_in_numeric_positions() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: raw-app
+  name: raw-app-{suffix}
 spec:
   replicas: "#,
         ),
@@ -512,9 +512,27 @@ fn base_template() -> ManifestTemplate {
     }
 }
 
+/// `{suffix}` in a literal part reads the platform's instance suffix value.
 fn template_with_raw_object(manifest: TemplateText) -> ManifestTemplate {
+    let mut parts = Vec::new();
+    for part in manifest.parts() {
+        let TemplateTextPart::Literal(literal) = part else {
+            parts.push(part.clone());
+            continue;
+        };
+        let mut pieces = literal.split("{suffix}");
+        parts.push(TemplateTextPart::literal(pieces.next().unwrap_or_default()));
+        for piece in pieces {
+            parts.push(TemplateTextPart::instance_value(
+                control_plane::manifest::INSTANCE_SUFFIX_VALUE,
+            ));
+            parts.push(TemplateTextPart::literal(piece));
+        }
+    }
     ManifestTemplate {
-        raw_objects: vec![RawKubernetesManifestTemplate { manifest }],
+        raw_objects: vec![RawKubernetesManifestTemplate {
+            manifest: TemplateText::from_parts(parts),
+        }],
         ..base_template()
     }
 }

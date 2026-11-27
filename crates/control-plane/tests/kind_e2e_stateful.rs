@@ -21,7 +21,7 @@ use control_plane::api::pb::{
     RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
     TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef,
     WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueSchema,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use control_plane::{render_instance_scoped_name, InstanceId};
@@ -946,10 +946,7 @@ async fn create_stateful_operator_resources(
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: true,
-            }),
+            value_schema: Some(required_values(&["tenant"])),
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms,
@@ -1003,10 +1000,7 @@ async fn create_exclusivity_resources(
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
             class_id: EXCLUSIVE_CLASS_ID.to_owned(),
             version: 1,
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: true,
-            }),
+            value_schema: Some(required_values(&["tenant", "volume_handle"])),
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -2274,6 +2268,25 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
             }),
         }],
         raw_objects: vec![],
+    }
+}
+
+/// A schema that requires each value the class templates read.
+fn required_values(fields: &[&str]) -> WorkloadValueSchema {
+    WorkloadValueSchema {
+        fields: fields
+            .iter()
+            .map(|field| {
+                (
+                    (*field).to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )
+            })
+            .collect(),
+        allow_extra: true,
     }
 }
 
