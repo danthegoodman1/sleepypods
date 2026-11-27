@@ -25,7 +25,8 @@
 //! travels in the userinfo of the Service origin: connections for different
 //! instances, Pod addresses or backend generations never share a pool.
 //!
-//! Every attempt counts once in [`pod_route_connects`] by how it ended.
+//! Every attempt counts once, by how it ended, in a process-wide counter that
+//! `PodRouteConnectsCollector` exports.
 use std::{
     collections::HashSet,
     fmt, io,
@@ -137,12 +138,12 @@ impl PodRoute {
 
 /// Pod-route connection attempts, one count per outcome.
 #[derive(Debug)]
-pub struct PodRouteConnects([AtomicU64; PodRouteOutcome::ALL.len()]);
+pub(crate) struct PodRouteConnects([AtomicU64; PodRouteOutcome::ALL.len()]);
 
 static POD_ROUTE_CONNECTS: PodRouteConnects = PodRouteConnects::new();
 
 /// Every proxy's Pod-route attempts since the process started.
-pub fn pod_route_connects() -> &'static PodRouteConnects {
+pub(crate) fn pod_route_connects() -> &'static PodRouteConnects {
     &POD_ROUTE_CONNECTS
 }
 
@@ -152,7 +153,7 @@ impl PodRouteConnects {
     }
 
     /// Attempts that ended with `outcome`.
-    pub fn get(&self, outcome: PodRouteOutcome) -> u64 {
+    pub(crate) fn get(&self, outcome: PodRouteOutcome) -> u64 {
         self.0[outcome as usize].load(Ordering::Relaxed)
     }
 
