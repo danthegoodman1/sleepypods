@@ -2263,6 +2263,68 @@ mod supervision_tests {
         }
     }
 
+    /// The unary delivery deadline cancels a connection whose response is
+    /// still being written. A Subscribe stream on that connection lives until
+    /// its own lifetime instead.
+    #[tokio::test]
+    async fn a_subscribe_stream_outlives_the_unary_delivery_deadline_over_the_production_transport()
+    {
+        use crate::api::pb::proxy_control_plane_client::ProxyControlPlaneClient;
+        use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+        let broker = RouteSubscriptionBroker::with_limits(crate::api::admission::ApiLimits {
+            unary_delivery_timeout: std::time::Duration::from_millis(100),
+            subscription_lifetime: std::time::Duration::from_secs(1),
+            ..Default::default()
+        });
+        let incoming = crate::runtime_io::BoundedIncoming::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let address = incoming.local_addr().unwrap();
+        let (shutdown, receiver) = watch::channel(false);
+        let service = crate::api::proxy_grpc_service_with_store_and_route_events(
+            Arc::new(tests::NoopStore),
+            KubernetesMaterializer::new(tests::NoopKubernetesClient),
+            MaterializationTarget::new("cluster-a", "apps").unwrap(),
+            broker.clone(),
+        );
+        let mut server = grpc_server(broker.clone(), None).unwrap();
+        let serving = tokio::spawn(async move {
+            let _ = server
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, wait_for_shutdown(receiver))
+                .await;
+        });
+        let mut client = ProxyControlPlaneClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+        let mut responses = client
+            .subscribe(ReceiverStream::new(incoming))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), responses.message())
+                .await
+                .is_err(),
+            "the stream stays open past the unary delivery deadline"
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), responses.message())
+            .await
+            .expect("the stream ends at its lifetime");
+        assert!(matches!(end, Ok(None)), "the stream ends in order: {end:?}");
+
+        let _ = shutdown.send(true);
+        broker.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn process_handles_sigterm() {
