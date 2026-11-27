@@ -270,7 +270,7 @@ async fn a_claim_for_another_instance_closes_before_the_app_and_a_claim_for_this
     assert_eq!(&echo, claim);
     for path in ["/keepalive-one", "/keepalive-two"] {
         write_http_request(&mut own, path).await;
-        let response = read_http_response(&mut own, path[1..].as_bytes()).await;
+        let response = read_http_response(&mut own, &path.as_bytes()[1..]).await;
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     }
     assert_eq!(upstream_connections.load(Ordering::Acquire), 1);
