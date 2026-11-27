@@ -314,6 +314,7 @@ struct HttpResponse {
 struct FrontlineMetricCounts {
     subscribe_route_success: f64,
     cache_hits: f64,
+    pod_route_connects: f64,
 }
 
 impl E2eConfig {
@@ -1070,8 +1071,10 @@ async fn assert_frontline_hot_cache_metrics(config: &E2eConfig) -> TestResult<()
             );
             let has_new_hit = counts.cache_hits > initial.cache_hits;
             let has_subscription = counts.subscribe_route_success >= 1.0;
+            // The cold request reached the app through its Pod address.
+            let reached_pod = counts.pod_route_connects >= 1.0;
             last_counts = Some(counts);
-            if has_new_hit && has_subscription {
+            if has_new_hit && has_subscription && reached_pod {
                 return Ok(());
             }
             sleep(Duration::from_millis(100)).await;
@@ -1080,7 +1083,7 @@ async fn assert_frontline_hot_cache_metrics(config: &E2eConfig) -> TestResult<()
     })
     .await
     .map_err(|_| {
-        format!("successful hot traffic produced no new cache hit within five seconds; last counters {last_counts:?}")
+        format!("successful hot traffic produced no new cache hit or Pod-route connect within five seconds; last counters {last_counts:?}")
     })?
 }
 
@@ -1113,6 +1116,11 @@ async fn frontline_metric_counts(metrics_addr: SocketAddr) -> TestResult<Frontli
             &response.body,
             "sleepypods_runtime_route_cache_lookups_total",
             &[("outcome", "hit")],
+        )?,
+        pod_route_connects: prometheus_counter(
+            &response.body,
+            "sleepypods_runtime_pod_route_connects_total",
+            &[("outcome", "pod")],
         )?,
     })
 }

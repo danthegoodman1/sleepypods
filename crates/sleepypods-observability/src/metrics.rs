@@ -1,4 +1,4 @@
-use super::{Operation, Outcome};
+use super::{Operation, Outcome, PodRouteOutcome};
 
 /// Metric label keys. Each takes values from a bounded set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -100,6 +100,13 @@ pub const RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL: MetricDescriptor = MetricDescriptor
     RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL_NAME,
     MetricKind::Counter,
     "Frontline route-cache lookup outcomes.",
+    OUTCOME_LABELS,
+);
+
+pub const RUNTIME_POD_ROUTE_CONNECTS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_pod_route_connects_total",
+    MetricKind::Counter,
+    "Frontline connections to a Pod address: those the sidecar confirmed, and why the rest used the Service.",
     OUTCOME_LABELS,
 );
 
@@ -268,6 +275,7 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     RUNTIME_HTTP01_RESULTS_TOTAL,
     RUNTIME_MATERIALIZATION_FAILURES_TOTAL,
     RUNTIME_ROUTE_CACHE_LOOKUPS_TOTAL,
+    RUNTIME_POD_ROUTE_CONNECTS_TOTAL,
     RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL,
     RUNTIME_WAKE_LATENCY_SECONDS,
     RECONCILER_RUNS_TOTAL,
@@ -376,11 +384,17 @@ impl Outcome {
     }
 }
 
+impl PodRouteOutcome {
+    pub const fn metric_label(self) -> MetricLabel {
+        MetricLabel::new(LabelKey::Outcome, self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use super::{LabelKey, MetricKind, Operation, Outcome, ALL_METRICS};
+    use super::{LabelKey, MetricKind, Operation, Outcome, PodRouteOutcome, ALL_METRICS};
 
     #[test]
     fn metric_descriptors_are_stable() {
@@ -408,6 +422,11 @@ mod tests {
             ),
             (
                 "sleepypods_runtime_route_cache_lookups_total",
+                MetricKind::Counter,
+                &[LabelKey::Outcome],
+            ),
+            (
+                "sleepypods_runtime_pod_route_connects_total",
                 MetricKind::Counter,
                 &[LabelKey::Outcome],
             ),
@@ -589,5 +608,9 @@ mod tests {
     fn typed_metric_labels_use_expected_keys() {
         assert_eq!(Operation::Apply.metric_label().key(), LabelKey::Operation);
         assert_eq!(Outcome::Success.metric_label().key(), LabelKey::Outcome);
+        assert_eq!(
+            PodRouteOutcome::KnownFailed.metric_label().key(),
+            LabelKey::Outcome
+        );
     }
 }

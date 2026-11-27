@@ -24,18 +24,24 @@
 //! The pooled HTTP client keys connections by URI authority, so the Pod route
 //! travels in the userinfo of the Service origin: connections for different
 //! instances, Pod addresses or backend generations never share a pool.
+//!
+//! Every attempt counts once in [`pod_route_connects`] by how it ended.
 use std::{
     collections::HashSet,
     fmt, io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
 
 use http::{uri::Authority, Uri};
 use sleepypods_api::ids::{is_dns_label, DNS_LABEL_MAX_LEN};
+use sleepypods_observability::PodRouteOutcome;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
@@ -129,38 +135,96 @@ impl PodRoute {
     }
 }
 
+/// Pod-route connection attempts, one count per outcome.
+#[derive(Debug)]
+pub struct PodRouteConnects([AtomicU64; PodRouteOutcome::ALL.len()]);
+
+static POD_ROUTE_CONNECTS: PodRouteConnects = PodRouteConnects::new();
+
+/// Every proxy's Pod-route attempts since the process started.
+pub fn pod_route_connects() -> &'static PodRouteConnects {
+    &POD_ROUTE_CONNECTS
+}
+
+impl PodRouteConnects {
+    pub(crate) const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; PodRouteOutcome::ALL.len()])
+    }
+
+    /// Attempts that ended with `outcome`.
+    pub fn get(&self, outcome: PodRouteOutcome) -> u64 {
+        self.0[outcome as usize].load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn count(&self, outcome: PodRouteOutcome) {
+        self.0[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The Pod routes one proxy has seen fail, so a stale Pod address costs one
 /// attempt per backend generation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct PodRoutes {
     failed: Arc<Mutex<HashSet<PodRoute>>>,
+    connects: &'static PodRouteConnects,
+}
+
+impl Default for PodRoutes {
+    fn default() -> Self {
+        Self {
+            failed: Arc::default(),
+            connects: pod_route_connects(),
+        }
+    }
 }
 
 impl PodRoutes {
+    /// Routes whose attempts count in `connects` instead of the process total.
+    #[cfg(test)]
+    fn counted_in(connects: &'static PodRouteConnects) -> Self {
+        Self {
+            failed: Arc::default(),
+            connects,
+        }
+    }
+
     /// Connects to the Pod and has its sidecar confirm the instance, within
     /// [`POD_ATTEMPT_TIMEOUT`] or `budget`, whichever is shorter. `None` means
     /// the caller uses the Service.
     pub(crate) async fn connect(&self, route: &PodRoute, budget: Duration) -> Option<TcpStream> {
         if self.failed().contains(route) {
+            self.connects.count(PodRouteOutcome::KnownFailed);
             return None;
         }
         let attempt = async {
-            let mut stream = TcpStream::connect(route.address).await?;
-            crate::listener::configure_socket(&stream)?;
-            claim(&mut stream, &route.claim()).await?;
-            Ok::<_, io::Error>(stream)
+            let mut stream =
+                TcpStream::connect(route.address)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::ConnectionRefused => PodRouteOutcome::Refused,
+                        _ => PodRouteOutcome::Error,
+                    })?;
+            crate::listener::configure_socket(&stream).map_err(|_| PodRouteOutcome::Error)?;
+            claim(&mut stream, &route.claim())
+                .await
+                .map_err(|_| PodRouteOutcome::ClaimRejected)?;
+            Ok(stream)
         };
-        match tokio::time::timeout(POD_ATTEMPT_TIMEOUT.min(budget), attempt).await {
-            Ok(Ok(stream)) => Some(stream),
-            _ => {
-                let mut failed = self.failed();
-                if failed.len() >= MAX_FAILED_POD_ROUTES {
-                    failed.clear();
-                }
-                failed.insert(route.clone());
-                None
+        let outcome = match tokio::time::timeout(POD_ATTEMPT_TIMEOUT.min(budget), attempt).await {
+            Ok(Ok(stream)) => {
+                self.connects.count(PodRouteOutcome::Pod);
+                return Some(stream);
             }
+            Ok(Err(outcome)) => outcome,
+            Err(_) => PodRouteOutcome::Timeout,
+        };
+        self.connects.count(outcome);
+        let mut failed = self.failed();
+        if failed.len() >= MAX_FAILED_POD_ROUTES {
+            failed.clear();
         }
+        failed.insert(route.clone());
+        None
     }
 
     fn failed(&self) -> std::sync::MutexGuard<'_, HashSet<PodRoute>> {

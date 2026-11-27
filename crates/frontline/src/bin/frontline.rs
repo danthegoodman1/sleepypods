@@ -8,7 +8,8 @@ use frontline::{
 use proxy_core::{
     observability::{
         prometheus::{
-            serve_prometheus_metrics, PrometheusMetricsSink, RuntimeActiveStreamsCollector,
+            serve_prometheus_metrics, PodRouteConnectsCollector, PrometheusMetricsSink,
+            RuntimeActiveStreamsCollector,
         },
         recorder::{
             CompositeObservabilitySink, FilteredStderrObservabilitySink, ObservabilityRecorder,
@@ -112,6 +113,7 @@ async fn run_with_shutdown(
     );
     let worker_shutdown = shutdown.clone();
     let certificate_metrics = tls_certificates.clone();
+    let pod_route_connects = PodRouteConnectsCollector::default();
     let serve = async {
         let result: Result<(), Box<dyn Error + Send + Sync>> = async {
             if let (Some(metrics_addr), Some(prometheus)) = (env.metrics_listen_addr(), prometheus)
@@ -137,10 +139,12 @@ async fn run_with_shutdown(
                                 let active_streams = active_streams.clone();
                                 let certificate_metrics = certificate_metrics.clone();
                                 let route_lookups = route_lookups.clone();
+                                let pod_route_connects = pod_route_connects.clone();
                                 async move {
                                     active_streams.collect(sink.clone());
                                     certificate_metrics.collect_metrics(&sink);
                                     route_lookups.collect(&sink);
+                                    pod_route_connects.collect(&sink);
                                 }
                             },
                         )

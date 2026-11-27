@@ -42,6 +42,47 @@ pub enum Outcome {
     AlreadyDraining,
 }
 
+/// How one connection attempt to a Pod address ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PodRouteOutcome {
+    /// The sidecar confirmed the instance; the request uses the Pod.
+    Pod,
+    /// The Pod address refused the TCP connection.
+    Refused,
+    /// The connection and claim outlasted the attempt budget.
+    Timeout,
+    /// The sidecar closed the connection after the claim or echoed another
+    /// one: it serves another instance.
+    ClaimRejected,
+    /// Another connect or claim error, such as an unreachable network.
+    Error,
+    /// The route failed before at this backend generation, so frontline went
+    /// straight to the Service.
+    KnownFailed,
+}
+
+impl PodRouteOutcome {
+    pub const ALL: [Self; 6] = [
+        Self::Pod,
+        Self::Refused,
+        Self::Timeout,
+        Self::ClaimRejected,
+        Self::Error,
+        Self::KnownFailed,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pod => "pod",
+            Self::Refused => "refused",
+            Self::Timeout => "timeout",
+            Self::ClaimRejected => "claim_rejected",
+            Self::Error => "error",
+            Self::KnownFailed => "known_failed",
+        }
+    }
+}
+
 impl Operation {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -85,7 +126,7 @@ impl Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, Outcome};
+    use super::{Operation, Outcome, PodRouteOutcome};
 
     #[test]
     fn label_values_are_stable() {
@@ -123,6 +164,20 @@ mod tests {
             (Outcome::AlreadyDraining, "already_draining"),
         ] {
             assert_eq!(outcome.as_str(), value);
+        }
+        assert_eq!(
+            PodRouteOutcome::ALL.map(PodRouteOutcome::as_str),
+            [
+                "pod",
+                "refused",
+                "timeout",
+                "claim_rejected",
+                "error",
+                "known_failed"
+            ]
+        );
+        for (index, outcome) in PodRouteOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(outcome as usize, index);
         }
     }
 }
