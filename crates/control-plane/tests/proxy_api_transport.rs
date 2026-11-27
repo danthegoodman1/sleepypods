@@ -783,12 +783,12 @@ async fn the_subscription_limit_refuses_one_subscription_and_the_stream_stays_up
 #[tokio::test(start_paused = true)]
 async fn a_rule_set_too_large_to_send_ends_that_subscription_and_the_stream_stays_up() {
     let store = Arc::new(FakeWakeStore::default());
-    // 250 rules of about 4.5 KiB each exceed the 1 MiB response limit.
-    for index in 0..250 {
+    // 256 rules of about 4.1 KiB each exceed the 1 MiB response limit.
+    for index in 0..256 {
         store.seed_route_resolved(
             exact_http(
                 "large.example.com",
-                Some(&format!("/{index}/{}", "p".repeat(4_500))),
+                Some(&format!("/{index:03}/{}", "p".repeat(4_088))),
             ),
             domain_route_entry(
                 &format!("large-{index}"),

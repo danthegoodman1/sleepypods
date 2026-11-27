@@ -443,6 +443,49 @@ async fn route_creation_rejects_hosts_no_request_can_carry() {
     }
 }
 
+#[tokio::test]
+async fn route_creation_bounds_the_path_prefix_by_the_longest_routed_path() {
+    let (store, api) = service();
+    create_class(&api, web_class("web"))
+        .await
+        .expect("a renderable class is accepted");
+    let longest = format!("/{}", "a".repeat(control_plane::MAX_ROUTE_PATH_BYTES - 1));
+    let longer = format!("{longest}a");
+    let create = |route_binding_id: &str, path: &str| {
+        api.create_route_binding(tonic::Request::new(CreateRouteBindingRequest {
+            route_binding_id: route_binding_id.to_owned(),
+            instance_id: "tenant-a".to_owned(),
+            identity: Some(http_identity("app.example.com", Some(path))),
+        }))
+    };
+
+    create("route-longest", &longest)
+        .await
+        .expect("a prefix as long as a routed path is accepted");
+    assert_rejected(
+        create("route-longer", &longer).await.map(|_| ()),
+        "route path prefix exceeds 4096 bytes",
+    );
+
+    let with_route = api
+        .create_instance(tonic::Request::new(CreateInstanceRequest {
+            instance_id: "tenant-b".to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "web".to_owned(),
+                version: 1,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes: vec![InstanceRoute {
+                route_binding_id: "tenant-b-web".to_owned(),
+                identity: Some(http_identity("b.example.com", Some(&longer))),
+            }],
+        }))
+        .await
+        .map(|_| ());
+    assert_rejected(with_route, "route path prefix exceeds 4096 bytes");
+    assert!(!store.instance_exists("tenant-b"));
+}
+
 /// xorshift64, so a failing case replays from its seed.
 struct Cases(u64);
 

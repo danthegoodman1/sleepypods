@@ -631,3 +631,82 @@ impl Drop for OwnedSubscriptionStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::rules_response;
+    use crate::{
+        api::proxy::MAX_PROXY_RESPONSE_BYTES,
+        ids::{BackendGeneration, Generation, InstanceId, RouteBindingId},
+        instance::InstanceState,
+        materialization::BackendEndpoint,
+        route::{
+            HostRules, PathPrefix, RouteEntry, RouteHost, RouteIdentity, RouteRule,
+            HOST_RULE_OVERHEAD_BYTES, MAX_HOST_RULES, MAX_HOST_RULES_BYTES, MAX_ROUTE_PATH_BYTES,
+        },
+    };
+
+    /// Route creation admits a host's rule set while its rules count at most
+    /// `MAX_HOST_RULES` and `MAX_HOST_RULES_BYTES`. The largest such set, with
+    /// the longest backend URI the materializer renders, fits one answer.
+    #[test]
+    fn the_largest_rule_set_route_creation_admits_fits_one_answer() {
+        let host = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        // A Service name and a namespace are each a label of at most 63 bytes.
+        let backend = format!(
+            "http://{}.{}.svc.cluster.local:65535",
+            "s".repeat(63),
+            "n".repeat(63)
+        );
+        let instance_id = "i".repeat(InstanceId::MAX_LEN);
+        for path_bytes in [1, 1024, 3000, MAX_ROUTE_PATH_BYTES] {
+            let mut rules = Vec::new();
+            let mut counted = 0;
+            loop {
+                let route_binding_id = format!("route-{:0>200}", rules.len());
+                let path = format!("/{:a>width$}", rules.len(), width = path_bytes - 1);
+                let bytes = route_binding_id.len()
+                    + instance_id.len()
+                    + host.len()
+                    + path.len()
+                    + HOST_RULE_OVERHEAD_BYTES;
+                if rules.len() == MAX_HOST_RULES || counted + bytes > MAX_HOST_RULES_BYTES {
+                    break;
+                }
+                counted += bytes;
+                rules.push(RouteRule {
+                    identity: RouteIdentity::Http {
+                        host: RouteHost::exact(&host).unwrap(),
+                        path: Some(PathPrefix::new(path).unwrap()),
+                    },
+                    entry: RouteEntry {
+                        route_binding_id: RouteBindingId::new(route_binding_id).unwrap(),
+                        instance_id: InstanceId::new(instance_id.clone()).unwrap(),
+                        instance_state: InstanceState::Running,
+                        instance_generation: Generation::new(u64::MAX),
+                        backend: Some(BackendEndpoint::new(backend.clone()).unwrap()),
+                        backend_generation: Some(BackendGeneration::new(u64::MAX)),
+                    },
+                });
+            }
+            let response = rules_response(
+                u64::MAX,
+                HostRules::ranked(rules),
+                Duration::from_millis(u64::MAX),
+            );
+            let encoded = prost::Message::encoded_len(&response);
+            assert!(
+                encoded <= MAX_PROXY_RESPONSE_BYTES,
+                "{path_bytes}-byte prefixes encode to {encoded} bytes"
+            );
+        }
+    }
+}

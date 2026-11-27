@@ -8,9 +8,12 @@ binding's instance and the Ready backend for that target in one PostgreSQL
 snapshot. A proxy routes a request to the first rule whose path prefix covers
 the request path; `HostRules` in `sleepypods-api` holds that ranking for both
 sides, and a property test checks it against Postgres for random binding sets.
-A host with more than 256 applicable bindings is refused. An uncommitted
-concurrent deletion leaves the old complete snapshot visible; once the deletion
-commits, the rule set is empty. This is snapshot consistency, with no promise
+A host with more than 256 applicable bindings is refused. Route creation keeps
+every name within that count and a 1 MiB budget of rule bytes: it checks the
+rule sets a new binding joins after its insert, while it holds the route-change
+revision row, so concurrent creates take turns. An uncommitted concurrent
+deletion leaves the old complete snapshot visible; once the deletion commits,
+the rule set is empty. This is snapshot consistency, with no promise
 that a returned backend stays live after the query completes. The rule sets the
 control plane pushes to subscribed proxies carry every later change.
 

@@ -98,8 +98,8 @@ pub use route::{
     CachePolicy, CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
     HostRules, ListRouteBindingsForInstanceRequest, PathPrefix, ResolveHostRulesRequest,
     RouteBindingRecord, RouteDependencyLookup, RouteDependencySet, RouteEntry, RouteHost,
-    RouteHostKind, RouteIdentity, RouteKind, RouteRule, MAX_HOST_RULES, MAX_ROUTE_HOST_BYTES,
-    MAX_ROUTE_PATH_BYTES,
+    RouteHostKind, RouteIdentity, RouteKind, RouteRule, HOST_RULE_OVERHEAD_BYTES, MAX_HOST_RULES,
+    MAX_HOST_RULES_BYTES, MAX_ROUTE_HOST_BYTES, MAX_ROUTE_PATH_BYTES,
 };
 pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,

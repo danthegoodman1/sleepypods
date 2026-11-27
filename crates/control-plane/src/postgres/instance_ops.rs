@@ -1,4 +1,4 @@
-use deadpool_postgres::GenericClient;
+use deadpool_postgres::{GenericClient, Transaction};
 use tokio_postgres::IsolationLevel;
 
 use crate::{
@@ -21,8 +21,8 @@ use super::{
     error::map_postgres_error,
     mapping::{
         generation_to_i64, instance_from_row, instance_state_to_db, manifest_template_to_json,
-        route_binding_from_row, route_identity_parts, sleep_policy_to_json, value_schema_to_json,
-        values_to_json, workload_class_version_from_row, workload_exclusivity_keys_to_json,
+        route_binding_from_row, sleep_policy_to_json, value_schema_to_json, values_to_json,
+        workload_class_version_from_row, workload_exclusivity_keys_to_json,
     },
 };
 
@@ -86,12 +86,12 @@ pub(crate) async fn create_instance(
 }
 
 async fn insert_instance_and_routes(
-    client: &impl GenericClient,
+    transaction: &Transaction<'_>,
     request: &CreateInstanceRequest,
 ) -> StoreResult<CreateInstanceResult> {
     Ok(CreateInstanceResult {
-        instance: insert_instance(client, request).await?,
-        route_bindings: insert_route_bindings(client, request).await?,
+        instance: insert_instance(transaction, request).await?,
+        route_bindings: insert_route_bindings(transaction, request).await?,
     })
 }
 
@@ -370,43 +370,20 @@ async fn insert_instance(
 }
 
 async fn insert_route_bindings(
-    client: &impl GenericClient,
+    transaction: &Transaction<'_>,
     request: &CreateInstanceRequest,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
     for route in &request.route_bindings {
-        let route_binding_id = route.id.as_str();
-        let instance_id = request.instance_id.as_str();
-        let parts = route_identity_parts(&route.identity);
-        let path_prefix = parts.path_prefix.as_deref();
-        let row = client
-            .query_one(
-                "
-                INSERT INTO route_bindings (
-                    route_binding_id,
-                    instance_id,
-                    identity_key,
-                    identity_kind,
-                    host_kind,
-                    host,
-                    path_prefix
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING route_binding_id, instance_id, identity_kind, host_kind, host, path_prefix
-                ",
-                &[
-                    &route_binding_id,
-                    &instance_id,
-                    &parts.key,
-                    &parts.identity_kind,
-                    &parts.host_kind,
-                    &parts.host,
-                    &path_prefix,
-                ],
+        route_bindings.push(
+            super::route_ops::insert_route_binding(
+                transaction,
+                &route.id,
+                &request.instance_id,
+                &route.identity,
             )
-            .await
-            .map_err(map_postgres_error)?;
-        route_bindings.push(route_binding_from_row(&row)?);
+            .await?,
+        );
     }
 
     Ok(route_bindings)

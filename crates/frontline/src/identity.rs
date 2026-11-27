@@ -34,7 +34,7 @@ impl RouteRequestIdentity {
                 host,
                 path: Some(
                     PathPrefix::new(path)
-                        .map_err(|error| RequestIdentityError::InvalidPath(error.value().into()))?,
+                        .map_err(|_| RequestIdentityError::InvalidPath(path.to_owned()))?,
                 ),
             },
         })

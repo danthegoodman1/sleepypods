@@ -600,7 +600,17 @@ A route host is an ASCII DNS name or IPv4 address without a port or path, at
 most 253 characters long. Each dot-separated label has 1 to 63 letters, digits,
 hyphens or underscores and starts and ends without a hyphen. The control plane
 lowercases the host and rejects any other form with `InvalidArgument`, so every
-stored route names a host a request can carry.
+stored route names a host a request can carry. A path prefix starts with `/`
+and is at most 4,096 bytes, the longest path frontline routes.
+
+A host's rule set holds its exact bindings and the wildcard bindings on its
+suffixes, and one Subscribe answer carries it. `CreateRouteBinding` and
+`CreateInstance` therefore return `InvalidArgument` for a route that would give
+any name more than 256 rules, or rules counting over 1 MiB: each rule counts
+its route binding ID, instance ID, host and path prefix plus 512 bytes. A
+wildcard counts toward every name under its suffix, so one wildcard can fill
+many hosts at once. Route creates take turns across the store, so concurrent
+creates cannot overfill a name.
 
 Add an HTTP-01 challenge token:
 
@@ -783,9 +793,10 @@ Failures stay as narrow as their cause:
   (`INVALID_ARGUMENT`), a store error or lookup timeout (`UNAVAILABLE`), or the
   per-stream subscription limit (`RESOURCE_EXHAUSTED`). A proxy at the limit
   releases its oldest hosts and asks again.
-- A host with more than 256 applicable bindings, or a rule set over 1MiB
-  encoded, is refused with `INVALID_ARGUMENT`. Requests for that host fail
-  until bindings are removed; other hosts are unaffected.
+- Route creation keeps every rule set within 256 bindings and one 1MiB
+  answer. A lookup that still finds a larger set refuses the host with
+  `INVALID_ARGUMENT`; requests for that host fail until bindings are removed,
+  and other hosts are unaffected.
 - A failed read of the change history leaves streams open and the cursor in
   place. The dispatcher reads again on the next notification or poll.
 - Lag beyond retained history, a change record the dispatcher cannot read, or a

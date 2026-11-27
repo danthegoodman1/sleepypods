@@ -12,6 +12,13 @@ pub const MAX_ROUTE_HOST_BYTES: usize = 253;
 pub const MAX_ROUTE_PATH_BYTES: usize = 4096;
 /// The most bindings one host's rule set may hold.
 pub const MAX_HOST_RULES: usize = 256;
+/// The most bytes one host's rule set may count, so that one Subscribe answer
+/// carries it. Each rule counts its IDs, host and path prefix plus
+/// [`HOST_RULE_OVERHEAD_BYTES`].
+pub const MAX_HOST_RULES_BYTES: usize = 1024 * 1024;
+/// What a rule counts beyond its IDs, host and path prefix: room for its
+/// backend URI and its framing in a Subscribe answer.
+pub const HOST_RULE_OVERHEAD_BYTES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RouteIdentity {
@@ -193,8 +200,11 @@ pub struct InvalidRouteHost {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidPathPrefix {
-    value: String,
+pub enum InvalidPathPrefix {
+    /// The prefix does not start with `/`.
+    Relative(String),
+    /// The prefix is longer than [`MAX_ROUTE_PATH_BYTES`].
+    TooLong,
 }
 
 impl CreateRouteBindingRequest {
@@ -311,13 +321,17 @@ impl RouteHost {
 }
 
 impl PathPrefix {
+    /// A prefix starts with `/` and is at most [`MAX_ROUTE_PATH_BYTES`] long,
+    /// the longest path a proxy routes.
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidPathPrefix> {
         let value = value.into();
-        if value.starts_with('/') {
-            return Ok(Self(value));
+        if !value.starts_with('/') {
+            return Err(InvalidPathPrefix::Relative(value));
         }
-
-        Err(InvalidPathPrefix { value })
+        if value.len() > MAX_ROUTE_PATH_BYTES {
+            return Err(InvalidPathPrefix::TooLong);
+        }
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -363,15 +377,12 @@ impl fmt::Display for InvalidRouteHost {
 
 impl Error for InvalidRouteHost {}
 
-impl InvalidPathPrefix {
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
 impl fmt::Display for InvalidPathPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "route path prefix {:?} must start with /", self.value)
+        match self {
+            Self::Relative(value) => write!(f, "route path prefix {value:?} must start with /"),
+            Self::TooLong => write!(f, "route path prefix exceeds {MAX_ROUTE_PATH_BYTES} bytes"),
+        }
     }
 }
 
@@ -409,8 +420,8 @@ fn normalize_host(value: &str, wildcard: bool) -> Result<String, InvalidRouteHos
 #[cfg(test)]
 mod tests {
     use super::{
-        HostRules, PathPrefix, RouteDependencyLookup, RouteEntry, RouteHost, RouteHostKind,
-        RouteIdentity, RouteKind, RouteRule,
+        HostRules, InvalidPathPrefix, PathPrefix, RouteDependencyLookup, RouteEntry, RouteHost,
+        RouteHostKind, RouteIdentity, RouteKind, RouteRule, MAX_ROUTE_PATH_BYTES,
     };
     use crate::{
         ids::{Generation, InstanceId, RouteBindingId},
@@ -479,7 +490,16 @@ mod tests {
     fn path_prefix_must_start_with_slash() {
         let error = PathPrefix::new("api").expect_err("relative prefixes are invalid");
 
-        assert_eq!(error.value(), "api");
+        assert_eq!(error, InvalidPathPrefix::Relative("api".to_owned()));
+    }
+
+    #[test]
+    fn path_prefix_is_at_most_the_longest_routed_path() {
+        let longest = format!("/{}", "a".repeat(MAX_ROUTE_PATH_BYTES - 1));
+        PathPrefix::new(longest.clone()).expect("a prefix as long as a routed path is valid");
+
+        let error = PathPrefix::new(format!("{longest}a")).expect_err("a longer prefix is invalid");
+        assert_eq!(error, InvalidPathPrefix::TooLong);
     }
 
     #[test]

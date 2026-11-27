@@ -4834,3 +4834,6 @@ mod certificates;
 
 #[path = "postgres_store/crash_boundaries.rs"]
 mod crash_boundaries;
+
+#[path = "postgres_store/host_rule_bounds.rs"]
+mod host_rule_bounds;

@@ -92,9 +92,9 @@ impl<C> StoreBackedProxyApi<C> {
 
 pub type StoreBackedProxyGrpcService<C> = ProxyControlPlaneServer<StoreBackedProxyApi<C>>;
 
-/// The largest message the proxy service sends. A message over it would end
-/// its stream.
-pub(super) const MAX_PROXY_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The largest message the proxy service sends, sized for the largest host rule
+/// set route creation admits. A message over it would end its stream.
+pub(super) const MAX_PROXY_RESPONSE_BYTES: usize = crate::route::MAX_HOST_RULES_BYTES;
 
 pub fn proxy_grpc_service_with_store<C>(
     store: Arc<dyn ControlPlaneStore>,
