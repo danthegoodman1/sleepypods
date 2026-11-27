@@ -118,6 +118,9 @@ impl WakeClient for NoWake {
     ) -> WakeClientFuture<'static, WakeInstanceResponse, Self::Error> {
         panic!("miss-only fixture cannot wake an instance")
     }
+    fn is_transient(error: &Self::Error) -> bool {
+        match *error {}
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -72,6 +72,80 @@ async fn wake_instance_ready_response_maps_through_generated_client() {
     );
 }
 
+fn wake_request() -> WakeInstanceRequest {
+    WakeInstanceRequest {
+        instance_id: instance_id("instance-a"),
+        expected_generation: Generation::new(7),
+    }
+}
+
+#[tokio::test]
+async fn only_an_unavailable_control_plane_or_a_failed_transport_is_a_transient_wake_error() {
+    for (status, transient) in [
+        (
+            Status::unavailable("control-plane store is unavailable"),
+            true,
+        ),
+        (Status::deadline_exceeded("deadline exceeded"), true),
+        (Status::not_found("instance not found"), false),
+        (Status::invalid_argument("invalid instance ID"), false),
+        (
+            Status::failed_precondition("no ready materialization"),
+            false,
+        ),
+        (
+            Status::internal("control-plane store operation failed"),
+            false,
+        ),
+    ] {
+        let service = FakeProxyControlPlane::default();
+        service.set_wake_response(Err(status.clone()));
+        let error = test_client(service)
+            .wake_instance(wake_request())
+            .await
+            .expect_err("the wake fails");
+        assert_eq!(error.is_transient(), transient, "{status:?}");
+    }
+
+    // An answer the proxy cannot read.
+    let service = FakeProxyControlPlane::default();
+    service.set_wake_response(Ok(pb::ProxyWakeInstanceResponse { outcome: None }));
+    let error = test_client(service)
+        .wake_instance(wake_request())
+        .await
+        .expect_err("the answer is malformed");
+    assert!(matches!(
+        error,
+        super::GrpcProxyControlPlaneError::Protocol(_)
+    ));
+    assert!(!error.is_transient());
+
+    // A control plane that closes every connection, then one that is gone.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let closing = tokio::spawn(async move {
+        loop {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        }
+    });
+    assert_transport_failure_is_transient(address).await;
+    closing.abort();
+    let _ = closing.await;
+    assert_transport_failure_is_transient(address).await;
+}
+
+async fn assert_transport_failure_is_transient(address: std::net::SocketAddr) {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_lazy();
+    let error = GrpcProxyControlPlaneClient::new(ProxyControlPlaneClient::new(channel))
+        .wake_instance(wake_request())
+        .await
+        .expect_err("the transport fails");
+    assert!(error.is_transient(), "{error:?}");
+}
+
 fn subscribe(id: u64, host: &str) -> RouteStreamRequest {
     RouteStreamRequest::Subscribe {
         id,

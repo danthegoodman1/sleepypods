@@ -169,6 +169,28 @@ where
             proxy_wake_response_from_proto(response).map_err(GrpcProxyControlPlaneError::Protocol)
         })
     }
+
+    fn is_transient(error: &Self::Error) -> bool {
+        error.is_transient()
+    }
+}
+
+impl GrpcProxyControlPlaneError {
+    /// A call that failed in transport, or that the control plane answered
+    /// with Unavailable or DeadlineExceeded. A status the client built from a
+    /// local transport error carries that error as its source; one the control
+    /// plane sent carries none.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Status(status) => {
+                matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                ) || status.source().is_some()
+            }
+            Self::Protocol(_) => false,
+        }
+    }
 }
 
 impl<T> Http01ChallengeResolver for GrpcProxyHttp01Resolver<T>
