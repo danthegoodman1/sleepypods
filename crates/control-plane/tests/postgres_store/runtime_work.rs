@@ -49,42 +49,45 @@ async fn ordered_notifications(
         "bundled instance and route writes both persist intent"
     );
     let cursor = initial.cursor;
+    let instances = |changes: &control_plane::runtime_work::DurableRouteChanges| {
+        changes
+            .events
+            .iter()
+            .map(|event| event["instance_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // A transaction that has written and not committed holds nothing another
+    // writer waits on. The later writer commits first and takes the earlier
+    // revision; the open transaction numbers its change when it commits.
     let (mut first, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let first_task = tokio::spawn(connection);
     let tx = first.transaction().await?;
     tx.execute("UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-a'", &[]).await?;
     let (second, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let second_task = tokio::spawn(connection);
-    let contender = tokio::spawn(async move {
-        second.execute("/* runtime-second-commit */ UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-b'", &[]).await
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let blocked: bool = admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%runtime-second-commit%' AND pid <> pg_backend_pid())", &[]).await.unwrap().get(0);
-            if blocked { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        second.execute("UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-b'", &[]),
+    )
+    .await
+    .map_err(|_| "an open lifecycle transaction stalled another writer")??;
+    let visible = store.load_route_changes(cursor, 1024).await?;
     assert_eq!(
-        store.load_route_changes(cursor, 1024).await?.cursor,
-        cursor,
-        "uncommitted revision ranges are invisible"
+        instances(&visible),
+        ["order-b"],
+        "an uncommitted change is invisible"
     );
     tx.commit().await?;
-    contender.await??;
-    let committed = store.load_route_changes(cursor, 1024).await?;
+    let committed = store.load_route_changes(visible.cursor, 1024).await?;
     assert_eq!(
-        committed
-            .events
-            .iter()
-            .map(|event| event["instance_id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["order-a", "order-b"]
+        instances(&committed),
+        ["order-a"],
+        "a reader caught up before a commit receives it"
     );
     assert_eq!(
         committed.cursor,
         cursor + 2,
-        "later transaction cannot publish an overtaking revision"
+        "revisions follow commit order"
     );
     let tx = first.transaction().await?;
     tx.execute("UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = 'order-a'", &[]).await?;

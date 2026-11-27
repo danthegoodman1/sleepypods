@@ -258,7 +258,9 @@ CREATE INDEX http01_challenges_expires_at_idx ON http01_challenges (expires_at_u
 
 -- A bounded transactional outbox of changes to route rule sets, read by
 -- revision. Every process reads it independently; no reader removes another's
--- records. The revision row's lock orders allocated ranges with commit.
+-- records. A transaction numbers its changes as it commits, under the revision
+-- row's lock, so revisions become visible in order and the lock is held only
+-- while a commit completes.
 CREATE TABLE route_change_revision (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     revision bigint NOT NULL CHECK (revision >= 0)
@@ -269,10 +271,14 @@ CREATE TABLE route_change_outbox (
     payload jsonb NOT NULL,
     created_at_unix_millis bigint NOT NULL DEFAULT (extract(epoch from clock_timestamp()) * 1000)::bigint
 );
+-- The changes an open transaction has made, in statement order.
+CREATE TABLE route_changes_pending (
+    txid xid8 PRIMARY KEY,
+    payloads jsonb NOT NULL
+);
 CREATE FUNCTION record_route_changes() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    next_revision bigint;
-    event_count bigint;
+    payloads jsonb;
     source_query text;
     payload_query text;
 BEGIN
@@ -290,12 +296,28 @@ BEGIN
     ELSE
         payload_query = format('SELECT DISTINCT jsonb_build_object(''kind'', ''instance'', ''instance_id'', value->''instance_id'') AS payload FROM (%s) changed', source_query);
     END IF;
-    EXECUTE 'SELECT count(*) FROM (' || payload_query || ') p' INTO event_count;
-    IF event_count = 0 THEN RETURN NULL; END IF;
-    -- One update per statement avoids quadratic same-row version chains for
-    -- bulk writes. The held row lock orders every allocated range with commit.
-    UPDATE route_change_revision SET revision = revision + event_count WHERE singleton RETURNING revision INTO next_revision;
-    EXECUTE 'INSERT INTO route_change_outbox(revision, payload) SELECT $1 + row_number() OVER (), payload FROM (' || payload_query || ') p' USING next_revision - event_count;
+    EXECUTE 'SELECT jsonb_agg(payload) FROM (' || payload_query || ') p' INTO payloads;
+    IF payloads IS NULL THEN RETURN NULL; END IF;
+    INSERT INTO route_changes_pending (txid, payloads) VALUES (pg_current_xact_id(), payloads)
+        ON CONFLICT (txid) DO UPDATE SET payloads = route_changes_pending.payloads || EXCLUDED.payloads;
+    RETURN NULL;
+END $$;
+-- Runs once per transaction, as it commits: the pending row is inserted once
+-- and later statements append to it.
+CREATE FUNCTION number_route_changes() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    payloads jsonb;
+    changes bigint;
+    next_revision bigint;
+BEGIN
+    DELETE FROM route_changes_pending WHERE txid = NEW.txid
+        RETURNING route_changes_pending.payloads INTO payloads;
+    changes := jsonb_array_length(payloads);
+    UPDATE route_change_revision SET revision = revision + changes
+        WHERE singleton RETURNING revision INTO next_revision;
+    INSERT INTO route_change_outbox (revision, payload)
+        SELECT next_revision - changes + ordinality, value
+        FROM jsonb_array_elements(payloads) WITH ORDINALITY;
     DELETE FROM route_change_outbox WHERE revision <= next_revision - 100000;
     -- Delivered at commit; wakes each replica's dispatcher to read the outbox.
     -- The channel is scoped to this schema, so stores sharing a database wake
@@ -303,6 +325,8 @@ BEGIN
     PERFORM pg_notify('sleepypods_routes_' || md5(TG_TABLE_SCHEMA), '');
     RETURN NULL;
 END $$;
+CREATE CONSTRAINT TRIGGER number_route_changes AFTER INSERT ON route_changes_pending
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION number_route_changes();
 CREATE TRIGGER route_bindings_route_change_insert AFTER INSERT ON route_bindings
     REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION record_route_changes();
 CREATE TRIGGER route_bindings_route_change_update AFTER UPDATE ON route_bindings

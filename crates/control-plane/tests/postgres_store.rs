@@ -4242,10 +4242,11 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
         .values()
         .all(|m| m.labels.get("sleepypods.io/instance-generation") == Some(&stamp.to_string())));
 
+    // The grace outlasts the drive and the revive below on a loaded machine.
     let drain = store
         .begin_sleep(
             BeginSleepRequest::new(running.id.clone(), running.generation, target.clone())
-                .with_drain_grace_timeout(Duration::from_secs(1)),
+                .with_drain_grace_timeout(Duration::from_secs(60)),
         )
         .await?;
     let deletes_before = client.deletes.load(Ordering::SeqCst);

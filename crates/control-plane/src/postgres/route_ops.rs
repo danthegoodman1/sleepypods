@@ -283,10 +283,10 @@ const RULE_TEXT_BYTES: &str = "octet_length(route_binding_id) + octet_length(ins
 /// belongs to a bound name, or to an unbound name directly under a wildcard
 /// binding at or below the suffix.
 ///
-/// Every binding insert holds the route-change revision row until commit (the
-/// outbox trigger updates it, and the lock below makes that explicit), so this
-/// check sees every binding committed before this one and a concurrent insert
-/// waits for this one.
+/// Binding creates take turns on a transaction lock of their own, held until
+/// commit, so this check sees every binding committed before this one and a
+/// concurrent create waits for this one. Deletes only shrink rule sets and
+/// take no part.
 async fn check_host_rule_room(
     transaction: &Transaction<'_>,
     identity: &RouteIdentity,
@@ -299,7 +299,7 @@ async fn check_host_rule_room(
 
     transaction
         .execute(
-            "SELECT 1 FROM route_change_revision WHERE singleton FOR UPDATE",
+            "SELECT pg_advisory_xact_lock('route_bindings'::regclass::oid::bigint)",
             &[],
         )
         .await
