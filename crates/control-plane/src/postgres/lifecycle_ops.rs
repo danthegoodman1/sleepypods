@@ -162,7 +162,7 @@ pub(crate) async fn accept_wake(
     let generation = generation_to_i64(expected_waking)?;
     let row = tx.query_one("
             UPDATE instances
-            SET state = 'waking', generation = $2, updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            SET state = 'waking', generation = $2
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ", &[&id,&generation]).await.map_err(map_postgres_error)?;
@@ -192,8 +192,7 @@ async fn revive_draining(
             UPDATE materializations
             SET state = 'ready',
                 instance_generation = $5,
-                backend_generation = backend_generation + 1,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                backend_generation = backend_generation + 1
             WHERE instance_id = $1
                 AND cluster_id = $2
                 AND namespace = $3
@@ -220,7 +219,7 @@ async fn revive_draining(
         .query_one(
             "
             UPDATE instances
-            SET state = 'running', generation = $2, updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            SET state = 'running', generation = $2
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
@@ -250,7 +249,7 @@ pub(crate) async fn activate_deferred_wake(
     let generation: i64 = intent.get("instance_generation");
     let row = tx.query_opt("
             UPDATE instances
-            SET state = 'waking', generation = $2, updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            SET state = 'waking', generation = $2
             WHERE instance_id = $1
             AND state = 'cold'
             AND generation = $2::bigint - 1
@@ -307,11 +306,16 @@ pub(crate) async fn request_instance_deletion(
     }
     if row.get::<_, String>("state") != "deleting" {
         generation_to_i64(actual.next())?;
-        tx.execute("
+        tx.execute(
+            "
             UPDATE instances
-            SET state = 'deleting', generation = generation + 1, updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            SET state = 'deleting', generation = generation + 1
             WHERE instance_id = $1
-            ", &[&id]).await.map_err(map_postgres_error)?;
+            ",
+            &[&id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
     }
     tx.execute(
         "DELETE FROM deferred_wake_intents WHERE instance_id = $1",

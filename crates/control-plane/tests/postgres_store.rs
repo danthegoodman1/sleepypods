@@ -1014,12 +1014,8 @@ async fn exercise_instance_lifecycle(
     assert_eq!(deleting_from_draining.state, InstanceState::Deleting);
     assert_eq!(deleting_from_draining.generation, Generation::new(4));
 
-    let failed_target = create_lifecycle_instance(
-        store,
-        workload_class.clone(),
-        "instance-lifecycle-failed-retry",
-    )
-    .await?;
+    let failed_target =
+        create_lifecycle_instance(store, workload_class, "instance-lifecycle-failed-retry").await?;
     store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             failed_target.instance.id.clone(),
@@ -1048,44 +1044,6 @@ async fn exercise_instance_lifecycle(
         .await?;
     assert_eq!(retry.state, InstanceState::Waking);
     assert_eq!(retry.generation, Generation::new(3));
-
-    let terminal_target =
-        create_lifecycle_instance(store, workload_class, "instance-lifecycle-terminal").await?;
-    let deleting = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            terminal_target.instance.id.clone(),
-            Generation::new(0),
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
-        .await?;
-    assert_eq!(deleting.generation, Generation::new(1));
-    let deleted = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            terminal_target.instance.id.clone(),
-            Generation::new(1),
-            InstanceState::Deleted,
-            StateTransitionReason::DeleteFinalized,
-        ))
-        .await?;
-    assert_eq!(deleted.state, InstanceState::Deleted);
-    assert_eq!(deleted.generation, Generation::new(2));
-    let terminal_wake = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            terminal_target.instance.id.clone(),
-            Generation::new(2),
-            InstanceState::Waking,
-            StateTransitionReason::WakeRequested,
-        ))
-        .await
-        .expect_err("deleted instances are terminal");
-    assert!(matches!(terminal_wake, StoreError::InvalidArgument { .. }));
-    let still_deleted = store
-        .get_instance(GetInstanceRequest::new(terminal_target.instance.id))
-        .await?
-        .expect("deleted terminal target still exists");
-    assert_eq!(still_deleted.state, InstanceState::Deleted);
-    assert_eq!(still_deleted.generation, Generation::new(2));
 
     Ok(())
 }
@@ -3754,7 +3712,7 @@ async fn phase5_reservation_concurrency(
     let held = store.record_materialization(requests[0].clone()).await?;
     let mut raw = raw_client(config).await?;
     let transaction = raw.transaction().await?;
-    transaction.execute("UPDATE materializations SET updated_at_unix_millis = updated_at_unix_millis + 1 WHERE materialization_id = $1", &[&held.id.as_str()]).await?;
+    transaction.execute("UPDATE materializations SET failure_count = failure_count WHERE materialization_id = $1", &[&held.id.as_str()]).await?;
     let legacy = raw_client(config).await?;
     legacy
         .batch_execute("SET lock_timeout = '100ms'; BEGIN")
@@ -3977,226 +3935,59 @@ async fn phase5_route_scale_snapshot_and_target(
     Ok(())
 }
 
+/// The schema applies in one transaction: a failure leaves nothing behind, a
+/// repeat changes nothing, and a recorded migration under another name stops
+/// the store from starting.
 #[tokio::test]
-async fn postgres_migration_backfill_and_collision_rejection() -> TestResult {
+async fn postgres_migrations_apply_atomically_once_and_fail_closed() -> TestResult {
     let Ok(base_url) = std::env::var("SLEEPYPODS_POSTGRES_URL") else {
-        eprintln!("skipping Postgres migration backfill; SLEEPYPODS_POSTGRES_URL is unset");
+        eprintln!("skipping Postgres migrations; SLEEPYPODS_POSTGRES_URL is unset");
         return Ok(());
     };
     let admin = raw_client(&PostgresStoreConfig::new(&base_url)?).await?;
-    for conflicting in [false, true] {
-        let schema = unique_schema_name();
-        admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+    let schema = unique_schema_name();
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
+    let raw = raw_client(&config).await?;
+    let result = async {
+        // An object the schema would create makes the migration fail midway.
+        raw.batch_execute("CREATE TABLE http01_challenges (host text)")
             .await?;
-        let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
-        let raw = raw_client(&config).await?;
-        raw.batch_execute("CREATE TABLE control_plane_schema_migrations (version integer PRIMARY KEY, name text NOT NULL)").await?;
-        for (version, name, sql) in [
-            (
-                1,
-                "initial_control_plane_store",
-                include_str!("../migrations/0001_initial_control_plane_store.sql"),
-            ),
-            (
-                2,
-                "workload_class_value_schema",
-                include_str!("../migrations/0002_workload_class_value_schema.sql"),
-            ),
-            (
-                3,
-                "workload_class_manifest_template",
-                include_str!("../migrations/0003_workload_class_manifest_template.sql"),
-            ),
-            (
-                4,
-                "workload_class_sleep_policy",
-                include_str!("../migrations/0004_workload_class_sleep_policy.sql"),
-            ),
-            (
-                5,
-                "workload_class_exclusivity_keys",
-                include_str!("../migrations/0005_workload_class_exclusivity_keys.sql"),
-            ),
-            (
-                6,
-                "materialization_reconciliation_leases",
-                include_str!("../migrations/0006_materialization_reconciliation_leases.sql"),
-            ),
-        ] {
-            raw.batch_execute(sql).await?;
-            raw.execute(
-                "INSERT INTO control_plane_schema_migrations VALUES ($1, $2)",
-                &[&version, &name],
-            )
-            .await?;
-        }
-        raw.batch_execute("INSERT INTO workload_class_versions(class_id,version,template_generation,default_values,value_schema,manifest_template,sleep_policy,exclusivity_keys) VALUES ('legacy',1,1,'{}','{}','{}','{}','[]');
-            INSERT INTO instances(instance_id,workload_class_id,workload_class_version,values,state,generation) VALUES ('legacy-owner','legacy',1,'{}','waking',1), ('legacy-contender','legacy',1,'{}','waking',1);
-            INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys,updated_at_unix_millis) VALUES ('legacy-mat','legacy-owner',1,'cluster','one','deleting',1,'[{\"api_version\":\"v1\",\"kind\":\"PersistentVolume\",\"namespace\":\"one\",\"name\":\"disk\"}]','[{\"name\":\"disk\",\"value\":\"one\"},{\"name\":\"disk\",\"value\":\"one\"}]',(extract(epoch from clock_timestamp())*1000)::bigint+60000);
-            INSERT INTO idempotency_records(idempotency_key,operation,request_fingerprint,resource_id) VALUES ('legacy-deleted','create_instance','{}','absent');").await?;
-        raw.batch_execute("INSERT INTO instances(instance_id,workload_class_id,workload_class_version,values,state,generation) VALUES ('legacy-stale-pending','legacy',1,'{}','waking',3);
-            INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys) VALUES ('legacy-stale-mat','legacy-stale-pending',1,'cluster','one','pending',1,'[]','[]')").await?;
-        if conflicting {
-            raw.batch_execute("INSERT INTO materializations(materialization_id,instance_id,instance_generation,cluster_id,namespace,state,backend_generation,rendered_objects,exclusivity_keys) VALUES ('conflicting-mat','legacy-contender',1,'cluster','two','pending',1,'[{\"api_version\":\"v1\",\"kind\":\"PersistentVolume\",\"namespace\":\"two\",\"name\":\"disk\"}]','[]')").await?;
-            assert!(
-                PostgresStore::connect(&config).await.is_err(),
-                "backfill must reject duplicate PV ownership across namespaces"
-            );
-            let versions: i64 = raw
-                .query_one("SELECT count(*) FROM control_plane_schema_migrations", &[])
-                .await?
-                .get(0);
-            assert_eq!(versions, 6, "failed migration must not record completion");
-            let table: Option<String> = raw
-                .query_one(
-                    "SELECT to_regclass('materialization_object_reservations')::text",
-                    &[],
-                )
-                .await?
-                .get(0);
-            assert!(table.is_none(), "failed migration must roll back its DDL");
-        } else {
-            let store = PostgresStore::connect(&config).await?;
-            let stale = raw.query_one("SELECT i.state, i.generation, m.state AS materialization_state, m.projection_generation FROM instances i JOIN materializations m USING(instance_id) WHERE i.instance_id = 'legacy-stale-pending'", &[]).await?;
-            assert_eq!(stale.get::<_, String>("state"), "failed");
-            assert_eq!(stale.get::<_, i64>("generation"), 4);
-            assert_eq!(stale.get::<_, String>("materialization_state"), "deleting");
-            assert_eq!(stale.get::<_, i64>("projection_generation"), 2);
-            // The raw migration fixture uses skeletal class JSON. Attach the
-            // ordinary typed class fixture before testing a real fresh wake.
-            let recover_class = workload_class("legacy-recover", 1);
-            store
-                .create_workload_class_version(CreateWorkloadClassVersionRequest::new(
-                    recover_class.clone(),
-                ))
-                .await?;
-            raw.execute("UPDATE instances SET workload_class_id = 'legacy-recover', values = '{\"tenant\":\"legacy-recovered\",\"image\":\"example/app:1\"}' WHERE instance_id = 'legacy-stale-pending'", &[]).await?;
-            let recovered_store = std::sync::Arc::new(store.clone());
-            let recover_target = MaterializationTarget::new("cluster", "one")?;
-            let recover_materializer = control_plane::materializer::KubernetesMaterializer::new(
-                LifecycleKubernetes::default(),
-            );
-            let driver = control_plane::MaterializationReconciler::new(
-                recovered_store.clone(),
-                recover_materializer.clone(),
-                recover_target.clone(),
-                transport_support::reconciler_config(),
-                sleepypods_observability::recorder::ObservabilityRecorder::noop(),
-            );
-            let stale_pending = InstanceId::new("legacy-stale-pending")?;
-            transport_support::reconcile_until(driver.clone(), || async {
-                store
-                    .load_active_materialization(LoadActiveMaterializationRequest::new(
-                        stale_pending.clone(),
-                        recover_target.clone(),
-                    ))
-                    .await
-                    .is_ok_and(|active| active.is_none())
-            })
-            .await;
-            use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
-            let recover_api = control_plane::api::StoreBackedProxyApi::new(
-                recovered_store,
-                recover_materializer,
-                recover_target,
-            );
-            recover_api
-                .wake_instance(tonic::Request::new(
-                    control_plane::api::pb::ProxyWakeInstanceRequest {
-                        instance_id: "legacy-stale-pending".to_owned(),
-                        expected_generation: 4,
-                        backend_generation: None,
-                    },
-                ))
-                .await?;
-            transport_support::reconcile_until(driver, || async {
-                store
-                    .get_instance(GetInstanceRequest::new(stale_pending.clone()))
-                    .await
-                    .is_ok_and(|instance| {
-                        instance.is_some_and(|instance| instance.state == InstanceState::Running)
-                    })
-            })
-            .await;
-            let legacy_orphan = raw.query_one("SELECT state, generation FROM instances WHERE instance_id = 'legacy-contender'", &[]).await?;
-            assert_eq!(
-                legacy_orphan.get::<_, String>("state"),
-                "failed",
-                "old unaccepted Waking gap becomes an explicit retryable terminal result"
-            );
-            assert_eq!(legacy_orphan.get::<_, i64>("generation"), 2);
-            let legacy_projection: i64 = raw.query_one("SELECT projection_generation FROM materializations WHERE materialization_id = 'legacy-mat'", &[]).await?.get(0);
-            assert_eq!(
-                legacy_projection, 1,
-                "legacy Deleting ownership stamp remains unchanged"
-            );
-            let retired = raw.execute("INSERT INTO instances(instance_id, workload_class_id, workload_class_version, values, state, generation) VALUES ('absent', 'legacy', 1, '{}', 'cold', 0)", &[]).await.expect_err("known legacy deleted ID is retired rather than assigned a guessable zero revision");
-            assert_eq!(
-                retired.as_db_error().unwrap().message(),
-                "instance_id_retired"
-            );
-            let row = raw
-                .query_one(
-                    "SELECT namespace FROM materialization_object_reservations WHERE materialization_id = 'legacy-mat'",
-                    &[],
-                )
-                .await?;
-            assert_eq!(
-                row.get::<_, String>(0),
-                "",
-                "PV reservations are cluster scoped"
-            );
-            assert_eq!(
-                raw.query_one("SELECT count(*) FROM materialization_key_reservations", &[])
-                    .await?
-                    .get::<_, i64>(0),
-                1,
-                "duplicate refs within one materialization normalize"
-            );
-            assert!(
-                raw.query_one(
-                    "SELECT retired FROM instance_generation_watermarks WHERE instance_id = 'absent'",
-                    &[]
-                )
-                .await?
-                .get::<_, bool>(0),
-                "an instance ID deleted before fencing existed stays retired"
-            );
-            assert!(raw
-                .query_one("SELECT to_regclass('idempotency_records') IS NULL", &[])
-                .await?
-                .get::<_, bool>(0));
-            let row = raw.query_one("SELECT drain_not_before_unix_millis > state_entered_at_unix_millis, next_attempt_at_unix_millis = drain_not_before_unix_millis FROM materializations WHERE materialization_id = 'legacy-mat'", &[]).await?;
-            assert!(row.get::<_, bool>(0));
-            assert!(row.get::<_, bool>(1));
-            assert!(
-                claim_next(
-                    &store,
-                    MaterializationState::Deleting,
-                    &MaterializationTarget::new("cluster", "one")?,
-                    "early",
-                    Duration::from_secs(30),
-                )
-                .await?
-                .is_none(),
-                "the backfilled drain deadline still holds the legacy cleanup"
-            );
-            raw.execute(
-                "UPDATE control_plane_schema_migrations SET name = 'wrong-name' WHERE version = 7",
+        assert!(PostgresStore::connect(&config).await.is_err());
+        let left: Vec<Option<String>> = raw
+            .query_one(
+                "SELECT to_regclass('instances')::text, to_regclass('control_plane_schema_migrations')::text",
                 &[],
             )
-            .await?;
-            assert!(
-                store.run_migrations().await.is_err(),
-                "migration metadata mismatch fails closed"
-            );
-        }
-        admin
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await?;
+            .await
+            .map(|row| vec![row.get(0), row.get(1)])?;
+        assert_eq!(
+            left,
+            [None, None],
+            "a failed migration rolls back its DDL and records nothing"
+        );
+
+        raw.batch_execute("DROP TABLE http01_challenges").await?;
+        let store = PostgresStore::connect(&config).await?;
+        store.run_migrations().await?;
+        raw.execute(
+            "UPDATE control_plane_schema_migrations SET name = 'wrong-name' WHERE version = 1",
+            &[],
+        )
+        .await?;
+        assert!(
+            store.run_migrations().await.is_err(),
+            "migration metadata mismatch fails closed"
+        );
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
     }
-    Ok(())
+    .await;
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    result
 }
 
 #[tokio::test]

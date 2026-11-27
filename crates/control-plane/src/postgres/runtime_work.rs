@@ -271,8 +271,8 @@ pub(super) async fn record_failure(
 pub(super) async fn enqueue(store: &PostgresStore, id: MaterializationId) -> StoreResult<bool> {
     let client = store.client().await?;
     // An admin request schedules normal work. It cannot override grace or a
-    // live attempt. Failed wakes first clean their retained inventory.
-    let changed = client.execute("UPDATE materializations SET state = CASE WHEN state = 'failed' THEN 'deleting' ELSE state END, failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting', 'failed') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint)", &[&id.as_str()]).await.map_err(map_postgres_error)?;
+    // live attempt.
+    let changed = client.execute("UPDATE materializations SET failure_kind = NULL, failure_message = '', failure_count = 0, operation_deadline_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) + lifecycle_operation_timeout_millis(), next_attempt_at_unix_millis = GREATEST(drain_not_before_unix_millis, (extract(epoch from clock_timestamp()) * 1000)::bigint) WHERE materialization_id = $1 AND state IN ('pending', 'deleting') AND (reconcile_owner IS NULL OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint)", &[&id.as_str()]).await.map_err(map_postgres_error)?;
     if changed == 1 {
         crate::runtime_work::signal_lifecycle_work();
     }

@@ -34,8 +34,7 @@ pub(crate) async fn put_http01_challenge(
             ON CONFLICT (host, token)
             DO UPDATE SET
                 key_authorization = EXCLUDED.key_authorization,
-                expires_at_unix_millis = EXCLUDED.expires_at_unix_millis,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                expires_at_unix_millis = EXCLUDED.expires_at_unix_millis
             RETURNING host, token, key_authorization, expires_at_unix_millis
             ",
             &[&host, &token, &key_authorization, &expires_at_unix_millis],

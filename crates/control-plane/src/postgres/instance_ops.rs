@@ -272,8 +272,7 @@ pub(crate) async fn compare_and_swap_instance_state(
             "
             UPDATE instances
             SET state = $2,
-                generation = $3,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                generation = $3
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",

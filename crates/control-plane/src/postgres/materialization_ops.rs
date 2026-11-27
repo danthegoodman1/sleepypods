@@ -220,8 +220,7 @@ pub(crate) async fn begin_sleep(
             "
             UPDATE instances
             SET state = $2,
-                generation = $3,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                generation = $3
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
@@ -358,8 +357,7 @@ pub(crate) async fn claim_next_materialization_reconciliation(
             UPDATE materializations
             SET reconcile_owner = $1,
                 reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $2,
-                reconcile_attempt = reconcile_attempt + 1,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                reconcile_attempt = reconcile_attempt + 1
             WHERE materialization_id = (
                 SELECT materialization_id
                 FROM materializations
@@ -408,8 +406,7 @@ pub(crate) async fn renew_materialization_reconciliation_lease(
         .execute(
             "
             UPDATE materializations
-            SET reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $3,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            SET reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $3
             WHERE materialization_id = $1
                 AND reconcile_owner = $2
                 AND reconcile_attempt = $4
@@ -441,8 +438,7 @@ pub(crate) async fn release_materialization_reconciliation_lease(
             UPDATE materializations
             SET reconcile_owner = NULL,
                 reconcile_lease_expires_at_unix_millis = NULL,
-                next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materialization_id = $1
                 AND reconcile_owner = $2
                 AND reconcile_attempt = $3
@@ -550,8 +546,7 @@ pub(crate) async fn delete_materialization_reconciliation(
                 rendered_objects = '[]'::jsonb,
                 exclusivity_keys = '[]'::jsonb,
                 reconcile_owner = NULL,
-                reconcile_lease_expires_at_unix_millis = NULL,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                reconcile_lease_expires_at_unix_millis = NULL
             WHERE materialization_id = $1
                 AND state = $2
                 AND instance_id = $3
@@ -653,8 +648,7 @@ pub(crate) async fn force_delete_materialization(
                     rendered_objects = '[]'::jsonb,
                     exclusivity_keys = '[]'::jsonb,
                     reconcile_owner = NULL,
-                    reconcile_lease_expires_at_unix_millis = NULL,
-                    updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    reconcile_lease_expires_at_unix_millis = NULL
                 WHERE materialization_id = $1
                 ",
                 &[&materialization_id],
@@ -675,8 +669,7 @@ pub(crate) async fn force_delete_materialization(
                         "
                         UPDATE instances
                         SET state = $2,
-                            generation = generation + 1,
-                            updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                            generation = generation + 1
                         WHERE instance_id = $1
                         ",
                         &[&instance_id, &settled],
@@ -763,8 +756,7 @@ pub(crate) async fn force_release_exclusivity_key(
                         key ->> 'name' = $3
                         AND key ->> 'value' = $4
                     )
-                ), '[]'::jsonb),
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                ), '[]'::jsonb)
             WHERE cluster_id = $1
                 AND namespace = $2
                 AND state <> 'deleted'
@@ -836,8 +828,7 @@ async fn complete_wake_in_transaction(
             "
             UPDATE instances
             SET state = $2,
-                generation = $3,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                generation = $3
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
@@ -921,8 +912,7 @@ async fn finalize_sleep_in_transaction(
             "
             UPDATE instances
             SET state = $2,
-                generation = $3,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                generation = $3
             WHERE instance_id = $1
             RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
             ",
@@ -1174,8 +1164,7 @@ pub(super) async fn upsert_materialization(
                 rendered_objects = EXCLUDED.rendered_objects,
                 exclusivity_keys = EXCLUDED.exclusivity_keys,
                 reconcile_owner = NULL,
-                reconcile_lease_expires_at_unix_millis = NULL,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                reconcile_lease_expires_at_unix_millis = NULL
             WHERE materializations.backend_generation <= EXCLUDED.backend_generation
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
                 namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
@@ -1271,8 +1260,7 @@ async fn mark_active_materialization_state(
                     rendered_objects = COALESCE($6, rendered_objects),
                     exclusivity_keys = COALESCE($7, exclusivity_keys),
                     reconcile_owner = NULL,
-                    reconcile_lease_expires_at_unix_millis = NULL,
-                    updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    reconcile_lease_expires_at_unix_millis = NULL
                 WHERE instance_id = $1
                     AND cluster_id = $2
                     AND namespace = $3
@@ -1303,8 +1291,7 @@ async fn mark_active_materialization_state(
                     backend_uri = NULL,
                 pod_backend_uri = NULL,
                     reconcile_owner = NULL,
-                    reconcile_lease_expires_at_unix_millis = NULL,
-                    updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    reconcile_lease_expires_at_unix_millis = NULL
                 WHERE instance_id = $1
                     AND cluster_id = $2
                     AND namespace = $3
@@ -1344,7 +1331,6 @@ async fn mark_active_materialization_deleting_for_sleep(
             SET state = $5,
                 reconcile_owner = NULL,
                 reconcile_lease_expires_at_unix_millis = NULL,
-                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint,
                 drain_not_before_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $6
             WHERE instance_id = $1
                 AND cluster_id = $2
