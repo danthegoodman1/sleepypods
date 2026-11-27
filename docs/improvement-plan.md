@@ -497,7 +497,7 @@ Status ledger:
 | Complete | Work | 5F: Control plane survives store unavailability | Commits `1a2a6bd`, `cd7177f`: `postgres_reconciler_rides_out_a_thirty_second_outage` resets every session through a TCP relay; the `sleepypods_control_plane_store_available` gauge reports the outage. |
 | Complete | Work | 5G: Session timeouts and one lock order | Commits `1a2a6bd`, `8b4dc14`: sessions set `idle_in_transaction_session_timeout` and keepalives; completions lock the instance first. |
 | Complete | Gate | Automatic recovery under injected faults | `postgres_lifecycle_recovers_from_each_fault_around_each_mutation` (create, activate and delete × 5xx, reset, 10 s stall and process loss), `postgres_crash_at_each_lock_boundary_keeps_the_key_and_yields_to_recovery`, and the 30 s outage test; every case ends Running or Cold with no operator RPC. |
-| In Progress | Test | Restart and failures kind gates under interruption | Both gates pass. API-server and Postgres interruption are covered by fault-injecting fakes and the real-Postgres relay test, not inside the kind gates. |
+| Complete | Test | Restart and failures kind gates under interruption | Commit `39ffbd1`: `dependency_interruptions_recover_without_an_operator` in the restart gate holds a wake, then stops Postgres for 30 s, stops the kind API server for 20 s, and stops Postgres for 30 s during a drain; each instance reaches Running or Cold with one transition, no operator RPC and no control-plane restart. Passed three runs in a row at `4128d76`. The failures gate covers invalid inputs and needs no interruption. |
 | Complete | Doc | `docs/projection-safety.md` and runbook | Commit `149bcfb`. |
 
 ## Phase 6: The API Rejects What Cannot Run

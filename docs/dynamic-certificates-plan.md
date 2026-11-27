@@ -107,12 +107,12 @@ the simplified protocol.
 
 | Phase | Delivered | Evidence |
 | --- | --- | --- |
-| 1 | Validated encrypted resources, conditional atomic storage, immutable warm TLS baseline | [Storage and baseline](review-evidence/dynamic-certificates/phase1/README.md) |
-| 2 | Native encrypted/authenticated publication and resolution, proxy HTTP-01 | [API and transport](review-evidence/dynamic-certificates/phase2/README.md) |
-| 3 | Bounded dynamic-only cache, real TLS handshakes, removal of static loading | [Cache and TLS](review-evidence/dynamic-certificates/phase3/README.md) |
-| 4 | Push synchronization, ordering fences, bounded watch admission | [Propagation](review-evidence/dynamic-certificates/phase4/README.md) |
-| 5 | Production-image lifecycle, resource, performance and recovery proof | [Deployed behavior](review-evidence/dynamic-certificates/phase5/README.md) |
-| 6 | Required CI, operational docs and independent whole-feature corrections | [Integration at `15a308e`](review-evidence/dynamic-certificates/phase6/README.md) |
+| 1 | Validated encrypted resources, conditional atomic storage, immutable warm TLS baseline | [Storage and baseline](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase1/README.md) |
+| 2 | Native encrypted/authenticated publication and resolution, proxy HTTP-01 | [API and transport](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase2/README.md) |
+| 3 | Bounded dynamic-only cache, real TLS handshakes, removal of static loading | [Cache and TLS](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase3/README.md) |
+| 4 | Push synchronization, ordering fences, bounded watch admission | [Propagation](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase4/README.md) |
+| 5 | Production-image lifecycle, resource, performance and recovery proof | [Deployed behavior](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase5/README.md) |
+| 6 | Required CI, operational docs and independent whole-feature corrections | [Integration at `15a308e`](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase6/README.md) |
 
 ## Phase 7: Authoritative snapshot simplification
 
@@ -136,7 +136,7 @@ the final implementation; hosted CI passes the pushed branch. Do not merge.
 
 | Status | Item | Required evidence |
 | --- | --- | --- |
-| Complete | Atomic storage and simpler protocol | Independent source/focused approval; real PostgreSQL CAS/rollback, conditional snapshots, same-ID binding, shared revisions, watermark and coalescing tests. [Evidence](review-evidence/dynamic-certificates/phase7/README.md). |
+| Complete | Atomic storage and simpler protocol | Independent source/focused approval; real PostgreSQL CAS/rollback, conditional snapshots, same-ID binding, shared revisions, watermark and coalescing tests. [Evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/dynamic-certificates/phase7/README.md). |
 | Complete | Cache and registration correctness | 26 focused cache cases pass, including original-lease retention, destructive watermark fencing, held stale responses, whole-message validation and registration/incarnation races; independently approved. |
 | Complete | Database work and bounds | Exact production EXPLAIN skips idle host scan; 16×1,024 disjoint native interests pass idle/churn/ordinary-progress and fixed-deadline checks. Maximum wire/decoded-memory proof passes; independently approved with measured workload limits. |
 | Complete | Final local and image validation | All twelve local gates and all six final checks pass; rebuilt production images/packaging, multi-replica dynamic TLS lifecycle, real five-minute outage and sleep/re-wake, sampled RSS, routing/protocol/restart/libpq and unchanged performance budgets. |
