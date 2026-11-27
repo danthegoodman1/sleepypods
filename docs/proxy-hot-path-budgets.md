@@ -412,9 +412,9 @@ defaults to `5000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 
 | Path | Harness | Budget intent |
 | --- | --- | --- |
-| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip` | Measure bidirectional copy overhead without external network variance. |
+| TCP forwarding | `tcp/proxy_streams_duplex_4k_round_trip`, `tcp/proxy_streams_with_idle_timeout_duplex_4k_round_trip` | Measure the byte relay without external network variance: first with no idle deadline, as a WebSocket session runs it, then with one, as TCP and SNI passthrough run it. |
 | HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
-| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Exercise frame relay over in-memory WebSocket streams without an external service. |
+| WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Two WebSocket peers exchange a binary message and close through the byte relay, without an external service. The peers frame; the relay copies bytes. |
 | TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
 | Frontline route lookup | `route_lookup/http_exact_host_many_unrelated`, `route_lookup/http_wildcard_suffix_many_unrelated`, `route_lookup/http_same_host_many_paths`, `route_lookup/sni_exact_host_many_unrelated` | Keep hot positive route-cache lookup indexed with many unrelated cached routes present. |
 | Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. |
