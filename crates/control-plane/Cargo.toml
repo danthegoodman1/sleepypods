@@ -35,7 +35,7 @@ zeroize = { version = "1", features = ["serde"] }
 [dev-dependencies]
 bytes = { workspace = true, default-features = true }
 control-plane = { path = ".", features = ["test-support"] }
-frontline = { path = "../frontline" }
+frontline = { path = "../frontline", features = ["test-support"] }
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 http = { workspace = true, default-features = false, features = ["std"] }
 http-body-util = { workspace = true, default-features = true }

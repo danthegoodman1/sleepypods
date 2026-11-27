@@ -81,7 +81,9 @@ const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_WAKE_DEADLINE: Duration = Duration::from_secs(5);
 const DEFAULT_ROUTE_DEADLINE: Duration = Duration::from_secs(130);
-const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// The wait after a failed stream before the next connect. A stream that
+/// ended in order is replaced at once.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
 /// How long a parked request trusts the push before it asks for its host's
 /// rule set again.
@@ -223,7 +225,6 @@ pub struct FrontlineRouteCoordinator<RouteClient, Wake> {
     wake_client: Wake,
     wake_deadline: Duration,
     route_deadline: Duration,
-    reconnect_backoff: Duration,
     observability: ObservabilityRecorder,
     counters: RouteLookupCounters,
 }
@@ -236,7 +237,6 @@ impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
             wake_client,
             wake_deadline: DEFAULT_WAKE_DEADLINE,
             route_deadline: DEFAULT_ROUTE_DEADLINE,
-            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
             observability: ObservabilityRecorder::default(),
             counters: RouteLookupCounters::default(),
         }
@@ -259,13 +259,6 @@ impl<RouteClient, Wake> FrontlineRouteCoordinator<RouteClient, Wake> {
 
     pub fn with_route_deadline(mut self, deadline: Duration) -> Self {
         self.route_deadline = deadline;
-        self
-    }
-
-    /// The wait after a failed stream before the next connect. A stream that
-    /// ended in order is replaced at once.
-    pub fn with_reconnect_backoff(mut self, backoff: Duration) -> Self {
-        self.reconnect_backoff = backoff;
         self
     }
 
@@ -306,7 +299,6 @@ where
             wake_calls: tokio::task::JoinSet::new(),
             effects: Effects::default(),
             wake_deadline: self.wake_deadline,
-            reconnect_backoff: self.reconnect_backoff,
             observability: self.observability,
         };
         SharedFrontlineRouteCoordinator {
@@ -431,6 +423,7 @@ where
     }
 
     /// Lookups the cache answered and lookups that needed the control plane.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn lookup_counters(&self) -> &RouteLookupCounters {
         &self.shared.state.counters
     }
@@ -859,7 +852,6 @@ struct Actor<Client, Wake: WakeClient> {
     wake_calls: tokio::task::JoinSet<(WakeKey, WakeResult<Wake::Error>)>,
     effects: Effects<Wake::Error>,
     wake_deadline: Duration,
-    reconnect_backoff: Duration,
     observability: ObservabilityRecorder,
 }
 
@@ -907,7 +899,7 @@ where
                     self.record_call(Operation::SubscribeStream, Outcome::Error);
                     // Nothing was lost: no stream existed to lose it.
                     self.session = Session::Idle {
-                        connect_at: tokio::time::Instant::now() + self.reconnect_backoff,
+                        connect_at: tokio::time::Instant::now() + RECONNECT_BACKOFF,
                     };
                 }
                 Step::Session(SessionEvent::Stream(event)) => {
@@ -1011,7 +1003,7 @@ where
         let backoff = if in_order {
             Duration::ZERO
         } else {
-            self.reconnect_backoff
+            RECONNECT_BACKOFF
         };
         self.session = Session::Idle {
             connect_at: tokio::time::Instant::now() + backoff,
