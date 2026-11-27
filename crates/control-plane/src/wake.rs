@@ -19,7 +19,7 @@ use crate::{
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError},
     sleep_policy::SleepPolicyError,
-    store::{ControlPlaneStore, StoreError},
+    store::{StoreError, WakeStore},
     workload::LoadWorkloadClassVersionRequest,
 };
 
@@ -88,7 +88,7 @@ pub async fn wake_instance_with_observability<S, C>(
     observability: ObservabilityRecorder,
 ) -> Result<WakeInstanceResult, WakeInstanceError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: WakeStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     let started = Instant::now();
@@ -109,7 +109,7 @@ async fn wake_instance<S, C>(
     request: WakeInstanceRequest,
 ) -> Result<WakeInstanceResult, WakeInstanceError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: WakeStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     let instance = store

@@ -1131,9 +1131,7 @@ async fn postgres_reconciler_rides_out_a_thirty_second_outage() -> TestResult {
         ))?;
         relayed.max_connections = SESSIONS_PER_STORE;
         let relayed: Arc<dyn ControlPlaneStore> =
-            Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(
-                PostgresStore::connect(&relayed).await?,
-            )));
+            Arc::new(PostgresStore::connect(&relayed).await?,);
         let sink = InMemoryObservability::default();
         let kube = LifecycleKubernetes::default();
         let driver = control_plane::MaterializationReconciler::new(

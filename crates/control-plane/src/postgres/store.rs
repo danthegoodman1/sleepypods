@@ -1,12 +1,22 @@
+//! The store traits over the Postgres operations. Each operation either
+//! repeats while the database is unavailable or runs once; an `Unavailable`
+//! answer can follow a commit, so only operations that are safe to repeat
+//! repeat.
+use std::future::Future;
+
 use crate::certificate::*;
 use crate::{
     http01::{
         DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
         PutHttp01ChallengeRequest,
     },
-    instance::{CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord},
+    ids::MaterializationId,
+    instance::{
+        CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord,
+        RequestInstanceDeletion,
+    },
     materialization::{
-        BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
+        AcceptWakeRequest, BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
         CompleteWakeReconciliationRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
         FinalizeSleepResult, ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
@@ -20,320 +30,378 @@ use crate::{
         CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
         ResolveHostRulesRequest, RouteBindingRecord,
     },
-    store::{ControlPlaneStore, StoreFuture, StoreResult},
+    runtime_work::{DurableRouteChanges, MaterializationWorkStatus, RecordMaterializationFailure},
+    store::{
+        CertificateStore, LifecycleReads, OperatorStore, ReconcilerStore, RouteStore, RuntimeStore,
+        SleepStore, StoreError, StoreFuture, StoreResult, TlsWatchStore, WakeStore,
+    },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
     },
 };
 
-use super::{connection::PostgresStore, http01_ops, instance_ops, materialization_ops, route_ops};
+use super::{
+    certificate_ops, connection::PostgresStore, http01_ops, instance_ops, lifecycle_ops,
+    materialization_ops, route_ops, runtime_work,
+};
 
-impl ControlPlaneStore for PostgresStore {
+impl PostgresStore {
+    /// Runs an operation that is safe to repeat, again while the database
+    /// is unavailable, as the store's retry policy allows.
+    fn repeated<'a, T, F, Fut>(&'a self, mut operation: F) -> StoreFuture<'a, StoreResult<T>>
+    where
+        T: Send + 'a,
+        F: FnMut() -> Fut + Send + 'a,
+        Fut: Future<Output = StoreResult<T>> + Send + 'a,
+    {
+        Box::pin(async move {
+            self.retry
+                .retry_if(&mut operation, StoreError::is_retryable)
+                .await
+        })
+    }
+
+    /// Runs an operation once: after an uncertain answer, a repeat could act
+    /// on a resource that has since changed hands.
+    fn once<'a, T>(
+        &'a self,
+        operation: impl Future<Output = StoreResult<T>> + Send + 'a,
+    ) -> StoreFuture<'a, StoreResult<T>> {
+        Box::pin(operation)
+    }
+}
+
+impl LifecycleReads for PostgresStore {
+    fn get_instance(
+        &self,
+        request: GetInstanceRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<InstanceRecord>>> {
+        self.repeated(move || instance_ops::get_instance(self, request.clone()))
+    }
+
+    fn load_workload_class_version(
+        &self,
+        request: LoadWorkloadClassVersionRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<WorkloadClassVersion>>> {
+        self.repeated(move || instance_ops::load_workload_class_version(self, request.clone()))
+    }
+
+    fn load_active_materialization(
+        &self,
+        request: LoadActiveMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.repeated(move || {
+            materialization_ops::load_active_materialization(self, request.clone())
+        })
+    }
+
+    fn load_materialization_work_status(
+        &self,
+        id: MaterializationId,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationWorkStatus>>> {
+        self.repeated(move || runtime_work::status(self, id.clone()))
+    }
+}
+
+impl WakeStore for PostgresStore {
+    fn load_ready_materialization(
+        &self,
+        request: LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.repeated(move || {
+            materialization_ops::load_ready_materialization(self, request.clone())
+        })
+    }
+
+    /// A repeat after a lost answer finds the wake accepted and returns it.
+    fn accept_wake(
+        &self,
+        request: AcceptWakeRequest,
+    ) -> StoreFuture<'_, StoreResult<InstanceRecord>> {
+        self.repeated(move || lifecycle_ops::accept_wake(self, request.clone()))
+    }
+}
+
+impl SleepStore for PostgresStore {
+    /// A repeat after a lost answer meets a generation conflict, which the
+    /// caller reads as a drain already under way.
+    fn begin_sleep(
+        &self,
+        request: BeginSleepRequest,
+    ) -> StoreFuture<'_, StoreResult<BeginSleepResult>> {
+        self.repeated(move || materialization_ops::begin_sleep(self, request.clone()))
+    }
+}
+
+impl ReconcilerStore for PostgresStore {
+    /// Runs once: a claim whose answer is lost leaves a lease nobody renews,
+    /// and a repeat would take a second row. The lost lease expires.
+    fn claim_next_materialization_reconciliation(
+        &self,
+        request: ClaimNextMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.once(materialization_ops::claim_next_materialization_reconciliation(self, request))
+    }
+
+    fn renew_materialization_reconciliation_lease(
+        &self,
+        request: RenewMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.repeated(move || {
+            materialization_ops::renew_materialization_reconciliation_lease(self, request.clone())
+        })
+    }
+
+    fn release_materialization_reconciliation_lease(
+        &self,
+        request: ReleaseMaterializationReconciliationLeaseRequest,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.repeated(move || {
+            materialization_ops::release_materialization_reconciliation_lease(self, request.clone())
+        })
+    }
+
+    fn complete_wake_reconciliation(
+        &self,
+        request: CompleteWakeReconciliationRequest,
+    ) -> StoreFuture<'_, StoreResult<CompleteWakeResult>> {
+        self.repeated(move || {
+            materialization_ops::complete_wake_reconciliation(self, request.clone())
+        })
+    }
+
+    fn finalize_sleep_reconciliation(
+        &self,
+        request: FinalizeSleepReconciliationRequest,
+    ) -> StoreFuture<'_, StoreResult<FinalizeSleepResult>> {
+        self.repeated(move || {
+            materialization_ops::finalize_sleep_reconciliation(self, request.clone())
+        })
+    }
+
+    fn delete_materialization_reconciliation(
+        &self,
+        request: DeleteMaterializationReconciliationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.repeated(move || {
+            materialization_ops::delete_materialization_reconciliation(self, request.clone())
+        })
+    }
+
+    fn record_materialization_failure(
+        &self,
+        request: RecordMaterializationFailure,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.repeated(move || runtime_work::record_failure(self, request.clone()))
+    }
+
+    fn finalize_instance_deletions(&self, limit: usize) -> StoreFuture<'_, StoreResult<usize>> {
+        self.repeated(move || lifecycle_ops::finalize_instance_deletions(self, limit))
+    }
+}
+
+impl OperatorStore for PostgresStore {
+    fn create_workload_class_version(
+        &self,
+        request: CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'_, StoreResult<WorkloadClassVersion>> {
+        self.repeated(move || instance_ops::create_workload_class_version(self, request.clone()))
+    }
+
+    /// Runs once: after a lost answer and a delete, a repeat would create the
+    /// instance again.
+    fn create_instance(
+        &self,
+        request: CreateInstanceRequest,
+    ) -> StoreFuture<'_, StoreResult<CreateInstanceResult>> {
+        self.once(instance_ops::create_instance(self, request))
+    }
+
+    fn request_instance_deletion(
+        &self,
+        request: RequestInstanceDeletion,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.repeated(move || lifecycle_ops::request_instance_deletion(self, request.clone()))
+    }
+
+    /// Runs once: after a lost answer and a delete, a repeat would create the
+    /// binding again.
+    fn create_route_binding(
+        &self,
+        request: CreateRouteBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<RouteBindingRecord>> {
+        self.once(route_ops::create_route_binding(self, request))
+    }
+
+    fn get_route_binding(
+        &self,
+        request: GetRouteBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<RouteBindingRecord>>> {
+        self.repeated(move || route_ops::get_route_binding(self, request.clone()))
+    }
+
+    /// Runs once: the ID may name a replacement once the first delete has
+    /// committed.
+    fn delete_route_binding(
+        &self,
+        request: DeleteRouteBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.once(route_ops::delete_route_binding(self, request))
+    }
+
+    fn load_materialization(
+        &self,
+        request: LoadMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.repeated(move || materialization_ops::load_materialization(self, request.clone()))
+    }
+
+    /// Runs once: a repeat after a lost answer could clear the backoff of the
+    /// attempt that followed.
+    fn enqueue_materialization(&self, id: MaterializationId) -> StoreFuture<'_, StoreResult<bool>> {
+        self.once(runtime_work::enqueue(self, id))
+    }
+
+    /// Runs once: the ID may name a replacement once the first override has
+    /// committed.
+    fn force_delete_materialization(
+        &self,
+        request: ForceDeleteMaterializationRequest,
+    ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+        self.once(materialization_ops::force_delete_materialization(
+            self, request,
+        ))
+    }
+
+    /// Runs once: another owner may take the released key before a repeat.
+    fn force_release_exclusivity_key(
+        &self,
+        request: ForceReleaseExclusivityKeyRequest,
+    ) -> StoreFuture<'_, StoreResult<ForceReleaseExclusivityKeyResult>> {
+        self.once(materialization_ops::force_release_exclusivity_key(
+            self, request,
+        ))
+    }
+
+    /// Runs once: a newer authorization may replace this host and token
+    /// after an uncertain write.
+    fn put_http01_challenge(
+        &self,
+        request: PutHttp01ChallengeRequest,
+    ) -> StoreFuture<'_, StoreResult<Http01ChallengeRecord>> {
+        self.once(http01_ops::put_http01_challenge(self, request))
+    }
+
+    /// Runs once: the host and token may already hold a replacement.
+    fn delete_http01_challenge(
+        &self,
+        request: DeleteHttp01ChallengeRequest,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.once(http01_ops::delete_http01_challenge(self, request))
+    }
+}
+
+impl RouteStore for PostgresStore {
+    fn resolve_host_rules(
+        &self,
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'_, StoreResult<HostRules>> {
+        self.repeated(move || route_ops::resolve_host_rules(self, request.clone()))
+    }
+
+    fn resolve_http01_challenge(
+        &self,
+        key: Http01ChallengeKey,
+    ) -> StoreFuture<'_, StoreResult<Option<Http01ChallengeRecord>>> {
+        self.repeated(move || http01_ops::resolve_http01_challenge(self, key.clone()))
+    }
+}
+
+/// Certificate writes run once: after an uncertain answer the caller reads the
+/// metadata before it chooses another conditional write.
+impl CertificateStore for PostgresStore {
     fn publish_certificate(
         &self,
         request: PublishCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(super::certificate_ops::publish(self, request))
+        self.once(certificate_ops::publish(self, request))
     }
     fn get_certificate_metadata(
         &self,
         id: CertificateId,
     ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>> {
-        Box::pin(super::certificate_ops::get_metadata(self, id))
+        self.repeated(move || certificate_ops::get_metadata(self, id.clone()))
     }
     fn set_tls_binding(
         &self,
         request: SetTlsBindingRequest,
     ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
-        Box::pin(super::certificate_ops::set_binding(self, request))
+        self.once(certificate_ops::set_binding(self, request))
     }
     fn get_tls_binding(&self, hostname: TlsHostname) -> StoreFuture<'_, StoreResult<TlsBinding>> {
-        Box::pin(super::certificate_ops::get_binding(self, hostname))
+        self.repeated(move || certificate_ops::get_binding(self, hostname.clone()))
     }
     fn remove_certificate(
         &self,
         request: RemoveCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(super::certificate_ops::remove(self, request))
+        self.once(certificate_ops::remove(self, request))
     }
     fn resolve_tls_certificate(
         &self,
         request: ResolveTlsCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>> {
-        Box::pin(super::certificate_ops::resolve(self, request))
+        self.repeated(move || certificate_ops::resolve(self, request.clone()))
     }
     fn reencrypt_certificate(
         &self,
         request: ReencryptCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
-        Box::pin(super::certificate_ops::reencrypt(self, request))
+        self.once(certificate_ops::reencrypt(self, request))
     }
     fn reencrypt_certificates_sealed_by(
         &self,
         sealing_key_id: String,
     ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
-        Box::pin(super::certificate_ops::reencrypt_sealed_by(
-            self,
-            sealing_key_id,
-        ))
+        self.once(certificate_ops::reencrypt_sealed_by(self, sealing_key_id))
     }
+}
 
+impl TlsWatchStore for PostgresStore {
     fn snapshot_tls_bindings(
         &self,
         hostnames: Vec<TlsHostname>,
         known_revision: Option<CertificateRevision>,
     ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
-        Box::pin(super::certificate_ops::snapshot(
-            self,
-            hostnames,
-            known_revision,
-        ))
+        self.repeated(move || certificate_ops::snapshot(self, hostnames.clone(), known_revision))
     }
+}
 
+impl RuntimeStore for PostgresStore {
     fn load_route_changes(
         &self,
         cursor: u64,
         limit: u32,
-    ) -> StoreFuture<'_, StoreResult<crate::runtime_work::DurableRouteChanges>> {
-        Box::pin(super::runtime_work::changes(self, cursor, limit))
+    ) -> StoreFuture<'_, StoreResult<DurableRouteChanges>> {
+        self.repeated(move || runtime_work::changes(self, cursor, limit))
     }
+
     fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
-        Box::pin(super::runtime_work::revision(self))
+        self.repeated(move || runtime_work::revision(self))
     }
+
     fn route_change_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.route_changes.subscribe()
     }
-    fn load_materialization_work_status(
-        &self,
-        id: crate::ids::MaterializationId,
-    ) -> StoreFuture<'_, StoreResult<Option<crate::runtime_work::MaterializationWorkStatus>>> {
-        Box::pin(super::runtime_work::status(self, id))
-    }
-    fn record_materialization_failure(
-        &self,
-        request: crate::runtime_work::RecordMaterializationFailure,
-    ) -> StoreFuture<'_, StoreResult<bool>> {
-        Box::pin(super::runtime_work::record_failure(self, request))
-    }
-    fn enqueue_materialization(
-        &self,
-        id: crate::ids::MaterializationId,
-    ) -> StoreFuture<'_, StoreResult<bool>> {
-        Box::pin(super::runtime_work::enqueue(self, id))
-    }
+
+    /// Each pass holds its batch limit; a repeat counts only what it removed.
     fn maintain_runtime_records(&self, limit: u32) -> StoreFuture<'_, StoreResult<u64>> {
-        Box::pin(super::runtime_work::maintain(self, limit))
-    }
-
-    fn accept_wake<'a>(
-        &'a self,
-        request: crate::materialization::AcceptWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move { super::lifecycle_ops::accept_wake(self, request).await })
-    }
-    fn request_instance_deletion<'a>(
-        &'a self,
-        request: crate::instance::RequestInstanceDeletion,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(
-            async move { super::lifecycle_ops::request_instance_deletion(self, request).await },
-        )
-    }
-    fn finalize_instance_deletions<'a>(
-        &'a self,
-        limit: usize,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(
-            async move { super::lifecycle_ops::finalize_instance_deletions(self, limit).await },
-        )
-    }
-
-    fn create_instance<'a>(
-        &'a self,
-        request: CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        Box::pin(async move { instance_ops::create_instance(self, request).await })
-    }
-
-    fn get_instance<'a>(
-        &'a self,
-        request: GetInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-        Box::pin(async move { instance_ops::get_instance(self, request).await })
-    }
-
-    fn create_workload_class_version<'a>(
-        &'a self,
-        request: CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
-        Box::pin(async move { instance_ops::create_workload_class_version(self, request).await })
-    }
-
-    fn load_workload_class_version<'a>(
-        &'a self,
-        request: LoadWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
-        Box::pin(async move { instance_ops::load_workload_class_version(self, request).await })
-    }
-
-    fn create_route_binding<'a>(
-        &'a self,
-        request: CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
-        Box::pin(async move { route_ops::create_route_binding(self, request).await })
-    }
-
-    fn get_route_binding<'a>(
-        &'a self,
-        request: GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
-        Box::pin(async move { route_ops::get_route_binding(self, request).await })
-    }
-
-    fn delete_route_binding<'a>(
-        &'a self,
-        request: DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move { route_ops::delete_route_binding(self, request).await })
-    }
-
-    fn resolve_host_rules<'a>(
-        &'a self,
-        request: ResolveHostRulesRequest,
-    ) -> StoreFuture<'a, StoreResult<HostRules>> {
-        Box::pin(async move { route_ops::resolve_host_rules(self, request).await })
-    }
-
-    fn load_ready_materialization<'a>(
-        &'a self,
-        request: LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(
-            async move { materialization_ops::load_ready_materialization(self, request).await },
-        )
-    }
-
-    fn load_active_materialization<'a>(
-        &'a self,
-        request: LoadActiveMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(
-            async move { materialization_ops::load_active_materialization(self, request).await },
-        )
-    }
-
-    fn load_materialization<'a>(
-        &'a self,
-        request: LoadMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move { materialization_ops::load_materialization(self, request).await })
-    }
-
-    fn begin_sleep<'a>(
-        &'a self,
-        request: BeginSleepRequest,
-    ) -> StoreFuture<'a, StoreResult<BeginSleepResult>> {
-        Box::pin(async move { materialization_ops::begin_sleep(self, request).await })
+        self.repeated(move || runtime_work::maintain(self, limit))
     }
 
     fn load_materialization_operational_metrics(
         &self,
     ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
-        Box::pin(async move {
-            materialization_ops::load_materialization_operational_metrics(self).await
-        })
-    }
-
-    fn claim_next_materialization_reconciliation<'a>(
-        &'a self,
-        request: ClaimNextMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move {
-            materialization_ops::claim_next_materialization_reconciliation(self, request).await
-        })
-    }
-
-    fn renew_materialization_reconciliation_lease<'a>(
-        &'a self,
-        request: RenewMaterializationReconciliationLeaseRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            materialization_ops::renew_materialization_reconciliation_lease(self, request).await
-        })
-    }
-
-    fn release_materialization_reconciliation_lease<'a>(
-        &'a self,
-        request: ReleaseMaterializationReconciliationLeaseRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            materialization_ops::release_materialization_reconciliation_lease(self, request).await
-        })
-    }
-
-    fn complete_wake_reconciliation<'a>(
-        &'a self,
-        request: CompleteWakeReconciliationRequest,
-    ) -> StoreFuture<'a, StoreResult<CompleteWakeResult>> {
-        Box::pin(
-            async move { materialization_ops::complete_wake_reconciliation(self, request).await },
-        )
-    }
-
-    fn finalize_sleep_reconciliation<'a>(
-        &'a self,
-        request: FinalizeSleepReconciliationRequest,
-    ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
-        Box::pin(
-            async move { materialization_ops::finalize_sleep_reconciliation(self, request).await },
-        )
-    }
-
-    fn delete_materialization_reconciliation<'a>(
-        &'a self,
-        request: DeleteMaterializationReconciliationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move {
-            materialization_ops::delete_materialization_reconciliation(self, request).await
-        })
-    }
-
-    fn force_delete_materialization<'a>(
-        &'a self,
-        request: ForceDeleteMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(
-            async move { materialization_ops::force_delete_materialization(self, request).await },
-        )
-    }
-
-    fn force_release_exclusivity_key<'a>(
-        &'a self,
-        request: ForceReleaseExclusivityKeyRequest,
-    ) -> StoreFuture<'a, StoreResult<ForceReleaseExclusivityKeyResult>> {
-        Box::pin(
-            async move { materialization_ops::force_release_exclusivity_key(self, request).await },
-        )
-    }
-
-    fn put_http01_challenge<'a>(
-        &'a self,
-        request: PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
-        Box::pin(async move { http01_ops::put_http01_challenge(self, request).await })
-    }
-
-    fn resolve_http01_challenge<'a>(
-        &'a self,
-        key: Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>> {
-        Box::pin(async move { http01_ops::resolve_http01_challenge(self, key).await })
-    }
-
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        request: DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move { http01_ops::delete_http01_challenge(self, request).await })
+        self.repeated(move || materialization_ops::load_materialization_operational_metrics(self))
     }
 }

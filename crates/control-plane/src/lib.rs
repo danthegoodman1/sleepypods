@@ -1,12 +1,5 @@
 //! Domain model and persistence contract for the SleepyPods control plane.
 
-#[cfg(test)]
-extern crate self as control_plane;
-#[cfg(test)]
-#[macro_use]
-#[path = "../tests/support/unexpected_store.rs"]
-mod unexpected_store;
-
 pub mod api;
 pub mod auth;
 pub mod certificate;
@@ -102,7 +95,9 @@ pub use sleep_policy::{
     IdleTimeoutOverridePolicy, ResolvedSleepPolicy, SleepPolicyError, WorkloadSleepPolicy,
 };
 pub use store::{
-    ControlPlaneStore, RetryingControlPlaneStore, StoreError, StoreFuture, StoreResult,
+    CertificateStore, ControlPlaneStore, LifecycleReads, OperatorServiceStore, OperatorStore,
+    ProxyServiceStore, ReconcilerStore, RouteStore, RuntimeStore, SleepStore, StoreError,
+    StoreFuture, StoreResult, TlsWatchStore, WakeStore, WorkloadServiceStore,
 };
 pub use workload::{
     CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, RenderedExclusivityKey,

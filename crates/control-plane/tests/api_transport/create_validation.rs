@@ -3,7 +3,9 @@
 use super::*;
 
 use control_plane::api::pb::{WorkloadValueFieldRule, WorkloadValueSchema};
-use control_plane::{render_manifests, GetInstanceRequest as DomainGetInstanceRequest};
+use control_plane::{
+    render_manifests, GetInstanceRequest as DomainGetInstanceRequest, LifecycleReads,
+};
 
 const SUFFIX_VALUE: &str = "sleepypods.instance_suffix";
 

@@ -75,9 +75,7 @@ async fn postgres_lifecycle_operations_fit_their_round_trip_budgets() -> TestRes
         // the ones each measurement reuses.
         relayed.max_connections = 1;
         let relayed: Arc<dyn ControlPlaneStore> = Arc::new(
-            control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(
-                PostgresStore::connect(&relayed).await?,
-            )),
+            PostgresStore::connect(&relayed).await?,
         );
         let class = class(&store, "round-trip-class").await?;
         // Each operation has a target of its own, so a claim finds only its row.

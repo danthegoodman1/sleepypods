@@ -6,7 +6,6 @@ use control_plane::{
     instance::RequestInstanceDeletion,
     KubernetesClientError, KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer,
     KubernetesMaterializerClient, KubernetesObject, MaterializationReconciler,
-    RetryingControlPlaneStore,
 };
 use pb::proxy_control_plane_server::ProxyControlPlane;
 use std::sync::{Arc, Mutex};
@@ -140,7 +139,7 @@ async fn exercise(pg: PostgresStore, raw: &tokio_postgres::Client) -> TestResult
     let class = workload_class("cleanup-boundary", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     let target = MaterializationTarget::new("cleanup-boundary", "apps")?;
     let client = TerminatingDescendant::default();
     let materializer = KubernetesMaterializer::new(client.clone());

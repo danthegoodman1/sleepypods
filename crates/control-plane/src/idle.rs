@@ -8,7 +8,7 @@ use crate::{
         MaterializationTarget,
     },
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
-    store::{ControlPlaneStore, StoreError},
+    store::{SleepStore, StoreError},
     workload::LoadWorkloadClassVersionRequest,
 };
 
@@ -82,7 +82,7 @@ pub async fn report_idle<S, C>(
     request: ReportIdleRequest,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     if request.active_count > 0 {
@@ -118,7 +118,7 @@ async fn already_draining<S>(
     current: InstanceRecord,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
     let projection = store
         .load_active_materialization(LoadActiveMaterializationRequest::new(
@@ -154,7 +154,7 @@ async fn begin_running_sleep<S>(
     sleep_policy: crate::sleep_policy::ResolvedSleepPolicy,
 ) -> Result<ReportIdleResult, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
     let minimum_ready_age = Duration::from_millis(sleep_policy.idle_timeout_ms)
         .max(sleepypods_api::INITIAL_ACTIVATION_TIMEOUT);
@@ -198,7 +198,7 @@ async fn verify_idle_member<S, C>(
     current: &InstanceRecord,
 ) -> Result<crate::sleep_policy::ResolvedSleepPolicy, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
     C: KubernetesMaterializerClient,
 {
     if request.pod_uid.trim().is_empty() {
@@ -265,7 +265,7 @@ async fn load_instance<S>(
     instance_id: InstanceId,
 ) -> Result<InstanceRecord, ReportIdleError>
 where
-    S: ControlPlaneStore + ?Sized,
+    S: SleepStore + ?Sized,
 {
     store
         .get_instance(GetInstanceRequest::new(instance_id))

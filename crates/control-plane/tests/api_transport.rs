@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "support/unexpected_store.rs"]
-mod unexpected_store;
 #[path = "api_transport/create_validation.rs"]
 mod create_validation;
 #[path = "api_transport/grpc_web_tls.rs"]

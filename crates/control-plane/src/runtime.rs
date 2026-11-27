@@ -35,7 +35,7 @@ use crate::{
     },
     postgres::PostgresStore,
     reconciler::{MaterializationReconciler, MaterializationReconcilerConfig},
-    store::{ControlPlaneStore, RetryingControlPlaneStore},
+    store::{ControlPlaneStore, OperatorServiceStore, RuntimeStore, WorkloadServiceStore},
     KubeMaterializerClient,
 };
 
@@ -312,7 +312,7 @@ impl RuntimeConfig {
 /// services. The operator service stays off it, so a compromised workload finds
 /// nothing but the two APIs its own components already speak.
 pub fn workload_router_with_tls<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn WorkloadServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     auth_config: AuthConfig,
@@ -326,7 +326,7 @@ where
     Ok(grpc_server(route_events.clone(), tls)?
         .add_service(tonic::service::interceptor::InterceptedService::new(
             proxy_grpc_service_with_store_and_route_events(
-                Arc::clone(&store),
+                store.clone(),
                 materializer.clone(),
                 target.clone(),
                 route_events.clone(),
@@ -347,7 +347,7 @@ where
 
 /// The listener an operator reaches, carrying the operator service alone.
 pub fn operator_router_with_tls<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn OperatorServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     auth_config: AuthConfig,
@@ -392,7 +392,7 @@ fn grpc_server(
 /// platform TLS identity when one is configured, for pages from
 /// `allowed_origins`.
 pub fn operator_grpc_web_router_with_tls<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn OperatorServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     auth_config: AuthConfig,
@@ -498,7 +498,7 @@ where
         );
     let route_events = RouteSubscriptionBroker::with_limits(config.api_limits.clone());
     let workload_router = workload_router_with_tls(
-        Arc::clone(&store),
+        store.clone(),
         materializer.clone(),
         config.target.clone(),
         config.control_plane.auth.clone(),
@@ -506,7 +506,7 @@ where
         config.security.tls(config.api_limits.setup_timeout)?,
     )?;
     let operator_router = operator_router_with_tls(
-        Arc::clone(&store),
+        store.clone(),
         materializer.clone(),
         config.target.clone(),
         config.control_plane.auth.clone(),
@@ -517,7 +517,7 @@ where
     let native_shutdown = shutdown_tx.subscribe();
     let reconciler_shutdown = shutdown_tx.subscribe();
     let reconciler = MaterializationReconciler::new(
-        Arc::clone(&store),
+        store.clone(),
         materializer.clone(),
         config.target.clone(),
         MaterializationReconcilerConfig::from_env()?,
@@ -572,7 +572,7 @@ where
 
     if let Some(web_incoming) = web_incoming {
         let operator_grpc_web_router = operator_grpc_web_router_with_tls(
-            Arc::clone(&store),
+            store.clone(),
             materializer.clone(),
             config.target.clone(),
             config.control_plane.auth.clone(),
@@ -689,7 +689,7 @@ const ROUTE_CHANGE_BATCH: u32 = 1024;
 /// subscribers lose nothing; history that was pruned past the cursor resets
 /// them.
 pub async fn dispatch_route_changes(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn RuntimeStore>,
     events: RouteSubscriptionBroker,
     mut cursor: u64,
     mut shutdown: watch::Receiver<bool>,
@@ -729,7 +729,7 @@ pub async fn dispatch_route_changes(
 /// A failed pass is retried at the next interval: the records only accumulate
 /// while the store is unavailable.
 async fn maintain_runtime(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn RuntimeStore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> RuntimeResult<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -762,7 +762,7 @@ pub fn install_runtime_observability(metrics_enabled: bool) -> Option<Prometheus
 }
 
 async fn record_materialization_operational_metrics(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn RuntimeStore>,
     sink: PrometheusMetricsSink,
 ) {
     for state in MaterializationState::BACKLOG_STATES {
@@ -849,10 +849,7 @@ pub async fn connect_store(
     if !missing.is_empty() {
         return Err(RuntimeConfigError::MissingSealingKeys(missing).into());
     }
-    let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
-    Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
-        store,
-    )))
+    Ok(Arc::new(store))
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -995,32 +992,15 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::{
-        http01::{
-            DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
-            PutHttp01ChallengeRequest,
-        },
-        instance::{
-            CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord,
-        },
         manifest::KubernetesObject,
         materialization::{
-            BackendEndpoint, CompleteWakeRequest, CompleteWakeResult,
-            LoadReadyMaterializationRequest, MaterializationBacklogOperationalMetrics,
+            BackendEndpoint, MaterializationBacklogOperationalMetrics,
             MaterializationHeldKeysOperationalMetrics, MaterializationOperationalMetrics,
-            MaterializationRecord, MaterializationState, RecordMaterializationRequest,
-            RenderedObjectRef,
+            MaterializationState, RenderedObjectRef,
         },
         materializer::{KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer},
-        route::{
-            CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-            HostRules, ResolveHostRulesRequest, RouteBindingRecord,
-        },
-        store::{StoreError, StoreFuture, StoreResult},
-        workload::{
-            CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest,
-            WorkloadClassVersion,
-        },
-        ControlPlaneStore, KubernetesMaterializerClient,
+        store::{StoreFuture, StoreResult},
+        KubernetesMaterializerClient,
     };
 
     use super::*;
@@ -1112,7 +1092,7 @@ pub(crate) mod tests {
     /// that finds the port still finds no operator method behind it.
     #[tokio::test]
     async fn the_workload_listener_serves_no_operator_method() {
-        let store: Arc<dyn ControlPlaneStore> = Arc::new(NoopStore);
+        let store: Arc<NoopStore> = Arc::new(NoopStore);
         let materializer = KubernetesMaterializer::new(NoopKubernetesClient);
         let target = MaterializationTarget::new("cluster-a", "apps").expect("target");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1531,12 +1511,12 @@ pub(crate) mod tests {
 
     #[test]
     fn constructs_a_router_for_each_listener() {
-        let store: Arc<dyn ControlPlaneStore> = Arc::new(NoopStore);
+        let store: Arc<NoopStore> = Arc::new(NoopStore);
         let materializer = KubernetesMaterializer::new(NoopKubernetesClient);
         let target = MaterializationTarget::new("cluster-a", "apps").expect("target");
 
         let _workload = workload_router_with_tls(
-            Arc::clone(&store),
+            store.clone(),
             materializer.clone(),
             target.clone(),
             AuthConfig::NoAuth,
@@ -1545,7 +1525,7 @@ pub(crate) mod tests {
         )
         .expect("workload router");
         let _operator = operator_router_with_tls(
-            Arc::clone(&store),
+            store.clone(),
             materializer.clone(),
             target.clone(),
             AuthConfig::NoAuth,
@@ -1568,7 +1548,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn materialization_operational_metrics_make_stuck_work_alertable_by_state() {
         let sink = PrometheusMetricsSink::new();
-        let store: Arc<dyn ControlPlaneStore> = Arc::new(OperationalMetricsStore);
+        let store: Arc<dyn RuntimeStore> = Arc::new(OperationalMetricsStore);
 
         record_materialization_operational_metrics(store, sink.clone()).await;
 
@@ -1801,50 +1781,28 @@ pub(crate) mod tests {
     #[derive(Debug)]
     struct OperationalMetricsStore;
 
-    impl ControlPlaneStore for OperationalMetricsStore {
-        unexpected_store_methods!(
-            publish_certificate,
-            get_certificate_metadata,
-            set_tls_binding,
-            get_tls_binding,
-            remove_certificate,
-            resolve_tls_certificate,
-            reencrypt_certificate,
-            reencrypt_certificates_sealed_by,
-            snapshot_tls_bindings,
-            load_route_changes,
-            load_route_change_revision,
-            load_materialization_work_status,
-            record_materialization_failure,
-            enqueue_materialization,
-            maintain_runtime_records,
-            accept_wake,
-            request_instance_deletion,
-            finalize_instance_deletions,
-            create_instance,
-            get_instance,
-            create_workload_class_version,
-            load_workload_class_version,
-            create_route_binding,
-            get_route_binding,
-            delete_route_binding,
-            resolve_host_rules,
-            load_ready_materialization,
-            load_active_materialization,
-            load_materialization,
-            begin_sleep,
-            claim_next_materialization_reconciliation,
-            renew_materialization_reconciliation_lease,
-            release_materialization_reconciliation_lease,
-            complete_wake_reconciliation,
-            finalize_sleep_reconciliation,
-            delete_materialization_reconciliation,
-            force_delete_materialization,
-            force_release_exclusivity_key,
-            put_http01_challenge,
-            resolve_http01_challenge,
-            delete_http01_challenge
-        );
+    impl RuntimeStore for OperationalMetricsStore {
+        fn load_route_changes(
+            &self,
+            cursor: u64,
+            _limit: u32,
+        ) -> StoreFuture<'_, StoreResult<crate::runtime_work::DurableRouteChanges>> {
+            Box::pin(async move {
+                Ok(crate::runtime_work::DurableRouteChanges {
+                    cursor,
+                    reset: false,
+                    events: Vec::new(),
+                })
+            })
+        }
+
+        fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn maintain_runtime_records(&self, _limit: u32) -> StoreFuture<'_, StoreResult<u64>> {
+            Box::pin(async { Ok(0) })
+        }
 
         fn load_materialization_operational_metrics(
             &self,
@@ -1878,139 +1836,245 @@ pub(crate) mod tests {
         }
     }
 
-    impl ControlPlaneStore for NoopStore {
-        unexpected_store_methods!(
-            publish_certificate,
-            get_certificate_metadata,
-            set_tls_binding,
-            get_tls_binding,
-            remove_certificate,
-            resolve_tls_certificate,
-            reencrypt_certificate,
-            reencrypt_certificates_sealed_by,
-            snapshot_tls_bindings,
-            load_route_changes,
-            load_route_change_revision,
-            load_materialization_work_status,
-            record_materialization_failure,
-            enqueue_materialization,
-            maintain_runtime_records,
-            accept_wake,
-            request_instance_deletion,
-            finalize_instance_deletions,
-            load_materialization,
-            load_materialization_operational_metrics,
-            claim_next_materialization_reconciliation,
-            renew_materialization_reconciliation_lease,
-            release_materialization_reconciliation_lease,
-            complete_wake_reconciliation,
-            finalize_sleep_reconciliation,
-            delete_materialization_reconciliation,
-            force_delete_materialization,
-            force_release_exclusivity_key
-        );
+    /// A store whose every operation fails with an internal error, for
+    /// transport tests that need a real service behind the listener.
+    mod noop_store {
+        use super::NoopStore;
+        use crate::certificate::*;
+        use crate::store::*;
 
-        fn create_instance<'a>(
-            &'a self,
-            _request: CreateInstanceRequest,
-        ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-            not_implemented()
+        use crate::{
+            http01::{
+                DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+                PutHttp01ChallengeRequest,
+            },
+            ids::MaterializationId,
+            instance::{
+                CreateInstanceRequest, CreateInstanceResult, GetInstanceRequest, InstanceRecord,
+                RequestInstanceDeletion,
+            },
+            materialization::{
+                AcceptWakeRequest, BeginSleepRequest, BeginSleepResult,
+                ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+                ForceReleaseExclusivityKeyResult, LoadActiveMaterializationRequest,
+                LoadMaterializationRequest, LoadReadyMaterializationRequest, MaterializationRecord,
+            },
+            route::{
+                CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
+                HostRules, ResolveHostRulesRequest, RouteBindingRecord,
+            },
+            runtime_work::MaterializationWorkStatus,
+            workload::{
+                CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest,
+                WorkloadClassVersion,
+            },
+        };
+
+        impl LifecycleReads for NoopStore {
+            fn get_instance(
+                &self,
+                _request: GetInstanceRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<InstanceRecord>>> {
+                failing()
+            }
+            fn load_workload_class_version(
+                &self,
+                _request: LoadWorkloadClassVersionRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<WorkloadClassVersion>>> {
+                failing()
+            }
+            fn load_active_materialization(
+                &self,
+                _request: LoadActiveMaterializationRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+                failing()
+            }
+            fn load_materialization_work_status(
+                &self,
+                _id: MaterializationId,
+            ) -> StoreFuture<'_, StoreResult<Option<MaterializationWorkStatus>>> {
+                failing()
+            }
         }
 
-        fn get_instance<'a>(
-            &'a self,
-            _request: GetInstanceRequest,
-        ) -> StoreFuture<'a, StoreResult<Option<InstanceRecord>>> {
-            not_implemented()
+        impl WakeStore for NoopStore {
+            fn load_ready_materialization(
+                &self,
+                _request: LoadReadyMaterializationRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+                failing()
+            }
+            fn accept_wake(
+                &self,
+                _request: AcceptWakeRequest,
+            ) -> StoreFuture<'_, StoreResult<InstanceRecord>> {
+                failing()
+            }
         }
 
-        fn create_workload_class_version<'a>(
-            &'a self,
-            _request: CreateWorkloadClassVersionRequest,
-        ) -> StoreFuture<'a, StoreResult<WorkloadClassVersion>> {
-            not_implemented()
+        impl SleepStore for NoopStore {
+            fn begin_sleep(
+                &self,
+                _request: BeginSleepRequest,
+            ) -> StoreFuture<'_, StoreResult<BeginSleepResult>> {
+                failing()
+            }
         }
 
-        fn load_workload_class_version<'a>(
-            &'a self,
-            _request: LoadWorkloadClassVersionRequest,
-        ) -> StoreFuture<'a, StoreResult<Option<WorkloadClassVersion>>> {
-            not_implemented()
+        impl RouteStore for NoopStore {
+            fn resolve_host_rules(
+                &self,
+                _request: ResolveHostRulesRequest,
+            ) -> StoreFuture<'_, StoreResult<HostRules>> {
+                failing()
+            }
+            fn resolve_http01_challenge(
+                &self,
+                _key: Http01ChallengeKey,
+            ) -> StoreFuture<'_, StoreResult<Option<Http01ChallengeRecord>>> {
+                failing()
+            }
         }
 
-        fn create_route_binding<'a>(
-            &'a self,
-            _request: CreateRouteBindingRequest,
-        ) -> StoreFuture<'a, StoreResult<RouteBindingRecord>> {
-            not_implemented()
+        impl CertificateStore for NoopStore {
+            fn publish_certificate(
+                &self,
+                _request: PublishCertificateRequest,
+            ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+                failing()
+            }
+            fn get_certificate_metadata(
+                &self,
+                _id: CertificateId,
+            ) -> StoreFuture<'_, StoreResult<Option<CertificateMetadata>>> {
+                failing()
+            }
+            fn set_tls_binding(
+                &self,
+                _request: SetTlsBindingRequest,
+            ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+                failing()
+            }
+            fn get_tls_binding(
+                &self,
+                _hostname: TlsHostname,
+            ) -> StoreFuture<'_, StoreResult<TlsBinding>> {
+                failing()
+            }
+            fn remove_certificate(
+                &self,
+                _request: RemoveCertificateRequest,
+            ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+                failing()
+            }
+            fn resolve_tls_certificate(
+                &self,
+                _request: ResolveTlsCertificateRequest,
+            ) -> StoreFuture<'_, StoreResult<TlsCertificateResolution>> {
+                failing()
+            }
+            fn reencrypt_certificate(
+                &self,
+                _request: ReencryptCertificateRequest,
+            ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
+                failing()
+            }
+            fn reencrypt_certificates_sealed_by(
+                &self,
+                _sealing_key_id: String,
+            ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+                failing()
+            }
         }
 
-        fn get_route_binding<'a>(
-            &'a self,
-            _request: GetRouteBindingRequest,
-        ) -> StoreFuture<'a, StoreResult<Option<RouteBindingRecord>>> {
-            not_implemented()
+        impl TlsWatchStore for NoopStore {
+            fn snapshot_tls_bindings(
+                &self,
+                _hostnames: Vec<TlsHostname>,
+                _known_revision: Option<CertificateRevision>,
+            ) -> StoreFuture<'_, StoreResult<Option<TlsBindingSnapshot>>> {
+                failing()
+            }
         }
 
-        fn delete_route_binding<'a>(
-            &'a self,
-            _request: DeleteRouteBindingRequest,
-        ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
+        impl OperatorStore for NoopStore {
+            fn create_workload_class_version(
+                &self,
+                _request: CreateWorkloadClassVersionRequest,
+            ) -> StoreFuture<'_, StoreResult<WorkloadClassVersion>> {
+                failing()
+            }
+            fn create_instance(
+                &self,
+                _request: CreateInstanceRequest,
+            ) -> StoreFuture<'_, StoreResult<CreateInstanceResult>> {
+                failing()
+            }
+            fn request_instance_deletion(
+                &self,
+                _request: RequestInstanceDeletion,
+            ) -> StoreFuture<'_, StoreResult<bool>> {
+                failing()
+            }
+            fn create_route_binding(
+                &self,
+                _request: CreateRouteBindingRequest,
+            ) -> StoreFuture<'_, StoreResult<RouteBindingRecord>> {
+                failing()
+            }
+            fn get_route_binding(
+                &self,
+                _request: GetRouteBindingRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<RouteBindingRecord>>> {
+                failing()
+            }
+            fn delete_route_binding(
+                &self,
+                _request: DeleteRouteBindingRequest,
+            ) -> StoreFuture<'_, StoreResult<bool>> {
+                failing()
+            }
+            fn load_materialization(
+                &self,
+                _request: LoadMaterializationRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+                failing()
+            }
+            fn enqueue_materialization(
+                &self,
+                _id: MaterializationId,
+            ) -> StoreFuture<'_, StoreResult<bool>> {
+                failing()
+            }
+            fn force_delete_materialization(
+                &self,
+                _request: ForceDeleteMaterializationRequest,
+            ) -> StoreFuture<'_, StoreResult<Option<MaterializationRecord>>> {
+                failing()
+            }
+            fn force_release_exclusivity_key(
+                &self,
+                _request: ForceReleaseExclusivityKeyRequest,
+            ) -> StoreFuture<'_, StoreResult<ForceReleaseExclusivityKeyResult>> {
+                failing()
+            }
+            fn put_http01_challenge(
+                &self,
+                _request: PutHttp01ChallengeRequest,
+            ) -> StoreFuture<'_, StoreResult<Http01ChallengeRecord>> {
+                failing()
+            }
+            fn delete_http01_challenge(
+                &self,
+                _request: DeleteHttp01ChallengeRequest,
+            ) -> StoreFuture<'_, StoreResult<bool>> {
+                failing()
+            }
         }
 
-        fn resolve_host_rules<'a>(
-            &'a self,
-            _request: ResolveHostRulesRequest,
-        ) -> StoreFuture<'a, StoreResult<HostRules>> {
-            not_implemented()
+        fn failing<'a, T>() -> StoreFuture<'a, StoreResult<T>> {
+            Box::pin(async { Err(StoreError::internal("not implemented")) })
         }
-
-        fn load_ready_materialization<'a>(
-            &'a self,
-            _request: LoadReadyMaterializationRequest,
-        ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-            not_implemented()
-        }
-
-        fn load_active_materialization<'a>(
-            &'a self,
-            _request: crate::LoadActiveMaterializationRequest,
-        ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-            not_implemented()
-        }
-
-        fn begin_sleep<'a>(
-            &'a self,
-            _request: crate::BeginSleepRequest,
-        ) -> StoreFuture<'a, StoreResult<crate::BeginSleepResult>> {
-            not_implemented()
-        }
-
-        fn put_http01_challenge<'a>(
-            &'a self,
-            _request: PutHttp01ChallengeRequest,
-        ) -> StoreFuture<'a, StoreResult<Http01ChallengeRecord>> {
-            not_implemented()
-        }
-
-        fn resolve_http01_challenge<'a>(
-            &'a self,
-            _key: Http01ChallengeKey,
-        ) -> StoreFuture<'a, StoreResult<Option<Http01ChallengeRecord>>> {
-            not_implemented()
-        }
-
-        fn delete_http01_challenge<'a>(
-            &'a self,
-            _request: DeleteHttp01ChallengeRequest,
-        ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
-        }
-    }
-
-    fn not_implemented<'a, T>() -> StoreFuture<'a, StoreResult<T>> {
-        Box::pin(async { Err(StoreError::internal("not implemented")) })
     }
 }
 

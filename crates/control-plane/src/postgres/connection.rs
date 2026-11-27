@@ -21,6 +21,7 @@ pub struct PostgresStore {
     pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
     pub(crate) route_changes: super::runtime_work::RouteChangeListener,
     pub(crate) classes: std::sync::Arc<super::class_cache::ClassCache>,
+    pub(crate) retry: crate::RetryPolicy,
 }
 
 impl PostgresStore {
@@ -52,6 +53,7 @@ impl PostgresStore {
             certificate_sealer: None,
             route_changes,
             classes: Default::default(),
+            retry: crate::RetryPolicy::default(),
         };
 
         store.run_migrations().await?;
@@ -66,6 +68,13 @@ impl PostgresStore {
         sealer: std::sync::Arc<crate::certificate::CertificateSealer>,
     ) -> Self {
         self.certificate_sealer = Some(sealer);
+        self
+    }
+
+    /// Sets how operations that are safe to repeat repeat while the
+    /// database is unavailable.
+    pub fn with_retry_policy(mut self, retry: crate::RetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 

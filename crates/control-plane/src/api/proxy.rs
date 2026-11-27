@@ -14,7 +14,7 @@ use crate::{
     materialization::{MaterializationRecord, MaterializationTarget},
     materializer::{KubernetesMaterializer, KubernetesMaterializerClient},
     route::{self as domain_route},
-    store::ControlPlaneStore,
+    store::ProxyServiceStore,
     wake::{self, WakeInstanceError, WakeInstanceResult, WakeUnavailableReason},
 };
 
@@ -22,7 +22,7 @@ pub const PROXY_SERVICE_NAME: &str = "sleepypods.controlplane.v1.ProxyControlPla
 
 #[derive(Clone)]
 pub struct StoreBackedProxyApi<C> {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn ProxyServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     observability: ObservabilityRecorder,
@@ -31,7 +31,7 @@ pub struct StoreBackedProxyApi<C> {
 
 impl<C> StoreBackedProxyApi<C> {
     pub fn new(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ProxyServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
@@ -44,7 +44,7 @@ impl<C> StoreBackedProxyApi<C> {
     }
 
     pub fn with_observability(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ProxyServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
         observability: ObservabilityRecorder,
@@ -59,7 +59,7 @@ impl<C> StoreBackedProxyApi<C> {
     }
 
     pub fn with_route_events(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ProxyServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
         route_events: RouteSubscriptionBroker,
@@ -74,7 +74,7 @@ impl<C> StoreBackedProxyApi<C> {
     }
 
     pub fn with_observability_and_route_events(
-        store: Arc<dyn ControlPlaneStore>,
+        store: Arc<dyn ProxyServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
         observability: ObservabilityRecorder,
@@ -97,7 +97,7 @@ pub type StoreBackedProxyGrpcService<C> = ProxyControlPlaneServer<StoreBackedPro
 pub(super) const MAX_PROXY_RESPONSE_BYTES: usize = crate::route::MAX_HOST_RULES_BYTES;
 
 pub fn proxy_grpc_service_with_store<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn ProxyServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
 ) -> StoreBackedProxyGrpcService<C>
@@ -113,7 +113,7 @@ where
 }
 
 pub fn proxy_grpc_service_with_store_and_route_events<C>(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn ProxyServiceStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     route_events: RouteSubscriptionBroker,
@@ -214,7 +214,7 @@ where
         request: Request<tonic::Streaming<pb::ProxySubscribeRequest>>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         super::route_subscriptions::open(
-            Arc::clone(&self.store),
+            self.store.clone(),
             self.target.clone(),
             &self.route_events,
             request.into_inner(),

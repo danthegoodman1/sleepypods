@@ -33,7 +33,7 @@ use crate::{
         CachePolicy, HostRules, ResolveHostRulesRequest, RouteHost, RouteIdentity, RouteKind,
         MAX_ROUTE_HOST_BYTES,
     },
-    store::{ControlPlaneStore, StoreError},
+    store::{RouteStore, StoreError},
 };
 
 pub(super) type SubscribeStream = Pin<
@@ -52,7 +52,7 @@ const CONCURRENT_LOOKUPS: usize = 16;
 const RECENT_EVENTS: usize = 256;
 
 pub(super) fn open(
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn RouteStore>,
     target: MaterializationTarget,
     broker: &RouteSubscriptionBroker,
     requests: tonic::Streaming<pb::ProxySubscribeRequest>,
@@ -124,7 +124,7 @@ enum Lookup {
 }
 
 struct HostSubscriptions {
-    store: Arc<dyn ControlPlaneStore>,
+    store: Arc<dyn RouteStore>,
     target: MaterializationTarget,
     limits: ApiLimits,
     responses: mpsc::Sender<Result<pb::ProxySubscribeResponse, Status>>,

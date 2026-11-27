@@ -1,55 +1,12 @@
 use super::*;
-use crate::store::{StoreError, StoreFuture, StoreResult};
+use crate::store::{StoreError, StoreFuture, StoreResult, TlsWatchStore};
 use std::sync::Mutex;
 #[derive(Default)]
 struct TestStore {
     calls: Mutex<Vec<(String, tokio::time::Instant)>>,
     failures: std::sync::atomic::AtomicUsize,
 }
-impl ControlPlaneStore for TestStore {
-    unexpected_store_methods!(
-        publish_certificate,
-        get_certificate_metadata,
-        set_tls_binding,
-        get_tls_binding,
-        remove_certificate,
-        resolve_tls_certificate,
-        reencrypt_certificate,
-        reencrypt_certificates_sealed_by,
-        load_route_changes,
-        load_route_change_revision,
-        load_materialization_work_status,
-        record_materialization_failure,
-        enqueue_materialization,
-        maintain_runtime_records,
-        accept_wake,
-        request_instance_deletion,
-        finalize_instance_deletions,
-        create_instance,
-        get_instance,
-        create_workload_class_version,
-        load_workload_class_version,
-        create_route_binding,
-        get_route_binding,
-        delete_route_binding,
-        resolve_host_rules,
-        load_ready_materialization,
-        load_active_materialization,
-        load_materialization,
-        begin_sleep,
-        load_materialization_operational_metrics,
-        claim_next_materialization_reconciliation,
-        renew_materialization_reconciliation_lease,
-        release_materialization_reconciliation_lease,
-        complete_wake_reconciliation,
-        finalize_sleep_reconciliation,
-        delete_materialization_reconciliation,
-        force_delete_materialization,
-        force_release_exclusivity_key,
-        put_http01_challenge,
-        resolve_http01_challenge,
-        delete_http01_challenge,
-    );
+impl TlsWatchStore for TestStore {
     fn snapshot_tls_bindings(
         &self,
         hosts: Vec<TlsHostname>,
@@ -87,6 +44,7 @@ impl ControlPlaneStore for TestStore {
         })
     }
 }
+
 fn input(id: u64, host: &str) -> pb::WatchTlsCertificatesRequest {
     pb::WatchTlsCertificatesRequest {
         registration: id,

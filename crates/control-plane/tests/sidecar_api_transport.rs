@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "support/unexpected_store.rs"]
-mod unexpected_store;
 mod support;
 use support::TestStore as FakeSidecarStore;
 

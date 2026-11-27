@@ -536,8 +536,7 @@ async fn fault_recovery(
         );
     }
     let (owner, contender) = (instances[0].clone(), instances[1].clone());
-    let store =
-        Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     let kube = FaultyKubernetes::default();
     let materializer = control_plane::KubernetesMaterializer::new(kube.clone());
     let wake = |instance: &control_plane::InstanceRecord| {

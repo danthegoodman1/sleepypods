@@ -1,5 +1,5 @@
 use super::*;
-use control_plane::{api::RouteSubscriptionBroker, RetryingControlPlaneStore};
+use control_plane::api::RouteSubscriptionBroker;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -27,7 +27,7 @@ async fn ordered_notifications(pg: PostgresStore, config: &PostgresStoreConfig) 
     let class = workload_class("runtime-events", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     for id in ["order-a", "order-b"] {
         store
             .create_instance(create_instance_request(
@@ -387,7 +387,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
     let class = workload_class("runtime-scheduler", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+    let store = Arc::new(pg);
     let (raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let raw_task = tokio::spawn(connection);
     let client = SchedulerKubernetes::default();
@@ -753,7 +753,7 @@ async fn postgres_runtime_delete_supersedes_pending_attempt() -> TestResult {
         PostgresStoreConfig::new(format!("{url}{separator}application_name=6l-supersession"))?;
     let result = async {
         let pg = PostgresStore::connect(&config).await?;
-        let store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(pg)));
+        let store = Arc::new(pg);
         let (raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
         connections.spawn(connection);
         let mut failures = Vec::new();
@@ -787,7 +787,7 @@ async fn postgres_runtime_delete_supersedes_pending_attempt() -> TestResult {
 const SUPERSESSION_LEASE_TTL: Duration = Duration::from_secs(2);
 
 async fn delete_supersedes_pending_case(
-    store: Arc<RetryingControlPlaneStore>,
+    store: Arc<PostgresStore>,
     raw: &tokio_postgres::Client,
     behavior: &'static str,
 ) -> TestResult {
@@ -1041,7 +1041,7 @@ async fn supersession_snapshot(raw: &tokio_postgres::Client, id: &str) -> TestRe
 }
 
 async fn deletion_and_failure_use_one_lock_order(
-    store: Arc<RetryingControlPlaneStore>,
+    store: Arc<PostgresStore>,
     config: &PostgresStoreConfig,
 ) -> TestResult {
     use control_plane::{
@@ -1091,20 +1091,20 @@ async fn deletion_and_failure_use_one_lock_order(
     } else {
         '?'
     };
-    let delete_store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(
+    let delete_store = Arc::new(
         PostgresStore::connect(&PostgresStoreConfig::new(format!(
             "{}{separator}application_name=6l-delete-order",
             config.connection_url()
         ))?)
         .await?,
-    )));
-    let failure_store = Arc::new(RetryingControlPlaneStore::with_default_policy(Arc::new(
+    );
+    let failure_store = Arc::new(
         PostgresStore::connect(&PostgresStoreConfig::new(format!(
             "{}{separator}application_name=6l-failure-order",
             config.connection_url()
         ))?)
         .await?,
-    )));
+    );
     let (mut blocker, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let mut connections = tokio::task::JoinSet::new();
     connections.spawn(connection);

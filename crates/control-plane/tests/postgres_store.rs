@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "support/unexpected_store.rs"]
-mod unexpected_store;
 #[path = "support/postgres_relay.rs"]
 mod postgres_relay;
 #[path = "support/mod.rs"]
@@ -32,6 +29,10 @@ use control_plane::{
     TemplateTextPart, WorkloadClassId, WorkloadClassVersion, WorkloadClassVersionRef,
     WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
     WorkloadValueFieldRule, WorkloadValueSchema,
+};
+use control_plane::{
+    CertificateStore, LifecycleReads, OperatorStore, ReconcilerStore, RouteStore, RuntimeStore,
+    SleepStore, TlsWatchStore, WakeStore,
 };
 use tokio_postgres::NoTls;
 
@@ -3358,7 +3359,15 @@ async fn phase5_single_slot_pool_and_cancelled_migration(
     let mut config = config.clone();
     config.max_connections = 1;
     config.pool_wait_timeout = Duration::from_millis(100);
-    let store = PostgresStore::connect(&config).await?;
+    // One attempt, so the checkout budget alone bounds the call.
+    let store =
+        PostgresStore::connect(&config)
+            .await?
+            .with_retry_policy(control_plane::RetryPolicy::new(
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+            ));
     // The old nested checkout deadlocked on the already-held only slot.
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -3855,8 +3864,7 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
     store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
-    let store =
-        Arc::new(control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(store)));
+    let store = Arc::new(store);
     let target = MaterializationTarget::new("cluster-a", "apps")?;
     let client = LifecycleKubernetes::default();
     let materializer = KubernetesMaterializer::new(client.clone());
@@ -4248,9 +4256,7 @@ async fn postgres_attempt_and_incarnation_fencing() -> TestResult {
     let config = PostgresStoreConfig::new(connection_url_with_search_path(&base_url, &schema))?;
     let raw_store = PostgresStore::connect(&config).await?;
     raw_store.run_migrations().await?;
-    let store = Arc::new(
-        control_plane::RetryingControlPlaneStore::with_default_policy(Arc::new(raw_store)),
-    );
+    let store = Arc::new(raw_store);
     let (raw, connection) = tokio_postgres::connect(config.connection_url(), NoTls).await?;
     let raw_task = tokio::spawn(async move {
         let _ = connection.await;
@@ -4450,5 +4456,7 @@ mod crash_boundaries;
 mod host_rule_bounds;
 #[path = "postgres_store/lifecycle_recovery.rs"]
 mod lifecycle_recovery;
+#[path = "postgres_store/replay_policy.rs"]
+mod replay_policy;
 #[path = "postgres_store/round_trips.rs"]
 mod round_trips;

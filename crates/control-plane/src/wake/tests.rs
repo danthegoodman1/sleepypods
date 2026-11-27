@@ -10,7 +10,7 @@ use crate::{
     materialization::{AcceptWakeRequest, BackendEndpoint, RenderedObjectRef},
     materializer::{KubernetesClientFuture, KubernetesClientResult},
     sleep_policy::WorkloadSleepPolicy,
-    store::{StoreFuture, StoreResult},
+    store::{LifecycleReads, StoreFuture, StoreResult},
     workload::{WorkloadClassVersion, WorkloadClassVersionRef, WorkloadValueSchema},
 };
 use std::sync::Mutex;
@@ -38,47 +38,7 @@ impl AcceptanceStore {
         }
     }
 }
-impl ControlPlaneStore for AcceptanceStore {
-    unexpected_store_methods!(
-        publish_certificate,
-        get_certificate_metadata,
-        set_tls_binding,
-        get_tls_binding,
-        remove_certificate,
-        resolve_tls_certificate,
-        reencrypt_certificate,
-        reencrypt_certificates_sealed_by,
-        snapshot_tls_bindings,
-        load_route_changes,
-        load_route_change_revision,
-        load_materialization_work_status,
-        record_materialization_failure,
-        enqueue_materialization,
-        maintain_runtime_records,
-        request_instance_deletion,
-        finalize_instance_deletions,
-        create_instance,
-        create_workload_class_version,
-        create_route_binding,
-        get_route_binding,
-        delete_route_binding,
-        resolve_host_rules,
-        load_materialization,
-        begin_sleep,
-        load_materialization_operational_metrics,
-        claim_next_materialization_reconciliation,
-        renew_materialization_reconciliation_lease,
-        release_materialization_reconciliation_lease,
-        complete_wake_reconciliation,
-        finalize_sleep_reconciliation,
-        delete_materialization_reconciliation,
-        force_delete_materialization,
-        force_release_exclusivity_key,
-        put_http01_challenge,
-        resolve_http01_challenge,
-        delete_http01_challenge
-    );
-
+impl LifecycleReads for AcceptanceStore {
     fn get_instance<'a>(
         &'a self,
         _: GetInstanceRequest,
@@ -97,6 +57,14 @@ impl ControlPlaneStore for AcceptanceStore {
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         Box::pin(async { Ok(None) })
     }
+    fn load_materialization_work_status<'a>(
+        &'a self,
+        _: crate::ids::MaterializationId,
+    ) -> StoreFuture<'a, StoreResult<Option<crate::runtime_work::MaterializationWorkStatus>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+impl WakeStore for AcceptanceStore {
     fn accept_wake<'a>(
         &'a self,
         request: AcceptWakeRequest,

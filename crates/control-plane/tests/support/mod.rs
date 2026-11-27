@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use control_plane::InstanceState as DomainInstanceState;
-use control_plane::{materialization::*, *};
+use control_plane::{certificate, materialization::*, *};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -439,94 +439,7 @@ pub fn route_change_payload(record: &RouteBindingRecord, removed: bool) -> serde
     })
 }
 
-impl ControlPlaneStore for TestStore {
-    // Transport fixtures do not pretend to supply persistence/runtime semantics.
-    unexpected_store_methods!(
-        publish_certificate,
-        get_certificate_metadata,
-        set_tls_binding,
-        get_tls_binding,
-        remove_certificate,
-        resolve_tls_certificate,
-        reencrypt_certificate,
-        reencrypt_certificates_sealed_by,
-        snapshot_tls_bindings,
-        maintain_runtime_records,
-        load_materialization_operational_metrics,
-    );
-    fn load_route_changes(
-        &self,
-        cursor: u64,
-        limit: u32,
-    ) -> StoreFuture<'_, StoreResult<control_plane::runtime_work::DurableRouteChanges>> {
-        Box::pin(async move {
-            let mut failures = self.route_change_read_failures.lock().unwrap();
-            if *failures > 0 {
-                *failures -= 1;
-                return Err(StoreError::unavailable(
-                    "route change history is unavailable",
-                ));
-            }
-            let changes = self.route_changes.lock().unwrap();
-            let events: Vec<_> = changes
-                .iter()
-                .skip(cursor as usize)
-                .take(limit as usize)
-                .cloned()
-                .collect();
-            Ok(control_plane::runtime_work::DurableRouteChanges {
-                cursor: cursor + events.len() as u64,
-                reset: false,
-                events,
-            })
-        })
-    }
-    fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
-        Box::pin(async move { Ok(self.route_changes.lock().unwrap().len() as u64) })
-    }
-    fn route_change_signal(&self) -> Arc<Notify> {
-        self.route_change_signal.clone()
-    }
-    fn create_instance<'a>(
-        &'a self,
-        request: control_plane::CreateInstanceRequest,
-    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
-        Box::pin(async move {
-            let instance = InstanceRecord {
-                id: request.instance_id,
-                workload_class: request.workload_class,
-                values: request.values,
-                state: DomainInstanceState::Cold,
-                generation: Generation::new(0),
-            };
-            self.instances
-                .lock()
-                .expect("fake store lock is available")
-                .insert(instance.id.as_str().to_owned(), instance.clone());
-            let route_bindings = request
-                .route_bindings
-                .into_iter()
-                .map(|route| control_plane::RouteBindingRecord {
-                    id: route.id,
-                    instance_id: instance.id.clone(),
-                    identity: route.identity,
-                })
-                .collect::<Vec<_>>();
-            let mut stored = self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available");
-            for record in &route_bindings {
-                stored.insert(record.id.as_str().to_owned(), record.clone());
-            }
-
-            Ok(CreateInstanceResult {
-                instance,
-                route_bindings,
-            })
-        })
-    }
-
+impl LifecycleReads for TestStore {
     fn get_instance<'a>(
         &'a self,
         request: control_plane::GetInstanceRequest,
@@ -544,25 +457,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn create_workload_class_version<'a>(
-        &'a self,
-        request: control_plane::CreateWorkloadClassVersionRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
-        Box::pin(async move {
-            let workload_class = request.workload_class_version;
-            let key = (
-                workload_class.reference.class_id.as_str().to_owned(),
-                workload_class.reference.version.get(),
-            );
-            self.workload_classes
-                .lock()
-                .expect("fake store lock is available")
-                .insert(key, workload_class.clone());
-
-            Ok(workload_class)
-        })
-    }
-
     fn load_workload_class_version<'a>(
         &'a self,
         request: control_plane::LoadWorkloadClassVersionRequest,
@@ -577,137 +471,6 @@ impl ControlPlaneStore for TestStore {
                 .lock()
                 .expect("fake store lock is available")
                 .get(&key)
-                .cloned())
-        })
-    }
-
-    fn create_route_binding<'a>(
-        &'a self,
-        request: control_plane::CreateRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
-        Box::pin(async move {
-            let record = control_plane::RouteBindingRecord {
-                id: request.route_binding_id,
-                instance_id: request.instance_id,
-                identity: request.identity,
-            };
-            self.route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .insert(record.id.as_str().to_owned(), record.clone());
-            self.record_route_change(route_change_payload(&record, false));
-
-            Ok(record)
-        })
-    }
-
-    fn get_route_binding<'a>(
-        &'a self,
-        request: control_plane::GetRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .get(request.route_binding_id.as_str())
-                .cloned())
-        })
-    }
-
-    fn delete_route_binding<'a>(
-        &'a self,
-        request: control_plane::DeleteRouteBindingRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let removed = self
-                .route_bindings
-                .lock()
-                .expect("fake store lock is available")
-                .remove(request.route_binding_id.as_str());
-            if let Some(record) = &removed {
-                self.record_route_change(route_change_payload(record, true));
-            }
-            Ok(removed.is_some())
-        })
-    }
-
-    fn put_http01_challenge<'a>(
-        &'a self,
-        request: control_plane::PutHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
-        Box::pin(async move {
-            let record = control_plane::Http01ChallengeRecord::new(
-                request.key().clone(),
-                request.key_authorization().to_owned(),
-                request.expires_at(),
-                UNIX_EPOCH,
-            )
-            .expect("service parsed a valid HTTP-01 challenge");
-            let key = (
-                record.key().host().as_str().to_owned(),
-                record.key().token().to_owned(),
-            );
-            self.http01
-                .lock()
-                .expect("fake store lock is available")
-                .insert(key, record.clone());
-
-            Ok(record)
-        })
-    }
-
-    fn resolve_http01_challenge<'a>(
-        &'a self,
-        key: control_plane::Http01ChallengeKey,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .http01
-                .lock()
-                .expect("fake store lock is available")
-                .get(&(key.host().as_str().to_owned(), key.token().to_owned()))
-                .cloned()
-                .filter(|record| record.expires_at() > SystemTime::now()))
-        })
-    }
-
-    fn delete_http01_challenge<'a>(
-        &'a self,
-        request: control_plane::DeleteHttp01ChallengeRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            Ok(self
-                .http01
-                .lock()
-                .expect("fake store lock is available")
-                .remove(&(
-                    request.key().host().as_str().to_owned(),
-                    request.key().token().to_owned(),
-                ))
-                .is_some())
-        })
-    }
-
-    fn load_ready_materialization<'a>(
-        &'a self,
-        request: control_plane::materialization::LoadReadyMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
-        Box::pin(async move {
-            if self.fail_ready_materialization_lookup {
-                return Err(StoreError::unavailable("separate backend lookup failed"));
-            }
-            Ok(self
-                .materializations
-                .lock()
-                .expect("fake store lock is available")
-                .iter()
-                .find(|materialization| {
-                    materialization.instance_id == request.instance_id
-                        && materialization.instance_generation == request.instance_generation
-                        && materialization.target == request.target
-                        && materialization.state == MaterializationState::Ready
-                })
                 .cloned())
         })
     }
@@ -731,72 +494,66 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn resolve_host_rules<'a>(
-        &'a self,
-        request: control_plane::ResolveHostRulesRequest,
-    ) -> StoreFuture<'a, StoreResult<control_plane::HostRules>> {
+    fn load_materialization_work_status(
+        &self,
+        id: control_plane::ids::MaterializationId,
+    ) -> StoreFuture<'_, StoreResult<Option<control_plane::runtime_work::MaterializationWorkStatus>>>
+    {
         Box::pin(async move {
-            *self
-                .resolve_route_requests
+            Ok(self
+                .materializations
                 .lock()
-                .expect("fake store lock is available") += 1;
-            let gate = self.resolve_gate.lock().unwrap().clone();
-            if let Some(gate) = gate {
-                gate.notified().await;
+                .unwrap()
+                .iter()
+                .any(|record| record.id == id)
+                .then(control_plane::runtime_work::MaterializationWorkStatus::default))
+        })
+    }
+}
+
+impl WakeStore for TestStore {
+    fn load_ready_materialization<'a>(
+        &'a self,
+        request: control_plane::materialization::LoadReadyMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::MaterializationRecord>>> {
+        Box::pin(async move {
+            if self.fail_ready_materialization_lookup {
+                return Err(StoreError::unavailable("separate backend lookup failed"));
             }
-            if let Some(message) = self.route_error.lock().unwrap().clone() {
-                return Err(StoreError::unavailable(message));
-            }
-            let bindings = self.route_bindings.lock().unwrap();
-            let entries = self.route_entries.lock().unwrap();
-            let instances = self.instances.lock().unwrap();
-            let materializations = self.materializations.lock().unwrap();
-            let rules = bindings
-                .values()
-                .filter(|binding| {
-                    binding
-                        .identity
-                        .applies_to(request.kind, request.host.as_str())
+            Ok(self
+                .materializations
+                .lock()
+                .expect("fake store lock is available")
+                .iter()
+                .find(|materialization| {
+                    materialization.instance_id == request.instance_id
+                        && materialization.instance_generation == request.instance_generation
+                        && materialization.target == request.target
+                        && materialization.state == MaterializationState::Ready
                 })
-                .map(|binding| {
-                    let seeded = entries.get(binding.id.as_str());
-                    let instance = instances.get(binding.instance_id.as_str());
-                    let instance_state = instance
-                        .map(|instance| instance.state)
-                        .or(seeded.map(|entry| entry.instance_state))
-                        .unwrap_or(DomainInstanceState::Cold);
-                    let instance_generation = instance
-                        .map(|instance| instance.generation)
-                        .or(seeded.map(|entry| entry.instance_generation))
-                        .unwrap_or(Generation::new(1));
-                    // The backend is the target's ready materialization for
-                    // the instance's current generation, as in the store query.
-                    let ready = materializations.iter().find(|materialization| {
-                        materialization.instance_id == binding.instance_id
-                            && materialization.instance_generation == instance_generation
-                            && materialization.target == request.target
-                            && materialization.state == MaterializationState::Ready
-                    });
-                    let backend = ready.and_then(|materialization| materialization.backend.clone());
-                    control_plane::RouteRule {
-                        identity: binding.identity.clone(),
-                        entry: RouteEntry {
-                            route_binding_id: binding.id.clone(),
-                            instance_id: binding.instance_id.clone(),
-                            instance_state,
-                            instance_generation,
-                            backend_generation: backend
-                                .as_ref()
-                                .and(ready.map(|ready| ready.backend_generation)),
-                            backend,
-                        },
-                    }
-                })
-                .collect();
-            Ok(control_plane::HostRules::ranked(rules))
+                .cloned())
         })
     }
 
+    fn accept_wake<'a>(
+        &'a self,
+        request: control_plane::materialization::AcceptWakeRequest,
+    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
+        Box::pin(async move {
+            let instance = self.transition_instance(
+                request.pending.instance_id.clone(),
+                request.expected_generation,
+                DomainInstanceState::Waking,
+                StateTransitionReason::WakeRequested,
+            )?;
+            assert_eq!(instance.generation, request.pending.instance_generation);
+            self.seed_materialization(fake_materialization_record(request.pending));
+            Ok(instance)
+        })
+    }
+}
+
+impl SleepStore for TestStore {
     fn begin_sleep<'a>(
         &'a self,
         request: BeginSleepRequest,
@@ -827,23 +584,9 @@ impl ControlPlaneStore for TestStore {
             })
         })
     }
+}
 
-    fn load_materialization_work_status(
-        &self,
-        id: control_plane::ids::MaterializationId,
-    ) -> StoreFuture<'_, StoreResult<Option<control_plane::runtime_work::MaterializationWorkStatus>>>
-    {
-        Box::pin(async move {
-            Ok(self
-                .materializations
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|record| record.id == id)
-                .then(control_plane::runtime_work::MaterializationWorkStatus::default))
-        })
-    }
-
+impl ReconcilerStore for TestStore {
     fn record_materialization_failure(
         &self,
         request: control_plane::runtime_work::RecordMaterializationFailure,
@@ -860,79 +603,6 @@ impl ControlPlaneStore for TestStore {
                 request.generation,
             ),
         )
-    }
-
-    fn enqueue_materialization(
-        &self,
-        id: control_plane::ids::MaterializationId,
-    ) -> StoreFuture<'_, StoreResult<bool>> {
-        Box::pin(async move {
-            Ok(self.materializations.lock().unwrap().iter().any(|record| {
-                record.id == id
-                    && matches!(
-                        record.state,
-                        MaterializationState::Pending | MaterializationState::Deleting
-                    )
-                    && record.reconciliation_lease.is_none()
-            }))
-        })
-    }
-
-    fn accept_wake<'a>(
-        &'a self,
-        request: control_plane::materialization::AcceptWakeRequest,
-    ) -> StoreFuture<'a, StoreResult<InstanceRecord>> {
-        Box::pin(async move {
-            let instance = self.transition_instance(
-                request.pending.instance_id.clone(),
-                request.expected_generation,
-                DomainInstanceState::Waking,
-                StateTransitionReason::WakeRequested,
-            )?;
-            assert_eq!(instance.generation, request.pending.instance_generation);
-            self.seed_materialization(fake_materialization_record(request.pending));
-            Ok(instance)
-        })
-    }
-
-    fn request_instance_deletion<'a>(
-        &'a self,
-        request: control_plane::instance::RequestInstanceDeletion,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let mut instances = self.instances.lock().unwrap();
-            let Some(instance) = instances.get_mut(request.instance_id.as_str()) else {
-                return Ok(false);
-            };
-            if instance.generation != request.expected_generation
-                && !(instance.state == DomainInstanceState::Deleting
-                    && instance.generation == request.expected_generation.next())
-            {
-                return Err(StoreError::GenerationConflict {
-                    expected: request.expected_generation,
-                    actual: instance.generation,
-                });
-            }
-            if instance.state != DomainInstanceState::Deleting {
-                instance.state = DomainInstanceState::Deleting;
-                instance.generation = instance.generation.next();
-            }
-            for record in self
-                .materializations
-                .lock()
-                .unwrap()
-                .iter_mut()
-                .filter(|record| {
-                    record.instance_id == request.instance_id
-                        && record.state != MaterializationState::Deleted
-                })
-            {
-                record.state = MaterializationState::Deleting;
-                record.backend = None;
-                record.reconciliation_lease = None;
-            }
-            Ok(true)
-        })
     }
 
     fn finalize_instance_deletions<'a>(
@@ -960,21 +630,6 @@ impl ControlPlaneStore for TestStore {
                 .into_iter()
                 .filter(|instance_id| self.finalize_deletion(instance_id.clone()))
                 .count())
-        })
-    }
-
-    fn load_materialization<'a>(
-        &'a self,
-        request: LoadMaterializationRequest,
-    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materializations
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|record| record.id == request.materialization_id)
-                .cloned())
         })
     }
 
@@ -1096,6 +751,231 @@ impl ControlPlaneStore for TestStore {
             Ok(Some(record.clone()))
         })
     }
+}
+
+impl OperatorStore for TestStore {
+    fn create_instance<'a>(
+        &'a self,
+        request: control_plane::CreateInstanceRequest,
+    ) -> StoreFuture<'a, StoreResult<CreateInstanceResult>> {
+        Box::pin(async move {
+            let instance = InstanceRecord {
+                id: request.instance_id,
+                workload_class: request.workload_class,
+                values: request.values,
+                state: DomainInstanceState::Cold,
+                generation: Generation::new(0),
+            };
+            self.instances
+                .lock()
+                .expect("fake store lock is available")
+                .insert(instance.id.as_str().to_owned(), instance.clone());
+            let route_bindings = request
+                .route_bindings
+                .into_iter()
+                .map(|route| control_plane::RouteBindingRecord {
+                    id: route.id,
+                    instance_id: instance.id.clone(),
+                    identity: route.identity,
+                })
+                .collect::<Vec<_>>();
+            let mut stored = self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available");
+            for record in &route_bindings {
+                stored.insert(record.id.as_str().to_owned(), record.clone());
+            }
+
+            Ok(CreateInstanceResult {
+                instance,
+                route_bindings,
+            })
+        })
+    }
+
+    fn create_workload_class_version<'a>(
+        &'a self,
+        request: control_plane::CreateWorkloadClassVersionRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::WorkloadClassVersion>> {
+        Box::pin(async move {
+            let workload_class = request.workload_class_version;
+            let key = (
+                workload_class.reference.class_id.as_str().to_owned(),
+                workload_class.reference.version.get(),
+            );
+            self.workload_classes
+                .lock()
+                .expect("fake store lock is available")
+                .insert(key, workload_class.clone());
+
+            Ok(workload_class)
+        })
+    }
+
+    fn create_route_binding<'a>(
+        &'a self,
+        request: control_plane::CreateRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::RouteBindingRecord>> {
+        Box::pin(async move {
+            let record = control_plane::RouteBindingRecord {
+                id: request.route_binding_id,
+                instance_id: request.instance_id,
+                identity: request.identity,
+            };
+            self.route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .insert(record.id.as_str().to_owned(), record.clone());
+            self.record_route_change(route_change_payload(&record, false));
+
+            Ok(record)
+        })
+    }
+
+    fn get_route_binding<'a>(
+        &'a self,
+        request: control_plane::GetRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::RouteBindingRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .get(request.route_binding_id.as_str())
+                .cloned())
+        })
+    }
+
+    fn delete_route_binding<'a>(
+        &'a self,
+        request: control_plane::DeleteRouteBindingRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            let removed = self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available")
+                .remove(request.route_binding_id.as_str());
+            if let Some(record) = &removed {
+                self.record_route_change(route_change_payload(record, true));
+            }
+            Ok(removed.is_some())
+        })
+    }
+
+    fn put_http01_challenge<'a>(
+        &'a self,
+        request: control_plane::PutHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::Http01ChallengeRecord>> {
+        Box::pin(async move {
+            let record = control_plane::Http01ChallengeRecord::new(
+                request.key().clone(),
+                request.key_authorization().to_owned(),
+                request.expires_at(),
+                UNIX_EPOCH,
+            )
+            .expect("service parsed a valid HTTP-01 challenge");
+            let key = (
+                record.key().host().as_str().to_owned(),
+                record.key().token().to_owned(),
+            );
+            self.http01
+                .lock()
+                .expect("fake store lock is available")
+                .insert(key, record.clone());
+
+            Ok(record)
+        })
+    }
+
+    fn delete_http01_challenge<'a>(
+        &'a self,
+        request: control_plane::DeleteHttp01ChallengeRequest,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .http01
+                .lock()
+                .expect("fake store lock is available")
+                .remove(&(
+                    request.key().host().as_str().to_owned(),
+                    request.key().token().to_owned(),
+                ))
+                .is_some())
+        })
+    }
+
+    fn enqueue_materialization(
+        &self,
+        id: control_plane::ids::MaterializationId,
+    ) -> StoreFuture<'_, StoreResult<bool>> {
+        Box::pin(async move {
+            Ok(self.materializations.lock().unwrap().iter().any(|record| {
+                record.id == id
+                    && matches!(
+                        record.state,
+                        MaterializationState::Pending | MaterializationState::Deleting
+                    )
+                    && record.reconciliation_lease.is_none()
+            }))
+        })
+    }
+
+    fn request_instance_deletion<'a>(
+        &'a self,
+        request: control_plane::instance::RequestInstanceDeletion,
+    ) -> StoreFuture<'a, StoreResult<bool>> {
+        Box::pin(async move {
+            let mut instances = self.instances.lock().unwrap();
+            let Some(instance) = instances.get_mut(request.instance_id.as_str()) else {
+                return Ok(false);
+            };
+            if instance.generation != request.expected_generation
+                && !(instance.state == DomainInstanceState::Deleting
+                    && instance.generation == request.expected_generation.next())
+            {
+                return Err(StoreError::GenerationConflict {
+                    expected: request.expected_generation,
+                    actual: instance.generation,
+                });
+            }
+            if instance.state != DomainInstanceState::Deleting {
+                instance.state = DomainInstanceState::Deleting;
+                instance.generation = instance.generation.next();
+            }
+            for record in self
+                .materializations
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .filter(|record| {
+                    record.instance_id == request.instance_id
+                        && record.state != MaterializationState::Deleted
+                })
+            {
+                record.state = MaterializationState::Deleting;
+                record.backend = None;
+                record.reconciliation_lease = None;
+            }
+            Ok(true)
+        })
+    }
+
+    fn load_materialization<'a>(
+        &'a self,
+        request: LoadMaterializationRequest,
+    ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .materializations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|record| record.id == request.materialization_id)
+                .cloned())
+        })
+    }
 
     fn force_delete_materialization<'a>(
         &'a self,
@@ -1149,6 +1029,241 @@ impl ControlPlaneStore for TestStore {
             })
         })
     }
+}
+
+impl RouteStore for TestStore {
+    fn resolve_http01_challenge<'a>(
+        &'a self,
+        key: control_plane::Http01ChallengeKey,
+    ) -> StoreFuture<'a, StoreResult<Option<control_plane::Http01ChallengeRecord>>> {
+        Box::pin(async move {
+            Ok(self
+                .http01
+                .lock()
+                .expect("fake store lock is available")
+                .get(&(key.host().as_str().to_owned(), key.token().to_owned()))
+                .cloned()
+                .filter(|record| record.expires_at() > SystemTime::now()))
+        })
+    }
+
+    fn resolve_host_rules<'a>(
+        &'a self,
+        request: control_plane::ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<control_plane::HostRules>> {
+        Box::pin(async move {
+            *self
+                .resolve_route_requests
+                .lock()
+                .expect("fake store lock is available") += 1;
+            let gate = self.resolve_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            if let Some(message) = self.route_error.lock().unwrap().clone() {
+                return Err(StoreError::unavailable(message));
+            }
+            let bindings = self.route_bindings.lock().unwrap();
+            let entries = self.route_entries.lock().unwrap();
+            let instances = self.instances.lock().unwrap();
+            let materializations = self.materializations.lock().unwrap();
+            let rules = bindings
+                .values()
+                .filter(|binding| {
+                    binding
+                        .identity
+                        .applies_to(request.kind, request.host.as_str())
+                })
+                .map(|binding| {
+                    let seeded = entries.get(binding.id.as_str());
+                    let instance = instances.get(binding.instance_id.as_str());
+                    let instance_state = instance
+                        .map(|instance| instance.state)
+                        .or(seeded.map(|entry| entry.instance_state))
+                        .unwrap_or(DomainInstanceState::Cold);
+                    let instance_generation = instance
+                        .map(|instance| instance.generation)
+                        .or(seeded.map(|entry| entry.instance_generation))
+                        .unwrap_or(Generation::new(1));
+                    // The backend is the target's ready materialization for
+                    // the instance's current generation, as in the store query.
+                    let ready = materializations.iter().find(|materialization| {
+                        materialization.instance_id == binding.instance_id
+                            && materialization.instance_generation == instance_generation
+                            && materialization.target == request.target
+                            && materialization.state == MaterializationState::Ready
+                    });
+                    let backend = ready.and_then(|materialization| materialization.backend.clone());
+                    control_plane::RouteRule {
+                        identity: binding.identity.clone(),
+                        entry: RouteEntry {
+                            route_binding_id: binding.id.clone(),
+                            instance_id: binding.instance_id.clone(),
+                            instance_state,
+                            instance_generation,
+                            backend_generation: backend
+                                .as_ref()
+                                .and(ready.map(|ready| ready.backend_generation)),
+                            backend,
+                        },
+                    }
+                })
+                .collect();
+            Ok(control_plane::HostRules::ranked(rules))
+        })
+    }
+}
+
+impl RuntimeStore for TestStore {
+    fn maintain_runtime_records(&self, _limit: u32) -> StoreFuture<'_, StoreResult<u64>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn load_materialization_operational_metrics(
+        &self,
+    ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
+        Box::pin(async {
+            Ok(MaterializationOperationalMetrics::new(
+                Vec::new(),
+                Vec::new(),
+            ))
+        })
+    }
+
+    fn load_route_changes(
+        &self,
+        cursor: u64,
+        limit: u32,
+    ) -> StoreFuture<'_, StoreResult<control_plane::runtime_work::DurableRouteChanges>> {
+        Box::pin(async move {
+            let mut failures = self.route_change_read_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(StoreError::unavailable(
+                    "route change history is unavailable",
+                ));
+            }
+            let changes = self.route_changes.lock().unwrap();
+            let events: Vec<_> = changes
+                .iter()
+                .skip(cursor as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(control_plane::runtime_work::DurableRouteChanges {
+                cursor: cursor + events.len() as u64,
+                reset: false,
+                events,
+            })
+        })
+    }
+
+    fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
+        Box::pin(async move { Ok(self.route_changes.lock().unwrap().len() as u64) })
+    }
+
+    fn route_change_signal(&self) -> Arc<Notify> {
+        self.route_change_signal.clone()
+    }
+}
+
+/// The fixture holds no certificates and no sealing keys: every hostname is
+/// unbound, and a certificate write fails as it does on a store without keys.
+impl CertificateStore for TestStore {
+    fn publish_certificate(
+        &self,
+        _request: certificate::PublishCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<certificate::CertificateMetadata>> {
+        Box::pin(async { Err(no_sealing_keys()) })
+    }
+    fn get_certificate_metadata(
+        &self,
+        _id: certificate::CertificateId,
+    ) -> StoreFuture<'_, StoreResult<Option<certificate::CertificateMetadata>>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn set_tls_binding(
+        &self,
+        _request: certificate::SetTlsBindingRequest,
+    ) -> StoreFuture<'_, StoreResult<certificate::TlsBinding>> {
+        Box::pin(async { Err(no_sealing_keys()) })
+    }
+    fn get_tls_binding(
+        &self,
+        hostname: certificate::TlsHostname,
+    ) -> StoreFuture<'_, StoreResult<certificate::TlsBinding>> {
+        Box::pin(async move { Ok(unbound(hostname)) })
+    }
+    fn remove_certificate(
+        &self,
+        _request: certificate::RemoveCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<certificate::CertificateMetadata>> {
+        Box::pin(async {
+            Err(StoreError::NotFound {
+                resource: "certificate",
+            })
+        })
+    }
+    fn resolve_tls_certificate(
+        &self,
+        request: certificate::ResolveTlsCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<certificate::TlsCertificateResolution>> {
+        Box::pin(async move {
+            Ok(certificate::TlsCertificateResolution {
+                hostname: request.hostname,
+                view_revision: certificate::CertificateRevision::ZERO,
+                observed_at_unix_millis: 0,
+                value: certificate::TlsCertificateValue::Missing,
+            })
+        })
+    }
+    fn reencrypt_certificate(
+        &self,
+        _request: certificate::ReencryptCertificateRequest,
+    ) -> StoreFuture<'_, StoreResult<certificate::CertificateMetadata>> {
+        Box::pin(async {
+            Err(StoreError::NotFound {
+                resource: "certificate",
+            })
+        })
+    }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        _sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<certificate::SealingKeyReencryption>> {
+        Box::pin(async { Err(no_sealing_keys()) })
+    }
+}
+
+impl TlsWatchStore for TestStore {
+    fn snapshot_tls_bindings(
+        &self,
+        hostnames: Vec<certificate::TlsHostname>,
+        known_revision: Option<certificate::CertificateRevision>,
+    ) -> StoreFuture<'_, StoreResult<Option<certificate::TlsBindingSnapshot>>> {
+        Box::pin(async move {
+            let revision = certificate::CertificateRevision::ZERO;
+            Ok(
+                (known_revision != Some(revision)).then(|| certificate::TlsBindingSnapshot {
+                    revision,
+                    bindings: hostnames.into_iter().map(unbound).collect(),
+                }),
+            )
+        })
+    }
+}
+
+fn unbound(hostname: certificate::TlsHostname) -> certificate::TlsBinding {
+    certificate::TlsBinding {
+        hostname,
+        certificate_id: None,
+        revision: certificate::CertificateRevision::ZERO,
+        last_invalidating_revision: certificate::CertificateRevision::ZERO,
+    }
+}
+
+fn no_sealing_keys() -> StoreError {
+    StoreError::internal("certificate sealing keys are not configured")
 }
 
 pub fn workload_class() -> control_plane::WorkloadClassVersion {

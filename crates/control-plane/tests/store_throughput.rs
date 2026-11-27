@@ -7,9 +7,6 @@
 //! SLEEPYPODS_POSTGRES_URL=postgres://... SLEEPYPODS_STORE_THROUGHPUT_SECONDS=10 \
 //!   cargo test --release -p control-plane --test store_throughput -- --nocapture
 //! ```
-#[macro_use]
-#[path = "support/unexpected_store.rs"]
-mod unexpected_store;
 #[path = "support/postgres_relay.rs"]
 mod postgres_relay;
 mod support;
@@ -22,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use control_plane::OperatorStore;
 use control_plane::{
     materialization::AcceptWakeRequest, BackendEndpoint, BackendGeneration, BeginSleepRequest,
     ClaimNextMaterializationRequest, CompleteWakeReconciliationRequest, CompleteWakeRequest,
