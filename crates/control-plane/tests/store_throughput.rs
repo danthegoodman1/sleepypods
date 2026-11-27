@@ -12,7 +12,6 @@
 mod unexpected_store;
 #[path = "support/postgres_relay.rs"]
 mod postgres_relay;
-#[allow(dead_code)]
 mod support;
 
 use std::{

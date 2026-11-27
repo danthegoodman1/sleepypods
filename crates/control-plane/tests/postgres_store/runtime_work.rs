@@ -15,7 +15,7 @@ async fn postgres_runtime_ordered_notifications_and_retention() -> TestResult {
         .await?;
     let config = PostgresStoreConfig::new(connection_url_with_search_path(&base, &schema))?;
     let pg = PostgresStore::connect(&config).await?;
-    let result = ordered_notifications(pg, &config, &admin).await;
+    let result = ordered_notifications(pg, &config).await;
     admin
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await?;
@@ -23,11 +23,7 @@ async fn postgres_runtime_ordered_notifications_and_retention() -> TestResult {
     result
 }
 
-async fn ordered_notifications(
-    pg: PostgresStore,
-    config: &PostgresStoreConfig,
-    admin: &tokio_postgres::Client,
-) -> TestResult {
+async fn ordered_notifications(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResult {
     let class = workload_class("runtime-events", 1);
     pg.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone()))
         .await?;
