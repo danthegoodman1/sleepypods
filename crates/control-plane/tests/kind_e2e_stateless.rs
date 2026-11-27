@@ -1,3 +1,6 @@
+#[path = "support/wake_latency.rs"]
+mod wake_latency;
+
 use std::{
     env,
     error::Error,
@@ -12,12 +15,12 @@ use control_plane::{
         proxy_control_plane_client::ProxyControlPlaneClient, proxy_wake_instance_response,
         route_identity, sidecar_control_plane_client::SidecarControlPlaneClient,
         template_text_part, ContainerPortTemplate, ContainerTemplate, CreateInstanceRequest,
-        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, GetInstanceRequest,
-        HttpRouteIdentity, Instance, InstanceState as PbInstanceState, ManifestTemplate,
-        ProtocolRoute, ProxyWakeInstanceRequest, RouteHost, RouteHostKind, RouteIdentity,
-        ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
-        TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-        WorkloadTemplate, WorkloadValueSchema,
+        CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
+        GetInstanceRequest, HttpRouteIdentity, Instance, InstanceState as PbInstanceState,
+        ManifestTemplate, ProtocolRoute, ProxyWakeInstanceRequest, RouteHost, RouteHostKind,
+        RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest,
+        SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind,
+        WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueSchema,
     },
     render_instance_scoped_name, BearerToken, InstanceId, OptionalBearerTokenInterceptor,
 };
@@ -48,6 +51,7 @@ const WORKLOAD_NAME: &str = "e2e-app";
 const RENDERED_WORKLOAD_NAME: &str = "e2e-app-0efa3edd";
 const SIDECAR_TOKEN_SECRET_NAME: &str = "sleepypods-sidecar-token-0efa3edd";
 const APP_RESPONSE: &str = "sleepypods-stateless-app";
+const LATENCY_CLASS_ID: &str = "stateless-wake-latency";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
 
@@ -162,6 +166,131 @@ async fn stateless_http_lifecycle_through_deployed_platform() -> TestResult<()> 
     }
 
     Ok(())
+}
+
+/// Measures the latency the platform adds to a cold request, one fresh
+/// instance per sample, while nothing else changes state.
+#[tokio::test]
+#[ignore = "requires scripts/test-kind-e2e-stateless.sh or an equivalent kind deployment"]
+async fn stateless_wake_latency_through_deployed_platform() -> TestResult<()> {
+    if env::var("SLEEPYPODS_KIND_E2E_STATELESS").as_deref() != Ok("1")
+        || env::var("SLEEPYPODS_KIND_E2E_WAKE_LATENCY").as_deref() != Ok("1")
+    {
+        eprintln!(
+            "skipping stateless wake latency because SLEEPYPODS_KIND_E2E_STATELESS=1 and SLEEPYPODS_KIND_E2E_WAKE_LATENCY=1 are not set"
+        );
+        return Ok(());
+    }
+
+    control_plane::install_rustls_crypto_provider();
+
+    let config = E2eConfig::from_env()?;
+    let kube = Client::try_default().await?;
+    let mut operator = connect_operator(&config.operator_endpoint, &config.operator_token).await?;
+    operator
+        .create_workload_class_version(CreateWorkloadClassVersionRequest {
+            idempotency_key: "kind-e2e-create-wake-latency-class".to_owned(),
+            class_id: LATENCY_CLASS_ID.to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: Default::default(),
+                allow_extra: false,
+            }),
+            template_generation: 1,
+            template: Some(manifest_template(&config)),
+            // Samples stay awake until the driver deletes them.
+            sleep_policy: Some(WorkloadSleepPolicy {
+                idle_timeout_ms: 900_000,
+                idle_retry_backoff_ms: 500,
+                drain_grace_timeout_ms: 500,
+                idle_timeout_override: None,
+            }),
+            exclusivity_keys: vec![],
+        })
+        .await?;
+
+    let mut samples = Vec::new();
+    let mut instance_ids = Vec::new();
+    for index in 0..wake_latency::sample_count()? {
+        let instance_id = format!("wake-latency-{index}");
+        let host = format!("wake-latency-{index}.sleepypods.test");
+        operator
+            .create_instance(CreateInstanceRequest {
+                idempotency_key: format!("kind-e2e-create-{instance_id}"),
+                instance_id: instance_id.clone(),
+                workload_class: Some(WorkloadClassVersionRef {
+                    class_id: LATENCY_CLASS_ID.to_owned(),
+                    version: 1,
+                }),
+                values: Default::default(),
+            })
+            .await?;
+        operator
+            .create_route_binding(CreateRouteBindingRequest {
+                idempotency_key: format!("kind-e2e-create-{instance_id}-route"),
+                route_binding_id: format!("{instance_id}-route"),
+                instance_id: instance_id.clone(),
+                identity: Some(RouteIdentity {
+                    kind: Some(route_identity::Kind::Http(HttpRouteIdentity {
+                        host: Some(RouteHost {
+                            kind: RouteHostKind::Exact as i32,
+                            host: host.clone(),
+                        }),
+                        path_prefix: None,
+                    })),
+                }),
+                protocol: ProtocolRoute::Http as i32,
+            })
+            .await?;
+        let sample = wake_latency::WakeSample {
+            service_name: render_instance_scoped_name(
+                WORKLOAD_NAME,
+                &InstanceId::new(instance_id.clone())?,
+            ),
+            instance_id: instance_id.clone(),
+            host,
+        };
+        instance_ids.push(instance_id);
+        sleep(wake_latency::spacing(index)).await;
+        let probe = operator.clone();
+        samples.push(
+            wake_latency::measure(
+                kube.clone(),
+                &config.namespace,
+                config.frontline_addr,
+                &sample,
+                PbInstanceState::Running as i32,
+                |instance_id| {
+                    let mut operator = probe.clone();
+                    async move {
+                        Ok(operator
+                            .get_instance(GetInstanceRequest { instance_id })
+                            .await?
+                            .into_inner()
+                            .state)
+                    }
+                },
+            )
+            .await?,
+        );
+    }
+
+    for instance_id in instance_ids {
+        let current = operator
+            .get_instance(GetInstanceRequest {
+                instance_id: instance_id.clone(),
+            })
+            .await?
+            .into_inner();
+        operator
+            .delete_instance(DeleteInstanceRequest {
+                instance_id,
+                expected_generation: Some(current.generation),
+            })
+            .await?;
+    }
+    wake_latency::report("stateless", &samples)
 }
 
 #[derive(Clone, Debug)]
