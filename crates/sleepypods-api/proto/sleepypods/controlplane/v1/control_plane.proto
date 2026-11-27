@@ -467,7 +467,8 @@ message DeleteInstanceResponse {
 
 // A repeat that names the same instance and identity returns the stored
 // binding; any other request for an existing route_binding_id returns
-// ALREADY_EXISTS.
+// ALREADY_EXISTS. A binding that would give any host more than 256 rules, or
+// rules counting over 1 MiB, returns INVALID_ARGUMENT.
 message CreateRouteBindingRequest {
   string route_binding_id = 1;
   string instance_id = 2;
@@ -501,6 +502,7 @@ message RouteIdentity {
 
 message HttpRouteIdentity {
   RouteHost host = 1;
+  // Starts with "/" and is at most 4,096 bytes.
   optional string path_prefix = 2;
 }
 
