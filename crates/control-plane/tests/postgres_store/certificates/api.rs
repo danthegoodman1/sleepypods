@@ -434,6 +434,117 @@ async fn postgres_certificate_native_tls_role_boundary_and_http01() -> TestResul
     .await
 }
 
+/// One bulk call re-seals sixteen certificates, so twenty take two calls.
+#[tokio::test]
+async fn postgres_sealing_key_rotation_reencrypts_certificates_in_bulk() -> TestResult {
+    database_test(|store, _raw, _config| async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = async {
+            let bound = publish("bulk-00", 0, &["app.example"]);
+            let key = bound.bundle.private_key_pkcs8_der().to_vec();
+            store.publish_certificate(bound).await?;
+            store
+                .set_tls_binding(bind("app.example", rev(0), Some("bulk-00")))
+                .await?;
+            for index in 1..20 {
+                store
+                    .publish_certificate(publish(
+                        &format!("bulk-{index:02}"),
+                        0,
+                        &["other.example"],
+                    ))
+                    .await?;
+            }
+
+            let rotated = store
+                .clone()
+                .with_certificate_sealer(ring("b", &[("a", 7), ("b", 8)]));
+            let published_under_b = rotated
+                .publish_certificate(publish("current", 0, &["current.example"]))
+                .await?;
+            let served = server(rotated, tokens(), true, &mut tasks).await?;
+            let connection = channel(served.operator_url, Some(&served.ca)).await?;
+            let mut operator = OperatorControlPlaneClient::new(connection.clone());
+            let request = |key: &str| pb::ReencryptCertificatesRequest {
+                sealing_key_id: key.into(),
+            };
+
+            let web_error = OperatorControlPlaneClient::new(WebContentType(connection))
+                .reencrypt_certificates(authorized(request("a"), "operator-secret"))
+                .await
+                .unwrap_err();
+            assert_eq!(web_error.code(), Code::PermissionDenied);
+            for token in ["proxy-secret", "sidecar-secret"] {
+                assert_eq!(
+                    operator
+                        .reencrypt_certificates(authorized(request("a"), token))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::PermissionDenied
+                );
+            }
+            for (key, reason) in [
+                ("b", "certificates under the active sealing key are current"),
+                ("absent", "the sealing key ring lacks this key"),
+                (
+                    "",
+                    "sealing key ID requires 1–64 ASCII identifier characters",
+                ),
+            ] {
+                let error = operator
+                    .reencrypt_certificates(authorized(request(key), "operator-secret"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), Code::InvalidArgument, "{key:?}");
+                assert_eq!(error.message(), reason);
+            }
+
+            let mut progress = Vec::new();
+            for _ in 0..3 {
+                let response = operator
+                    .reencrypt_certificates(authorized(request("a"), "operator-secret"))
+                    .await?
+                    .into_inner();
+                progress.push((response.reencrypted, response.remaining));
+            }
+            assert_eq!(progress, [(16, 4), (4, 0), (0, 0)]);
+
+            for index in 0..20 {
+                let metadata = store
+                    .get_certificate_metadata(id(&format!("bulk-{index:02}")))
+                    .await?
+                    .expect("certificate exists");
+                assert_eq!(metadata.sealing_key_id.as_deref(), Some("b"));
+                assert_eq!(metadata.version, rev(1));
+                assert_eq!(metadata.sealing_revision, rev(2));
+            }
+            assert_eq!(
+                store.get_certificate_metadata(id("current")).await?,
+                Some(published_under_b),
+                "a certificate under the active key stays as published"
+            );
+
+            // The retired key has left the ring and every certificate still opens.
+            let without_a = store
+                .clone()
+                .with_certificate_sealer(ring("b", &[("b", 8)]));
+            match resolve(&without_a, "app.example").await?.value {
+                TlsCertificateValue::Found { bundle, .. } => {
+                    assert!(bundle.private_key_pkcs8_der() == key)
+                }
+                _ => panic!("a re-sealed certificate resolves"),
+            }
+            Ok(())
+        }
+        .await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        result
+    })
+    .await
+}
+
 #[tokio::test]
 async fn postgres_cancelled_certificate_sql_retains_capacity_until_drained() -> TestResult {
     database_test(|_store, raw, mut config| async move {

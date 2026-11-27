@@ -73,6 +73,15 @@ impl ControlPlaneStore for PostgresStore {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         Box::pin(super::certificate_ops::reencrypt(self, request))
     }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+        Box::pin(super::certificate_ops::reencrypt_sealed_by(
+            self,
+            sealing_key_id,
+        ))
+    }
 
     fn snapshot_tls_bindings(
         &self,

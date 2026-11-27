@@ -84,6 +84,20 @@ impl CertificateSealer {
             keys: result,
         })
     }
+    /// The key new seals use.
+    pub(crate) fn active_id(&self) -> &str {
+        &self.active_id
+    }
+
+    /// Whether the ring can open a seal made with `key_id`.
+    pub(crate) fn holds(&self, key_id: &str) -> bool {
+        self.keys.contains_key(key_id)
+    }
+
+    pub(crate) fn key_ids(&self) -> Vec<String> {
+        self.keys.keys().cloned().collect()
+    }
+
     pub(crate) fn seal(
         &self,
         id: &CertificateId,
@@ -158,7 +172,7 @@ fn associated_data(
     }
     aad
 }
-fn validate_key_id(id: &str) -> Result<(), InvalidCertificateResource> {
+pub(crate) fn validate_key_id(id: &str) -> Result<(), InvalidCertificateResource> {
     if id.is_empty()
         || id.len() > 64
         || !id

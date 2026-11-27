@@ -14,6 +14,7 @@ service OperatorControlPlane {
   rpc GetTlsBinding(GetTlsBindingRequest) returns (TlsBinding);
   rpc RemoveCertificate(RemoveCertificateRequest) returns (CertificateMetadata);
   rpc ReencryptCertificate(ReencryptCertificateRequest) returns (CertificateMetadata);
+  rpc ReencryptCertificates(ReencryptCertificatesRequest) returns (ReencryptCertificatesResponse);
   rpc CreateWorkloadClassVersion(CreateWorkloadClassVersionRequest) returns (WorkloadClassVersion);
   rpc GetWorkloadClassVersion(GetWorkloadClassVersionRequest) returns (WorkloadClassVersion);
   rpc CreateInstance(CreateInstanceRequest) returns (Instance);
@@ -677,6 +678,15 @@ message ReencryptCertificateRequest {
   string certificate_id = 1;
   optional uint64 expected_version = 2;
   optional uint64 expected_sealing_revision = 3;
+}
+// Re-seals a batch of the active certificates held under one sealing key with
+// the key ring's active key. Repeat the call until `remaining` is zero; the key
+// can then leave the ring.
+message ReencryptCertificatesRequest { string sealing_key_id = 1; }
+message ReencryptCertificatesResponse {
+  uint32 reencrypted = 1;
+  // Active certificates still sealed under the key.
+  uint64 remaining = 2;
 }
 message ResolveTlsCertificateRequest {
   string server_name = 1;

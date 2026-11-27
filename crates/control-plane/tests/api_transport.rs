@@ -3121,6 +3121,13 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
         panic!("unexpected certificate operation")
     }
 
+    async fn reencrypt_certificates(
+        &self,
+        _: tonic::Request<control_plane::api::pb::ReencryptCertificatesRequest>,
+    ) -> Result<Response<control_plane::api::pb::ReencryptCertificatesResponse>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
     async fn create_workload_class_version(
         &self,
         _request: tonic::Request<CreateWorkloadClassVersionRequest>,

@@ -67,6 +67,15 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.fail("reencrypt_certificate", format!("{request:?}"))
     }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+        self.fail(
+            "reencrypt_certificates_sealed_by",
+            format!("{sealing_key_id:?}"),
+        )
+    }
 
     fn snapshot_tls_bindings(
         &self,
@@ -443,6 +452,7 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             expected_sealing_revision: CertificateRevision::new(31).unwrap()
         }
     );
+    check!(1, reencrypt_certificates_sealed_by, "retired".to_owned());
     let hosts = vec![TlsHostname::new("snapshot.example").unwrap()];
     for known in [None, Some(cert_rev)] {
         assert!(store

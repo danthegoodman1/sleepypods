@@ -181,6 +181,13 @@ where
         super::certificates::reencrypt(self.store.as_ref(), request).await
     }
 
+    async fn reencrypt_certificates(
+        &self,
+        request: Request<pb::ReencryptCertificatesRequest>,
+    ) -> Result<Response<pb::ReencryptCertificatesResponse>, Status> {
+        super::certificates::reencrypt_sealed_by(self.store.as_ref(), request).await
+    }
+
     async fn create_workload_class_version(
         &self,
         request: Request<pb::CreateWorkloadClassVersionRequest>,

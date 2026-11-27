@@ -44,6 +44,7 @@ impl ControlPlaneStore for AcceptanceStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
+        reencrypt_certificates_sealed_by,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,

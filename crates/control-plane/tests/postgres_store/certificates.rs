@@ -585,6 +585,7 @@ struct LostCertificateResponse {
 impl ControlPlaneStore for LostCertificateResponse {
     unexpected_store_methods!(
         get_certificate_metadata,
+        reencrypt_certificates_sealed_by,
         get_tls_binding,
         resolve_tls_certificate,
         snapshot_tls_bindings,
