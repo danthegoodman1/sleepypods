@@ -3,11 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tonic::{
-    codegen::http::{header, HeaderName, Method},
-    Request, Response, Status,
-};
-use tower_http::cors::{Any, CorsLayer};
+use tonic::{Request, Response, Status};
 
 use crate::{
     api::{
@@ -136,25 +132,6 @@ where
     ))
     .max_decoding_message_size(256 * 1024)
     .max_encoding_message_size(1024 * 1024)
-}
-
-pub fn operator_grpc_web_cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::POST, Method::OPTIONS])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            HeaderName::from_static("grpc-timeout"),
-            HeaderName::from_static("x-grpc-web"),
-            HeaderName::from_static("x-sleepypods-operator"),
-            HeaderName::from_static("x-user-agent"),
-        ])
-        .expose_headers([
-            HeaderName::from_static("grpc-status"),
-            HeaderName::from_static("grpc-message"),
-            HeaderName::from_static("grpc-status-details-bin"),
-        ])
 }
 
 #[tonic::async_trait]

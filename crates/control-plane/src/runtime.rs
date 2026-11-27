@@ -18,7 +18,7 @@ use sleepypods_observability::{
     },
 };
 use tokio::{sync::watch, task::JoinSet};
-use tonic::transport::server::Router;
+use tonic::{codegen::http::HeaderValue, transport::server::Router};
 use tower::layer::util::{Identity, Stack};
 use tower_http::cors::CorsLayer;
 
@@ -46,6 +46,9 @@ pub const CONTROL_PLANE_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_LISTEN
 /// to reach. Keeping the two apart lets a NetworkPolicy separate them.
 pub const OPERATOR_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_OPERATOR_LISTEN_ADDR";
 pub const OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV: &str = "SLEEPYPODS_OPERATOR_GRPC_WEB_LISTEN_ADDR";
+/// Comma-separated origins whose pages may call the gRPC-Web listener.
+pub const OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV: &str =
+    "SLEEPYPODS_OPERATOR_GRPC_WEB_ALLOWED_ORIGINS";
 pub const STORE_PROVIDER_ENV: &str = "SLEEPYPODS_STORE_PROVIDER";
 pub const POSTGRES_URL_ENV: &str = "SLEEPYPODS_POSTGRES_URL";
 pub const CLUSTER_ID_ENV: &str = "SLEEPYPODS_CLUSTER_ID";
@@ -60,7 +63,10 @@ pub type NativeControlPlaneRouter =
     Router<Stack<crate::api::admission::RpcAdmissionLayer, Identity>>;
 pub type OperatorGrpcWebLayers = Stack<
     tonic_web::GrpcWebLayer,
-    Stack<crate::api::admission::RpcAdmissionLayer, Stack<CorsLayer, Identity>>,
+    Stack<
+        crate::api::admission::RpcAdmissionLayer,
+        Stack<CorsLayer, Stack<crate::api::grpc_web::OriginGuardLayer, Identity>>,
+    >,
 >;
 pub type OperatorGrpcWebRouter = Router<OperatorGrpcWebLayers>;
 pub type RuntimeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -70,6 +76,9 @@ pub struct RuntimeConfig {
     pub listen_addr: SocketAddr,
     pub operator_listen_addr: SocketAddr,
     pub operator_grpc_web_listen_addr: Option<SocketAddr>,
+    /// Origins whose pages may call the gRPC-Web listener. Empty admits no
+    /// browser page.
+    pub operator_grpc_web_allowed_origins: Vec<HeaderValue>,
     pub metrics_listen_addr: Option<SocketAddr>,
     pub control_plane: ControlPlaneConfig,
     pub target: MaterializationTarget,
@@ -122,6 +131,27 @@ impl RuntimeConfig {
         let operator_listen_addr = parse_required_socket_addr(&values, OPERATOR_LISTEN_ADDR_ENV)?;
         let operator_grpc_web_listen_addr =
             parse_optional_socket_addr(&values, OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV)?;
+        let operator_grpc_web_allowed_origins = values
+            .get(OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(|origin| {
+                crate::api::grpc_web::parse_allowed_origin(origin).ok_or(
+                    RuntimeConfigError::InvalidSecurity(
+                        "gRPC-Web allowed origins must each be scheme://host[:port]",
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !operator_grpc_web_allowed_origins.is_empty() && operator_grpc_web_listen_addr.is_none()
+        {
+            return Err(RuntimeConfigError::InvalidSecurity(
+                "gRPC-Web allowed origins require the gRPC-Web listener",
+            ));
+        }
         let metrics_listen_addr = parse_optional_socket_addr(&values, METRICS_LISTEN_ADDR_ENV)?;
         let provider = required_value(&values, STORE_PROVIDER_ENV)?;
         let store = match provider.parse::<StoreProviderName>().map_err(|_| {
@@ -288,6 +318,7 @@ impl RuntimeConfig {
             listen_addr,
             operator_listen_addr,
             operator_grpc_web_listen_addr,
+            operator_grpc_web_allowed_origins,
             metrics_listen_addr,
             control_plane: ControlPlaneConfig::new(store, auth),
             target,
@@ -385,35 +416,28 @@ fn grpc_server(
         .layer(route_events.admission.clone()))
 }
 
-pub fn operator_grpc_web_router<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-) -> OperatorGrpcWebRouter
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    operator_grpc_web_router_with_route_events(
-        store,
-        materializer,
-        target,
-        AuthConfig::NoAuth,
-        RouteSubscriptionBroker::new(),
-    )
-}
-
-fn operator_grpc_web_router_with_route_events<C>(
+/// The browser-facing listener: the operator service over gRPC-Web, behind the
+/// platform TLS identity when one is configured, for pages from
+/// `allowed_origins`.
+pub fn operator_grpc_web_router_with_tls<C>(
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     auth_config: AuthConfig,
     route_events: RouteSubscriptionBroker,
-) -> OperatorGrpcWebRouter
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    allowed_origins: &[HeaderValue],
+) -> RuntimeResult<OperatorGrpcWebRouter>
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
-    admitted_grpc_web_server_builder(route_events.admission.clone())
+    let mut server =
+        admitted_grpc_web_server_builder(route_events.admission.clone(), allowed_origins);
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    Ok(server
         .timeout(std::time::Duration::from_secs(10))
         .max_concurrent_streams(32)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
@@ -429,17 +453,20 @@ where
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
             ),
-        ))
+        )))
 }
 
-// CORS adds headers only; admission must wrap the gRPC-web body transformation,
-// including its newly allocated base64 output, to retain final delivery ownership.
+/// The gRPC-Web layer stack. The origin guard and CORS run first; admission
+/// wraps the gRPC-Web body transformation, including its newly allocated base64
+/// output, to retain final delivery ownership.
 pub(crate) fn admitted_grpc_web_server_builder(
     admission: crate::api::admission::RpcAdmissionLayer,
+    allowed_origins: &[HeaderValue],
 ) -> tonic::transport::Server<OperatorGrpcWebLayers> {
     tonic::transport::Server::builder()
         .accept_http1(true)
-        .layer(crate::api::server::operator_grpc_web_cors_layer())
+        .layer(crate::api::grpc_web::OriginGuardLayer::new(allowed_origins))
+        .layer(crate::api::operator_grpc_web_cors_layer(allowed_origins))
         .layer(admission)
         .layer(tonic_web::GrpcWebLayer::new())
 }
@@ -569,13 +596,15 @@ where
     });
 
     if let Some(web_incoming) = web_incoming {
-        let operator_grpc_web_router = operator_grpc_web_router_with_route_events(
+        let operator_grpc_web_router = operator_grpc_web_router_with_tls(
             Arc::clone(&store),
             materializer.clone(),
             config.target.clone(),
             config.control_plane.auth.clone(),
             route_events.clone(),
-        );
+            config.security.tls(config.api_limits.setup_timeout)?,
+            &config.operator_grpc_web_allowed_origins,
+        )?;
         let operator_grpc_web_shutdown = native_shutdown.clone();
         listeners.spawn(async move {
             operator_grpc_web_router
@@ -1298,6 +1327,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn grpc_web_origins_default_to_none_and_parse_a_list() {
+        let mut values = valid_env();
+        values.push((OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV, "127.0.0.1:50052"));
+        let config = RuntimeConfig::from_key_values(values.clone()).expect("valid config");
+        assert!(config.operator_grpc_web_allowed_origins.is_empty());
+
+        values.push((
+            OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV,
+            "https://console.example, http://localhost:3000",
+        ));
+        let config = RuntimeConfig::from_key_values(values).expect("valid config");
+        assert_eq!(
+            config.operator_grpc_web_allowed_origins,
+            ["https://console.example", "http://localhost:3000"]
+        );
+    }
+
+    #[test]
+    fn grpc_web_origins_reject_wildcards_and_a_missing_listener() {
+        for origins in ["*", "https://console.example/", "console.example"] {
+            let mut values = valid_env();
+            values.push((OPERATOR_GRPC_WEB_LISTEN_ADDR_ENV, "127.0.0.1:50052"));
+            values.push((OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV, origins));
+            assert!(
+                matches!(
+                    RuntimeConfig::from_key_values(values),
+                    Err(RuntimeConfigError::InvalidSecurity(_))
+                ),
+                "{origins:?} is not an origin"
+            );
+        }
+
+        let mut values = valid_env();
+        values.push((
+            OPERATOR_GRPC_WEB_ALLOWED_ORIGINS_ENV,
+            "https://console.example",
+        ));
+        assert!(matches!(
+            RuntimeConfig::from_key_values(values),
+            Err(RuntimeConfigError::InvalidSecurity(_))
+        ));
+    }
+
+    #[test]
     fn env_config_defaults_metrics_listener_to_absent() {
         let config = RuntimeConfig::from_key_values(valid_env())
             .expect("valid config without metrics listener");
@@ -1498,7 +1571,16 @@ pub(crate) mod tests {
             None,
         )
         .expect("operator router");
-        let _operator_grpc_web = operator_grpc_web_router(store, materializer, target);
+        let _operator_grpc_web = operator_grpc_web_router_with_tls(
+            store,
+            materializer,
+            target,
+            AuthConfig::NoAuth,
+            RouteSubscriptionBroker::new(),
+            None,
+            &[],
+        )
+        .expect("operator gRPC-Web router");
     }
 
     #[tokio::test]

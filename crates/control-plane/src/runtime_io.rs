@@ -619,6 +619,7 @@ mod tests {
                         1,
                         Duration::from_millis(150),
                     ),
+                    &[],
                 )
                 .http2_keepalive_interval(Some(Duration::from_millis(20)))
                 .http2_keepalive_timeout(Some(Duration::from_millis(20)))

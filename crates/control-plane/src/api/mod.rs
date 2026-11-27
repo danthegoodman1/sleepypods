@@ -3,6 +3,7 @@
 pub mod admission;
 mod certificate_watch;
 mod certificates;
+pub mod grpc_web;
 mod proxy;
 mod route_events;
 pub mod server;
@@ -18,14 +19,15 @@ use tonic::Status;
 
 use crate::store::StoreError;
 
+pub use grpc_web::operator_grpc_web_cors_layer;
 pub use proxy::{
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
     StoreBackedProxyApi, StoreBackedProxyGrpcService, PROXY_SERVICE_NAME,
 };
 pub use route_events::RouteSubscriptionBroker;
 pub use server::{
-    operator_grpc_service_with_store_and_route_events, operator_grpc_web_cors_layer,
-    StoreBackedOperatorApi, StoreBackedOperatorGrpcService, OPERATOR_SERVICE_NAME,
+    operator_grpc_service_with_store_and_route_events, StoreBackedOperatorApi,
+    StoreBackedOperatorGrpcService, OPERATOR_SERVICE_NAME,
 };
 pub use sidecar::{
     sidecar_grpc_service_with_store, sidecar_grpc_service_with_store_and_route_events,

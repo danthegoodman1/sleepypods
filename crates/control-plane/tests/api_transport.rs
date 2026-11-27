@@ -3,6 +3,8 @@
 mod unexpected_store;
 #[path = "api_transport/create_validation.rs"]
 mod create_validation;
+#[path = "api_transport/grpc_web_tls.rs"]
+mod grpc_web_tls;
 #[path = "api_transport/quiet_logging.rs"]
 mod quiet_logging;
 mod support;
@@ -89,6 +91,11 @@ fn store_operator_grpc_service(
         target(),
         RouteSubscriptionBroker::new(),
     )
+}
+
+/// The origin `grpc_web_operator_request` sends.
+fn browser_origins() -> [HeaderValue; 1] {
+    [HeaderValue::from_static("https://operator.example")]
 }
 
 fn auth_config() -> AuthConfig {
@@ -2345,7 +2352,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
 
 #[tokio::test]
 async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
@@ -2361,7 +2368,7 @@ async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .expect("allow-origin is returned"),
-        "*"
+        "https://operator.example"
     );
     let allow_methods = response
         .headers()
@@ -2431,7 +2438,7 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
 
 #[tokio::test]
 async fn grpc_web_store_backed_errors_return_structured_status() {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
@@ -2466,7 +2473,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
     let store = store_with_class("class-auth", 1);
     let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
 
-    let valid_response = operator_grpc_web_cors_layer()
+    let valid_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
                 &store_for_service,
@@ -2505,7 +2512,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
         },
     );
     missing_request.headers_mut().remove(header::AUTHORIZATION);
-    let missing_response = operator_grpc_web_cors_layer()
+    let missing_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
                 &store_for_service,
@@ -2518,7 +2525,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
     assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "16");
     assert!(!store.instance_exists("grpc-web-auth-missing"));
 
-    let wrong_response = operator_grpc_web_cors_layer()
+    let wrong_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(store_for_service)),
         )
@@ -2578,7 +2585,7 @@ where
     M: Message + Default,
     R: Message,
 {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(store)))
         .oneshot(grpc_web_operator_request(method, request))
         .await
