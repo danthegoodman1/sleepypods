@@ -19,8 +19,8 @@ use super::{
     RawKubernetesObject, RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret,
     SecretKeyRef, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet,
     StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
-    WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
-    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    WorkloadKind, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
+    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
 const CONTROL_PLANE_SERVICE_NAME: &str = "sleepypods-control-plane";
@@ -67,7 +67,6 @@ pub(crate) fn render_manifests_with_options(
         .transpose()?;
     let selector_labels = selector_labels(request.instance, &workload_name)?;
     let metadata_labels = metadata_labels(request.instance, &workload_name)?;
-    let annotations = metadata_annotations(&request);
     let sidecar = render_sidecar_config(request.template, request.instance)?;
 
     let rendered_volumes = request
@@ -86,7 +85,7 @@ pub(crate) fn render_manifests_with_options(
                     name: rendered.pv_name.clone(),
                     namespace: None,
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 spec: PersistentVolumeSpec {
                     capacity: rendered.capacity.clone(),
@@ -110,7 +109,7 @@ pub(crate) fn render_manifests_with_options(
                     name: rendered.pvc_name.clone(),
                     namespace: Some(request.namespace.to_owned()),
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 spec: PersistentVolumeClaimSpec {
                     access_modes: rendered.access_modes.clone(),
@@ -125,7 +124,7 @@ pub(crate) fn render_manifests_with_options(
     }
 
     if let Some(service) = &request.template.service {
-        let mut service_annotations = annotations.clone();
+        let mut service_annotations = BTreeMap::new();
         if sidecar.mode.as_deref() == Some("tcp") {
             service_annotations.insert(ANNOTATION_BACKEND_SCHEME.to_owned(), "tcp".to_owned());
         }
@@ -156,7 +155,7 @@ pub(crate) fn render_manifests_with_options(
                     name: name.clone(),
                     namespace: Some(request.namespace.to_owned()),
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 type_: "Opaque".to_owned(),
                 string_data: BTreeMap::from([(
@@ -173,7 +172,7 @@ pub(crate) fn render_manifests_with_options(
     let pod_template = PodTemplateSpec {
         metadata: PodTemplateMetadata {
             labels: metadata_labels.clone(),
-            annotations: annotations.clone(),
+            annotations: BTreeMap::new(),
         },
         spec: PodSpec {
             containers: vec![
@@ -214,7 +213,7 @@ pub(crate) fn render_manifests_with_options(
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
                         labels: metadata_labels.clone(),
-                        annotations: annotations.clone(),
+                        annotations: BTreeMap::new(),
                     },
                     spec: DeploymentSpec {
                         replicas,
@@ -238,7 +237,7 @@ pub(crate) fn render_manifests_with_options(
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
                         labels: metadata_labels.clone(),
-                        annotations: annotations.clone(),
+                        annotations: BTreeMap::new(),
                     },
                     spec: StatefulSetSpec {
                         replicas,
@@ -261,7 +260,6 @@ pub(crate) fn render_manifests_with_options(
             request.instance,
             request.namespace,
             &auxiliary_labels,
-            &annotations,
         )?);
     }
 
@@ -271,7 +269,6 @@ pub(crate) fn render_manifests_with_options(
 
     Ok(RenderedManifest {
         instance_generation: request.instance.generation,
-        template_generation: request.template_generation,
         objects,
     })
 }
@@ -281,7 +278,6 @@ fn render_raw_object(
     instance: &InstanceRecord,
     namespace: &str,
     metadata_labels: &BTreeMap<String, String>,
-    annotations: &BTreeMap<String, String>,
 ) -> Result<RenderedManifestObject, ManifestRenderError> {
     let document = PlaceholderDocument::new(&template.manifest).with_values(&instance.values)?;
     if document.text().trim().is_empty() {
@@ -340,12 +336,6 @@ fn render_raw_object(
         metadata_labels,
         "raw_objects.manifest.metadata.labels",
     )?;
-    merge_required_string_map(
-        metadata,
-        "annotations",
-        annotations,
-        "raw_objects.manifest.metadata.annotations",
-    )?;
     let object_metadata = ObjectMeta {
         name,
         namespace: namespaced.then_some(effective_namespace),
@@ -358,11 +348,7 @@ fn render_raw_object(
     };
 
     let pod_template_metadata = if matches!(kind.as_str(), "Deployment" | "StatefulSet") {
-        Some(raw_pod_template_metadata(
-            &mut value,
-            metadata_labels,
-            annotations,
-        )?)
+        Some(raw_pod_template_metadata(&mut value, metadata_labels)?)
     } else {
         None
     };
@@ -489,7 +475,6 @@ fn raw_effective_namespace(
 fn raw_pod_template_metadata(
     value: &mut Value,
     metadata_labels: &BTreeMap<String, String>,
-    annotations: &BTreeMap<String, String>,
 ) -> Result<PodTemplateMetadata, ManifestRenderError> {
     let object = value
         .as_object_mut()
@@ -524,12 +509,6 @@ fn raw_pod_template_metadata(
         "labels",
         metadata_labels,
         "raw_objects.manifest.spec.template.metadata.labels",
-    )?;
-    merge_required_string_map(
-        metadata,
-        "annotations",
-        annotations,
-        "raw_objects.manifest.spec.template.metadata.annotations",
     )?;
 
     Ok(PodTemplateMetadata {
@@ -1245,18 +1224,6 @@ fn metadata_labels(
         )?,
         label(LABEL_WORKLOAD_NAME, workload_name)?,
     ]))
-}
-
-fn metadata_annotations(request: &RenderManifestRequest<'_>) -> BTreeMap<String, String> {
-    request
-        .template_generation
-        .map(|generation| {
-            BTreeMap::from([(
-                ANNOTATION_TEMPLATE_GENERATION.to_owned(),
-                generation.to_string(),
-            )])
-        })
-        .unwrap_or_default()
 }
 
 fn validate_retained_static_inventory(

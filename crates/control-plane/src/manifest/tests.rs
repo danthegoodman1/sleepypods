@@ -86,7 +86,6 @@ fn renders_deployment_and_service_without_volumes() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("deployment renders");
 
@@ -115,10 +114,6 @@ fn renders_deployment_and_service_without_volumes() {
         deployment.metadata.labels[LABEL_WORKLOAD_CLASS_VERSION],
         "1"
     );
-    assert_eq!(
-        deployment.metadata.annotations["sleepypods.io/template-generation"],
-        "3"
-    );
     assert_eq!(deployment.spec.replicas, 1);
     assert_eq!(
         deployment.spec.selector.match_labels, service.spec.selector,
@@ -127,10 +122,6 @@ fn renders_deployment_and_service_without_volumes() {
     assert_eq!(
         deployment.spec.template.metadata.labels[LABEL_INSTANCE_ID],
         "instance-a"
-    );
-    assert_eq!(
-        deployment.spec.template.metadata.annotations["sleepypods.io/template-generation"],
-        "3"
     );
     assert_eq!(deployment.spec.template.spec.containers.len(), 2);
     assert_eq!(
@@ -220,7 +211,6 @@ fn private_render_options_inject_sidecar_control_plane_token() {
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
             sleep_policy: sleep_policy(),
             namespace: "apps",
-            template_generation: Some(Generation::new(3)),
         },
         RenderManifestOptions {
             sidecar_control_plane_token: Some(&token),
@@ -296,7 +286,6 @@ fn rendered_names_use_hash_suffix_for_short_instance_id() {
         instance: &instance("abc", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect("deployment renders");
 
@@ -317,7 +306,6 @@ fn rendered_names_hash_full_long_instance_id() {
         instance: &instance("abcdefghijk", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect("deployment renders");
 
@@ -342,7 +330,6 @@ fn rendered_names_truncate_operator_base_before_instance_suffix() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect("deployment renders");
 
@@ -367,7 +354,6 @@ fn rendered_names_do_not_add_kubernetes_kind_tokens() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect("deployment renders");
 
@@ -391,7 +377,6 @@ fn rejects_invalid_custom_rendered_object_name() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("invalid custom name is rejected");
 
@@ -414,7 +399,6 @@ fn renders_optional_sidecar_mode_env() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("deployment renders");
     let service = match &rendered.objects[0].object {
@@ -444,7 +428,6 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("deployment renders");
 
@@ -460,10 +443,6 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     assert_eq!(
         service["metadata"]["labels"][LABEL_INSTANCE_ID],
         json!("instance-a")
-    );
-    assert_eq!(
-        service["metadata"]["annotations"]["sleepypods.io/template-generation"],
-        json!("3")
     );
     assert_eq!(
         service["spec"]["selector"][LABEL_INSTANCE_ID],
@@ -551,7 +530,6 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("stateful workload renders");
 
@@ -748,7 +726,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("raw objects render");
 
@@ -868,7 +845,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("disallowed kind is rejected");
 
@@ -889,7 +865,6 @@ fn rejects_invalid_raw_manifest_yaml() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("invalid YAML is rejected");
 
@@ -916,7 +891,6 @@ metadata: {}
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("missing name is rejected");
 
@@ -945,7 +919,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("non-string namespace is rejected");
 
@@ -976,7 +949,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("PersistentVolume namespace is rejected");
 
@@ -1004,7 +976,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("duplicate ref is rejected");
 
@@ -1034,7 +1005,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("conflicting ownership label is rejected");
 
@@ -1064,7 +1034,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("non-string ownership label is rejected");
 
@@ -1076,7 +1045,7 @@ metadata:
 }
 
 #[test]
-fn rejects_non_string_raw_sleepypods_annotations() {
+fn rejects_non_string_raw_annotations() {
     let mut template = deployment_template();
     template.raw_objects = vec![raw_manifest(
         r#"
@@ -1085,7 +1054,7 @@ kind: Service
 metadata:
   name: raw-svc
   annotations:
-    sleepypods.io/template-generation: [3]
+    example.com/revision: [3]
 "#,
     )];
 
@@ -1094,14 +1063,13 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
-    .expect_err("non-string template annotation is rejected");
+    .expect_err("non-string annotation is rejected");
 
     assert_invalid_field(
         error,
         "raw_objects.manifest.metadata.annotations",
-        "sleepypods.io/template-generation must be \"3\", got non-string value",
+        "all values must be strings",
     );
 }
 
@@ -1132,7 +1100,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect_err("a raw PV without Retain is rejected even when templated");
 
@@ -1173,7 +1140,6 @@ spec:
         ),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect_err("an instance may not choose the reclaim policy");
 
@@ -1213,7 +1179,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("a templated raw PV declaring Retain renders");
 
@@ -1265,7 +1230,6 @@ spec:
         ),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("raw object renders");
 
@@ -1308,7 +1272,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("raw object renders");
 
@@ -1350,7 +1313,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("raw object renders");
 
@@ -1377,7 +1339,6 @@ fn rejects_host_path_whose_root_an_instance_value_chooses() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("a hostPath root chosen by an instance is rejected");
 
@@ -1403,7 +1364,6 @@ fn rejects_host_path_that_climbs_out_of_the_authors_directory() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("a hostPath climbing out of its directory is rejected");
 
@@ -1429,7 +1389,6 @@ fn renders_host_path_subdirectory_whose_name_begins_with_dots() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("a subdirectory whose name begins with dots still renders");
 
@@ -1468,7 +1427,6 @@ metadata:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(3)),
     })
     .expect("raw object renders");
 
@@ -1501,7 +1459,6 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("Archil-style CSI workload renders");
 
@@ -1585,7 +1542,6 @@ fn renders_all_csi_secret_refs_to_kubernetes_keys() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("CSI workload with all secret refs renders");
 
@@ -1655,7 +1611,6 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("stateful workload renders");
 
@@ -1757,7 +1712,6 @@ fn renders_host_path_persistent_volume_source() {
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("hostPath stateful workload renders");
 
@@ -1782,7 +1736,6 @@ fn serializes_host_path_persistent_volume_source_as_kubernetes_json() {
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect("hostPath stateful workload renders");
 
@@ -1812,9 +1765,7 @@ fn managed_storage_rejects_destructive_policy_at_class_admission_and_legacy_rend
     );
     let class = crate::workload::WorkloadClassVersion {
         reference: instance.workload_class.clone(),
-        template_generation: Generation::new(1),
         template: template.clone(),
-        default_values: Default::default(),
         value_schema: crate::workload::WorkloadValueSchema::new(true),
         sleep_policy: crate::sleep_policy::WorkloadSleepPolicy::new(60_000, 1_000, 30_000).unwrap(),
         exclusivity_keys: vec![],
@@ -1828,7 +1779,6 @@ fn managed_storage_rejects_destructive_policy_at_class_admission_and_legacy_rend
         instance: &instance,
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .unwrap_err();
     assert!(error.to_string().contains("Retain"));
@@ -1849,7 +1799,6 @@ fn raw_storage_cannot_bypass_retention_or_static_binding_validation() {
             instance: &instance("raw-storage", 2, values([("tenant", "acme")])),
             sleep_policy: sleep_policy(),
             namespace: "apps",
-            template_generation: None,
         });
         assert!(result.is_err(), "unsafe raw storage must be refused: {raw}");
     }
@@ -1867,7 +1816,6 @@ fn rendering_legacy_classes_rejects_zero_and_multiple_replicas() {
                 instance: &instance("old-app", 2, values([("tenant", "acme"), ("volume", "v1")])),
                 sleep_policy: sleep_policy(),
                 namespace: "apps",
-                template_generation: None,
             })
             .expect_err("legacy unsupported replica count cannot create resources");
             assert!(matches!(error, ManifestRenderError::InvalidReplicas { .. }));
@@ -1889,7 +1837,6 @@ fn rejects_stateful_set_scale_above_one() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("scaled StatefulSet is rejected");
 
@@ -1926,7 +1873,6 @@ fn rejects_workload_class_id_that_is_not_label_value_safe() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("invalid workload class label is rejected");
 
@@ -1943,7 +1889,6 @@ fn rejects_zero_container_port() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("zero container port is rejected");
 
@@ -1966,7 +1911,6 @@ fn rejects_zero_service_port() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("zero service port is rejected");
 
@@ -1989,7 +1933,6 @@ fn rejects_zero_service_target_port() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("zero service target port is rejected");
 
@@ -2012,7 +1955,6 @@ fn rejects_zero_sidecar_listen_port() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("zero sidecar listen port is rejected");
 
@@ -2035,7 +1977,6 @@ fn rejects_invalid_sidecar_mode() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("invalid sidecar mode is rejected");
 
@@ -2058,7 +1999,6 @@ fn rejects_service_without_ports_for_sidecar_routing() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("service port is required");
 
@@ -2082,7 +2022,6 @@ fn rejects_missing_service_for_sidecar_routing() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("service is required");
 
@@ -2114,7 +2053,6 @@ fn rejects_multiple_service_ports_for_sidecar_routing() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("ambiguous service ports are rejected");
 
@@ -2138,7 +2076,6 @@ fn rejects_app_target_port_matching_sidecar_listen_port() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("loop-prone sidecar target is rejected");
 
@@ -2161,7 +2098,6 @@ fn rejects_service_target_port_not_declared_on_app_container() {
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .expect_err("service target port must be an app container port");
 
@@ -2188,7 +2124,6 @@ fn rejects_volume_without_access_modes() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("empty access modes are rejected");
 
@@ -2218,7 +2153,6 @@ fn rejects_duplicate_volume_access_modes() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("duplicate access modes are rejected");
 
@@ -2254,7 +2188,6 @@ fn rejects_missing_csi_volume_handle_value() {
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("missing CSI volume handle is rejected");
 
@@ -2279,7 +2212,6 @@ fn rejects_empty_csi_volume_handle() {
         ),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("empty CSI volume handle is rejected");
 
@@ -2389,7 +2321,6 @@ fn rejects_invalid_csi_secret_ref_templates() {
             instance: &instance("postgres-a", 2, values),
             sleep_policy: sleep_policy(),
             namespace: "data",
-            template_generation: None,
         });
         let error = match result {
             Ok(_) => panic!("{name} should be rejected"),
@@ -2413,7 +2344,6 @@ fn rejects_relative_host_path_persistent_volume_source() {
         instance: &instance("postgres-a", 2, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "data",
-        template_generation: None,
     })
     .expect_err("relative hostPath source is rejected");
 
@@ -2709,7 +2639,6 @@ fn primary_http_and_tcp_workloads_have_private_transport_readiness() {
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
             sleep_policy: sleep_policy(),
             namespace: "apps",
-            template_generation: None,
         })
         .unwrap();
         let workload = rendered
@@ -2764,7 +2693,6 @@ fn readiness_port_skips_declared_app_proxy_and_metrics_ports() {
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
             sleep_policy: sleep_policy(),
             namespace: "apps",
-            template_generation: None,
         })
     };
     let rendered = render(&template).unwrap();
@@ -2855,7 +2783,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .unwrap();
     let service = rendered
@@ -2911,7 +2838,6 @@ fn raw_auxiliaries_cannot_supply_reserved_primary_selector_labels_or_expressions
                 instance: &instance("instance-a", 7, values([("tenant", "acme")])),
                 sleep_policy: sleep_policy(),
                 namespace: "apps",
-                template_generation: None,
             }),
             Err(ManifestRenderError::InvalidField {
                 field: "raw_objects.manifest",
@@ -2929,7 +2855,6 @@ fn raw_auxiliaries_cannot_supply_reserved_primary_selector_labels_or_expressions
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
             sleep_policy: sleep_policy(),
             namespace: "apps",
-            template_generation: None,
         }),
         Err(ManifestRenderError::InvalidField {
             field: "raw_objects.manifest.kind",
@@ -2960,7 +2885,6 @@ spec:
         instance: &instance("instance-a", 7, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: None,
     })
     .unwrap();
     let workload = rendered

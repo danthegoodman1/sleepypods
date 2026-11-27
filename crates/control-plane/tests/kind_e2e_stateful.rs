@@ -944,15 +944,12 @@ async fn create_stateful_operator_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("{idempotency_scope}-create-class"),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: true,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms,
@@ -1003,15 +1000,12 @@ async fn create_exclusivity_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-exclusivity-create-class".to_owned(),
             class_id: EXCLUSIVE_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: true,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,

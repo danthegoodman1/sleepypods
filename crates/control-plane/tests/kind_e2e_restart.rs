@@ -16,13 +16,13 @@ use control_plane::api::pb::{
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     DeleteHttp01ChallengeRequest, DeleteInstanceRequest, DeleteRouteBindingRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity,
-    Instance, InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute,
-    ProxyWakeInstanceRequest, PutHttp01ChallengeRequest, ReconcileMaterializationRequest,
-    ReconcileMaterializationResponse, ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
-    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    GetInstanceRequest, Http01ChallengeKey, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, ProxyWakeInstanceRequest,
+    PutHttp01ChallengeRequest, ReconcileMaterializationRequest, ReconcileMaterializationResponse,
+    ResolveHttp01ChallengeRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, WorkloadClassVersionRef,
+    WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
+    WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, ReplicaSet},
@@ -81,7 +81,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.late_app_image,
         &config.sidecar_image,
         sleep_policy(900_000),
-        "late",
     )
     .await?;
     create_workload_class(
@@ -90,7 +89,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.app_image,
         &config.sidecar_image,
         sleep_policy(900_000),
-        "normal",
     )
     .await?;
     create_workload_class(
@@ -99,7 +97,6 @@ async fn control_plane_restart_recovery_through_deployed_platform() -> TestResul
         &config.app_image,
         &config.sidecar_image,
         sleep_policy(5_000),
-        "fast-sleep",
     )
     .await?;
 
@@ -981,25 +978,6 @@ async fn http01_challenges_survive_restart_and_cleanup(
     {
         return Err("expired HTTP-01 token still resolves authoritatively".into());
     }
-    // Maintenance may already have collected the row. The manual pass is
-    // idempotent; authoritative absence, not which worker deleted it, matters.
-    operator
-        .expire_http01_challenges(ExpireHttp01ChallengesRequest {
-            now_unix_millis: unix_millis(SystemTime::now())?,
-            limit: Some(10),
-        })
-        .await?
-        .into_inner();
-    if operator
-        .delete_http01_challenge(DeleteHttp01ChallengeRequest {
-            key: Some(http01_key(HTTP01_HOST, HTTP01_EXPIRING_TOKEN)),
-        })
-        .await?
-        .into_inner()
-        .deleted
-    {
-        return Err("expired HTTP-01 row remained after bounded cleanup".into());
-    }
 
     Ok(())
 }
@@ -1019,14 +997,11 @@ async fn create_workload_class(
     app_image: &str,
     sidecar_image: &str,
     sleep_policy: WorkloadSleepPolicy,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-class"),
             class_id: class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -1037,7 +1012,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(app_image, sidecar_image)),
             sleep_policy: Some(sleep_policy),
             exclusivity_keys: vec![],

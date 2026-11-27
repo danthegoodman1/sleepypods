@@ -95,7 +95,7 @@ use control_plane::api::{
         SidecarReportIdleRequest, SidecarReportIdleResponse, SidecarReportIdleUnavailableReason,
     },
     sidecar_grpc_service_with_store, StoreBackedSidecarApi, StoreBackedSidecarGrpcService,
-    OPERATOR_UNARY_METHODS, SIDECAR_SERVICE_NAME,
+    SIDECAR_SERVICE_NAME,
 };
 use control_plane::projection::{
     LiveObjectMetadata, ProjectionObjectInspection, ANNOTATION_MATERIALIZATION_ID,
@@ -167,8 +167,6 @@ fn generated_api_contains_sidecar_report_idle_shape_without_operator_surface_cha
         <StoreBackedSidecarGrpcService<FakeKubernetesClient> as NamedService>::NAME,
         SIDECAR_SERVICE_NAME
     );
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ReportIdle"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"SidecarControlPlane/ReportIdle"));
 }
 
 #[tokio::test]

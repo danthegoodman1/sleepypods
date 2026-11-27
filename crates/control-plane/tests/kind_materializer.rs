@@ -235,7 +235,6 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
         instance: &instance,
         sleep_policy: resolved_sleep_policy(),
         namespace,
-        template_generation: Some(Generation::new(1)),
     })?;
     // This isolated PV/projection gate deliberately uses nginx as a serving
     // fixture, without a control plane or the production sidecar. Keep a real

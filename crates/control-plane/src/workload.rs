@@ -26,9 +26,7 @@ pub struct CreateWorkloadClassVersionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkloadClassVersion {
     pub reference: WorkloadClassVersionRef,
-    pub template_generation: Generation,
     pub template: ManifestTemplate,
-    pub default_values: InstanceValues,
     pub value_schema: WorkloadValueSchema,
     pub sleep_policy: WorkloadSleepPolicy,
     pub exclusivity_keys: Vec<WorkloadExclusivityKeyTemplate>,
@@ -494,7 +492,6 @@ mod tests {
                 crate::ids::WorkloadClassId::new("class-a").expect("valid class id"),
                 crate::ids::Generation::new(1),
             ),
-            template_generation: crate::ids::Generation::new(1),
             template: crate::manifest::ManifestTemplate {
                 workload: crate::manifest::WorkloadTemplate {
                     kind: crate::manifest::WorkloadKind::Deployment,
@@ -517,7 +514,6 @@ mod tests {
                 volumes: vec![],
                 raw_objects: vec![],
             },
-            default_values: InstanceValues::new(),
             value_schema: WorkloadValueSchema::new(true),
             sleep_policy: crate::sleep_policy::WorkloadSleepPolicy::new(60_000, 1_000, 30_000)
                 .expect("valid sleep policy"),

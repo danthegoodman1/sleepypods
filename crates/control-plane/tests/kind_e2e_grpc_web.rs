@@ -72,15 +72,9 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateWorkloadClassVersion",
         CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-grpc-web-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: HashMap::from([(
-                "image".to_owned(),
-                "registry.k8s.io/pause:3.10".to_owned(),
-            )]),
             value_schema: None,
-            template_generation: 1,
             template: Some(manifest_template()),
             sleep_policy: Some(sleep_policy()),
             exclusivity_keys: vec![],

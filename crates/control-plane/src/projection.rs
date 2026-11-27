@@ -1487,7 +1487,6 @@ mod tests {
                 drain_grace_timeout_ms: 30_000,
             },
             namespace: "apps",
-            template_generation: Some(Generation::new(3)),
         })
         .expect("manifest renders")
     }

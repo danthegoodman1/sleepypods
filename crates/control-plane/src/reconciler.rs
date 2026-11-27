@@ -730,7 +730,6 @@ where
                 instance,
                 sleep_policy,
                 namespace: materialization.target.namespace(),
-                template_generation: Some(workload_class.template_generation),
             },
             self.materializer.render_options(),
         )
@@ -1228,7 +1227,6 @@ mod tests {
             instance: &projected_instance,
             sleep_policy: class.sleep_policy.resolve(&instance.values).unwrap(),
             namespace: "apps",
-            template_generation: Some(class.template_generation),
         })
         .unwrap();
         for object in &mut legacy_manifest.objects {
@@ -2206,7 +2204,6 @@ mod tests {
                 .resolve(&instance.values)
                 .expect("sleep policy resolves"),
             namespace: "apps",
-            template_generation: Some(workload_class.template_generation),
         })
         .expect("manifest renders");
         let materializer = KubernetesMaterializer::new(FakeKubernetesClient::default());
@@ -2270,7 +2267,6 @@ mod tests {
                 WorkloadClassId::new("class-a").expect("valid class id"),
                 Generation::new(1),
             ),
-            template_generation: Generation::new(3),
             template: ManifestTemplate {
                 workload: WorkloadTemplate {
                     kind: WorkloadKind::Deployment,
@@ -2306,7 +2302,6 @@ mod tests {
                 volumes: Vec::new(),
                 raw_objects: Vec::new(),
             },
-            default_values: InstanceValues::new(),
             value_schema: WorkloadValueSchema::new(true),
             sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000)
                 .expect("valid sleep policy"),
@@ -2469,8 +2464,7 @@ mod tests {
             lookup_route_dependencies,
             put_http01_challenge,
             resolve_http01_challenge,
-            delete_http01_challenge,
-            expire_http01_challenges
+            delete_http01_challenge
         );
 
         fn finalize_instance_deletions(
@@ -2824,7 +2818,6 @@ mod tests {
                     .resolve(&instance.values)
                     .expect("sleep policy resolves"),
                 namespace: materialization.target.namespace(),
-                template_generation: Some(workload_class.template_generation),
             })
             .expect("manifest renders");
             let plan = ProjectionPlan::from_manifest(materialization, &manifest)

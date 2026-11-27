@@ -11,7 +11,7 @@ use crate::{
     kubernetes_name::is_dns_label,
     manifest::{
         ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject,
-        ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION,
+        LABEL_INSTANCE_GENERATION,
     },
     materialization::{BackendEndpoint, RenderedObjectRef},
     projection::{ProjectionObjectInspection, ProjectionReadinessInspection},
@@ -860,60 +860,26 @@ impl Error for MaterializerError {
 
 fn validate_manifest_generations(manifest: &RenderedManifest) -> Result<(), MaterializerError> {
     let expected_instance_generation = manifest.instance_generation.to_string();
-    let expected_template_generation = manifest
-        .template_generation
-        .map(|generation| generation.to_string());
 
     for rendered in &manifest.objects {
-        let (labels, annotations) = object_metadata(&rendered.object);
-        validate_metadata_generation(
+        let (labels, _) = object_metadata(&rendered.object);
+        validate_generation_value(
             &rendered.object,
-            labels,
-            annotations,
-            &expected_instance_generation,
-            expected_template_generation.as_deref(),
             "metadata",
+            LABEL_INSTANCE_GENERATION,
+            labels.get(LABEL_INSTANCE_GENERATION),
+            &expected_instance_generation,
         )?;
 
-        if let Some((labels, annotations)) = pod_template_metadata(&rendered.object) {
-            validate_metadata_generation(
+        if let Some((labels, _)) = pod_template_metadata(&rendered.object) {
+            validate_generation_value(
                 &rendered.object,
-                labels,
-                annotations,
-                &expected_instance_generation,
-                expected_template_generation.as_deref(),
                 "pod template metadata",
+                LABEL_INSTANCE_GENERATION,
+                labels.get(LABEL_INSTANCE_GENERATION),
+                &expected_instance_generation,
             )?;
         }
-    }
-
-    Ok(())
-}
-
-fn validate_metadata_generation(
-    object: &KubernetesObject,
-    labels: &BTreeMap<String, String>,
-    annotations: &BTreeMap<String, String>,
-    expected_instance_generation: &str,
-    expected_template_generation: Option<&str>,
-    context: &'static str,
-) -> Result<(), MaterializerError> {
-    validate_generation_value(
-        object,
-        context,
-        LABEL_INSTANCE_GENERATION,
-        labels.get(LABEL_INSTANCE_GENERATION),
-        expected_instance_generation,
-    )?;
-
-    if let Some(expected) = expected_template_generation {
-        validate_generation_value(
-            object,
-            context,
-            ANNOTATION_TEMPLATE_GENERATION,
-            annotations.get(ANNOTATION_TEMPLATE_GENERATION),
-            expected,
-        )?;
     }
 
     Ok(())
@@ -1835,39 +1801,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_template_generation_manifest_is_rejected_before_apply() {
-        let client = FakeKubernetesClient::default();
-        let materializer = KubernetesMaterializer::new(client.clone());
-        let mut manifest = deployment_manifest();
-        let deployment = manifest
-            .objects
-            .iter_mut()
-            .find_map(|object| match &mut object.object {
-                KubernetesObject::Deployment(deployment) => Some(deployment),
-                _ => None,
-            })
-            .expect("deployment object");
-        deployment.spec.template.metadata.annotations.insert(
-            "sleepypods.io/template-generation".to_owned(),
-            "2".to_owned(),
-        );
-
-        let error = materializer
-            .apply_manifest(&manifest)
-            .await
-            .expect_err("stale template generation annotation is rejected");
-
-        assert_invalid_manifest(
-            error,
-            "Deployment apps/app-acme-69856ec0faae6daf pod template metadata sleepypods.io/template-generation must be \"3\"",
-        );
-        assert!(
-            client.operations().is_empty(),
-            "stale manifest must not be applied"
-        );
-    }
-
-    #[tokio::test]
     async fn invalid_rendered_name_is_rejected_before_apply() {
         let client = FakeKubernetesClient::default();
         let materializer = KubernetesMaterializer::new(client.clone());
@@ -2214,7 +2147,6 @@ mod tests {
             instance: &instance("instance-a", 7, values([("tenant", "acme")])),
             sleep_policy: resolved_sleep_policy(),
             namespace: "apps",
-            template_generation: Some(Generation::new(3)),
         })
         .expect("deployment renders")
     }
@@ -2229,7 +2161,6 @@ mod tests {
             ),
             sleep_policy: resolved_sleep_policy(),
             namespace: "data",
-            template_generation: None,
         })
         .expect("stateful workload renders")
     }

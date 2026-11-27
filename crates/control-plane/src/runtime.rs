@@ -980,13 +980,13 @@ impl Error for RuntimeConfigError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::{
         http01::{
-            DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-            Http01ChallengeRecord, PutHttp01ChallengeRequest,
+            DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+            PutHttp01ChallengeRequest,
         },
         instance::{
             CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    pub(super) struct NoopKubernetesClient;
+    pub(crate) struct NoopKubernetesClient;
 
     impl KubernetesMaterializerClient for NoopKubernetesClient {
         fn apply_object<'a>(
@@ -1727,7 +1727,19 @@ mod tests {
     }
 
     #[derive(Debug)]
-    pub(super) struct NoopStore;
+    pub(crate) struct NoopStore;
+
+    /// The operator service over a store whose every operation fails, for
+    /// transport tests that need a real service behind the listener.
+    pub(crate) fn noop_operator_service(
+    ) -> crate::api::StoreBackedOperatorGrpcService<NoopKubernetesClient> {
+        operator_grpc_service_with_store_and_route_events(
+            Arc::new(NoopStore),
+            KubernetesMaterializer::new(NoopKubernetesClient),
+            MaterializationTarget::new("cluster-a", "apps").expect("valid target"),
+            RouteSubscriptionBroker::new(),
+        )
+    }
 
     #[derive(Debug)]
     struct OperationalMetricsStore;
@@ -1783,8 +1795,7 @@ mod tests {
             lookup_route_dependencies,
             put_http01_challenge,
             resolve_http01_challenge,
-            delete_http01_challenge,
-            expire_http01_challenges
+            delete_http01_challenge
         );
 
         fn load_materialization_operational_metrics(
@@ -1991,13 +2002,6 @@ mod tests {
             &'a self,
             _request: DeleteHttp01ChallengeRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
-        }
-
-        fn expire_http01_challenges<'a>(
-            &'a self,
-            _request: ExpireHttp01ChallengesRequest,
-        ) -> StoreFuture<'a, StoreResult<usize>> {
             not_implemented()
         }
     }

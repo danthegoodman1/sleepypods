@@ -475,27 +475,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async move {
-            let mut records = self.http01.lock().expect("fake store lock is available");
-            let expired_keys = records
-                .iter()
-                .filter(|(_, record)| record.expires_at() <= request.now)
-                .take(request.limit.unwrap_or(usize::MAX))
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            let expired = expired_keys.len();
-            for key in expired_keys {
-                records.remove(&key);
-            }
-
-            Ok(expired)
-        })
-    }
-
     fn record_materialization<'a>(
         &'a self,
         request: control_plane::RecordMaterializationRequest,
@@ -1133,7 +1112,6 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
             control_plane::WorkloadClassId::new("class-1").expect("class id is valid"),
             Generation::new(1),
         ),
-        template_generation: Generation::new(1),
         template: control_plane::ManifestTemplate {
             workload: control_plane::WorkloadTemplate {
                 kind: control_plane::WorkloadKind::Deployment,
@@ -1166,7 +1144,6 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        default_values: BTreeMap::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),
         sleep_policy: control_plane::WorkloadSleepPolicy::new(120_000, 5_000, 30_000)
             .expect("sleep policy is valid"),

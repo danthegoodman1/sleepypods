@@ -74,7 +74,6 @@ spec:
         instance: &instance("tenant-evil", 1, values([("tag", malicious_tag)])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render still accepts the manifest");
 
@@ -143,7 +142,6 @@ spec:
         instance: &instance("tenant-a", 1, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("raw object with instance values renders");
 
@@ -217,7 +215,6 @@ spec:
         instance: &instance("tenant-evil", 1, values([("tag", "1")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render accepts a fully privileged raw workload");
 
@@ -254,7 +251,6 @@ fn rendered_pod_spec_drops_its_service_account_token_and_sandboxes_the_workload(
         instance: &instance("tenant-a", 1, values([("tag", "1")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("deployment renders");
 
@@ -371,7 +367,6 @@ spec:
         instance: &instance("tenant-a", 1, values([("replicas", "3")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render succeeds");
 
@@ -402,7 +397,6 @@ fn host_path_fully_chosen_by_an_instance_value_is_rejected() {
         instance: &instance("tenant-evil", 1, values([("data_dir", "/")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect_err("an unrooted hostPath template is rejected");
 
@@ -424,7 +418,6 @@ fn host_path_traversal_out_of_the_authors_directory_is_rejected() {
         instance: &instance("tenant-evil", 1, values([("data_dir", "../../../")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect_err("traversal out of the fixed directory is rejected");
 
@@ -448,7 +441,6 @@ fn host_path_rooted_in_an_author_literal_still_renders_per_instance() {
         instance: &instance("tenant-a", 1, values([("data_dir", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("a rooted per-instance hostPath still renders");
 
@@ -553,22 +545,4 @@ fn sleep_policy() -> ResolvedSleepPolicy {
         idle_retry_backoff_ms: 5_000,
         drain_grace_timeout_ms: 30_000,
     }
-}
-
-// --------------------------------------------------------------------------
-// F3 (fixed): serving an ACME challenge is a proxy read, so the internet-facing
-// frontline no longer needs an operator credential.
-// --------------------------------------------------------------------------
-
-/// The operator surface keeps the HTTP-01 writes and gives up the read.
-#[test]
-fn http01_resolve_is_not_on_the_operator_surface() {
-    use control_plane::api::OPERATOR_UNARY_METHODS;
-
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
-
-    // The writes stay: inserting and clearing a challenge is ACME-owner work.
-    assert!(OPERATOR_UNARY_METHODS.contains(&"PutHttp01Challenge"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteHttp01Challenge"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ExpireHttp01Challenges"));
 }

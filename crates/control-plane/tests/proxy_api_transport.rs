@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
-    operator_grpc_server_builder,
     pb::{
         operator_control_plane_server::OperatorControlPlane,
         proxy_control_plane_client::ProxyControlPlaneClient,
@@ -28,7 +27,7 @@ use control_plane::api::{
     },
     proxy_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
     RouteSubscriptionBroker, StoreBackedOperatorApi, StoreBackedProxyApi,
-    StoreBackedProxyGrpcService, StoreBackedSidecarApi, OPERATOR_UNARY_METHODS, PROXY_SERVICE_NAME,
+    StoreBackedProxyGrpcService, StoreBackedSidecarApi, PROXY_SERVICE_NAME,
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
@@ -101,10 +100,6 @@ fn generated_api_contains_proxy_wake_shape_without_operator_surface_change() {
         <StoreBackedProxyGrpcService<FakeKubernetesClient> as NamedService>::NAME,
         PROXY_SERVICE_NAME
     );
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/WakeInstance"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ProxyControlPlane/Subscribe"));
 
     let subscribe = ProxySubscribeRequest {
         input: Some(proxy_subscribe_request::Input::SubscribeRoute(
@@ -1885,7 +1880,7 @@ async fn unconsumed_subscription_output_stops_production_and_recovers_on_drop() 
 
 #[test]
 fn native_grpc_server_can_be_constructed_with_store_backed_proxy_service() {
-    let _router = operator_grpc_server_builder().add_service(proxy_grpc_service_with_store(
+    let _router = tonic::transport::Server::builder().add_service(proxy_grpc_service_with_store(
         Arc::new(FakeWakeStore::default()),
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         proxy_target(),
@@ -2478,7 +2473,6 @@ fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> Ren
 fn domain_workload_class() -> control_plane::WorkloadClassVersion {
     control_plane::WorkloadClassVersion {
         reference: domain_workload_ref(),
-        template_generation: Generation::new(3),
         template: control_plane::ManifestTemplate {
             workload: control_plane::WorkloadTemplate {
                 kind: control_plane::WorkloadKind::Deployment,
@@ -2511,7 +2505,6 @@ fn domain_workload_class() -> control_plane::WorkloadClassVersion {
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        default_values: control_plane::InstanceValues::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),
         sleep_policy: control_plane::WorkloadSleepPolicy::new(300_000, 5_000, 30_000)
             .expect("valid sleep policy"),

@@ -19,9 +19,9 @@ use control_plane::{
     ContainerTemplate, ControlPlaneStore, CreateInstanceRequest, CreateRouteBindingRequest,
     CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
     DeleteMaterializationReconciliationRequest, DeleteRouteBindingRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, FinalizeSleepReconciliationRequest, FinalizeSleepRequest,
-    ForceReleaseExclusivityKeyRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
-    Http01ChallengeKey, IdempotencyKey, IdleTimeoutOverridePolicy, InstanceId, InstanceState,
+    FinalizeSleepReconciliationRequest, FinalizeSleepRequest, ForceReleaseExclusivityKeyRequest,
+    Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey,
+    IdleTimeoutOverridePolicy, InstanceId, InstanceState,
     ListMaterializationReconciliationCandidatesRequest, ManifestTemplate, MaterializationState,
     MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
@@ -112,7 +112,7 @@ async fn run_conformance(
     assert_eq!(duplicate, class);
 
     let mut changed_class = class.clone();
-    changed_class.template_generation = Generation::new(2);
+    changed_class.value_schema.allow_extra = !changed_class.value_schema.allow_extra;
     let conflict = store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(changed_class))
         .await
@@ -290,7 +290,6 @@ async fn run_conformance(
             .resolve(&created.instance.values)
             .map_err(|error| StoreError::internal(error.to_string()))?,
         namespace: "apps",
-        template_generation: Some(loaded.template_generation),
     })
     .map_err(|error| StoreError::internal(error.to_string()))?;
     let rendered_names = rendered
@@ -801,13 +800,16 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
         .await?
         .is_none());
 
-    let expired = store
-        .expire_http01_challenges(
-            ExpireHttp01ChallengesRequest::new(SystemTime::now()).with_limit(1),
-        )
-        .await?;
-    assert_eq!(expired, 1);
-    assert!(store.resolve_http01_challenge(expired_key).await?.is_none());
+    // Runtime maintenance collects the expired row; an explicit delete then
+    // finds nothing left.
+    store.maintain_runtime_records(1024).await?;
+    assert!(
+        !store
+            .delete_http01_challenge(control_plane::DeleteHttp01ChallengeRequest::new(
+                expired_key
+            ))
+            .await?
+    );
 
     Ok(())
 }
@@ -3275,9 +3277,7 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
             WorkloadClassId::new(class_id).expect("valid workload class ID"),
             Generation::new(version),
         ),
-        template_generation: Generation::new(1),
         template: workload_manifest_template(),
-        default_values: BTreeMap::from([("image".to_owned(), image.clone())]),
         value_schema: WorkloadValueSchema::new(false)
             .with_field("tenant", WorkloadValueFieldRule::required())
             .with_field(

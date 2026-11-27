@@ -67,8 +67,7 @@ impl ControlPlaneStore for LostResponseStore {
         finalize_sleep_reconciliation,
         delete_materialization_reconciliation,
         lookup_route_dependencies,
-        resolve_http01_challenge,
-        expire_http01_challenges
+        resolve_http01_challenge
     );
     fn record_materialization_failure(
         &self,

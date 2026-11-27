@@ -202,15 +202,12 @@ async fn invalid_volume_template_is_rejected_by_operator_api(
 ) -> TestResult<()> {
     let error = operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-failure-invalid-volume-class".to_owned(),
             class_id: INVALID_VOLUME_CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(ManifestTemplate {
                 workload: Some(workload_template(
                     WorkloadKind::StatefulSet,
@@ -573,15 +570,12 @@ async fn create_class_instance_and_route(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-class"),
             class_id: spec.class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: Default::default(),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(ManifestTemplate {
                 workload: Some(workload_template(
                     spec.workload_kind,
@@ -1233,7 +1227,6 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
             drain_grace_timeout_ms: 500,
         },
         namespace,
-        template_generation: Some(domain::Generation::new(1)),
     })?;
     // The projection plan adds the same final managed-by/ownership stamps used
     // by the production reconciler; the pure renderer alone does not add them.

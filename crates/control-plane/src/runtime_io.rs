@@ -234,7 +234,7 @@ mod tests {
         let server = tokio::spawn(
             tonic::transport::Server::builder()
                 .layer(crate::api::admission::RpcAdmissionLayer::new(4))
-                .add_service(crate::api::operator_grpc_service())
+                .add_service(crate::runtime::tests::noop_operator_service())
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = receiver.await;
                 }),
@@ -280,7 +280,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert_eq!(status.code(), tonic::Code::Unimplemented);
+            assert_eq!(status.code(), tonic::Code::Internal);
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         drop(client);

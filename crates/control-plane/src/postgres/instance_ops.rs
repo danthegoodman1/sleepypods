@@ -100,9 +100,7 @@ pub(crate) async fn create_workload_class_version(
     let client = store.client().await?;
     let class_id = desired.reference.class_id.as_str();
     let version = generation_to_i64(desired.reference.version)?;
-    let template_generation = generation_to_i64(desired.template_generation)?;
     let manifest_template = manifest_template_to_json(&desired.template)?;
-    let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
     let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
     let exclusivity_keys = workload_exclusivity_keys_to_json(&desired.exclusivity_keys)?;
@@ -112,22 +110,18 @@ pub(crate) async fn create_workload_class_version(
             INSERT INTO workload_class_versions (
                 class_id,
                 version,
-                template_generation,
                 manifest_template,
-                default_values,
                 value_schema,
                 sleep_policy,
                 exclusivity_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
                 &class_id,
                 &version,
-                &template_generation,
                 &manifest_template,
-                &default_values,
                 &value_schema,
                 &sleep_policy,
                 &exclusivity_keys,
@@ -341,8 +335,8 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, manifest_template, default_values,
-                value_schema, sleep_policy, exclusivity_keys
+            SELECT class_id, version, manifest_template, value_schema, sleep_policy,
+                exclusivity_keys
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",

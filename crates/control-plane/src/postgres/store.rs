@@ -1,8 +1,8 @@
 use crate::certificate::*;
 use crate::{
     http01::{
-        DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-        Http01ChallengeRecord, PutHttp01ChallengeRequest,
+        DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+        PutHttp01ChallengeRequest,
     },
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
@@ -404,12 +404,5 @@ impl ControlPlaneStore for PostgresStore {
         request: DeleteHttp01ChallengeRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async move { http01_ops::delete_http01_challenge(self, request).await })
-    }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async move { http01_ops::expire_http01_challenges(self, request).await })
     }
 }

@@ -64,6 +64,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dynamic_certificates",
         sql: include_str!("../../migrations/0011_dynamic_certificates.sql"),
     },
+    Migration {
+        version: 14,
+        name: "api_cleanup",
+        sql: include_str!("../../migrations/0014_api_cleanup.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {

@@ -344,12 +344,6 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<bool>> {
         self.fail("delete_http01_challenge", format!("{request:?}"))
     }
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        self.fail("expire_http01_challenges", format!("{request:?}"))
-    }
 }
 
 #[tokio::test]
@@ -734,11 +728,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
         1,
         delete_http01_challenge,
         DeleteHttp01ChallengeRequest::new(key)
-    );
-    check!(
-        2,
-        expire_http01_challenges,
-        ExpireHttp01ChallengesRequest::new(now).with_limit(101)
     );
 }
 

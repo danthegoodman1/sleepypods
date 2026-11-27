@@ -264,8 +264,6 @@ impl CompareAndSwapInstanceStateRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use crate::{
         ids::{Generation, IdempotencyKey, InstanceId, WorkloadClassId},
         manifest::{
@@ -579,9 +577,7 @@ mod tests {
                 WorkloadClassId::new("class-1").expect("valid class ID"),
                 Generation::new(1),
             ),
-            template_generation: Generation::new(1),
             template: test_manifest_template(),
-            default_values: BTreeMap::new(),
             value_schema,
             sleep_policy,
             exclusivity_keys: vec![],

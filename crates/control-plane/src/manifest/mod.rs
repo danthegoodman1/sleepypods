@@ -36,7 +36,6 @@ pub(crate) const LABEL_INSTANCE_GENERATION: &str = "sleepypods.io/instance-gener
 pub(crate) const LABEL_WORKLOAD_CLASS_ID: &str = "sleepypods.io/workload-class-id";
 pub(crate) const LABEL_WORKLOAD_CLASS_VERSION: &str = "sleepypods.io/workload-class-version";
 pub(crate) const LABEL_WORKLOAD_NAME: &str = "sleepypods.io/workload-name";
-pub(crate) const ANNOTATION_TEMPLATE_GENERATION: &str = "sleepypods.io/template-generation";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderManifestRequest<'a> {
@@ -44,7 +43,6 @@ pub struct RenderManifestRequest<'a> {
     pub instance: &'a InstanceRecord,
     pub sleep_policy: ResolvedSleepPolicy,
     pub namespace: &'a str,
-    pub template_generation: Option<crate::ids::Generation>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

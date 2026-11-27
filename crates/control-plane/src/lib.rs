@@ -44,8 +44,8 @@ pub use auth::{
 };
 pub use config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
 pub use http01::{
-    DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-    Http01ChallengeRecord, PutHttp01ChallengeRequest,
+    DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+    PutHttp01ChallengeRequest,
 };
 pub use ids::{
     BackendGeneration, Generation, IdempotencyKey, InstanceId, MaterializationId, NonEmptyString,

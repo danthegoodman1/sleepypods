@@ -365,21 +365,6 @@ async fn postgres_certificate_native_tls_role_boundary_and_http01() -> TestResul
                     .is_none(),
                 "expired row must be hidden before garbage collection"
             );
-            operator
-                .expire_http01_challenges(authorized(
-                    pb::ExpireHttp01ChallengesRequest {
-                        now_unix_millis: 2_000_000_000_000,
-                        limit: Some(1),
-                    },
-                    "operator-secret",
-                ))
-                .await?;
-            assert!(proxy
-                .resolve_http01_challenge(authorized(request, "proxy-secret"))
-                .await?
-                .into_inner()
-                .challenge
-                .is_none());
             raw.batch_execute("ALTER TABLE http01_challenges RENAME TO http01_unavailable_fixture")
                 .await?;
             assert_eq!(

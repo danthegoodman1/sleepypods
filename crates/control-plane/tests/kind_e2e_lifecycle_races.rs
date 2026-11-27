@@ -80,7 +80,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-normal-app",
             volumes: Vec::new(),
-            idempotency_suffix: "normal",
         },
     )
     .await?;
@@ -93,7 +92,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-sleep-waking-app",
             volumes: Vec::new(),
-            idempotency_suffix: "sleep-waking",
         },
     )
     .await?;
@@ -110,7 +108,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
                 "lifecycle-delete-waking-pvc",
                 "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-waking",
             ),
-            idempotency_suffix: "delete-waking",
         },
     )
     .await?;
@@ -127,7 +124,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
                 "lifecycle-delete-draining-pvc",
                 "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-draining",
             ),
-            idempotency_suffix: "delete-draining",
         },
     )
     .await?;
@@ -140,7 +136,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-failed-retry-app",
             volumes: Vec::new(),
-            idempotency_suffix: "failed-retry",
         },
     )
     .await?;
@@ -1302,7 +1297,6 @@ struct WorkloadClassFixture<'a> {
     kind: WorkloadKind,
     workload_name: &'a str,
     volumes: Vec<VolumeTemplate>,
-    idempotency_suffix: &'a str,
 }
 
 async fn create_workload_class(
@@ -1311,10 +1305,8 @@ async fn create_workload_class(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-lifecycle-{}-class", fixture.idempotency_suffix),
             class_id: fixture.class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -1325,7 +1317,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(ManifestTemplate {
                 workload: Some(workload_template(
                     fixture.kind,

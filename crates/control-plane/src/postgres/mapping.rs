@@ -50,9 +50,7 @@ pub(crate) struct RouteIdentityParts {
 pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<WorkloadClassVersion> {
     let class_id: String = row.get("class_id");
     let version: i64 = row.get("version");
-    let template_generation: i64 = row.get("template_generation");
     let template: Value = row.get("manifest_template");
-    let default_values: Value = row.get("default_values");
     let value_schema: Value = row.get("value_schema");
     let sleep_policy: Value = row.get("sleep_policy");
     let exclusivity_keys: Value = row.get("exclusivity_keys");
@@ -62,9 +60,7 @@ pub(crate) fn workload_class_version_from_row(row: &Row) -> StoreResult<Workload
             class_id: WorkloadClassId::new(class_id).map_err(invalid_stored_data)?,
             version: generation_from_i64(version)?,
         },
-        template_generation: generation_from_i64(template_generation)?,
         template: manifest_template_from_json(template)?,
-        default_values: values_from_json(default_values)?,
         value_schema: value_schema_from_json(value_schema)?,
         sleep_policy: sleep_policy_from_json(sleep_policy)?,
         exclusivity_keys: workload_exclusivity_keys_from_json(exclusivity_keys)?,
