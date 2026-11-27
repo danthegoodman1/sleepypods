@@ -9,9 +9,9 @@ status when a documented gap actually closes.
 - `crates/control-plane`: API service implementations, durable store trait, Postgres provider,
   route resolver, wake/sleep/delete state machines, manifest rendering,
   Kubernetes materializer, native gRPC, and gRPC-Web operator transport.
-- `crates/frontline`: always-on proxy runtime, route cache and matcher, lazy
-  Subscribe resolver, wake coordination, HTTP-01 interception, HTTP/TLS/SNI
-  listeners, and frontline load-smoke helper.
+- `crates/frontline`: always-on proxy runtime, host-keyed route cache, the route
+  coordinator that owns the Subscribe stream and wake coordination, HTTP-01
+  interception, HTTP/TLS/SNI listeners, and frontline load-smoke helper.
 - `crates/sidecar`: workload-local HTTP/TCP proxy, drain/idle detection,
   `ReportIdle` client, and sidecar load-smoke helper.
 - `crates/proxy-core`: shared proxy primitives, TLS ClientHello/SNI parsing,
@@ -45,9 +45,13 @@ status when a documented gap actually closes.
   are in `crates/sleepypods-api/src/{route,http01}.rs`.
 - Operator/proxy/sidecar services:
   `crates/control-plane/src/api/server.rs`, `api/proxy.rs`, `api/sidecar.rs`
-- Frontline route cache/resolver:
-  `crates/frontline/src/cache.rs`, `matcher.rs`, `resolver.rs`, `route.rs`,
-  `subscription.rs`
+- Route rule sets and their ranking: `HostRules` in
+  `crates/sleepypods-api/src/route.rs`; the control plane's Subscribe stream:
+  `crates/control-plane/src/api/route_subscriptions.rs`
+- Frontline route cache and coordinator:
+  `crates/frontline/src/cache.rs`, `route.rs`, `subscription.rs`, with test
+  fakes in `route/testing.rs`; the two composed in process:
+  `crates/control-plane/tests/proxy_api_transport/route_edge.rs`
 - Certificate delivery: `crates/frontline/src/certificates/`; shared validation:
   `crates/sleepypods-certificate/src/lib.rs`; encrypted persistence and native
   management/resolution APIs: `crates/control-plane/src/certificate/`,
@@ -145,8 +149,11 @@ Targeted gates live in `scripts/`:
 - `WorkloadClassVersion` is immutable; instances pin a class version.
 - Hot proxy paths must avoid control-plane calls, database access, global locks,
   unbounded allocation, and per-request client construction.
-- Route cache subscription IDs are opaque. Do not parse them or make them part
-  of public resource identity.
+- A proxy chooses its route subscription IDs, and they mean nothing outside its
+  stream. Keep them out of public resource identity.
+- The route cache answers for an exact host with that host's complete rule set.
+  Rank and match rules only through `HostRules`, which the store and the proxy
+  share.
 - Deployment and StatefulSet automatic sleep require exactly one replica and a current Pod UID; unknown or overlapping membership fails closed.
 - HTTP/3, multi-cluster remote forwarding, and rich route predicates are
   deferred.

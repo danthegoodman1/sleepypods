@@ -80,6 +80,38 @@ session. Cancellation drops the permit and aborts an unfinished upstream HTTP
 driver. Production listeners own their upgrade tasks, reap completed tasks and
 abort remaining tasks after the shared drain grace period.
 
+## Route resolution
+
+Frontline routes a request by its exact host: the HTTP Host without port, or
+the TLS SNI name, in lower case without trailing dots. The first request for a
+host fetches the host's complete rule set from the control plane; every later
+request for that host, on any path, is matched locally against the cached set.
+The first rule whose path prefix covers the request path is the route. An exact
+host ranks before a wildcard suffix, a longer suffix before a shorter one, and
+a longer path prefix before a shorter one. A prefix matches itself and whole
+path segments below it.
+
+| Request | Response |
+| --- | --- |
+| Missing or malformed Host, or a host over 253 bytes | 400, with no lookup |
+| Path over 4,096 bytes | 414, with no lookup |
+| No rule covers the host and path | 404 |
+| The rule's instance is being deleted | 503 |
+| The lookup failed, timed out or found 64 other hosts already resolving | 503 |
+| 256 requests are already waiting for a lookup or a wake | 503 |
+| The instance did not run within the route timeout | 503 |
+
+A lookup failure affects only requests for its own host; hosts already cached
+keep serving. A request for an instance that is not running waits for it under
+the route timeout, and the proxy asks the control plane to wake each instance
+generation once. Requests waiting on a wake hold no lookup slot, so lookups for
+other hosts proceed. A passthrough or terminated TLS connection whose SNI name
+has no route, or cannot be routed, is closed.
+
+The control plane sends a host's rule set again whenever a binding or instance
+it depends on changes, and the proxy replaces the cached set. A proxy that may
+have missed a change discards its whole cache before it serves another request.
+
 ## Activation and automatic idle sleep
 
 A generation's persisted Ready transition starts a fixed 190-second activation

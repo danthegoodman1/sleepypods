@@ -1,13 +1,27 @@
 # Postgres store contract
 
-Route resolution takes an exact request identity and a materialization target.
-One SQL statement selects indexed exact-host and wildcard-suffix candidates,
-ranks host specificity before literal path-prefix length, and joins the instance
-and the Ready backend for that target in one PostgreSQL snapshot. An uncommitted
+Route resolution takes a listener family, an exact host and a materialization
+target, and returns the host's complete rule set. One SQL statement selects the
+indexed exact-host bindings and every wildcard-suffix binding that covers the
+host, ranks host specificity before literal path-prefix length, and joins each
+binding's instance and the Ready backend for that target in one PostgreSQL
+snapshot. A proxy routes a request to the first rule whose path prefix covers
+the request path; `HostRules` in `sleepypods-api` holds that ranking for both
+sides, and a property test checks it against Postgres for random binding sets.
+A host with more than 256 applicable bindings is refused. An uncommitted
 concurrent deletion leaves the old complete snapshot visible; once the deletion
-commits, resolution returns a miss. This is snapshot consistency, not a promise
-that a returned backend stays live after the query completes. Proxy subscription
-invalidation provides the subsequent-change contract.
+commits, the rule set is empty. This is snapshot consistency, with no promise
+that a returned backend stays live after the query completes. The rule sets the
+control plane pushes to subscribed proxies carry every later change.
+
+Every write that can change a rule set records a row in the route-change outbox
+and calls `pg_notify` from the same trigger, on a channel named for the store's
+schema. PostgreSQL delivers the notification at commit, so a rolled-back write
+wakes nobody. Each control-plane process holds one dedicated listening
+connection beside its pool and reads the outbox when notified; the outbox, read
+by revision, stays the record of what changed. `LISTEN` needs a session
+connection: behind a transaction-pooling proxy the listener hears nothing, and
+the 250ms outbox poll alone carries delivery.
 
 Kubernetes object reservations are unique by cluster, API group, kind, namespace
 and name. API versions of one group share the reservation. PersistentVolume
@@ -83,7 +97,10 @@ addition within Postgres integer limits. Environment values are positive integer
 The same limits apply to `PostgresStoreConfig`, including rejecting fractional
 milliseconds, and are checked before pool allocation or connection attempts.
 A one-connection pool is supported;
-workload class creation reuses its held client. Pool/query budgets bound an
+workload class creation reuses its held client. The route-change listener's
+connection is separate from the pool: allow one more connection per
+control-plane process. It reconnects one second after a failure, and the 250ms
+outbox poll covers the gap. Pool/query budgets bound an
 individual attempt; a retry wrapper can perform additional attempts according
 to its retry policy.
 

@@ -56,7 +56,7 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_proxy_forwarded_messages_total` | counter | `protocol`, `direction` | Message-oriented forwarding, including WebSocket. |
 | `sleepypods_proxy_operation_duration_seconds` | histogram | `protocol`, `operation`, `outcome` | Bounded proxy primitive duration. |
 | `sleepypods_proxy_tls_client_hello_total` | counter | `protocol`, `outcome` | TLS ClientHello/SNI parser outcomes. |
-| `sleepypods_runtime_control_plane_calls_total` | counter | `operation`, `outcome` | Runtime calls such as subscribe, wake, unsubscribe, report idle. |
+| `sleepypods_runtime_control_plane_calls_total` | counter | `operation`, `outcome` | Runtime calls: `subscribe_stream` per Subscribe stream opened or refused, `subscribe_route` per host lookup, `unsubscribe`, `wake_instance`, `report_idle`. |
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
@@ -70,8 +70,8 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_certificate_expiry_risk` | gauge | none | Retained positive views whose lease or chain expires within 60 seconds, including already expired views. |
 | `sleepypods_runtime_certificate_events_total` | counter | `operation`, `outcome` | Fixed certificate fetch, refresh, watch and install outcomes. |
 | `sleepypods_runtime_materialization_failures_total` | counter | `operation`, `outcome` | Kubernetes/materialization failure path. |
-| `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline route-cache hit/miss results. |
-| `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream close/update/invalidation events. |
+| `sleepypods_runtime_route_cache_lookups_total` | counter | `outcome` | Frontline requests the route cache answered (`hit`) and requests that needed a lookup (`miss`), exported at scrape time. |
+| `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream events: `closed` for an orderly end, `error` for a failed stream that cost the cache, `updated` for a pushed rule set, `invalidated` for a host the control plane stopped serving. |
 | `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
 | `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization discovery/scheduling scans. |
 | `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one discovery/scheduling scan. |
@@ -120,7 +120,6 @@ Event names:
 - `runtime.drain.started`
 - `runtime.drain.completed`
 - `runtime.drain.timeout`
-- `runtime.route_cache.lookup`
 - `runtime.subscribe_stream.event`
 - `runtime.wake.event`
 - `runtime.materialization.failure`
@@ -158,6 +157,12 @@ Build dashboards from the exact names above:
   `sleepypods_runtime_route_cache_lookups_total{outcome=hit}` divided by hit
   plus miss. Alert on sustained miss spikes or hot-cache load phases making
   `subscribe_route` calls.
+- Subscribe stream health:
+  `sleepypods_runtime_subscribe_stream_events_total{outcome=closed}` rises
+  once per frontline per subscription lifetime. Alert on `outcome=error`, which
+  marks a discarded route cache, and on
+  `sleepypods_runtime_control_plane_calls_total{operation=subscribe_stream,outcome=error}`,
+  which marks a frontline that cannot open its stream.
 - Control-plane calls: rate of
   `sleepypods_runtime_control_plane_calls_total` by `operation,outcome`.
   Alert on `outcome=error` for `subscribe_route`, `wake_instance`,
@@ -299,22 +304,32 @@ Non-terminal materialization is stuck:
 Hot routes are missing or unexpectedly cold:
 
 1. Check route-cache miss rate and
-   `sleepypods_runtime_control_plane_calls_total{operation=subscribe_route}`.
+   `sleepypods_runtime_control_plane_calls_total{operation=subscribe_route}` by
+   outcome. `rejected` means the control plane refused the host: an invalid
+   name, more than 256 applicable bindings, or a rule set over 1MiB. `error`
+   and `timeout` mean the lookup failed or went unanswered for five seconds.
 2. Confirm the `RouteBinding` identity is exact or wildcard as intended and that
-   the route protocol matches HTTP or TLS SNI.
-3. Search `runtime.route_cache.lookup` for `route.id` and `subscription.id`.
+   its kind is HTTP or TLS SNI to match the listener. A wildcard suffix covers
+   names under it and leaves the base name itself to an exact binding.
+3. Check `sleepypods_runtime_subscribe_stream_events_total{outcome=error}`: a
+   frontline discards every cached host when its stream fails, and the next
+   request for each host pays one lookup.
 4. Verify the instance has a ready materialization backend if state is
    `Running`.
 
 A route change still reaches the old backend:
 
 1. Check `sleepypods_runtime_subscribe_stream_events_total` for
-   `outcome=invalidated` or `closed`.
-2. Search `runtime.subscribe_stream.event` for the old `subscription.id`.
-3. Confirm frontlines can reconnect to the control plane and that route
-   reassignment committed in the database.
-4. Send a fresh request after invalidation; stale serving before positive TTL
-   expiry is a release-blocking bug.
+   `outcome=updated`: each pushed rule set counts once on every frontline
+   subscribed to the host.
+2. Confirm the change committed in the database and that the control plane's
+   route-change dispatcher is reading: its listening connection reconnects
+   after one second, and the 250ms poll delivers meanwhile.
+3. Confirm frontlines hold a stream: `subscribe_stream` calls with
+   `outcome=error` mark one that cannot connect, and such a frontline serves
+   what it holds until the positive TTL.
+4. Send a fresh request after the push; stale serving on a frontline with a
+   healthy stream is a release-blocking bug.
 
 Idle sleep is not happening:
 
@@ -398,12 +413,19 @@ Postgres or database outage:
 
 Proxy `Subscribe` disconnects:
 
-1. Check `sleepypods_runtime_subscribe_stream_events_total{outcome=closed}`.
-2. Confirm frontlines can reach `SLEEPYPODS_CONTROL_PLANE_ENDPOINT`.
-3. Expect lazy cache rebuild on later requests; sustained reconnect loops should
-   also show control-plane call errors.
-4. Verify route invalidations are received after reconnect by changing a test
-   route and watching for cache miss/re-resolve.
+1. Check `sleepypods_runtime_subscribe_stream_events_total`. `closed` is the
+   orderly end at the subscription lifetime: the frontline reconnects at once
+   and keeps serving from its cache. `error` is a failed stream: the frontline
+   discards its cache, reconnects after 250ms, and rebuilds the cache as
+   requests arrive.
+2. Confirm frontlines can reach `SLEEPYPODS_CONTROL_PLANE_ENDPOINT`. A
+   reconnect loop shows as `subscribe_stream` calls with `outcome=error`.
+3. Repeated `error` ends with a reachable control plane point at lost route
+   changes (`DATA_LOSS`) or a frontline too slow to read its stream
+   (`DEADLINE_EXCEEDED`); check control-plane load and
+   `SLEEPYPODS_CONTROL_PLANE_RESPONSE_TIMEOUT_MS`.
+4. Verify pushes arrive after reconnect by changing a test route and watching
+   `outcome=updated`.
 
 Control-plane API returns `Unauthenticated` or `PermissionDenied`:
 
