@@ -24,7 +24,6 @@ service OperatorControlPlane {
   rpc DeleteRouteBinding(DeleteRouteBindingRequest) returns (DeleteRouteBindingResponse);
   rpc PutHttp01Challenge(PutHttp01ChallengeRequest) returns (Http01Challenge);
   rpc DeleteHttp01Challenge(DeleteHttp01ChallengeRequest) returns (DeleteHttp01ChallengeResponse);
-  rpc ExpireHttp01Challenges(ExpireHttp01ChallengesRequest) returns (ExpireHttp01ChallengesResponse);
   rpc ReconcileMaterialization(ReconcileMaterializationRequest) returns (ReconcileMaterializationResponse);
   rpc ForceDeleteMaterialization(ForceDeleteMaterializationRequest) returns (ForceDeleteMaterializationResponse);
   rpc ForceReleaseExclusivityKey(ForceReleaseExclusivityKeyRequest) returns (ForceReleaseExclusivityKeyResponse);
@@ -278,6 +277,9 @@ message WorkloadTemplate {
   TemplateText name = 2;
   optional uint32 replicas = 3;
   ContainerTemplate app_container = 4;
+  // Seconds Kubernetes waits between SIGTERM and SIGKILL when the pod stops.
+  // Unset means 30; the maximum is 300.
+  optional uint32 termination_grace_period_seconds = 5;
 }
 
 enum WorkloadKind {
@@ -308,6 +310,15 @@ message SidecarTemplate {
   TemplateText image = 2;
   uint32 listen_port = 3;
   optional string mode = 4;
+  // The protocol the sidecar speaks to the app container in http mode.
+  AppProtocol app_protocol = 5;
+}
+
+enum AppProtocol {
+  // HTTP/1.1, the default.
+  APP_PROTOCOL_HTTP1 = 0;
+  // HTTP/2 without TLS, for apps such as gRPC servers.
+  APP_PROTOCOL_H2C = 1;
 }
 
 message ServiceTemplate {
@@ -378,24 +389,21 @@ message HostPathVolumeSourceTemplate {
 
 message WorkloadClassVersion {
   WorkloadClassVersionRef reference = 1;
-  uint64 template_generation = 2;
-  map<string, string> default_values = 3;
-  WorkloadValueSchema value_schema = 4;
-  ManifestTemplate template = 5;
-  WorkloadSleepPolicy sleep_policy = 6;
-  repeated WorkloadExclusivityKey exclusivity_keys = 7;
+  WorkloadValueSchema value_schema = 2;
+  ManifestTemplate template = 3;
+  WorkloadSleepPolicy sleep_policy = 4;
+  repeated WorkloadExclusivityKey exclusivity_keys = 5;
 }
 
+// Creating a version that already exists succeeds when the request matches the
+// stored version, and fails with AlreadyExists when it differs.
 message CreateWorkloadClassVersionRequest {
-  string idempotency_key = 1;
-  string class_id = 2;
-  uint64 version = 3;
-  map<string, string> default_values = 4;
-  WorkloadValueSchema value_schema = 5;
-  uint64 template_generation = 6;
-  ManifestTemplate template = 7;
-  WorkloadSleepPolicy sleep_policy = 8;
-  repeated WorkloadExclusivityKey exclusivity_keys = 9;
+  string class_id = 1;
+  uint64 version = 2;
+  WorkloadValueSchema value_schema = 3;
+  ManifestTemplate template = 4;
+  WorkloadSleepPolicy sleep_policy = 5;
+  repeated WorkloadExclusivityKey exclusivity_keys = 6;
 }
 
 message GetWorkloadClassVersionRequest {
@@ -426,6 +434,13 @@ message CreateInstanceRequest {
   string instance_id = 2;
   WorkloadClassVersionRef workload_class = 3;
   map<string, string> values = 4;
+  // Route bindings created in the same transaction as the instance.
+  repeated InstanceRoute routes = 5;
+}
+
+message InstanceRoute {
+  string route_binding_id = 1;
+  RouteIdentity identity = 2;
 }
 
 message GetInstanceRequest {
@@ -539,17 +554,9 @@ message DeleteHttp01ChallengeResponse {
   bool deleted = 1;
 }
 
-message ExpireHttp01ChallengesRequest {
-  int64 now_unix_millis = 1;
-  optional uint64 limit = 2;
-}
-
-message ExpireHttp01ChallengesResponse {
-  uint64 expired = 1;
-}
-
+// Addresses the instance's materialization in this control plane's target.
 message ReconcileMaterializationRequest {
-  string materialization_id = 1;
+  string instance_id = 1;
   bool status_only = 2;
 }
 
@@ -584,8 +591,9 @@ message UncertainMaterializationEffect {
   int64 started_at_unix_millis = 9;
 }
 
+// Addresses the instance's materialization in this control plane's target.
 message ForceDeleteMaterializationRequest {
-  string materialization_id = 1;
+  string instance_id = 1;
   string operator = 2;
   string reason = 3;
 }

@@ -243,10 +243,8 @@ async fn create_operator_resources(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-protocols-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -257,7 +255,6 @@ async fn create_operator_resources(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -279,6 +276,7 @@ async fn create_operator_resources(
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 
@@ -753,12 +751,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                     value: Some(target_text("", "")),
                 }],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("e2e-protocol-", "")),

@@ -32,7 +32,7 @@ fn instance_value_cannot_inject_pod_spec_structure_into_a_raw_manifest() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: raw-app
+  name: raw-app-{suffix}
 spec:
   selector:
     matchLabels:
@@ -74,7 +74,6 @@ spec:
         instance: &instance("tenant-evil", 1, values([("tag", malicious_tag)])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render still accepts the manifest");
 
@@ -119,7 +118,7 @@ metadata:
         ),
         TemplateTextPart::instance_value("tenant"),
         TemplateTextPart::literal(
-            r#"
+            r#"-{suffix}
   annotations:
     example.com/owner: "team-"#,
         ),
@@ -143,7 +142,6 @@ spec:
         instance: &instance("tenant-a", 1, values([("tenant", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("raw object with instance values renders");
 
@@ -156,7 +154,7 @@ spec:
         })
         .expect("raw object was rendered");
 
-    assert_eq!(raw.metadata.name, "raw-svc-acme");
+    assert_eq!(raw.metadata.name, "raw-svc-acme-80a707af7dc77ee1");
     assert_eq!(
         raw.value["metadata"]["annotations"]["example.com/owner"],
         "team-acme"
@@ -176,7 +174,7 @@ fn raw_workload_manifest_is_applied_with_no_pod_security_validation() {
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: raw-db
+  name: raw-db-{suffix}
 spec:
   serviceName: raw-db
   selector:
@@ -217,7 +215,6 @@ spec:
         instance: &instance("tenant-evil", 1, values([("tag", "1")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render accepts a fully privileged raw workload");
 
@@ -254,7 +251,6 @@ fn rendered_pod_spec_drops_its_service_account_token_and_sandboxes_the_workload(
         instance: &instance("tenant-a", 1, values([("tag", "1")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("deployment renders");
 
@@ -344,7 +340,7 @@ fn instance_values_bind_as_strings_even_in_numeric_positions() {
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: raw-app
+  name: raw-app-{suffix}
 spec:
   replicas: "#,
         ),
@@ -371,7 +367,6 @@ spec:
         instance: &instance("tenant-a", 1, values([("replicas", "3")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("render succeeds");
 
@@ -402,7 +397,6 @@ fn host_path_fully_chosen_by_an_instance_value_is_rejected() {
         instance: &instance("tenant-evil", 1, values([("data_dir", "/")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect_err("an unrooted hostPath template is rejected");
 
@@ -424,7 +418,6 @@ fn host_path_traversal_out_of_the_authors_directory_is_rejected() {
         instance: &instance("tenant-evil", 1, values([("data_dir", "../../../")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect_err("traversal out of the fixed directory is rejected");
 
@@ -448,7 +441,6 @@ fn host_path_rooted_in_an_author_literal_still_renders_per_instance() {
         instance: &instance("tenant-a", 1, values([("data_dir", "acme")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
-        template_generation: Some(Generation::new(1)),
     })
     .expect("a rooted per-instance hostPath still renders");
 
@@ -500,6 +492,7 @@ fn base_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal("svc"),
@@ -514,15 +507,34 @@ fn base_template() -> ManifestTemplate {
             image: TemplateText::literal("example/sidecar:1"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         volumes: Vec::new(),
         raw_objects: Vec::new(),
     }
 }
 
+/// `{suffix}` in a literal part reads the platform's instance suffix value.
 fn template_with_raw_object(manifest: TemplateText) -> ManifestTemplate {
+    let mut parts = Vec::new();
+    for part in manifest.parts() {
+        let TemplateTextPart::Literal(literal) = part else {
+            parts.push(part.clone());
+            continue;
+        };
+        let mut pieces = literal.split("{suffix}");
+        parts.push(TemplateTextPart::literal(pieces.next().unwrap_or_default()));
+        for piece in pieces {
+            parts.push(TemplateTextPart::instance_value(
+                control_plane::manifest::INSTANCE_SUFFIX_VALUE,
+            ));
+            parts.push(TemplateTextPart::literal(piece));
+        }
+    }
     ManifestTemplate {
-        raw_objects: vec![RawKubernetesManifestTemplate { manifest }],
+        raw_objects: vec![RawKubernetesManifestTemplate {
+            manifest: TemplateText::from_parts(parts),
+        }],
         ..base_template()
     }
 }
@@ -553,22 +565,4 @@ fn sleep_policy() -> ResolvedSleepPolicy {
         idle_retry_backoff_ms: 5_000,
         drain_grace_timeout_ms: 30_000,
     }
-}
-
-// --------------------------------------------------------------------------
-// F3 (fixed): serving an ACME challenge is a proxy read, so the internet-facing
-// frontline no longer needs an operator credential.
-// --------------------------------------------------------------------------
-
-/// The operator surface keeps the HTTP-01 writes and gives up the read.
-#[test]
-fn http01_resolve_is_not_on_the_operator_surface() {
-    use control_plane::api::OPERATOR_UNARY_METHODS;
-
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
-
-    // The writes stay: inserting and clearing a challenge is ACME-owner work.
-    assert!(OPERATOR_UNARY_METHODS.contains(&"PutHttp01Challenge"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteHttp01Challenge"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ExpireHttp01Challenges"));
 }

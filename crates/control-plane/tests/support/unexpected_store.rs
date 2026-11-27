@@ -420,13 +420,4 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (expire_http01_challenges $(, $rest:ident)* $(,)?) => {
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        _request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<usize>> {
-        panic!("unexpected test store capability: expire_http01_challenges")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
 }

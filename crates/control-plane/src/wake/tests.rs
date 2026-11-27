@@ -83,8 +83,7 @@ impl ControlPlaneStore for AcceptanceStore {
         lookup_route_dependencies,
         put_http01_challenge,
         resolve_http01_challenge,
-        delete_http01_challenge,
-        expire_http01_challenges
+        delete_http01_challenge
     );
 
     fn get_instance<'a>(
@@ -302,9 +301,7 @@ async fn duplicate_waking_and_stale_or_terminal_requests_do_not_schedule_work() 
 fn workload_class() -> WorkloadClassVersion {
     WorkloadClassVersion {
         reference: workload_ref(),
-        template_generation: Generation::new(3),
         template: deployment_template(),
-        default_values: InstanceValues::new(),
         value_schema: WorkloadValueSchema::new(true),
         sleep_policy: WorkloadSleepPolicy::new(120_000, 5_000, 30_000).expect("valid sleep policy"),
         exclusivity_keys: vec![],
@@ -336,6 +333,7 @@ fn deployment_template() -> ManifestTemplate {
                     value: TemplateText::literal("acme"),
                 }],
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal("svc-acme"),
@@ -350,6 +348,7 @@ fn deployment_template() -> ManifestTemplate {
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         volumes: Vec::new(),
         raw_objects: Vec::new(),

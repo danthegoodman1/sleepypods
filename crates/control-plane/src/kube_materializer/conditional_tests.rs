@@ -61,7 +61,6 @@ fn plan() -> ProjectionPlan {
         &record,
         &RenderedManifest {
             instance_generation: generation,
-            template_generation: None,
             objects: vec![RenderedManifestObject {
                 apply_order: ApplyOrder::Service,
                 object,

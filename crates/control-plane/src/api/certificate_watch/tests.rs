@@ -58,7 +58,6 @@ impl ControlPlaneStore for TestStore {
         put_http01_challenge,
         resolve_http01_challenge,
         delete_http01_challenge,
-        expire_http01_challenges,
     );
     fn snapshot_tls_bindings(
         &self,

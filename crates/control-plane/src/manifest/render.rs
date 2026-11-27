@@ -4,14 +4,16 @@ use serde_json::{Map, Value};
 
 use crate::{
     instance::InstanceRecord,
-    kubernetes_name::{is_dns_label, render_instance_scoped_name},
+    kubernetes_name::{
+        instance_suffix, is_dns_label, render_instance_scoped_name, STATEFUL_SET_NAME_MAX_LEN,
+    },
 };
 
 use super::{
-    bind::PlaceholderDocument, ApplyOrder, Container, ContainerPort, ContainerTemplate,
-    CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference, Deployment,
-    DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
-    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
+    bind::PlaceholderDocument, AppProtocol, ApplyOrder, Container, ContainerPort,
+    ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference,
+    Deployment, DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject,
+    LabelSelector, ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
     PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
     PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
@@ -19,7 +21,7 @@ use super::{
     RawKubernetesObject, RenderManifestRequest, RenderedManifest, RenderedManifestObject, Secret,
     SecretKeyRef, Service, ServicePort, ServiceSpec, ServiceTemplate, SidecarTemplate, StatefulSet,
     StatefulSetSpec, TemplateText, VolumeMount, VolumeResourceRequirements, VolumeTemplate,
-    WorkloadKind, ANNOTATION_TEMPLATE_GENERATION, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    WorkloadKind, INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
     LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 
@@ -36,6 +38,7 @@ const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
 const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const ENV_SIDECAR_MODE: &str = "SLEEPYPODS_SIDECAR_MODE";
+const ENV_APP_PROTOCOL: &str = "SLEEPYPODS_APP_PROTOCOL";
 const ENV_CONTROL_PLANE_SIDECAR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
 const SIDECAR_TOKEN_SECRET_KEY: &str = "token";
 const ANNOTATION_BACKEND_SCHEME: &str = "sleepypods.io/backend-scheme";
@@ -53,28 +56,47 @@ pub(crate) fn render_manifests_with_options(
     request.template.workload.validate_replicas()?;
     request.template.validate_storage_retention()?;
     validate_namespace(request.namespace)?;
+    let termination_grace_period_seconds = request
+        .template
+        .workload
+        .termination_grace_period_seconds()?;
 
-    let workload_name = render_object_name(
+    let suffix = instance_suffix(&request.instance.id);
+    let mut instance = request.instance.clone();
+    instance
+        .values
+        .insert(INSTANCE_SUFFIX_VALUE.to_owned(), suffix.clone());
+    let instance = &instance;
+
+    let workload_name =
+        render_object_name("workload.name", &request.template.workload.name, instance)?;
+    validate_kind_name(
         "workload.name",
-        &request.template.workload.name,
-        request.instance,
+        match request.template.workload.kind {
+            WorkloadKind::Deployment => "Deployment",
+            WorkloadKind::StatefulSet => "StatefulSet",
+        },
+        &workload_name,
     )?;
     let service_name = request
         .template
         .service
         .as_ref()
-        .map(|service| render_object_name("service.name", &service.name, request.instance))
+        .map(|service| {
+            let name = render_object_name("service.name", &service.name, instance)?;
+            validate_kind_name("service.name", "Service", &name)?;
+            Ok(name)
+        })
         .transpose()?;
-    let selector_labels = selector_labels(request.instance, &workload_name)?;
-    let metadata_labels = metadata_labels(request.instance, &workload_name)?;
-    let annotations = metadata_annotations(&request);
-    let sidecar = render_sidecar_config(request.template, request.instance)?;
+    let selector_labels = selector_labels(instance, &workload_name)?;
+    let metadata_labels = metadata_labels(instance, &workload_name)?;
+    let sidecar = render_sidecar_config(request.template, instance)?;
 
     let rendered_volumes = request
         .template
         .volumes
         .iter()
-        .map(|volume| render_volume(volume, request.instance, request.namespace))
+        .map(|volume| render_volume(volume, instance, request.namespace))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut objects = Vec::new();
@@ -86,7 +108,7 @@ pub(crate) fn render_manifests_with_options(
                     name: rendered.pv_name.clone(),
                     namespace: None,
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 spec: PersistentVolumeSpec {
                     capacity: rendered.capacity.clone(),
@@ -110,7 +132,7 @@ pub(crate) fn render_manifests_with_options(
                     name: rendered.pvc_name.clone(),
                     namespace: Some(request.namespace.to_owned()),
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 spec: PersistentVolumeClaimSpec {
                     access_modes: rendered.access_modes.clone(),
@@ -125,7 +147,7 @@ pub(crate) fn render_manifests_with_options(
     }
 
     if let Some(service) = &request.template.service {
-        let mut service_annotations = annotations.clone();
+        let mut service_annotations = BTreeMap::new();
         if sidecar.mode.as_deref() == Some("tcp") {
             service_annotations.insert(ANNOTATION_BACKEND_SCHEME.to_owned(), "tcp".to_owned());
         }
@@ -148,7 +170,7 @@ pub(crate) fn render_manifests_with_options(
     }
 
     let sidecar_token_secret_name = if let Some(token) = options.sidecar_control_plane_token {
-        let name = render_instance_scoped_name("sleepypods-sidecar-token", &request.instance.id);
+        let name = render_instance_scoped_name("sleepypods-sidecar-token", &instance.id);
         objects.push(RenderedManifestObject {
             apply_order: ApplyOrder::Secret,
             object: KubernetesObject::Secret(Secret {
@@ -156,7 +178,7 @@ pub(crate) fn render_manifests_with_options(
                     name: name.clone(),
                     namespace: Some(request.namespace.to_owned()),
                     labels: metadata_labels.clone(),
-                    annotations: annotations.clone(),
+                    annotations: BTreeMap::new(),
                 },
                 type_: "Opaque".to_owned(),
                 string_data: BTreeMap::from([(
@@ -173,18 +195,18 @@ pub(crate) fn render_manifests_with_options(
     let pod_template = PodTemplateSpec {
         metadata: PodTemplateMetadata {
             labels: metadata_labels.clone(),
-            annotations: annotations.clone(),
+            annotations: BTreeMap::new(),
         },
         spec: PodSpec {
             containers: vec![
                 render_app_container(
                     &request.template.workload.app_container,
-                    request.instance,
+                    instance,
                     &rendered_volumes,
                 )?,
                 render_sidecar_container(
                     &request.template.sidecar,
-                    request.instance,
+                    instance,
                     &sidecar,
                     request.namespace,
                     request.sleep_policy,
@@ -201,6 +223,7 @@ pub(crate) fn render_manifests_with_options(
                     },
                 })
                 .collect(),
+            termination_grace_period_seconds,
         },
     };
 
@@ -214,7 +237,7 @@ pub(crate) fn render_manifests_with_options(
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
                         labels: metadata_labels.clone(),
-                        annotations: annotations.clone(),
+                        annotations: BTreeMap::new(),
                     },
                     spec: DeploymentSpec {
                         replicas,
@@ -238,7 +261,7 @@ pub(crate) fn render_manifests_with_options(
                         name: workload_name,
                         namespace: Some(request.namespace.to_owned()),
                         labels: metadata_labels.clone(),
-                        annotations: annotations.clone(),
+                        annotations: BTreeMap::new(),
                     },
                     spec: StatefulSetSpec {
                         replicas,
@@ -258,10 +281,10 @@ pub(crate) fn render_manifests_with_options(
     for raw in &request.template.raw_objects {
         objects.push(render_raw_object(
             raw,
-            request.instance,
+            instance,
+            &suffix,
             request.namespace,
             &auxiliary_labels,
-            &annotations,
         )?);
     }
 
@@ -271,7 +294,6 @@ pub(crate) fn render_manifests_with_options(
 
     Ok(RenderedManifest {
         instance_generation: request.instance.generation,
-        template_generation: request.template_generation,
         objects,
     })
 }
@@ -279,9 +301,9 @@ pub(crate) fn render_manifests_with_options(
 fn render_raw_object(
     template: &RawKubernetesManifestTemplate,
     instance: &InstanceRecord,
+    suffix: &str,
     namespace: &str,
     metadata_labels: &BTreeMap<String, String>,
-    annotations: &BTreeMap<String, String>,
 ) -> Result<RenderedManifestObject, ManifestRenderError> {
     let document = PlaceholderDocument::new(&template.manifest).with_values(&instance.values)?;
     if document.text().trim().is_empty() {
@@ -323,6 +345,19 @@ fn render_raw_object(
         })?;
     let name = required_string_field(metadata, "name", "raw_objects.manifest.metadata.name")?;
     validate_dns_label("raw_objects.manifest.metadata.name", &name)?;
+    validate_kind_name("raw_objects.manifest.metadata.name", &kind, &name)?;
+    if !name
+        .strip_suffix(suffix)
+        .is_some_and(|base| base.ends_with('-'))
+    {
+        return Err(ManifestRenderError::InvalidField {
+            field: "raw_objects.manifest.metadata.name",
+            message: format!(
+                "name {name:?} must end with \"-\" and the instance suffix; \
+                 read it from instance value {INSTANCE_SUFFIX_VALUE:?}"
+            ),
+        });
+    }
 
     let effective_namespace = raw_effective_namespace(metadata, namespace, namespaced)?;
     if namespaced {
@@ -340,12 +375,6 @@ fn render_raw_object(
         metadata_labels,
         "raw_objects.manifest.metadata.labels",
     )?;
-    merge_required_string_map(
-        metadata,
-        "annotations",
-        annotations,
-        "raw_objects.manifest.metadata.annotations",
-    )?;
     let object_metadata = ObjectMeta {
         name,
         namespace: namespaced.then_some(effective_namespace),
@@ -358,11 +387,7 @@ fn render_raw_object(
     };
 
     let pod_template_metadata = if matches!(kind.as_str(), "Deployment" | "StatefulSet") {
-        Some(raw_pod_template_metadata(
-            &mut value,
-            metadata_labels,
-            annotations,
-        )?)
+        Some(raw_pod_template_metadata(&mut value, metadata_labels)?)
     } else {
         None
     };
@@ -489,7 +514,6 @@ fn raw_effective_namespace(
 fn raw_pod_template_metadata(
     value: &mut Value,
     metadata_labels: &BTreeMap<String, String>,
-    annotations: &BTreeMap<String, String>,
 ) -> Result<PodTemplateMetadata, ManifestRenderError> {
     let object = value
         .as_object_mut()
@@ -524,12 +548,6 @@ fn raw_pod_template_metadata(
         "labels",
         metadata_labels,
         "raw_objects.manifest.spec.template.metadata.labels",
-    )?;
-    merge_required_string_map(
-        metadata,
-        "annotations",
-        annotations,
-        "raw_objects.manifest.spec.template.metadata.annotations",
     )?;
 
     Ok(PodTemplateMetadata {
@@ -669,6 +687,8 @@ struct SidecarRenderConfig {
     app_port: u16,
     readiness_port: u16,
     mode: Option<String>,
+    /// Set in http mode, the only mode that speaks an application protocol.
+    app_protocol: Option<AppProtocol>,
 }
 
 fn render_sidecar_config(
@@ -719,6 +739,13 @@ fn render_sidecar_config(
             });
         }
     }
+    let tcp = template.sidecar.mode.as_deref() == Some("tcp");
+    if tcp && template.sidecar.app_protocol != AppProtocol::default() {
+        return Err(ManifestRenderError::InvalidField {
+            field: "sidecar.app_protocol",
+            message: "an app protocol applies to http mode; tcp mode relays bytes".to_owned(),
+        });
+    }
 
     Ok(SidecarRenderConfig {
         listen_port: template.sidecar.listen_port,
@@ -729,6 +756,7 @@ fn render_sidecar_config(
         app_port,
         readiness_port: readiness_port(template, instance)?,
         mode: template.sidecar.mode.clone(),
+        app_protocol: (!tcp).then_some(template.sidecar.app_protocol),
     })
 }
 
@@ -1049,6 +1077,13 @@ fn render_sidecar_container(
             value_from: None,
         });
     }
+    if let Some(app_protocol) = config.app_protocol {
+        env.push(EnvVar {
+            name: ENV_APP_PROTOCOL.to_owned(),
+            value: app_protocol.as_str().to_owned(),
+            value_from: None,
+        });
+    }
     if let Some(secret_name) = sidecar_token_secret_name {
         env.push(EnvVar {
             name: ENV_CONTROL_PLANE_SIDECAR_TOKEN.to_owned(),
@@ -1139,12 +1174,14 @@ fn validate_host_path(template: &TemplateText, rendered: &str) -> Result<(), Man
             message: format!("hostPath path {rendered:?} must be absolute"),
         });
     }
-    if !template.literal_prefix().starts_with('/') {
+    let prefix = template.literal_prefix();
+    let reads_values = template.referenced_values().next().is_some();
+    if !prefix.starts_with('/') || (reads_values && (prefix == "/" || !prefix.ends_with('/'))) {
         return Err(ManifestRenderError::InvalidField {
             field: "volume.source.host_path.path",
             message: format!(
-                "hostPath path {rendered:?} must start with a literal absolute directory, \
-                 so that an instance value chooses a subdirectory rather than the root"
+                "hostPath path {rendered:?} must start with a literal absolute directory \
+                 ending in \"/\", so that an instance value chooses a subdirectory of it"
             ),
         });
     }
@@ -1157,6 +1194,26 @@ fn validate_host_path(template: &TemplateText, rendered: &str) -> Result<(), Man
         });
     }
     Ok(())
+}
+
+/// Applies the name rules Kubernetes adds for a kind on top of a DNS label.
+fn validate_kind_name(
+    field: &'static str,
+    kind: &str,
+    name: &str,
+) -> Result<(), ManifestRenderError> {
+    let message = match kind {
+        "StatefulSet" if name.len() > STATEFUL_SET_NAME_MAX_LEN => format!(
+            "StatefulSet name {name:?} has {} characters; Kubernetes allows \
+             {STATEFUL_SET_NAME_MAX_LEN} characters so that Pod labels fit",
+            name.len()
+        ),
+        "Service" if !name.starts_with(|first: char| first.is_ascii_lowercase()) => {
+            format!("Service name {name:?} must start with a letter")
+        }
+        _ => return Ok(()),
+    };
+    Err(ManifestRenderError::InvalidField { field, message })
 }
 
 fn validate_namespace(namespace: &str) -> Result<(), ManifestRenderError> {
@@ -1245,18 +1302,6 @@ fn metadata_labels(
         )?,
         label(LABEL_WORKLOAD_NAME, workload_name)?,
     ]))
-}
-
-fn metadata_annotations(request: &RenderManifestRequest<'_>) -> BTreeMap<String, String> {
-    request
-        .template_generation
-        .map(|generation| {
-            BTreeMap::from([(
-                ANNOTATION_TEMPLATE_GENERATION.to_owned(),
-                generation.to_string(),
-            )])
-        })
-        .unwrap_or_default()
 }
 
 fn validate_retained_static_inventory(

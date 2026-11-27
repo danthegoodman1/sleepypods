@@ -5,10 +5,8 @@ use std::{
 
 use tonic::{
     codegen::http::{header, HeaderName, Method},
-    transport::Server,
     Request, Response, Status,
 };
-use tower::layer::util::{Identity, Stack};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
@@ -42,44 +40,12 @@ use super::template::{
 
 pub const OPERATOR_SERVICE_NAME: &str = "sleepypods.controlplane.v1.OperatorControlPlane";
 
-pub const OPERATOR_UNARY_METHODS: &[&str] = &[
-    "ReencryptCertificate",
-    "RemoveCertificate",
-    "GetTlsBinding",
-    "SetTlsBinding",
-    "GetCertificateMetadata",
-    "PublishCertificate",
-    "CreateWorkloadClassVersion",
-    "GetWorkloadClassVersion",
-    "CreateInstance",
-    "GetInstance",
-    "DeleteInstance",
-    "CreateRouteBinding",
-    "GetRouteBinding",
-    "DeleteRouteBinding",
-    "PutHttp01Challenge",
-    "DeleteHttp01Challenge",
-    "ExpireHttp01Challenges",
-    "ReconcileMaterialization",
-    "ForceDeleteMaterialization",
-    "ForceReleaseExclusivityKey",
-];
-
-#[derive(Clone, Debug, Default)]
-pub struct OperatorApiPlaceholder;
-
 #[derive(Clone)]
 pub struct StoreBackedOperatorApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
     route_events: RouteSubscriptionBroker,
-}
-
-impl OperatorApiPlaceholder {
-    pub fn new() -> Self {
-        Self
-    }
 }
 
 impl<C> StoreBackedOperatorApi<C> {
@@ -110,6 +76,12 @@ impl<C> StoreBackedOperatorApi<C>
 where
     C: KubernetesMaterializerClient,
 {
+    /// The instance's materialization in this control plane's target.
+    fn materialization_id(&self, instance_id: String) -> Result<MaterializationId, Status> {
+        crate::ids::materialization_id(&parse_instance_id(instance_id)?, &self.target)
+            .map_err(invalid_argument_status)
+    }
+
     async fn projection_observations(
         &self,
         materialization: &MaterializationRecord,
@@ -142,31 +114,7 @@ where
         observations
     }
 }
-
-pub type OperatorGrpcService = OperatorControlPlaneServer<OperatorApiPlaceholder>;
 pub type StoreBackedOperatorGrpcService<C> = OperatorControlPlaneServer<StoreBackedOperatorApi<C>>;
-pub type OperatorGrpcWebServerBuilder =
-    Server<Stack<tonic_web::GrpcWebLayer, Stack<CorsLayer, Identity>>>;
-
-pub fn operator_grpc_service() -> OperatorGrpcService {
-    OperatorControlPlaneServer::new(OperatorApiPlaceholder::new())
-}
-
-pub fn operator_grpc_service_with_store<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-) -> StoreBackedOperatorGrpcService<C>
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    operator_grpc_service_with_store_and_route_events(
-        store,
-        materializer,
-        target,
-        RouteSubscriptionBroker::new(),
-    )
-}
 
 pub fn operator_grpc_service_with_store_and_route_events<C>(
     store: Arc<dyn ControlPlaneStore>,
@@ -187,17 +135,6 @@ where
     .max_encoding_message_size(1024 * 1024)
 }
 
-pub fn operator_grpc_server_builder() -> Server {
-    Server::builder()
-}
-
-pub fn operator_grpc_web_server_builder() -> OperatorGrpcWebServerBuilder {
-    Server::builder()
-        .accept_http1(true)
-        .layer(operator_grpc_web_cors_layer())
-        .layer(tonic_web::GrpcWebLayer::new())
-}
-
 pub fn operator_grpc_web_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
@@ -215,161 +152,6 @@ pub fn operator_grpc_web_cors_layer() -> CorsLayer {
             HeaderName::from_static("grpc-message"),
             HeaderName::from_static("grpc-status-details-bin"),
         ])
-}
-
-fn placeholder_status(method: &'static str) -> Status {
-    Status::unimplemented(format!(
-        "{method} transport is scaffolded; store-backed behavior is deferred"
-    ))
-}
-
-#[tonic::async_trait]
-impl OperatorControlPlane for OperatorApiPlaceholder {
-    async fn publish_certificate(
-        &self,
-        request: Request<pb::PublishCertificateRequest>,
-    ) -> Result<Response<pb::CertificateMetadata>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("publish_certificate"))
-    }
-
-    async fn get_certificate_metadata(
-        &self,
-        request: Request<pb::GetCertificateMetadataRequest>,
-    ) -> Result<Response<pb::CertificateMetadata>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("get_certificate_metadata"))
-    }
-
-    async fn set_tls_binding(
-        &self,
-        request: Request<pb::SetTlsBindingRequest>,
-    ) -> Result<Response<pb::TlsBinding>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("set_tls_binding"))
-    }
-
-    async fn get_tls_binding(
-        &self,
-        request: Request<pb::GetTlsBindingRequest>,
-    ) -> Result<Response<pb::TlsBinding>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("get_tls_binding"))
-    }
-
-    async fn remove_certificate(
-        &self,
-        request: Request<pb::RemoveCertificateRequest>,
-    ) -> Result<Response<pb::CertificateMetadata>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("remove_certificate"))
-    }
-
-    async fn reencrypt_certificate(
-        &self,
-        request: Request<pb::ReencryptCertificateRequest>,
-    ) -> Result<Response<pb::CertificateMetadata>, Status> {
-        super::certificates::require_secure(&request, crate::auth::CallerRole::Operator)?;
-        Err(placeholder_status("reencrypt_certificate"))
-    }
-
-    async fn create_workload_class_version(
-        &self,
-        _request: Request<pb::CreateWorkloadClassVersionRequest>,
-    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
-        Err(placeholder_status("CreateWorkloadClassVersion"))
-    }
-
-    async fn get_workload_class_version(
-        &self,
-        _request: Request<pb::GetWorkloadClassVersionRequest>,
-    ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
-        Err(placeholder_status("GetWorkloadClassVersion"))
-    }
-
-    async fn create_instance(
-        &self,
-        _request: Request<pb::CreateInstanceRequest>,
-    ) -> Result<Response<pb::Instance>, Status> {
-        Err(placeholder_status("CreateInstance"))
-    }
-
-    async fn get_instance(
-        &self,
-        _request: Request<pb::GetInstanceRequest>,
-    ) -> Result<Response<pb::Instance>, Status> {
-        Err(placeholder_status("GetInstance"))
-    }
-
-    async fn delete_instance(
-        &self,
-        _request: Request<pb::DeleteInstanceRequest>,
-    ) -> Result<Response<pb::DeleteInstanceResponse>, Status> {
-        Err(placeholder_status("DeleteInstance"))
-    }
-
-    async fn create_route_binding(
-        &self,
-        _request: Request<pb::CreateRouteBindingRequest>,
-    ) -> Result<Response<pb::RouteBinding>, Status> {
-        Err(placeholder_status("CreateRouteBinding"))
-    }
-
-    async fn get_route_binding(
-        &self,
-        _request: Request<pb::GetRouteBindingRequest>,
-    ) -> Result<Response<pb::RouteBinding>, Status> {
-        Err(placeholder_status("GetRouteBinding"))
-    }
-
-    async fn delete_route_binding(
-        &self,
-        _request: Request<pb::DeleteRouteBindingRequest>,
-    ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
-        Err(placeholder_status("DeleteRouteBinding"))
-    }
-
-    async fn put_http01_challenge(
-        &self,
-        _request: Request<pb::PutHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::Http01Challenge>, Status> {
-        Err(placeholder_status("PutHttp01Challenge"))
-    }
-
-    async fn delete_http01_challenge(
-        &self,
-        _request: Request<pb::DeleteHttp01ChallengeRequest>,
-    ) -> Result<Response<pb::DeleteHttp01ChallengeResponse>, Status> {
-        Err(placeholder_status("DeleteHttp01Challenge"))
-    }
-
-    async fn expire_http01_challenges(
-        &self,
-        _request: Request<pb::ExpireHttp01ChallengesRequest>,
-    ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
-        Err(placeholder_status("ExpireHttp01Challenges"))
-    }
-
-    async fn reconcile_materialization(
-        &self,
-        _request: Request<pb::ReconcileMaterializationRequest>,
-    ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
-        Err(placeholder_status("ReconcileMaterialization"))
-    }
-
-    async fn force_delete_materialization(
-        &self,
-        _request: Request<pb::ForceDeleteMaterializationRequest>,
-    ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
-        Err(placeholder_status("ForceDeleteMaterialization"))
-    }
-
-    async fn force_release_exclusivity_key(
-        &self,
-        _request: Request<pb::ForceReleaseExclusivityKeyRequest>,
-    ) -> Result<Response<pb::ForceReleaseExclusivityKeyResponse>, Status> {
-        Err(placeholder_status("ForceReleaseExclusivityKey"))
-    }
 }
 
 #[tonic::async_trait]
@@ -423,11 +205,14 @@ where
         &self,
         request: Request<pb::CreateWorkloadClassVersionRequest>,
     ) -> Result<Response<pb::WorkloadClassVersion>, Status> {
+        let request = create_workload_class_request_from_proto(request.into_inner())?;
+        request
+            .workload_class_version
+            .validate_renderable(self.target.namespace())
+            .map_err(invalid_argument_status)?;
         let workload_class = self
             .store
-            .create_workload_class_version(create_workload_class_request_from_proto(
-                request.into_inner(),
-            )?)
+            .create_workload_class_version(request)
             .await
             .map_err(store_error_to_status)?;
 
@@ -459,9 +244,28 @@ where
         &self,
         request: Request<pb::CreateInstanceRequest>,
     ) -> Result<Response<pb::Instance>, Status> {
+        let request = create_instance_request_from_proto(request.into_inner())?;
+        let workload_class = self
+            .store
+            .load_workload_class_version(domain_workload::LoadWorkloadClassVersionRequest::new(
+                request.workload_class.clone(),
+            ))
+            .await
+            .map_err(store_error_to_status)?
+            .ok_or_else(|| Status::not_found("workload class version not found"))?;
+        let request = request
+            .validate_values_against(&workload_class)
+            .map_err(invalid_argument_status)?;
+        request
+            .validate_renders(
+                &workload_class,
+                self.target.namespace(),
+                self.materializer.render_options(),
+            )
+            .map_err(invalid_argument_status)?;
         let result = self
             .store
-            .create_instance(create_instance_request_from_proto(request.into_inner())?)
+            .create_instance(request)
             .await
             .map_err(store_error_to_status)?;
 
@@ -605,29 +409,12 @@ where
         Ok(Response::new(pb::DeleteHttp01ChallengeResponse { deleted }))
     }
 
-    async fn expire_http01_challenges(
-        &self,
-        request: Request<pb::ExpireHttp01ChallengesRequest>,
-    ) -> Result<Response<pb::ExpireHttp01ChallengesResponse>, Status> {
-        let request = expire_http01_request_from_proto(request.into_inner())?;
-        let expired = self
-            .store
-            .expire_http01_challenges(request)
-            .await
-            .map_err(store_error_to_status)?;
-
-        Ok(Response::new(pb::ExpireHttp01ChallengesResponse {
-            expired: expired as u64,
-        }))
-    }
-
     async fn reconcile_materialization(
         &self,
         request: Request<pb::ReconcileMaterializationRequest>,
     ) -> Result<Response<pb::ReconcileMaterializationResponse>, Status> {
         let request = request.into_inner();
-        let materialization_id =
-            MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?;
+        let materialization_id = self.materialization_id(request.instance_id)?;
         let before = self
             .store
             .load_materialization(LoadMaterializationRequest::new(materialization_id.clone()))
@@ -649,7 +436,7 @@ where
             }));
         };
 
-        let attempted = if request.status_only || before.target != self.target {
+        let attempted = if request.status_only {
             false
         } else {
             self.store
@@ -707,7 +494,12 @@ where
         &self,
         request: Request<pb::ForceDeleteMaterializationRequest>,
     ) -> Result<Response<pb::ForceDeleteMaterializationResponse>, Status> {
-        let request = force_delete_materialization_request_from_proto(request.into_inner())?;
+        let request = request.into_inner();
+        let request = ForceDeleteMaterializationRequest::new(
+            self.materialization_id(request.instance_id)?,
+            request.operator,
+            request.reason,
+        );
         let materialization_id = request.materialization_id.as_str().to_owned();
         let materialization = self
             .store
@@ -767,29 +559,41 @@ fn create_instance_request_from_proto(
         .ok_or_else(|| Status::invalid_argument("workload_class is required"))
         .and_then(workload_class_ref_from_proto)?;
 
+    let route_bindings = request
+        .routes
+        .into_iter()
+        .map(|route| {
+            Ok(domain_instance::InstanceRoute {
+                id: parse_route_binding_id(route.route_binding_id)?,
+                identity: route
+                    .identity
+                    .ok_or_else(|| Status::invalid_argument("routes.identity is required"))
+                    .and_then(route_identity_from_proto)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
     Ok(domain_instance::CreateInstanceRequest::new(
         parse_idempotency_key(request.idempotency_key)?,
         parse_instance_id(request.instance_id)?,
         workload_class,
     )
-    .with_values(request.values.into_iter().collect()))
+    .with_values(request.values.into_iter().collect())
+    .with_route_bindings(route_bindings))
 }
 
 fn create_workload_class_request_from_proto(
     request: pb::CreateWorkloadClassVersionRequest,
 ) -> Result<domain_workload::CreateWorkloadClassVersionRequest, Status> {
-    let _ = parse_idempotency_key(request.idempotency_key)?;
     let workload_class = WorkloadClassVersion {
         reference: WorkloadClassVersionRef::new(
             WorkloadClassId::new(request.class_id).map_err(invalid_argument_status)?,
             crate::ids::Generation::new(request.version),
         ),
-        template_generation: crate::ids::Generation::new(request.template_generation),
         template: request
             .template
             .ok_or_else(|| Status::invalid_argument("template is required"))
             .and_then(manifest_template_from_proto)?,
-        default_values: request.default_values.into_iter().collect(),
         value_schema: request
             .value_schema
             .map(workload_value_schema_from_proto)
@@ -805,8 +609,6 @@ fn create_workload_class_request_from_proto(
             .map(workload_exclusivity_key_from_proto)
             .collect::<Result<_, _>>()?,
     };
-    workload_class.validate().map_err(invalid_argument_status)?;
-
     Ok(domain_workload::CreateWorkloadClassVersionRequest::new(
         workload_class,
     ))
@@ -918,8 +720,11 @@ fn route_identity_from_proto(
     }
 }
 
+/// A binding's host is a DNS name a request can carry: frontline looks up the
+/// lowercased `Host` or SNI name without its port, so any other spelling would
+/// store a route that matches nothing.
 fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost, Status> {
-    match pb::RouteHostKind::try_from(host.kind)
+    let host = match pb::RouteHostKind::try_from(host.kind)
         .map_err(|_| Status::invalid_argument("route host kind is invalid"))?
     {
         pb::RouteHostKind::Exact => {
@@ -931,7 +736,21 @@ fn route_host_from_proto(host: pb::RouteHost) -> Result<domain_route::RouteHost,
         pb::RouteHostKind::Unspecified => {
             Err(Status::invalid_argument("route host kind is required"))
         }
+    }?;
+    let is_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+            })
+    };
+    if host.as_str().len() > 253 || !host.as_str().split('.').all(is_label) {
+        return Err(Status::invalid_argument(
+            "route host must be an ASCII DNS name or IPv4 address without a port or path",
+        ));
     }
+    Ok(host)
 }
 
 fn protocol_from_proto(protocol: i32) -> Result<domain_route::ProtocolRoute, Status> {
@@ -966,31 +785,6 @@ pub(super) fn http01_key_from_proto(
     key: pb::Http01ChallengeKey,
 ) -> Result<domain_http01::Http01ChallengeKey, Status> {
     domain_http01::Http01ChallengeKey::new(key.host, key.token).map_err(invalid_argument_status)
-}
-
-fn expire_http01_request_from_proto(
-    request: pb::ExpireHttp01ChallengesRequest,
-) -> Result<domain_http01::ExpireHttp01ChallengesRequest, Status> {
-    let mut domain_request = domain_http01::ExpireHttp01ChallengesRequest::new(
-        system_time_from_unix_millis(request.now_unix_millis),
-    );
-    if let Some(limit) = request.limit {
-        let limit = usize::try_from(limit)
-            .map_err(|_| Status::invalid_argument("HTTP-01 expire limit is too large"))?;
-        domain_request = domain_request.with_limit(limit);
-    }
-
-    Ok(domain_request)
-}
-
-fn force_delete_materialization_request_from_proto(
-    request: pb::ForceDeleteMaterializationRequest,
-) -> Result<ForceDeleteMaterializationRequest, Status> {
-    Ok(ForceDeleteMaterializationRequest::new(
-        MaterializationId::new(request.materialization_id).map_err(invalid_argument_status)?,
-        request.operator,
-        request.reason,
-    ))
 }
 
 fn force_release_exclusivity_key_request_from_proto(
@@ -1055,8 +849,6 @@ fn instance_to_proto(instance: domain_instance::InstanceRecord) -> pb::Instance 
 fn workload_class_to_proto(workload_class: WorkloadClassVersion) -> pb::WorkloadClassVersion {
     pb::WorkloadClassVersion {
         reference: Some(workload_class_ref_to_proto(&workload_class.reference)),
-        template_generation: workload_class.template_generation.get(),
-        default_values: workload_class.default_values.into_iter().collect(),
         value_schema: Some(workload_value_schema_to_proto(workload_class.value_schema)),
         template: Some(manifest_template_to_proto(workload_class.template)),
         sleep_policy: Some(workload_sleep_policy_to_proto(workload_class.sleep_policy)),

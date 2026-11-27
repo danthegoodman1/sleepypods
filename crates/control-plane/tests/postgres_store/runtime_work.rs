@@ -38,7 +38,7 @@ async fn ordered_notifications(
                 id,
                 id,
                 class.reference.clone(),
-                vec![http_route(&format!("{id}.example.test"), None)],
+                vec![http_identity(&format!("{id}.example.test"), None)],
             ))
             .await?;
     }
@@ -508,7 +508,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
             isolated.clone(),
         )
         .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-            materialization_id: pending.id.as_str().into(),
+            instance_id: pending.instance_id.as_str().into(),
             status_only: true,
         }))
         .await?
@@ -703,7 +703,7 @@ async fn scheduling(pg: PostgresStore, config: &PostgresStoreConfig) -> TestResu
         deadline_target,
     )
     .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-        materialization_id: deadline.id.as_str().into(),
+        instance_id: deadline.instance_id.as_str().into(),
         status_only: true,
     }))
     .await?
@@ -1005,7 +1005,7 @@ async fn delete_supersedes_pending_case(
                 pending.target.clone(),
             )
             .reconcile_materialization(tonic::Request::new(pb::ReconcileMaterializationRequest {
-                materialization_id: pending.id.as_str().into(),
+                instance_id: pending.instance_id.as_str().into(),
                 status_only: true,
             }))
             .await?

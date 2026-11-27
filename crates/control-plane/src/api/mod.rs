@@ -17,10 +17,8 @@ pub use proxy::{
 };
 pub use route_events::RouteSubscriptionBroker;
 pub use server::{
-    operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
     operator_grpc_service_with_store_and_route_events, operator_grpc_web_cors_layer,
-    operator_grpc_web_server_builder, OperatorApiPlaceholder, StoreBackedOperatorApi,
-    StoreBackedOperatorGrpcService, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
+    StoreBackedOperatorApi, StoreBackedOperatorGrpcService, OPERATOR_SERVICE_NAME,
 };
 pub use sidecar::{
     sidecar_grpc_service_with_store, sidecar_grpc_service_with_store_and_route_events,

@@ -631,7 +631,6 @@ impl ControlPlaneStore for LostCertificateResponse {
         put_http01_challenge,
         resolve_http01_challenge,
         delete_http01_challenge,
-        expire_http01_challenges,
     );
     fn publish_certificate(
         &self,

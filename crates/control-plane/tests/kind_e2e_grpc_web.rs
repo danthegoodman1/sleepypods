@@ -48,6 +48,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         None,
@@ -63,6 +64,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
         "16",
         Some(&format!("Bearer {}", config.invalid_token)),
@@ -72,15 +74,9 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
         &endpoint,
         "CreateWorkloadClassVersion",
         CreateWorkloadClassVersionRequest {
-            idempotency_key: "kind-e2e-grpc-web-create-class".to_owned(),
             class_id: CLASS_ID.to_owned(),
             version: 1,
-            default_values: HashMap::from([(
-                "image".to_owned(),
-                "registry.k8s.io/pause:3.10".to_owned(),
-            )]),
             value_schema: None,
-            template_generation: 1,
             template: Some(manifest_template()),
             sleep_policy: Some(sleep_policy()),
             exclusivity_keys: vec![],
@@ -118,6 +114,7 @@ fn browser_shaped_grpc_web_operator_calls_deployed_control_plane() -> TestResult
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
     )?;
     assert_eq!(created_instance.instance_id, INSTANCE_ID);
@@ -605,12 +602,14 @@ fn manifest_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:kind-e2e-grpc-web")),
             listen_port: 15_000,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text("grpc-web-kind")),

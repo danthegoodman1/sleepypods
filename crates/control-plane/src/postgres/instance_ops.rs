@@ -8,7 +8,7 @@ use crate::{
         CreateInstanceRequest, CreateInstanceResult, DeleteInstanceRequest, GetInstanceRequest,
         InstanceRecord, InstanceState,
     },
-    route::RouteBindingRecord,
+    route::{ProtocolRoute, RouteBindingRecord, RouteIdentity},
     store::{StoreError, StoreResult},
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -21,10 +21,10 @@ use super::{
     error::map_postgres_error,
     idempotency::{self, CREATE_INSTANCE_OPERATION},
     mapping::{
-        self, generation_to_i64, instance_from_row, instance_state_to_db,
-        manifest_template_to_json, protocol_to_db, route_binding_from_row, route_identity_parts,
-        sleep_policy_to_json, value_schema_to_json, values_to_json,
-        workload_class_version_from_row, workload_exclusivity_keys_to_json,
+        generation_to_i64, instance_from_row, instance_state_to_db, manifest_template_to_json,
+        protocol_to_db, route_binding_from_row, route_identity_parts, sleep_policy_to_json,
+        value_schema_to_json, values_to_json, workload_class_version_from_row,
+        workload_exclusivity_keys_to_json,
     },
 };
 
@@ -100,9 +100,7 @@ pub(crate) async fn create_workload_class_version(
     let client = store.client().await?;
     let class_id = desired.reference.class_id.as_str();
     let version = generation_to_i64(desired.reference.version)?;
-    let template_generation = generation_to_i64(desired.template_generation)?;
     let manifest_template = manifest_template_to_json(&desired.template)?;
-    let default_values = values_to_json(&desired.default_values)?;
     let value_schema = value_schema_to_json(&desired.value_schema);
     let sleep_policy = sleep_policy_to_json(&desired.sleep_policy)?;
     let exclusivity_keys = workload_exclusivity_keys_to_json(&desired.exclusivity_keys)?;
@@ -112,22 +110,18 @@ pub(crate) async fn create_workload_class_version(
             INSERT INTO workload_class_versions (
                 class_id,
                 version,
-                template_generation,
                 manifest_template,
-                default_values,
                 value_schema,
                 sleep_policy,
                 exclusivity_keys
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (class_id, version) DO NOTHING
             ",
             &[
                 &class_id,
                 &version,
-                &template_generation,
                 &manifest_template,
-                &default_values,
                 &value_schema,
                 &sleep_policy,
                 &exclusivity_keys,
@@ -341,8 +335,8 @@ async fn load_workload_class_version_from_client(
     let row = client
         .query_opt(
             "
-            SELECT class_id, version, template_generation, manifest_template, default_values,
-                value_schema, sleep_policy, exclusivity_keys
+            SELECT class_id, version, manifest_template, value_schema, sleep_policy,
+                exclusivity_keys
             FROM workload_class_versions
             WHERE class_id = $1 AND version = $2
             ",
@@ -400,12 +394,14 @@ async fn insert_route_bindings(
     request: &CreateInstanceRequest,
 ) -> StoreResult<Vec<RouteBindingRecord>> {
     let mut route_bindings = Vec::with_capacity(request.route_bindings.len());
-    for (index, spec) in request.route_bindings.iter().enumerate() {
-        mapping::validate_route_protocol(spec)?;
-        let route_binding_id = format!("{}:route:{}", request.instance_id.as_str(), index + 1);
+    for route in &request.route_bindings {
+        let route_binding_id = route.id.as_str();
         let instance_id = request.instance_id.as_str();
-        let parts = route_identity_parts(&spec.identity);
-        let protocol = protocol_to_db(spec.protocol);
+        let parts = route_identity_parts(&route.identity);
+        let protocol = protocol_to_db(match route.identity {
+            RouteIdentity::Http { .. } => ProtocolRoute::Http,
+            RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
+        });
         let path_prefix = parts.path_prefix.as_deref();
         let row = client
             .query_one(
