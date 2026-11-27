@@ -82,15 +82,14 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_subscribe_stream_events_total` | counter | `outcome` | Subscribe stream events: `closed` for an orderly end, `error` for a failed stream that cost the cache, `updated` for a pushed rule set, `invalidated` for a host the control plane stopped serving. |
 | `sleepypods_runtime_wake_latency_seconds` | histogram | `outcome` | Control-plane wake latency. |
 | `sleepypods_control_plane_auth_decisions_total` | counter | `outcome` | Control-plane caller authentication decisions: `success` for accepted calls, `rejected` otherwise. |
-| `sleepypods_reconciler_runs_total` | counter | `outcome` | Materialization discovery/scheduling scans. |
-| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one discovery/scheduling scan. |
-| `sleepypods_reconciler_candidates_total` | counter | `state` | Rows selected for reconciliation. |
-| `sleepypods_reconciler_claims_total` | counter | `state`, `outcome` | Reconciliation lease claim outcomes. |
+| `sleepypods_reconciler_runs_total` | counter | `outcome` | Scans that claim due wakes and cleanups. |
+| `sleepypods_reconciler_run_duration_seconds` | histogram | `outcome` | Duration of one claim scan. |
+| `sleepypods_reconciler_claims_total` | counter | `state`, `outcome` | Reconciliation leases claimed, by materialization state. |
 | `sleepypods_reconciler_lease_renewals_total` | counter | `outcome` | Lease renewal success, error, and lease-loss outcomes. |
+| `sleepypods_control_plane_store_available` | gauge | none | 1 while the reconciler reaches the store, 0 while it retries an unavailable store. |
 | `sleepypods_materializations_nonterminal` | gauge | `state` | Current pending/deleting materialization backlog by state. |
-| `sleepypods_materialization_effects_uncertain` | gauge | none | Materializations with unresolved Kubernetes effect barriers. |
-| `sleepypods_materialization_failures_blocked` | gauge | none | Materializations with blocked failure status. |
-| `sleepypods_materialization_oldest_nonterminal_age_seconds` | gauge | `state` | Oldest pending/deleting materialization age by state. |
+| `sleepypods_materialization_failures_blocked` | gauge | none | Cleanups parked by a recorded object name that another owner's object holds. |
+| `sleepypods_materialization_oldest_nonterminal_age_seconds` | gauge | `state` | Oldest pending/deleting materialization age by state; for `deleting`, how long cleanup has been retrying. |
 | `sleepypods_exclusivity_keys_held` | gauge | `state` | Held rendered exclusivity keys by non-deleted materialization state. |
 | `sleepypods_kubernetes_operations_total` | counter | `operation`, `outcome` | Controller apply/delete/readiness operation outcomes. |
 | `sleepypods_kubernetes_operation_duration_seconds` | histogram | `operation`, `outcome` | Controller apply/delete/readiness operation duration. |
@@ -182,21 +181,31 @@ Build dashboards from the exact names above:
   `outcome`; alert on high latency and any sustained `error` or `timeout`.
 - Materialization failures: rate of
   `sleepypods_runtime_materialization_failures_total` by `operation,outcome`;
-  page on nonzero sustained failures.
-- Reconciler health: rate of `sleepypods_reconciler_runs_total`,
+  page on nonzero sustained failures. The counter counts attempts that ended
+  without finishing their work. A wake or sleep that completes records none,
+  including a sleep that waits for its Pod to stop and work that rides out a
+  store outage inside its lease.
+- Reconciler health: rate of `sleepypods_reconciler_runs_total` by `outcome`,
   p95/p99 over `sleepypods_reconciler_run_duration_seconds`, and
-  `sleepypods_reconciler_claims_total` by `state,outcome`. Alert when runs stop
-  or claim errors/rejections spike across replicas. Run duration measures the
-  discovery/scheduling scan; use Kubernetes operation metrics for worker latency.
+  `sleepypods_reconciler_claims_total` by `state`. Alert when runs stop or
+  `outcome=error` runs persist. Run duration measures one claim scan; use
+  Kubernetes operation metrics for worker latency.
+- Store availability: alert when
+  `sleepypods_control_plane_store_available` stays 0. The reconciler keeps
+  running and retries its scan; no wake or cleanup is claimed until the store
+  answers.
 - Materialization backlog and locks:
   `sleepypods_materializations_nonterminal`,
   `sleepypods_materialization_oldest_nonterminal_age_seconds`, and
-  `sleepypods_exclusivity_keys_held` by `state`. Page on old pending/deleting
-  work or held keys that do not fall after sleep cleanup.
-- Blocked recovery: alert on nonzero `sleepypods_materialization_effects_uncertain`
-  or sustained `sleepypods_materialization_failures_blocked`. Inspect status and
-  follow the [uncertain-effect recovery procedure](projection-safety.md); do not
-  automatically release reservations to clear an alert.
+  `sleepypods_exclusivity_keys_held` by `state`. Page on old pending work, on
+  held keys that do not fall after sleep cleanup, and on the oldest `deleting`
+  age: cleanup retries until it succeeds, so that age is the signal that
+  something holds its objects.
+- Parked cleanup: alert on nonzero
+  `sleepypods_materialization_failures_blocked`. It counts cleanups stopped by
+  an object the materialization does not own. Follow
+  [recovery](projection-safety.md#recovery); do not release reservations to
+  clear the alert.
 - Kubernetes controller operations: rate and latency for
   `sleepypods_kubernetes_operations_total` and
   `sleepypods_kubernetes_operation_duration_seconds` by `operation,outcome`.
@@ -252,9 +261,14 @@ Cold wakes are slow or failing:
    `event.name=runtime.materialization.failure` for `instance.id`,
    `generation`, `cluster.id`, `namespace`, and `error.reason`.
 3. Check Kubernetes for rendered PV/PVC, Service, workload readiness, image pull,
-   and EndpointSlice publication in the materialization namespace.
+   and EndpointSlice publication in the materialization namespace. The
+   workload is created with zero replicas and then scaled up; the scheduler
+   holds its Pod until the claim binds.
 4. Check Postgres availability and the instance state/generation with
-   `GetInstance`.
+   `GetInstance`. A wake that cannot succeed, or passes its operation deadline,
+   leaves the instance `Failed` and cleans up; the next request starts a fresh
+   wake. `ReconcileMaterialization` with `status_only=true` returns the reason
+   in `wake_failure_message`.
 
 Rendered object name collision:
 
@@ -277,47 +291,58 @@ Workload exclusivity key conflict:
    disk or license parsing. Rendered key values are intentionally not logged.
 3. Inspect the owner instance and active materialization. Pending, Ready, and
    Deleting materializations keep keys held; Deleted materializations do not.
-4. If cleanup is stuck, resolve Kubernetes deletion errors first. Do not wake a
-   second same-key instance until the first materialization has safely finalized
-   or an operator has deliberately changed the workload values/key declaration.
-5. If cleanup was externally verified and the old process/request path has been
-   fenced so no delayed mutation can take effect, use `ForceDeleteMaterialization` with the instance ID, operator, and
-   reason. If only the lock must be released, use `ForceReleaseExclusivityKey`
-   with the exact target, key name, and key value. Both force responses include
-   best-effort projection observations for scoped refs, but treat key release as
-   unsafe unless the singleton resource cannot still be attached by the old
-   instance.
+4. Cleanup retries until every object and Pod is absent, and the key is released
+   by that proof. If the owner's cleanup is slow, read its failure message with
+   `ReconcileMaterialization` and `status_only=true`, and fix what holds the
+   objects. Do not wake a second same-key instance until the first
+   materialization has finalized or an operator has deliberately changed the
+   workload values/key declaration.
+5. If the owner's objects are gone for good (its cluster was removed, or they
+   were deleted by hand and verified), use `ForceDeleteMaterialization` with the
+   instance ID, operator, and reason. If only the lock must be released, use
+   `ForceReleaseExclusivityKey` with the exact target, key name, and key value.
+   Both force responses include best-effort projection observations for scoped
+   refs. Both release the key without proving absence, so use them only when
+   the singleton resource cannot still be attached by the old instance.
 
 Non-terminal materialization is stuck:
 
 1. Search `runtime.materialization.reconciliation` for `operation=claim`,
-   `operation=reconcile`, `operation=lease_lost`, and `outcome=error`.
-2. Call `ReconcileMaterialization` with the instance ID. It enqueues
-   eligible work through the shared scheduler; `attempted` means enqueue accepted.
-   Use `status_only=true` for read-only inspection. The response includes state,
-   lease metadata, recorded refs, projection observations, failure details,
-   scheduling deadline and any unresolved effect identity.
-3. Treat `missing` observations as cleanup progress only when no unresolved
-   effect barrier remains. Finalization requires all refs and old Pod/ReplicaSet
-   members absent. Check [effect diagnostics](projection-safety.md) when a lease
-   expired but no new controller can claim the row; name absence cannot resolve
-   an old dispatched create.
-4. Treat `present_unowned` and `deleting_unowned` as unsafe conflicts. Do not
-   force-release exclusivity keys or delete the object through SleepyPods; first
-   identify why the live object no longer carries the current SleepyPods
-   materialization stamps.
-5. Treat `delete_blocked` with finalizers as non-terminal. Fix or intentionally
-   remove the Kubernetes finalizer through the owning controller or a manual
-   Kubernetes operation, then let reconciliation retry.
-6. Treat `inspect_failed` as non-terminal, including when it appears in a force
+   `operation=reconcile`, `operation=lease_lost`, `operation=scan`, and
+   `outcome=error`.
+2. Call `ReconcileMaterialization` with the instance ID and
+   `status_only=true`. The response includes state, lease metadata, recorded
+   refs, projection observations, failure count, kind and message, and the
+   next attempt.
+3. `failure_kind=transient` retries on its own at a 2 to 32 second backoff: a
+   wake until its operation deadline, cleanup until it succeeds. Fix the fault
+   the failure message names; no operator RPC is needed.
+4. `failure_kind=permanent` on a `deleting` materialization is an ownership
+   conflict: observations show `present_unowned` or `deleting_unowned`. Do not
+   force-release exclusivity keys or delete the object through SleepyPods.
+   Identify why the live object does not carry this materialization's stamps
+   and resolve the collision, then call `ReconcileMaterialization` without
+   `status_only` to schedule cleanup again. `attempted` means the schedule was
+   accepted; drain grace and a live attempt are never overridden.
+5. Treat `delete_blocked` with finalizers as progress waiting on that finalizer.
+   Fix or intentionally remove it through the owning controller or a manual
+   Kubernetes operation; cleanup finishes on a later attempt.
+6. Treat `inspect_failed` as unproven, including when it appears in a force
    operation response. Fix Kubernetes API connectivity, RBAC, discovery, or
-   namespace access first; the control plane has not proven whether that ref is
-   missing, owned, unowned, or finalizer-blocked.
-7. Before `ForceDeleteMaterialization`, fence the old process and request path,
-   establish that old accepted API mutations can no longer take effect, inspect
-   every ref/descendant, and verify no singleton resource can be attached by the
-   old workload. Record this evidence in the audit reason. An absent name or a
-   stopped process alone is insufficient; keep the barrier if proof is unavailable.
+   namespace access; the control plane has not proven whether that ref is
+   missing, owned, unowned, or finalizer-blocked, and cleanup retries once it
+   can read it.
+7. Finalization requires every recorded ref and every Pod and ReplicaSet with
+   the instance label absent. `missing` observations for the refs alone do not
+   finish cleanup.
+8. While `sleepypods_control_plane_store_available` is 0, no work is claimed;
+   see the Postgres outage runbook below.
+9. Use `ForceDeleteMaterialization` only when the materialization's objects are
+   gone for good: inspect every ref and descendant, remove what remains, and
+   verify no singleton resource can be attached by the old workload. Record
+   this evidence in the audit reason. The operation leaves the instance where
+   its next wake can start: Waking becomes Failed, Running becomes Cold, and
+   Draining becomes Cold with its deferred wake started.
 
 Hot routes are missing or unexpectedly cold:
 
@@ -363,6 +388,11 @@ quiet interval after actual traffic.
    `SLEEPYPODS_IDLE_RETRY_BACKOFF_MS`, and
    `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS`.
 4. Check control-plane call errors for `operation=report_idle`.
+5. Read the report outcome. `already_draining` means the instance is draining on
+   the reporting Pod's projection; the sidecar keeps reporting while idle, so a
+   Pod revived by a wake during drain sleeps again after its next quiet
+   interval and a fresh activation floor. `unavailable` names an instance state
+   with no Running projection to sleep.
 
 Delete cleanup is stuck or objects leak:
 
@@ -370,7 +400,10 @@ Delete cleanup is stuck or objects leak:
 2. Search `runtime.materialization.failure` and `runtime.wake.event` for cleanup
    `error.reason`.
 3. Check Kubernetes delete permissions for StatefulSet, Deployment, Service,
-   Secret, PVC and PV objects, plus Pod/ReplicaSet list permissions and whether finalizers block deletion.
+   Secret, PVC and PV objects, plus Pod/ReplicaSet list permissions and whether
+   finalizers block deletion. One cleanup attempt waits up to 60 seconds for
+   deleted objects and their Pods to disappear; after that it retries at a 2 to
+   32 second backoff until it succeeds.
 4. Compare leaked objects' SleepyPods labels and annotations with
    `ReconcileMaterialization` projection observations. Current-owned objects
    carry `managed-by=sleepypods`, materialization id, instance id, instance
@@ -378,10 +411,16 @@ Delete cleanup is stuck or objects leak:
 5. If observations show an unowned same-name object, do not ask SleepyPods to
    delete it. Resolve the name collision or manually remove the object only
    after confirming its real owner.
-6. After manual cleanup, prefer waiting for materialization reconciliation to
-   finalize. Use `ForceDeleteMaterialization` only after the old process/request
-   path is fenced, delayed effects are excluded, and cleanup is proven. Follow
-   the [uncertain-effect recovery procedure](projection-safety.md).
+6. After manual cleanup, wait for reconciliation to finalize: its next attempt
+   proves absence and releases the reservations. Use
+   `ForceDeleteMaterialization` only when the objects are gone for good and
+   that is verified; see [recovery](projection-safety.md#recovery).
+7. An object under an instance's rendered name that appears after the
+   instance's cleanup finished is a create that arrived late: a workload with
+   zero replicas, or a Service, Secret or volume object with no Pod. It runs
+   nothing, and the instance's next wake takes it over. For a deleted
+   instance, remove it by hand; select by
+   `app.kubernetes.io/managed-by=sleepypods` and `sleepypods.io/instance-id`.
 
 HTTP-01 challenge fails:
 
@@ -423,7 +462,11 @@ Postgres or database outage:
 1. Search control-plane logs for `event.name=control_plane.store.error` and
    check runtime control-plane call `outcome=error`. The event's `error.reason`
    is `unavailable` or `internal` and its `error.message` carries the backend
-   text; callers receive the status code with a fixed message.
+   text; callers receive the status code with a fixed message. The reconciler
+   reports `sleepypods_control_plane_store_available` as 0 and retries its scan
+   after 2 seconds, doubling to 15; maintenance retries every 5 seconds. Wakes
+   and cleanups in flight continue while their 60-second lease lasts, and the
+   next claim resumes the rest once the store answers.
 2. Verify `SLEEPYPODS_POSTGRES_URL`.
 3. Restore database availability before restarting frontlines aggressively;
    proxies can keep hot cached routes briefly but cold wakes and misses need the

@@ -58,8 +58,11 @@ pub(crate) fn map_postgres_error(error: tokio_postgres::Error) -> StoreError {
         };
     }
 
-    if error.is_closed() {
-        StoreError::unavailable(format!("Postgres connection closed: {error}"))
+    // A closed connection and an I/O error on an open one both say the server
+    // was not reached or did not answer; another attempt can succeed.
+    let io = std::error::Error::source(&error).is_some_and(|source| source.is::<std::io::Error>());
+    if error.is_closed() || io {
+        StoreError::unavailable(format!("Postgres connection failed: {error}"))
     } else {
         StoreError::internal(format!("Postgres query failed: {error}"))
     }

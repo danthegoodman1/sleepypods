@@ -17,7 +17,11 @@ pub struct MaterializationRecord {
     pub projection_generation: Generation,
     pub target: MaterializationTarget,
     pub state: MaterializationState,
+    /// The Service address routes use.
     pub backend: Option<BackendEndpoint>,
+    /// The ready Pod's own address, when the driver observed one. It is
+    /// recorded and cleared with `backend`.
+    pub pod_backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
     pub exclusivity_keys: Vec<RenderedExclusivityKey>,
@@ -33,6 +37,7 @@ pub struct RecordMaterializationRequest {
     pub target: MaterializationTarget,
     pub state: MaterializationState,
     pub backend: Option<BackendEndpoint>,
+    pub pod_backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
     pub exclusivity_keys: Vec<RenderedExclusivityKey>,
@@ -52,6 +57,7 @@ pub struct CompleteWakeRequest {
     pub expected_waking_generation: Generation,
     pub target: MaterializationTarget,
     pub backend: BackendEndpoint,
+    pub pod_backend: Option<BackendEndpoint>,
     pub backend_generation: BackendGeneration,
     pub rendered_objects: Vec<RenderedObjectRef>,
     pub exclusivity_keys: Vec<RenderedExclusivityKey>,
@@ -102,14 +108,7 @@ pub struct MaterializationReconciliationLease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ListMaterializationReconciliationCandidatesRequest {
-    pub target: Option<MaterializationTarget>,
-    pub limit: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MaterializationOperationalMetrics {
-    pub uncertain_effects: u64,
     pub blocked_failures: u64,
     pub backlog_states: Vec<MaterializationBacklogOperationalMetrics>,
     pub held_key_states: Vec<MaterializationHeldKeysOperationalMetrics>,
@@ -132,12 +131,14 @@ pub struct MaterializationHeldKeysOperationalMetrics {
 /// bounds. Anything longer outlives the process that would renew it.
 pub const MAX_RECONCILIATION_LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Reconciliation leases are requested as a lifetime, never as an instant. The
-/// store starts every lease from its own clock so one process's offset cannot
-/// lengthen or shorten the window other processes wait before reclaiming work.
+/// Claims the next due materialization in one state for one target. The lease
+/// is requested as a lifetime, never as an instant: the store starts every
+/// lease from its own clock so one process's offset cannot lengthen or shorten
+/// the window other processes wait before reclaiming work.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaimMaterializationReconciliationRequest {
-    pub materialization_id: MaterializationId,
+pub struct ClaimNextMaterializationRequest {
+    pub state: MaterializationState,
+    pub target: MaterializationTarget,
     pub owner: String,
     pub lease_ttl: Duration,
 }
@@ -263,6 +264,7 @@ impl RecordMaterializationRequest {
             target,
             state,
             backend: None,
+            pod_backend: None,
             backend_generation,
             rendered_objects: Vec::new(),
             exclusivity_keys: Vec::new(),
@@ -283,6 +285,7 @@ impl CompleteWakeRequest {
             expected_waking_generation,
             target,
             backend,
+            pod_backend: None,
             backend_generation,
             rendered_objects: Vec::new(),
             exclusivity_keys: Vec::new(),
@@ -359,19 +362,6 @@ impl FinalizeSleepRequest {
     }
 }
 
-impl ListMaterializationReconciliationCandidatesRequest {
-    pub fn for_target(mut self, target: MaterializationTarget) -> Self {
-        self.target = Some(target);
-        self
-    }
-    pub fn new(limit: usize) -> Self {
-        Self {
-            target: None,
-            limit,
-        }
-    }
-}
-
 impl MaterializationOperationalMetrics {
     pub fn new(
         backlog_states: Vec<MaterializationBacklogOperationalMetrics>,
@@ -380,7 +370,6 @@ impl MaterializationOperationalMetrics {
         Self {
             backlog_states,
             held_key_states,
-            uncertain_effects: 0,
             blocked_failures: 0,
         }
     }
@@ -409,14 +398,16 @@ impl MaterializationHeldKeysOperationalMetrics {
     }
 }
 
-impl ClaimMaterializationReconciliationRequest {
+impl ClaimNextMaterializationRequest {
     pub fn new(
-        materialization_id: MaterializationId,
+        state: MaterializationState,
+        target: MaterializationTarget,
         owner: impl Into<String>,
         lease_ttl: Duration,
     ) -> Self {
         Self {
-            materialization_id,
+            state,
+            target,
             owner: owner.into(),
             lease_ttl,
         }
@@ -563,27 +554,4 @@ impl MaterializationState {
     pub const fn metric_label(self) -> sleepypods_observability::metrics::MetricLabel {
         sleepypods_observability::metrics::MetricLabel::state(self.as_str())
     }
-}
-
-/// One potentially dispatched mutation. This durable barrier survives lease expiry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MaterializationEffectRequest {
-    pub effect_id: u64,
-    pub materialization_id: MaterializationId,
-    pub owner: String,
-    pub attempt: u64,
-    pub instance_generation: Generation,
-    pub expected_state: MaterializationState,
-    pub operation: &'static str,
-    pub object: RenderedObjectRef,
-    pub precondition: Option<crate::projection::LiveObjectIdentity>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AcknowledgeMaterializationEffectRequest {
-    pub instance_generation: Generation,
-    pub effect_id: u64,
-    pub materialization_id: MaterializationId,
-    pub owner: String,
-    pub attempt: u64,
 }

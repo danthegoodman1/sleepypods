@@ -215,12 +215,12 @@ where
         instance: Box::new(instance.clone()),
         source,
     })?;
-    let refs = materializer
-        .rendered_object_refs(&manifest)
-        .map_err(|source| WakeInstanceError::Materializer {
+    let refs = crate::materializer::rendered_object_refs(&manifest).map_err(|source| {
+        WakeInstanceError::Materializer {
             instance: Box::new(instance.clone()),
             source,
-        })?;
+        }
+    })?;
     let keys = class
         .render_exclusivity_keys(&instance.values)
         .map_err(|source| WakeInstanceError::Render {
@@ -239,6 +239,7 @@ where
     );
     pending.rendered_objects = refs;
     pending.exclusivity_keys = keys;
+    let target = pending.target.clone();
     let accepted = store
         .accept_wake(crate::materialization::AcceptWakeRequest {
             expected_generation: instance.generation,
@@ -246,6 +247,26 @@ where
         })
         .await
         .map_err(map_store_error)?;
+    // A wake during drain grace returns the instance to Running on the
+    // projection it already has.
+    if accepted.state == InstanceState::Running {
+        let materialization = store
+            .load_ready_materialization(LoadReadyMaterializationRequest::new(
+                accepted.id.clone(),
+                accepted.generation,
+                target.clone(),
+            ))
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| WakeInstanceError::ReadyMaterializationNotFound {
+                instance: Box::new(accepted.clone()),
+                target,
+            })?;
+        return Ok(WakeInstanceResult::AlreadyRunning {
+            instance: accepted,
+            materialization: Box::new(materialization),
+        });
+    }
     Ok(WakeInstanceResult::AlreadyWaking { instance: accepted })
 }
 

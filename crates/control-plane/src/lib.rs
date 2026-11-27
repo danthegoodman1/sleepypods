@@ -74,12 +74,11 @@ pub use manifest::{
     VolumeMount, VolumeResourceRequirements, VolumeTemplate, WorkloadKind, WorkloadTemplate,
 };
 pub use materialization::{
-    BackendEndpoint, BeginSleepRequest, BeginSleepResult,
-    ClaimMaterializationReconciliationRequest, CompleteWakeReconciliationRequest,
-    CompleteWakeRequest, CompleteWakeResult, DeleteMaterializationReconciliationRequest,
-    FinalizeSleepReconciliationRequest, FinalizeSleepRequest, FinalizeSleepResult,
-    ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
-    ForceReleaseExclusivityKeyResult, ListMaterializationReconciliationCandidatesRequest,
+    BackendEndpoint, BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
+    CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
+    DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
+    FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
+    ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
     LoadActiveMaterializationRequest, LoadMaterializationRequest,
     MaterializationReconciliationLease, MaterializationRecord, MaterializationState,
     MaterializationTarget, RecordMaterializationRequest,
@@ -87,9 +86,9 @@ pub use materialization::{
     RenewMaterializationReconciliationLeaseRequest,
 };
 pub use materializer::{
-    rendered_object_ref, AppliedMaterialization, KubernetesClientError, KubernetesClientFuture,
-    KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
-    MaterializerError, RetryingKubernetesMaterializerClient,
+    rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
+    KubernetesMaterializer, KubernetesMaterializerClient, MaterializerError,
+    RetryingKubernetesMaterializerClient,
 };
 pub use postgres::PostgresStore;
 pub use reconciler::{MaterializationReconciler, MaterializationReconcilerConfig};

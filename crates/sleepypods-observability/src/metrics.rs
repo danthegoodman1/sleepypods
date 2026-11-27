@@ -57,7 +57,6 @@ pub const RUNTIME_SUBSCRIBE_STREAM_EVENTS_TOTAL_NAME: &str =
 pub const RUNTIME_WAKE_LATENCY_SECONDS_NAME: &str = "sleepypods_runtime_wake_latency_seconds";
 pub const RECONCILER_RUNS_TOTAL_NAME: &str = "sleepypods_reconciler_runs_total";
 pub const RECONCILER_RUN_DURATION_SECONDS_NAME: &str = "sleepypods_reconciler_run_duration_seconds";
-pub const RECONCILER_CANDIDATES_TOTAL_NAME: &str = "sleepypods_reconciler_candidates_total";
 pub const RECONCILER_CLAIMS_TOTAL_NAME: &str = "sleepypods_reconciler_claims_total";
 pub const RECONCILER_LEASE_RENEWALS_TOTAL_NAME: &str = "sleepypods_reconciler_lease_renewals_total";
 pub const MATERIALIZATIONS_NONTERMINAL_NAME: &str = "sleepypods_materializations_nonterminal";
@@ -214,14 +213,6 @@ pub const RECONCILER_RUN_DURATION_SECONDS: MetricDescriptor = MetricDescriptor::
     OUTCOME_LABELS,
 );
 
-pub const RECONCILER_CANDIDATES_TOTAL: MetricDescriptor = MetricDescriptor::new(
-    RECONCILER_CANDIDATES_TOTAL_NAME,
-    MetricKind::Counter,
-    Some("candidates"),
-    "Materialization rows selected as reconciliation candidates.",
-    &[LabelKey::State],
-);
-
 pub const RECONCILER_CLAIMS_TOTAL: MetricDescriptor = MetricDescriptor::new(
     RECONCILER_CLAIMS_TOTAL_NAME,
     MetricKind::Counter,
@@ -278,18 +269,18 @@ pub const KUBERNETES_OPERATION_DURATION_SECONDS: MetricDescriptor = MetricDescri
     OPERATION_OUTCOME_LABELS,
 );
 
-pub const MATERIALIZATION_EFFECTS_UNCERTAIN: MetricDescriptor = MetricDescriptor::new(
-    "sleepypods_materialization_effects_uncertain",
-    MetricKind::Gauge,
-    Some("effects"),
-    "Unresolved Kubernetes effects retaining ownership.",
-    &[],
-);
 pub const MATERIALIZATION_FAILURES_BLOCKED: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_materialization_failures_blocked",
     MetricKind::Gauge,
     Some("materializations"),
-    "Permanent or expired operations retaining inventory.",
+    "Cleanups parked by an object another owner holds.",
+    &[],
+);
+pub const CONTROL_PLANE_STORE_AVAILABLE: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_control_plane_store_available",
+    MetricKind::Gauge,
+    None,
+    "One while the reconciler reaches the store, zero while it retries an unavailable store.",
     &[],
 );
 
@@ -390,7 +381,6 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     RUNTIME_WAKE_LATENCY_SECONDS,
     RECONCILER_RUNS_TOTAL,
     RECONCILER_RUN_DURATION_SECONDS,
-    RECONCILER_CANDIDATES_TOTAL,
     RECONCILER_CLAIMS_TOTAL,
     RECONCILER_LEASE_RENEWALS_TOTAL,
     MATERIALIZATIONS_NONTERMINAL,
@@ -398,8 +388,8 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     EXCLUSIVITY_KEYS_HELD,
     KUBERNETES_OPERATIONS_TOTAL,
     KUBERNETES_OPERATION_DURATION_SECONDS,
-    MATERIALIZATION_EFFECTS_UNCERTAIN,
     MATERIALIZATION_FAILURES_BLOCKED,
+    CONTROL_PLANE_STORE_AVAILABLE,
     CONTROL_PLANE_AUTH_DECISIONS_TOTAL,
     RUNTIME_CERTIFICATE_ENTRIES,
     RUNTIME_CERTIFICATE_NEGATIVE_ENTRIES,
@@ -650,12 +640,6 @@ mod tests {
                 &[LabelKey::Outcome],
             ),
             (
-                "sleepypods_reconciler_candidates_total",
-                MetricKind::Counter,
-                Some("candidates"),
-                &[LabelKey::State],
-            ),
-            (
                 "sleepypods_reconciler_claims_total",
                 MetricKind::Counter,
                 Some("claims"),
@@ -698,15 +682,15 @@ mod tests {
                 &[LabelKey::Operation, LabelKey::Outcome],
             ),
             (
-                "sleepypods_materialization_effects_uncertain",
-                MetricKind::Gauge,
-                Some("effects"),
-                &[],
-            ),
-            (
                 "sleepypods_materialization_failures_blocked",
                 MetricKind::Gauge,
                 Some("materializations"),
+                &[],
+            ),
+            (
+                "sleepypods_control_plane_store_available",
+                MetricKind::Gauge,
+                None,
                 &[],
             ),
             (

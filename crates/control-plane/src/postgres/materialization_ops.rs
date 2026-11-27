@@ -6,16 +6,16 @@ use crate::{
     ids::Generation,
     instance::{validate_instance_state_transition, InstanceState, StateTransitionReason},
     materialization::{
-        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
         CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
-        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationRequest, LoadReadyMaterializationRequest,
-        MaterializationBacklogOperationalMetrics, MaterializationHeldKeysOperationalMetrics,
-        MaterializationOperationalMetrics, MaterializationRecord, MaterializationState,
-        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
+        LoadActiveMaterializationRequest, LoadMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationBacklogOperationalMetrics,
+        MaterializationHeldKeysOperationalMetrics, MaterializationOperationalMetrics,
+        MaterializationRecord, MaterializationState, RecordMaterializationRequest,
+        ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     store::{StoreError, StoreResult},
@@ -58,7 +58,7 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -95,7 +95,7 @@ pub(crate) async fn load_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -258,46 +258,6 @@ pub(crate) async fn finalize_sleep(
     Ok(result)
 }
 
-pub(crate) async fn list_materialization_reconciliation_candidates(
-    store: &PostgresStore,
-    request: ListMaterializationReconciliationCandidatesRequest,
-) -> StoreResult<Vec<MaterializationRecord>> {
-    let client = store.client().await?;
-    let limit = i64::try_from(request.limit)
-        .map_err(|_| StoreError::invalid_argument("reconciliation candidate limit is too large"))?;
-    let cluster = request.target.as_ref().map(|t| t.cluster_id());
-    let namespace = request.target.as_ref().map(|t| t.namespace());
-    // Eligibility compares stored deadlines against the database clock that
-    // wrote them. A caller clock never decides whose work is reclaimable.
-    let rows = client
-        .query(
-            "
-            SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
-                exclusivity_keys, reconcile_owner,
-                reconcile_lease_expires_at_unix_millis, reconcile_attempt
-            FROM materializations
-            WHERE state IN ('pending', 'deleting')
-                AND (failure_kind IS NULL OR failure_kind = 'transient' OR failure_requires_cleanup)
-                AND ($2::text IS NULL OR (cluster_id = $2 AND namespace = $3))
-                AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)
-                AND next_attempt_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                AND drain_not_before_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                AND (
-                    reconcile_owner IS NULL
-                    OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                )
-            ORDER BY (state = 'deleting') DESC, next_attempt_at_unix_millis, materialization_id
-            LIMIT $1
-            ",
-            &[&limit, &cluster, &namespace],
-        )
-        .await
-        .map_err(map_postgres_error)?;
-
-    rows.iter().map(materialization_from_row).collect()
-}
-
 pub(crate) async fn load_materialization_operational_metrics(
     store: &PostgresStore,
 ) -> StoreResult<MaterializationOperationalMetrics> {
@@ -363,58 +323,71 @@ pub(crate) async fn load_materialization_operational_metrics(
         ));
     }
 
-    let row = client.query_one("SELECT (SELECT count(*) FROM materialization_effects) AS uncertain, (SELECT count(*) FROM materializations WHERE failure_kind IN ('permanent', 'deadline')) AS blocked", &[]).await.map_err(map_postgres_error)?;
+    let row = client
+        .query_one(
+            "SELECT count(*) AS blocked FROM materializations
+             WHERE state IN ('pending', 'deleting') AND failure_kind IN ('permanent', 'deadline')
+                AND NOT failure_requires_cleanup",
+            &[],
+        )
+        .await
+        .map_err(map_postgres_error)?;
     let mut metrics = MaterializationOperationalMetrics::new(backlog_states, held_key_states);
-    metrics.uncertain_effects = row.get::<_, i64>("uncertain") as u64;
     metrics.blocked_failures = row.get::<_, i64>("blocked") as u64;
     Ok(metrics)
 }
 
-pub(crate) async fn claim_materialization_reconciliation(
+/// Claims the due materialization in one state that has waited longest.
+/// `SKIP LOCKED` lets concurrent claimers take different rows without waiting.
+/// Eligibility and the new expiry read the database clock, so a lease lasts its
+/// requested TTL measured by the clock every other process compares against.
+pub(crate) async fn claim_next_materialization_reconciliation(
     store: &PostgresStore,
-    request: ClaimMaterializationReconciliationRequest,
+    request: ClaimNextMaterializationRequest,
 ) -> StoreResult<Option<MaterializationRecord>> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
     validate_lease_owner(&request.owner)?;
     let lease_ttl_millis = lease_ttl_millis(request.lease_ttl)?;
-
-    let materialization_id = request.materialization_id.as_str();
+    let client = store.client().await?;
     let owner = request.owner.as_str();
-    // Lock first, then take a fresh READ COMMITTED snapshot for the barrier.
-    // A NOT EXISTS in the locking UPDATE alone can retain a pre-wait snapshot.
-    transaction.query_opt("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&materialization_id]).await.map_err(map_postgres_error)?;
-    // Both the eligibility comparisons and the new expiry read the database
-    // clock after the lock wait, so a lease always lasts its requested TTL
-    // measured by the same clock every other process compares against.
-    let row = transaction
+    let state = materialization_state_to_db(request.state);
+    let cluster_id = request.target.cluster_id();
+    let namespace = request.target.namespace();
+    let row = client
         .query_opt(
             "
             UPDATE materializations
-            SET reconcile_owner = $2,
-                reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $3,
+            SET reconcile_owner = $1,
+                reconcile_lease_expires_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint + $2,
                 reconcile_attempt = reconcile_attempt + 1,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
-            WHERE materialization_id = $1
-                AND state IN ('pending', 'deleting') AND (failure_kind IS NULL OR failure_kind = 'transient' OR failure_requires_cleanup)
-                AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)
-                AND next_attempt_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                AND drain_not_before_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                AND (
-                    reconcile_owner IS NULL
-                    OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
-                )
+            WHERE materialization_id = (
+                SELECT materialization_id
+                FROM materializations
+                WHERE state = $3
+                    AND state IN ('pending', 'deleting')
+                    AND cluster_id = $4
+                    AND namespace = $5
+                    AND (failure_kind IS NULL OR failure_kind = 'transient' OR failure_requires_cleanup)
+                    AND next_attempt_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    AND drain_not_before_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    AND (
+                        reconcile_owner IS NULL
+                        OR reconcile_lease_expires_at_unix_millis <= (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                ORDER BY next_attempt_at_unix_millis, materialization_id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
-            &[&materialization_id, &owner, &lease_ttl_millis],
+            &[&owner, &lease_ttl_millis, &state, &cluster_id, &namespace],
         )
         .await
         .map_err(map_postgres_error)?;
 
-    transaction.commit().await.map_err(map_postgres_error)?;
     row.as_ref().map(materialization_from_row).transpose()
 }
 
@@ -471,7 +444,6 @@ pub(crate) async fn release_materialization_reconciliation_lease(
                 next_attempt_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materialization_id = $1
-                AND NOT EXISTS (SELECT 1 FROM materialization_effects e WHERE e.materialization_id = materializations.materialization_id)
                 AND reconcile_owner = $2
                 AND reconcile_attempt = $3
                 AND instance_generation = $4
@@ -495,6 +467,7 @@ pub(crate) async fn complete_wake_reconciliation(
     normalize_exclusivity_keys(&mut complete.exclusivity_keys);
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    lock_instance(&transaction, complete.instance_id.as_str()).await?;
     ensure_reconciliation_lease(
         &transaction,
         request.materialization_id.as_str(),
@@ -521,6 +494,7 @@ pub(crate) async fn finalize_sleep_reconciliation(
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
     let materialization_generation = previous_generation(finalize.expected_draining_generation)?;
+    lock_instance(&transaction, finalize.instance_id.as_str()).await?;
     ensure_reconciliation_lease(
         &transaction,
         request.materialization_id.as_str(),
@@ -534,6 +508,8 @@ pub(crate) async fn finalize_sleep_reconciliation(
 
     let result = finalize_sleep_in_transaction(&transaction, finalize).await?;
     transaction.commit().await.map_err(map_postgres_error)?;
+    // A wake deferred during the drain is now Pending.
+    crate::runtime_work::signal_lifecycle_work();
 
     Ok(result)
 }
@@ -545,6 +521,7 @@ pub(crate) async fn delete_materialization_reconciliation(
     validate_lease_owner(&request.lease_owner)?;
     let mut client = store.client().await?;
     let transaction = client.transaction().await.map_err(map_postgres_error)?;
+    lock_instance(&transaction, request.instance_id.as_str()).await?;
     ensure_reconciliation_lease(
         &transaction,
         request.materialization_id.as_str(),
@@ -569,6 +546,7 @@ pub(crate) async fn delete_materialization_reconciliation(
             UPDATE materializations
             SET state = 'deleted',
                 backend_uri = NULL,
+                pod_backend_uri = NULL,
                 rendered_objects = '[]'::jsonb,
                 exclusivity_keys = '[]'::jsonb,
                 reconcile_owner = NULL,
@@ -583,7 +561,7 @@ pub(crate) async fn delete_materialization_reconciliation(
                 AND reconcile_owner = $7
                 AND reconcile_lease_expires_at_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -604,6 +582,10 @@ pub(crate) async fn delete_materialization_reconciliation(
     row.as_ref().map(materialization_from_row).transpose()
 }
 
+/// Removes a materialization's record and reservations on an operator's
+/// word, and moves its instance to a state the next wake can start from:
+/// Waking becomes Failed, Running becomes Cold, and Draining becomes Cold with
+/// its deferred wake activated.
 pub(crate) async fn force_delete_materialization(
     store: &PostgresStore,
     request: ForceDeleteMaterializationRequest,
@@ -625,11 +607,24 @@ pub(crate) async fn force_delete_materialization(
         },
     )
     .await?;
+    let instance = transaction
+        .query_opt(
+            "
+            SELECT i.instance_id, i.state
+            FROM instances i
+            JOIN materializations m USING (instance_id)
+            WHERE m.materialization_id = $1
+            FOR UPDATE OF i
+            ",
+            &[&materialization_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
     let existing = transaction
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -640,20 +635,21 @@ pub(crate) async fn force_delete_materialization(
         )
         .await
         .map_err(map_postgres_error)?;
-    if existing.is_some() {
-        transaction
-            .execute(
-                "DELETE FROM materialization_effects WHERE materialization_id = $1",
-                &[&materialization_id],
-            )
-            .await
-            .map_err(map_postgres_error)?;
+    let existing = existing
+        .as_ref()
+        .map(materialization_from_row)
+        .transpose()?;
+    if existing
+        .as_ref()
+        .is_some_and(|existing| existing.state != MaterializationState::Deleted)
+    {
         transaction
             .execute(
                 "
                 UPDATE materializations
                 SET state = 'deleted',
                     backend_uri = NULL,
+                pod_backend_uri = NULL,
                     rendered_objects = '[]'::jsonb,
                     exclusivity_keys = '[]'::jsonb,
                     reconcile_owner = NULL,
@@ -665,10 +661,39 @@ pub(crate) async fn force_delete_materialization(
             )
             .await
             .map_err(map_postgres_error)?;
+        if let Some(instance) = instance {
+            let instance_id: String = instance.get("instance_id");
+            let state: String = instance.get("state");
+            let settled = match state.as_str() {
+                "waking" => Some("failed"),
+                "running" | "draining" => Some("cold"),
+                _ => None,
+            };
+            if let Some(settled) = settled {
+                transaction
+                    .execute(
+                        "
+                        UPDATE instances
+                        SET state = $2,
+                            generation = generation + 1,
+                            updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+                        WHERE instance_id = $1
+                        ",
+                        &[&instance_id, &settled],
+                    )
+                    .await
+                    .map_err(map_postgres_error)?;
+                if state == "draining" {
+                    super::lifecycle_ops::activate_deferred_wake(&transaction, &instance_id)
+                        .await?;
+                }
+            }
+        }
     }
     transaction.commit().await.map_err(map_postgres_error)?;
+    crate::runtime_work::signal_lifecycle_work();
 
-    existing.as_ref().map(materialization_from_row).transpose()
+    Ok(existing)
 }
 
 pub(crate) async fn force_release_exclusivity_key(
@@ -704,7 +729,7 @@ pub(crate) async fn force_release_exclusivity_key(
         .query(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -838,6 +863,7 @@ async fn complete_wake_in_transaction(
         .map(|m| m.projection_generation)
         .unwrap_or(running_generation);
     materialization_request.backend = Some(request.backend);
+    materialization_request.pod_backend = request.pod_backend;
     materialization_request.rendered_objects = request.rendered_objects;
     materialization_request.exclusivity_keys = request.exclusivity_keys;
     let materialization = upsert_materialization(transaction, &materialization_request).await?;
@@ -926,6 +952,18 @@ async fn finalize_sleep_in_transaction(
     })
 }
 
+/// Every lifecycle transaction locks the instance before its materialization.
+async fn lock_instance(client: &impl GenericClient, instance_id: &str) -> StoreResult<()> {
+    client
+        .query_opt(
+            "SELECT instance_id FROM instances WHERE instance_id = $1 FOR UPDATE",
+            &[&instance_id],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    Ok(())
+}
+
 async fn ensure_reconciliation_lease(
     client: &impl GenericClient,
     materialization_id: &str,
@@ -1003,19 +1041,6 @@ async fn ensure_reconciliation_lease(
         });
     }
 
-    if client
-        .query_opt(
-            "SELECT 1 FROM materialization_effects WHERE materialization_id = $1",
-            &[&materialization_id],
-        )
-        .await
-        .map_err(map_postgres_error)?
-        .is_some()
-    {
-        return Err(StoreError::LeaseConflict {
-            message: "Kubernetes effect outcome remains unacknowledged".into(),
-        });
-    }
     Ok(())
 }
 
@@ -1113,6 +1138,7 @@ pub(super) async fn upsert_materialization(
     let namespace = request.target.namespace();
     let state = materialization_state_to_db(request.state);
     let backend_uri = request.backend.as_ref().map(|backend| backend.uri());
+    let pod_backend_uri = request.pod_backend.as_ref().map(|backend| backend.uri());
     let backend_generation = backend_generation_to_i64(request.backend_generation)?;
     let rendered_objects = rendered_objects_to_json(&request.rendered_objects);
     let exclusivity_keys = rendered_exclusivity_keys_to_json(&request.exclusivity_keys);
@@ -1132,9 +1158,10 @@ pub(super) async fn upsert_materialization(
                 backend_generation,
                 rendered_objects,
                 exclusivity_keys,
-                projection_generation
+                projection_generation,
+                pod_backend_uri
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (instance_id, cluster_id, namespace)
             DO UPDATE SET
                 materialization_id = EXCLUDED.materialization_id,
@@ -1142,6 +1169,7 @@ pub(super) async fn upsert_materialization(
                 projection_generation = EXCLUDED.projection_generation,
                 state = EXCLUDED.state,
                 backend_uri = EXCLUDED.backend_uri,
+                pod_backend_uri = EXCLUDED.pod_backend_uri,
                 backend_generation = EXCLUDED.backend_generation,
                 rendered_objects = EXCLUDED.rendered_objects,
                 exclusivity_keys = EXCLUDED.exclusivity_keys,
@@ -1150,7 +1178,7 @@ pub(super) async fn upsert_materialization(
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
             WHERE materializations.backend_generation <= EXCLUDED.backend_generation
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -1166,6 +1194,7 @@ pub(super) async fn upsert_materialization(
                 &rendered_objects,
                 &exclusivity_keys,
                 &projection_generation,
+                &pod_backend_uri,
             ],
         )
         .await
@@ -1196,7 +1225,7 @@ async fn load_active_materialization_from_client(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations
@@ -1238,6 +1267,7 @@ async fn mark_active_materialization_state(
                 SET state = $4,
                     instance_generation = $5,
                     backend_uri = NULL,
+                pod_backend_uri = NULL,
                     rendered_objects = COALESCE($6, rendered_objects),
                     exclusivity_keys = COALESCE($7, exclusivity_keys),
                     reconcile_owner = NULL,
@@ -1248,7 +1278,7 @@ async fn mark_active_materialization_state(
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                     exclusivity_keys, reconcile_owner,
                     reconcile_lease_expires_at_unix_millis, reconcile_attempt
                 ",
@@ -1271,6 +1301,7 @@ async fn mark_active_materialization_state(
                 UPDATE materializations
                 SET state = $4,
                     backend_uri = NULL,
+                pod_backend_uri = NULL,
                     reconcile_owner = NULL,
                     reconcile_lease_expires_at_unix_millis = NULL,
                     updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
@@ -1279,7 +1310,7 @@ async fn mark_active_materialization_state(
                     AND namespace = $3
                     AND state <> 'deleted'
                 RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                    namespace, state, backend_uri, backend_generation, rendered_objects,
+                    namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                     exclusivity_keys, reconcile_owner,
                     reconcile_lease_expires_at_unix_millis, reconcile_attempt
                 ",
@@ -1311,7 +1342,6 @@ async fn mark_active_materialization_deleting_for_sleep(
             "
             UPDATE materializations
             SET state = $5,
-                backend_uri = NULL,
                 reconcile_owner = NULL,
                 reconcile_lease_expires_at_unix_millis = NULL,
                 updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint,
@@ -1322,7 +1352,7 @@ async fn mark_active_materialization_deleting_for_sleep(
                 AND instance_generation = $4
                 AND state <> 'deleted'
             RETURNING materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             ",
@@ -1446,70 +1476,4 @@ fn lease_attempt(attempt: u64) -> StoreResult<i64> {
         .ok_or_else(|| {
             StoreError::invalid_argument("lease attempt must be a positive signed 64-bit integer")
         })
-}
-
-/// Begin under the same row lock used by lease acquisition and lifecycle commits.
-/// The record is deliberately retained if the caller disappears before acknowledgement.
-pub(crate) async fn begin_materialization_effect(
-    store: &PostgresStore,
-    request: crate::materialization::MaterializationEffectRequest,
-) -> StoreResult<bool> {
-    validate_lease_owner(&request.owner)?;
-    let attempt = lease_attempt(request.attempt)?;
-    let effect_id = lease_attempt(request.effect_id)?;
-    let generation = generation_to_i64(request.instance_generation)?;
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let id = request.materialization_id.as_str();
-    let state = materialization_state_to_db(request.expected_state);
-    transaction.query_opt("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&id]).await.map_err(map_postgres_error)?;
-    let row = transaction.query_opt(
-        "SELECT 1 FROM materializations WHERE materialization_id = $1 AND reconcile_owner = $2 AND reconcile_attempt = $3 AND instance_generation = $4 AND state = $5 AND reconcile_lease_expires_at_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint",
-        &[&id, &request.owner, &attempt, &generation, &state],
-    ).await.map_err(map_postgres_error)?;
-    if row.is_none() {
-        return Ok(false);
-    }
-    let object = serde_json::json!({"api_version": request.object.api_version, "kind": request.object.kind, "namespace": request.object.namespace, "name": request.object.name});
-    let uid = request
-        .precondition
-        .as_ref()
-        .map(|identity| identity.uid.as_str());
-    let resource_version = request
-        .precondition
-        .as_ref()
-        .map(|identity| identity.resource_version.as_str());
-    let inserted = transaction.execute(
-        "INSERT INTO materialization_effects (materialization_id, lease_owner, lease_attempt, instance_generation, operation, object_ref, expected_uid, expected_resource_version, effect_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
-        &[&id, &request.owner, &attempt, &generation, &request.operation, &object, &uid, &resource_version, &effect_id],
-    ).await.map_err(map_postgres_error)?;
-    let same_operation = if inserted == 0 {
-        transaction.query_opt("SELECT 1 FROM materialization_effects WHERE materialization_id = $1 AND lease_owner = $2 AND lease_attempt = $3 AND instance_generation = $4 AND operation = $5 AND object_ref = $6 AND expected_uid IS NOT DISTINCT FROM $7 AND expected_resource_version IS NOT DISTINCT FROM $8 AND effect_id = $9", &[&id, &request.owner, &attempt, &generation, &request.operation, &object, &uid, &resource_version, &effect_id]).await.map_err(map_postgres_error)?.is_some()
-    } else {
-        false
-    };
-    transaction.commit().await.map_err(map_postgres_error)?;
-    Ok(inserted == 1 || same_operation)
-}
-
-pub(crate) async fn acknowledge_materialization_effect(
-    store: &PostgresStore,
-    request: crate::materialization::AcknowledgeMaterializationEffectRequest,
-) -> StoreResult<bool> {
-    let mut client = store.client().await?;
-    let transaction = client.transaction().await.map_err(map_postgres_error)?;
-    let attempt = lease_attempt(request.attempt)?;
-    let effect_id = lease_attempt(request.effect_id)?;
-    let generation = generation_to_i64(request.instance_generation)?;
-    // A definite response still resolves uncertainty after lease expiry. The
-    // unresolved barrier prevented any intervening attempt from acquiring ownership.
-    // An ambiguous begin may still hold its row lock while committing. Wait for
-    // that transaction before taking the snapshot used by this exact ACK.
-    transaction.query_opt("SELECT materialization_id FROM materializations WHERE materialization_id = $1 FOR UPDATE", &[&request.materialization_id.as_str()]).await.map_err(map_postgres_error)?;
-    let deleted = transaction.execute(
-        "DELETE FROM materialization_effects WHERE materialization_id = $1 AND lease_owner = $2 AND lease_attempt = $3 AND effect_id = $4 AND instance_generation = $5",
-        &[&request.materialization_id.as_str(), &request.owner, &attempt, &effect_id, &generation],
-    ).await.map_err(map_postgres_error)?;
-    transaction.commit().await.map_err(map_postgres_error)?;
-    Ok(deleted == 1)
 }

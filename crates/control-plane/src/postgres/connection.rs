@@ -10,6 +10,10 @@ use crate::{
 
 use super::migrations;
 
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const KEEPALIVE_RETRIES: u32 = 3;
+
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
     pub(crate) pool: Pool,
@@ -23,15 +27,7 @@ impl PostgresStore {
         config.validate_limits().map_err(|setting| {
             StoreError::invalid_argument(format!("{setting} is outside its supported limits"))
         })?;
-        let statement_timeout = config.statement_timeout.as_millis();
-        let operation_timeout = config.operation_timeout.as_millis();
-        let mut pg_config = parse_connection_url(config.connection_url())?;
-        pg_config.connect_timeout(config.connection_timeout);
-        let options = format!(
-            "{} -c statement_timeout={statement_timeout} -c sleepypods.operation_timeout_ms={operation_timeout}",
-            pg_config.get_options().unwrap_or("")
-        );
-        pg_config.options(&options);
+        let pg_config = session_config(config)?;
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
@@ -91,6 +87,29 @@ impl PostgresStore {
     }
 }
 
+/// The settings every pooled session connects with.
+fn session_config(config: &PostgresStoreConfig) -> StoreResult<PgConfig> {
+    let statement_timeout = config.statement_timeout.as_millis();
+    let operation_timeout = config.operation_timeout.as_millis();
+    let mut pg_config = parse_connection_url(config.connection_url())?;
+    pg_config.connect_timeout(config.connection_timeout);
+    // A session that sits inside a transaction holds row locks every other
+    // writer waits on. No transaction here idles longer than a statement may
+    // run, so the same bound ends a frozen one. Keepalives detect a peer that
+    // vanished without closing the connection.
+    let options = format!(
+        "{} -c statement_timeout={statement_timeout} -c idle_in_transaction_session_timeout={statement_timeout} -c sleepypods.operation_timeout_ms={operation_timeout}",
+        pg_config.get_options().unwrap_or("")
+    );
+    pg_config.options(&options);
+    pg_config
+        .keepalives(true)
+        .keepalives_idle(KEEPALIVE_IDLE)
+        .keepalives_interval(KEEPALIVE_INTERVAL)
+        .keepalives_retries(KEEPALIVE_RETRIES);
+    Ok(pg_config)
+}
+
 fn parse_connection_url(value: &str) -> StoreResult<PgConfig> {
     PgConfig::from_str(value).map_err(|error| {
         StoreError::invalid_argument(format!(
@@ -110,6 +129,30 @@ mod tests {
             .expect_err("non-Postgres URL is invalid");
 
         assert!(matches!(error, StoreError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn sessions_bound_idle_transactions_and_probe_a_silent_peer() {
+        let mut config = PostgresStoreConfig::new("postgres://user@db/sleepypods").unwrap();
+        config.statement_timeout = std::time::Duration::from_secs(7);
+        let session = super::session_config(&config).unwrap();
+
+        let options = session.get_options().unwrap();
+        assert!(options.contains("-c statement_timeout=7000"), "{options}");
+        assert!(
+            options.contains("-c idle_in_transaction_session_timeout=7000"),
+            "{options}"
+        );
+        assert!(session.get_keepalives());
+        assert_eq!(session.get_keepalives_idle(), super::KEEPALIVE_IDLE);
+        assert_eq!(
+            session.get_keepalives_interval(),
+            Some(super::KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            session.get_keepalives_retries(),
+            Some(super::KEEPALIVE_RETRIES)
+        );
     }
 
     #[test]

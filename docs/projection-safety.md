@@ -1,161 +1,174 @@
-# Projection ownership and uncertain effects
+# Projection ownership and recovery
 
 A materialization has a stable `projection_generation` for its Kubernetes and
-sidecar ownership stamp. Its instance CAS revision can change independently.
-Every lease acquisition increments an attempt. Renew, release and completion
-check the acquired owner, attempt and materialization generation; recreated
-instance IDs cannot reuse an old lease even when their deterministic
+sidecar ownership stamp. Its instance revision changes independently. Every
+lease acquisition increments an attempt. Renew, release, failure recording and
+completion check the acquired owner, attempt and materialization generation;
+a recreated instance ID cannot reuse an old lease even when its deterministic
 materialization ID and attempt counter repeat.
 
-Before each Kubernetes mutation the sole lifecycle driver records an effect in
-Postgres under the materialization row lock. The effect includes its generation,
-owner, attempt, individual effect ID, object ref and observed UID/resourceVersion.
-Only an active matching lease can dispatch. Claims first lock the materialization,
-then inspect the effect barrier in a fresh statement. An unacknowledged effect
-prevents lease transfer and automatic inventory/key release. Exact effect ACKs
-also lock first, so an ACK cannot miss a still-committing begin transaction or
-erase a later operation. Begin replay matches the entire operation; the runtime
-forwards begin once and retries exact ACKs on transient database failures.
+## Two authorities
 
-The Kubernetes client uses create for an absent object. Updates carry the
-observed UID and resourceVersion in a merge patch; foreground deletes carry
-both in DeleteOptions preconditions. A conflict triggers a later inspection,
-never an unconditional fallback. Applied inventory survives partial failure;
-there is no unchecked rollback. Secrets are applied before services/workloads.
-Cleanup requires all recorded refs to be absent and instance-labelled Pods and
-ReplicaSets in the target namespaces to be absent, including terminating
-members. Every managed static PV must explicitly use `Retain`, including raw
-PV/PVC inventory. Class/render validation rejects destructive policies and
-unsupported bindings. Legacy live cleanup validates all PV policies and PVC
-bindings before any teardown; a Delete/unknown policy or unproven binding blocks
-cleanup before deleting a PVC could trigger reclamation. The supported contract
-assumes exclusive control over managed object metadata, Pod templates, and
-PV/PVC specs, especially reclaim policy and volume bindings. PVC delete
-preconditions cannot atomically fence a separate actor changing its PV policy
-after preflight. Concurrent external storage-policy or binding edits require
-quiescing managed work first. New drivers never write Delete and old writers
-must be quiesced for migration. Removing ownership labels, force-reparenting
-descendants or bypassing normal Kubernetes garbage collection is an operator
-intervention.
+The database lease decides who drives a materialization. The API server decides
+whether each mutation still applies. Together they fence a driver that has lost
+its lease without any record of the mutations it sent.
 
-Default leases last 60 seconds and renew every 20 seconds during apply, PVC and
-readiness work. The concrete Kubernetes client bounds mutations and short reads
-with its 10-second `delete_timeout`; the fenced driver adds a 15-second mutation
-ceiling. PVC and readiness waits have a 120-second ceiling, including blocked
-network reads. Read timeouts do not create effect uncertainty. Lease loss cancels
-local work and prevents any subsequent dispatch or publication.
+- The driver renews its lease immediately before every mutation. A driver that
+  has lost the lease can therefore land at most the one request already
+  checked.
+- A patch or delete carries the UID and resourceVersion the driver observed.
+  The API server refuses it once the object changes or is replaced.
+- A create has no precondition, so it creates nothing that runs. A Deployment
+  or StatefulSet, structured or raw, is created with zero replicas. The driver
+  then reads the created object's UID and scales that object up with a patch
+  conditional on the UID. Only the driver that saw the create succeed knows
+  the UID, and cleanup removes the object before it proves absence. This one
+  patch leaves the resourceVersion out, because the workload's controller
+  writes its status right after creation. A Service, Secret, PersistentVolume
+  or PersistentVolumeClaim attaches nothing without a Pod.
 
-Renewal and failure publication also check the work state claimed by the attempt.
-An accepted Delete changes Pending to Deleting without stealing its lease or
-changing its immutable projection stamp. The old worker discovers this at its
-next heartbeat and cooperatively cancels readiness. A definite operation failure
-that finishes earlier also cannot publish into the new Deleting work. Failure
-publication locks the instance before the materialization, matching acceptance,
-then checks the current state in a fresh statement. Once the owned work settles,
-an exact conditional release makes definite cleanup eligible without waiting for
-lease expiry. The existing grace deadline still applies. An unresolved dispatched
-effect blocks that release and any replacement, even after lease expiry; operator
-status continues to expose its identity independently of the new work's failure
-count. This is bounded intent preemption under functioning dependencies, not a
-new wall-clock deletion SLA or a way to clear uncertain operations.
+A request that arrives late is thus one of three things. A conditional patch
+or delete applies only to the exact object version its sender inspected, an
+object cleanup must still remove before it proves absence. A create leaves an
+object with zero replicas. Neither starts a Pod for a projection that cleanup
+has finished, and neither changes an object a newer incarnation has written.
 
-The heartbeat's renewal is polled alongside work as one owned future. An effect
-begin transaction can hold the materialization row that renewal needs; work must
-continue to be polled so it can commit and release that lock. Awaiting renewal
-inside the timer branch would freeze its own transaction and delay cancellation.
-No independent heartbeat task or overlapping renewal loop is created.
+## Apply
 
-Each public one-shot reconciliation job owns a fresh cancellation token, as the
-continuous runtime already does. Canceling one job cannot cancel a sibling or a
-later use of the same library handle.
+Each apply round inspects every rendered object, then walks them in order:
+PersistentVolumes, claims, Secrets, Services, workloads. A missing object is
+created; a present, owned object is patched on condition that it is unchanged.
+A present object with another owner's stamps, or a newer generation of this
+instance, is an ownership conflict and stops the wake. A same-instance object
+from an older generation is a leftover: the wake patches it in place.
 
-## Primary Service readiness
+A mutation whose outcome is unknown (a 5xx, a broken connection, a request
+timeout) or whose precondition went stale (409) starts another round, up to
+four per attempt. The round inspects again, so it creates what is still
+missing and patches what arrived. A 429 is retried in place.
 
-The primary Service retains its stable instance/workload selector. Only the
+The workload is created without waiting for its claim to bind; the scheduler
+holds the Pod until the volume is bound.
+
+## Readiness
+
+The primary Service keeps its stable instance and workload selector. Only the
 structured primary Pod template receives its workload-name label; raw auxiliary
-Deployment/StatefulSet templates receive cleanup ownership without that label.
-Explicit raw uses of the reserved primary selector key are rejected, and raw
-standalone Pods remain unsupported. No immutable primary selector migration is
-needed.
+Deployment and StatefulSet templates receive cleanup ownership without that
+label. Explicit raw uses of the reserved primary selector key are rejected, and
+raw standalone Pods are unsupported.
 
 The injected sidecar has a private HTTP readiness probe on a separate declared
-port. Its health listener becomes available only after the actual proxy binds;
-`/ready` additionally requires a bounded in-Pod loopback app connection. Health
-traffic does not reach the proxy or its idle/drain accounting. Both initial
-readiness waits and live readiness inspections require EndpointSlice ownership
-by the observed Service UID and a ready, nonterminating endpoint with an address.
-Deleting Services/slices and ownerless or old same-name slices are unready.
-Kubernetes' unspecified `ready` condition retains its documented ready default;
-explicit false always blocks. This is a current transport observation, not an
-application-level health guarantee or an atomic promise about future traffic.
+port. Its health listener becomes available only after the proxy binds;
+`/ready` also requires a bounded in-Pod loopback connection to the app. Health
+traffic does not reach the proxy or its idle and drain accounting.
 
-Custom sidecar images need the readiness interface before deployment. Existing
-Running rows keep their current projection until ordinary lifecycle replacement;
-upgrade and sleep/wake them to adopt the probe and auxiliary isolation. See the
-[operator guide](operator-guide.md) for port selection and upgrade details.
+The driver reads the Service and its EndpointSlices, then follows the slices by
+watch. The wake is ready when a slice owned by the observed Service UID has a
+ready, nonterminating endpoint with an address. Deleting Services and slices,
+and ownerless or old same-name slices, are unready. An unspecified `ready`
+condition keeps its documented ready default; explicit false always blocks.
+The watch restarts every 30 seconds and whenever it ends, which rereads the
+Service. This is a transport observation, not an application health guarantee.
 
-Already-Pending work with no old effects can render the new projection. A
-partially applied old same-generation projection instead has a different desired
-rendered hash and is rejected before any new apply. That is a permanent wake
-failure; the scheduler queues recorded-ref cleanup, whose ownership checks do
-not require the old desired hash, and retains inventory until cleanup succeeds.
-This also avoids relying on merge-patch omission to remove old auxiliary labels.
-An ordinary wake retry is safe after cleanup. Uncertain effects remain barred.
+The published backend address is the Service ClusterIP, which is fixed for the
+Service's life. A headless Service publishes its DNS name. The driver creates
+and deletes the Service, so its address reaches only this projection's Pod.
+The completed wake also records the ready Pod's own address, from the ready
+EndpointSlice endpoint and its target port, beside it (`pod_backend_uri`).
+Routes use the Service address. The Pod address is cleared with the Service
+address and kept across a revive, which keeps the same Pod.
 
-## Recovery boundary
+## Cleanup
 
-A successful or definite rejected Kubernetes response acknowledges its exact
-effect. Transient ACK failures are retried; a lost ACK response after its commit
-is recoverable on the next ordinary pass. API conflicts and failures known before
-dispatch preserve ordinary retry behavior. If begin returns an error, the live
-driver knows it has not polled the Kubernetes operation and attempts an exact ACK
-before returning.
+Cleanup inspects every recorded object and deletes, with foreground
+propagation and the observed UID and resourceVersion, each one that is present
+and owned. It then waits inside the attempt, for up to 60 seconds, until every
+recorded object is absent and no Pod or ReplicaSet with the instance label
+remains in the target namespaces. A terminating object or Pod is progress: the
+attempt keeps waiting, and a sleep that ends within the wait records no
+failure. An object that is still present and not terminating is deleted again
+in the next poll.
 
-A mutating transport error, timeout, cancellation or process loss can leave the
-API server processing a request after its client disappears. In particular, an
-old create can arrive after a replacement controller observes an absent name.
-No Kubernetes read can prove that such a request will never arrive. The durable
-effect remains blocked, retaining inventory and exclusivity. This also includes
-the irreducible crash/cancellation window between committing begin and dispatch:
-a fresh process cannot determine whether the request was sent. Autonomous
-recovery is deliberately limited at this boundary. Supervised cooperative shutdown
-now lets an owned live task finish begin and await an exact ACK when it knows the
-Kubernetes future has never been polled. After dispatch, cancellation retains the
-barrier. The controller allows 20 seconds to drain and the runtime 25 seconds;
-a database call that cannot finish within that budget can still require hard
-abort. Hard abort or process death cannot establish whether dispatch occurred.
+Exclusivity keys and the object inventory are released only by that proof of
+absence, or by an audited force operation.
 
-`ReconcileMaterialization` with `status_only=true` exposes the durable scheduling
-deadline, failure classification/message and complete uncertain-effect identity,
-including expected UID/resourceVersion. The bounded operational gauges
-`sleepypods_materialization_effects_uncertain` and
-`sleepypods_materialization_failures_blocked` expose aggregate counts without
-resource-ID labels.
+Every managed static PersistentVolume must use `Retain`, including raw
+inventory. Class and render validation reject destructive policies and
+unsupported bindings. Before any teardown request, cleanup validates every live
+volume's reclaim policy and every claim's binding to a recorded volume; a
+`Delete` or unknown policy, or an unproven binding, blocks cleanup before
+deleting a claim could trigger reclamation. The supported contract assumes
+exclusive control over managed object metadata, Pod templates and volume
+specifications. Delete preconditions cannot fence a separate actor changing a
+volume's policy after that check, so quiesce managed work before editing
+storage policy or bindings by hand.
 
-An operator can diagnose the barrier with this read-only query (filter the
-materialization ID as appropriate). It contains refs and fencing identities, not
-Secret contents:
+## Leases, timeouts and cancellation
 
-```sql
-SELECT materialization_id, instance_generation, lease_owner, lease_attempt,
-       effect_id, operation, object_ref, expected_uid,
-       expected_resource_version, started_at_unix_millis
-FROM materialization_effects
-ORDER BY started_at_unix_millis;
-```
+A lease lasts 60 seconds and is renewed every 20 seconds while a wake waits
+for readiness or cleanup waits for absence, and before each mutation. The
+store refusing a renewal loses the lease at once. A store error is retried
+until the lease's own expiry, measured locally from the last successful
+renewal, and only then counts as loss; a store outage shorter than the lease
+does not interrupt the work. Completion, failure recording and release are
+retried the same way.
 
-`ForceDeleteMaterialization` explicitly clears the barrier and the recorded
-inventory in one audited transaction. Before using it, fence the old process and
-its request path, establish that previously accepted mutating API requests have
-completed or cannot take effect, then inspect/clean the objects and descendants
-and verify external singleton resources cannot be attached by the old workload.
-Stopping a process or observing an absent name alone is insufficient. If that
-proof is unavailable, retain the barrier and reservations. Record the fencing
-and cleanup evidence in the required operator/reason fields. The same condition
-applies before `ForceReleaseExclusivityKey`; it bypasses the automatic guarantee.
-Do not edit effect rows directly as a recovery shortcut.
+One Kubernetes mutation or short read is bounded at 10 seconds. A readiness
+wait is bounded at 120 seconds per attempt. A wake has an operation deadline
+(600 seconds by default) after which it fails; cleanup has none.
 
-Upgrade migrations 8 and 9 with old writers quiesced and their in-flight mutation
-requests settled. Mixing a driver that lacks these barriers with the new driver
-cannot provide the new guarantee. Restore generation watermarks and effect rows
-with the rest of the database.
+Cancellation, from shutdown, lease loss or the wake deadline, stops the work
+at its next step. A mutation already dispatched runs to its own timeout first,
+so its response is seen. The controller allows 20 seconds to drain and the
+runtime 25 seconds.
+
+An accepted Delete changes Pending to Deleting without taking the lease or
+changing the projection stamp. Renewal checks the state the attempt claimed,
+so the wake's driver stops at its next renewal or mutation, releases its exact
+claim, and cleanup starts without waiting for the lease to expire.
+
+Every lifecycle transaction locks the instance row before its materialization
+row.
+
+## Recovery
+
+Each of these recovers without an operator:
+
+| Fault | What happens |
+| --- | --- |
+| 5xx, reset connection or stalled request on a create, patch or delete | The attempt inspects the object again and continues. After four rounds it ends as a transient failure and the next attempt, after a backoff of 2 to 32 seconds, starts from inspection. |
+| Control-plane process lost at any point around a mutation | The lease expires within 60 seconds. The next claim inspects the live objects and continues the wake or the cleanup. A create the lost process had in flight either arrived, and is patched or deleted like any other object, or arrives later with zero replicas. |
+| Store unavailable | Work in flight continues while its lease lasts. The reconciler backs off between scans, from twice its interval up to 15 seconds, and reports `sleepypods_control_plane_store_available` as 0. The reconciler keeps running and resumes when the store answers. |
+| Wake cannot succeed (invalid manifest, refused request, ownership conflict) or passes its deadline | The instance becomes Failed and its materialization is cleaned up at once. The next request starts a fresh wake. |
+| Cleanup slowed by a terminating Pod, a finalizer, a volume detach or a refused API call | Cleanup retries until it succeeds, at a backoff capped at 32 seconds. `sleepypods_materialization_oldest_nonterminal_age_seconds{state="deleting"}` shows how long it has been trying. |
+
+One condition parks cleanup for an operator: a recorded object name held by an
+object that another owner, or a newer generation of the instance, stamped. The
+driver deletes nothing it does not own. `sleepypods_materialization_failures_blocked`
+counts these. Resolve the collision, then call `ReconcileMaterialization` to
+schedule cleanup again.
+
+A create that arrives after cleanup has proven absence leaves an object with
+zero replicas under the instance's rendered name. The instance's next wake
+takes it over as an older-generation leftover. If the instance is deleted
+before it wakes again, the object stays until an operator removes it; it
+carries the `app.kubernetes.io/managed-by=sleepypods` and
+`sleepypods.io/instance-id` labels and runs nothing.
+
+`ReconcileMaterialization` with `status_only=true` reports the scheduling
+deadline, failure classification and message. Without `status_only` it clears
+the failure state and schedules the work again; it never overrides drain grace
+or a live attempt.
+
+`ForceDeleteMaterialization` removes a materialization's record, inventory and
+exclusivity keys in one audited transaction, without touching Kubernetes, and
+leaves the instance where its next wake can start: Waking becomes Failed,
+Running becomes Cold, and Draining becomes Cold with its deferred wake
+activated. Use it when the cluster the materialization lived in is gone or its
+objects were removed by hand. Before using it on a live cluster, inspect and
+remove the objects and their Pods, and verify that an external singleton
+resource cannot still be attached by the old workload: the force operation
+releases the keys without proving absence. Record that evidence in the
+required operator and reason fields. The same applies to
+`ForceReleaseExclusivityKey`.

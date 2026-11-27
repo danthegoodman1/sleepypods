@@ -12,13 +12,13 @@ use control_plane::api::pb::{
     proxy_control_plane_client::ProxyControlPlaneClient, proxy_wake_instance_response,
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
-    HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance, InstanceState as PbInstanceState,
-    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSourceTemplate, ProxyWakeInstanceRequest, RawKubernetesManifestTemplate,
-    ReconcileMaterializationRequest, RouteHost, RouteHostKind, RouteIdentity, ServicePortTemplate,
-    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate,
-    WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueSchema,
+    DeleteInstanceRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance,
+    InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProxyWakeInstanceRequest,
+    RawKubernetesManifestTemplate, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -55,8 +55,12 @@ const UNBOUND_INSTANCE_ID: &str = "failure-unbound";
 const UNBOUND_ROUTE_ID: &str = "failure-unbound-route";
 const UNBOUND_ROUTE_HOST: &str = "unbound.failure.sleepypods.test";
 const UNBOUND_WORKLOAD_NAME: &str = "failure-unbound-app";
+const UNBOUND_PV_BASE: &str = "failure-unbound-pv";
+const UNBOUND_FIRST_PVC_BASE: &str = "failure-unbound-a-pvc";
 const UNBOUND_PV_NAME: &str = "failure-unbound-pv-69ac89bca4a0a94a";
 const UNBOUND_FIRST_PVC_NAME: &str = "failure-unbound-a-pvc-69ac89bca4a0a94a";
+/// Where a raw manifest reads the instance suffix the platform supplies.
+const SUFFIX: &str = "{suffix}";
 const UNBOUND_SECOND_PVC_NAME: &str = "failure-unbound-b-pvc";
 // Explicit test-owned stale reservation, never the UID of a live claim.
 const UNBOUND_PREVIOUS_CLAIM_UID: &str = "00000000-0000-4000-8000-000000000001";
@@ -96,8 +100,7 @@ async fn failure_paths_through_deployed_platform() -> TestResult<()> {
         &config,
     )
     .await?;
-    missing_pvc_binding_fails_materialization_without_ready_backend(&mut operator, kube, &config)
-        .await?;
+    unbound_auxiliary_claim_leaves_the_wake_to_readiness(&mut operator, kube, &config).await?;
 
     Ok(())
 }
@@ -450,7 +453,11 @@ async fn duplicate_volume_inventory_is_rejected_at_class_creation(
         .await
 }
 
-async fn missing_pvc_binding_fails_materialization_without_ready_backend(
+/// The workload is created without waiting for a claim to bind, and the wake
+/// completes when its Pod is ready. An auxiliary claim the Pod does not mount,
+/// reserved to an earlier claim so that it never binds, holds nothing up, and
+/// deleting the instance still removes it with the rest of the inventory.
+async fn unbound_auxiliary_claim_leaves_the_wake_to_readiness(
     operator: &mut OperatorControlPlaneClient<Channel>,
     kube: Client,
     config: &E2eConfig,
@@ -498,46 +505,74 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
     {
         return Err(format!("accepted unbound wake must identify exactly the next Waking generation: Cold={}, accepted={accepted:?}", created.generation).into());
     }
-    // Observe a real Kubernetes Pending claim before terminal cleanup can remove it.
+    // Observe a real Kubernetes Pending claim with the binding refused.
     wait_for_stale_claim_inventory(
         kube.clone(),
         &config.namespace,
         accepted.instance_generation,
     )
     .await?;
-    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
 
-    // One request waits on the accepted wake; it must never receive a ready backend.
-    let failed_response = tokio::time::timeout(
+    let served = tokio::time::timeout(
         Duration::from_secs(60),
         http_get(config.frontline_addr, UNBOUND_ROUTE_HOST, "/"),
     )
     .await??;
-    if failed_response.status != 503 || failed_response.body.contains(APP_RESPONSE) {
+    if served.status != 200 || !served.body.contains(APP_RESPONSE) {
         return Err(format!(
-            "unbound PVC must return HTTP 503 without backend body, got {} {:?}",
-            failed_response.status, failed_response.body
+            "an unbound auxiliary claim must leave the wake to its Pod, got {} {:?}",
+            served.status, served.body
         )
         .into());
     }
-    let failed = wait_for_instance_state(
+    let running = wait_for_instance_state(
         operator,
         UNBOUND_INSTANCE_ID,
-        PbInstanceState::Failed,
+        PbInstanceState::Running,
         Duration::from_secs(30),
     )
     .await?;
-    if failed.generation < accepted.instance_generation
-        || started.elapsed() > Duration::from_secs(90)
-    {
-        return Err(
-            "accepted PVC binding failure did not reach Failed within the bounded gate".into(),
-        );
+    if started.elapsed() > Duration::from_secs(90) {
+        return Err("the wake waited on a claim its Pod does not mount".into());
     }
-    assert_no_stateful_backend(kube.clone(), &config.namespace).await?;
-    wait_for_unbound_inventory_cleanup(kube, &config.namespace).await?;
+    wait_for_stale_claim_inventory(
+        kube.clone(),
+        &config.namespace,
+        accepted.instance_generation,
+    )
+    .await?;
 
-    Ok(())
+    operator
+        .delete_instance(DeleteInstanceRequest {
+            instance_id: UNBOUND_INSTANCE_ID.to_owned(),
+            expected_generation: Some(running.generation),
+        })
+        .await?;
+    wait_for_unbound_inventory_cleanup(kube, &config.namespace).await?;
+    wait_for_instance_absent(operator, UNBOUND_INSTANCE_ID, Duration::from_secs(60)).await
+}
+
+async fn wait_for_instance_absent(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    instance_id: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match operator
+            .get_instance(control_plane::api::pb::GetInstanceRequest {
+                instance_id: instance_id.to_owned(),
+            })
+            .await
+        {
+            Err(status) if status.code() == Code::NotFound => return Ok(()),
+            Err(status) => return Err(status.into()),
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(format!("instance {instance_id} was not deleted").into())
+            }
+            Ok(_) => sleep(Duration::from_secs(1)).await,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -999,33 +1034,18 @@ fn assert_inventory_ownership_for_accepted_wake(
     Ok(())
 }
 
-async fn assert_no_stateful_backend(kube: Client, namespace: &str) -> TestResult<()> {
-    let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
-    assert_no_labeled_objects(
-        "StatefulSet",
-        UNBOUND_INSTANCE_ID,
-        Api::<StatefulSet>::namespaced(kube.clone(), namespace)
-            .list(&selector)
-            .await?,
-    )?;
-    assert_no_labeled_objects(
-        "Service",
-        UNBOUND_INSTANCE_ID,
-        Api::<Service>::namespaced(kube, namespace)
-            .list(&selector)
-            .await?,
-    )?;
-    Ok(())
-}
-
 async fn wait_for_unbound_inventory_cleanup(kube: Client, namespace: &str) -> TestResult<()> {
     let pvs: Api<PersistentVolume> = Api::all(kube.clone());
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube, namespace);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(kube.clone(), namespace);
+    let stateful_sets: Api<StatefulSet> = Api::namespaced(kube.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(kube, namespace);
     let selector = ListParams::default().labels(&instance_selector(UNBOUND_INSTANCE_ID));
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if pvs.list(&selector).await?.items.is_empty()
             && pvcs.list(&selector).await?.items.is_empty()
+            && stateful_sets.list(&selector).await?.items.is_empty()
+            && services.list(&selector).await?.items.is_empty()
         {
             return Ok(());
         }
@@ -1119,32 +1139,66 @@ fn unbound_static_inventory(namespace: &str) -> Vec<RawKubernetesManifestTemplat
     // prebindings without that check. Reserve this task-owned Retain PV to an
     // explicit prior claim incarnation, keeping exact recorded names and equal
     // capacities. The current claim must stay Pending until the wake deadline.
+    let pv_name = format!("{UNBOUND_PV_BASE}-{SUFFIX}");
+    let pvc_name = format!("{UNBOUND_FIRST_PVC_BASE}-{SUFFIX}");
     [
         json!({
             "apiVersion": "v1", "kind": "PersistentVolume",
-            "metadata": { "name": UNBOUND_PV_NAME },
+            "metadata": { "name": pv_name },
             "spec": {
                 "capacity": { "storage": "1Mi" },
                 "accessModes": ["ReadWriteOnce"],
                 "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
                 "persistentVolumeReclaimPolicy": "Retain",
-                "claimRef": { "namespace": namespace, "name": UNBOUND_FIRST_PVC_NAME, "uid": UNBOUND_PREVIOUS_CLAIM_UID },
+                "claimRef": { "namespace": namespace, "name": pvc_name, "uid": UNBOUND_PREVIOUS_CLAIM_UID },
                 "hostPath": { "path": "/tmp/sleepypods-kind-e2e-failures/unbound", "type": "DirectoryOrCreate" }
             }
         }),
         json!({
             "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": { "name": UNBOUND_FIRST_PVC_NAME, "namespace": namespace },
+            "metadata": { "name": pvc_name, "namespace": namespace },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
                 "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
-                "volumeName": UNBOUND_PV_NAME,
+                "volumeName": pv_name,
                 "resources": { "requests": { "storage": "1Mi" } }
             }
         }),
     ].into_iter().map(|value| RawKubernetesManifestTemplate {
-        manifest: Some(literal_text(&value.to_string())),
+        manifest: Some(suffixed_text(&value.to_string())),
     }).collect()
+}
+
+/// Template text that reads the instance suffix wherever `value` has `SUFFIX`.
+fn suffixed_text(value: &str) -> TemplateText {
+    let mut pieces = value.split(SUFFIX);
+    let literal = |text: &str| TemplateTextPart {
+        kind: Some(template_text_part::Kind::Literal(text.to_owned())),
+    };
+    let mut parts = vec![literal(pieces.next().unwrap_or_default())];
+    for piece in pieces {
+        parts.push(TemplateTextPart {
+            kind: Some(template_text_part::Kind::InstanceValue(
+                control_plane::manifest::INSTANCE_SUFFIX_VALUE.to_owned(),
+            )),
+        });
+        parts.push(literal(piece));
+    }
+    TemplateText { parts }
+}
+
+#[test]
+fn unbound_names_are_the_instance_scoped_names() {
+    let instance_id = control_plane::InstanceId::new(UNBOUND_INSTANCE_ID).unwrap();
+    for (constant, base) in [
+        (UNBOUND_PV_NAME, UNBOUND_PV_BASE),
+        (UNBOUND_FIRST_PVC_NAME, UNBOUND_FIRST_PVC_BASE),
+    ] {
+        assert_eq!(
+            constant,
+            control_plane::render_instance_scoped_name(base, &instance_id)
+        );
+    }
 }
 
 // Run the same raw inventory through the real renderer without requiring a cluster.
@@ -1156,15 +1210,23 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
     let raw_objects = unbound_static_inventory(namespace)
         .into_iter()
         .map(|raw| {
-            let text = raw.manifest.expect("fixture raw manifest exists");
-            let [TemplateTextPart {
-                kind: Some(template_text_part::Kind::Literal(text)),
-            }] = text.parts.as_slice()
-            else {
-                panic!("fixture raw manifest is literal");
-            };
+            let parts: Vec<domain::TemplateTextPart> = raw
+                .manifest
+                .expect("fixture raw manifest exists")
+                .parts
+                .into_iter()
+                .map(|part| match part.kind {
+                    Some(template_text_part::Kind::Literal(text)) => {
+                        domain::TemplateTextPart::literal(text)
+                    }
+                    Some(template_text_part::Kind::InstanceValue(name)) => {
+                        domain::TemplateTextPart::instance_value(name)
+                    }
+                    other => panic!("unexpected fixture text part {other:?}"),
+                })
+                .collect();
             domain::manifest::RawKubernetesManifestTemplate {
-                manifest: domain::TemplateText::literal(text),
+                manifest: domain::TemplateText::from_parts(parts),
             }
         })
         .collect();
@@ -1234,6 +1296,7 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
     // The projection plan adds the same final managed-by/ownership stamps used
     // by the production reconciler; the pure renderer alone does not add them.
     let materialization = domain::MaterializationRecord {
+        pod_backend: None,
         id: domain::MaterializationId::new("fixture-unbound")?,
         instance_id: pending.instance_id,
         instance_generation: pending.instance_generation,

@@ -12,18 +12,19 @@ use k8s_openapi::api::{
 use kube::{
     api::{
         Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
-        Preconditions,
+        Preconditions, WatchEvent, WatchParams,
     },
     Client, Error as KubeError,
 };
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::timeout;
+use tonic::codegen::tokio_stream::StreamExt;
 
 use crate::{
     manifest::KubernetesObject,
     materialization::{BackendEndpoint, RenderedObjectRef},
     materializer::{
-        rendered_object_ref, KubernetesClientError, KubernetesClientFuture, KubernetesClientResult,
-        KubernetesMaterializerClient,
+        is_workload_ref, rendered_object_ref, KubernetesClientError, KubernetesClientFuture,
+        KubernetesClientResult, KubernetesMaterializerClient,
     },
     projection::{LiveObjectMetadata, ProjectionObjectInspection, ProjectionReadinessInspection},
 };
@@ -31,6 +32,10 @@ use crate::{
 const DEFAULT_FIELD_MANAGER: &str = "sleepypods-control-plane";
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 const BACKEND_SCHEME_ANNOTATION: &str = "sleepypods.io/backend-scheme";
+/// The API server ends each readiness watch after this long, which bounds how
+/// long a replaced Service goes unread.
+const WATCH_ROUND_SECONDS: u32 = 30;
+const WATCH_ROUND_PAUSE: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct KubeMaterializerClient {
@@ -42,10 +47,10 @@ pub struct KubeMaterializerClient {
 pub struct KubeMaterializerClientConfig {
     pub field_manager: String,
     pub backend_scheme: String,
-    pub delete_timeout: Duration,
-    pub pvc_bound_timeout: Duration,
+    /// Bounds one mutation or short read.
+    pub request_timeout: Duration,
+    /// Bounds one wait for a ready endpoint.
     pub readiness_timeout: Duration,
-    pub poll_interval: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +98,64 @@ impl KubeMaterializerClient {
     }
 }
 
+impl KubeMaterializerClient {
+    /// Returns once an EndpointSlice the Service owns has a ready endpoint.
+    /// Each round reads the Service and its slices, then follows the slices by
+    /// watch from that list's resourceVersion. A round ends when the watch
+    /// does, so a replaced Service or an expired resourceVersion is read again.
+    async fn watch_for_ready_endpoint(
+        &self,
+        service_ref: &RenderedObjectRef,
+    ) -> KubernetesClientResult<BackendEndpoint> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &service_ref.namespace);
+        let endpoint_slices: Api<EndpointSlice> =
+            Api::namespaced(self.client.clone(), &service_ref.namespace);
+        let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
+        loop {
+            let service = services.get(&service_ref.name).await.map_err(kube_error)?;
+            let backend = backend_endpoint_for_service(&service, &self.config)?;
+            let listed = endpoint_slices
+                .list(&ListParams::default().labels(&selector))
+                .await
+                .map_err(kube_error)?;
+            if listed
+                .iter()
+                .any(|slice| endpoint_slice_has_ready_endpoint(&service, slice))
+            {
+                return Ok(backend);
+            }
+            let version = listed.metadata.resource_version.unwrap_or_default();
+            let watch = endpoint_slices
+                .watch(
+                    &WatchParams::default()
+                        .labels(&selector)
+                        .timeout(WATCH_ROUND_SECONDS),
+                    &version,
+                )
+                .await
+                .map_err(kube_error)?;
+            let mut watch = std::pin::pin!(watch);
+            while let Some(event) = watch.next().await {
+                match event {
+                    Ok(WatchEvent::Added(slice) | WatchEvent::Modified(slice))
+                        if endpoint_slice_has_ready_endpoint(&service, &slice) =>
+                    {
+                        return Ok(backend);
+                    }
+                    Ok(
+                        WatchEvent::Added(_) | WatchEvent::Modified(_) | WatchEvent::Bookmark(_),
+                    ) => {}
+                    // A deleted slice, an expired version or a broken stream:
+                    // read the current state again.
+                    Ok(WatchEvent::Deleted(_) | WatchEvent::Error(_)) | Err(_) => break,
+                }
+            }
+            // An API server that ends watches early is read at this pace.
+            tokio::time::sleep(WATCH_ROUND_PAUSE).await;
+        }
+    }
+}
+
 impl KubernetesMaterializerClient for KubeMaterializerClient {
     fn verify_idle_member<'a>(
         &'a self,
@@ -118,9 +181,13 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
             let object_ref = rendered_object_ref(object);
             let api = self.dynamic_api(&object_ref)?;
             let mut body = object.to_kubernetes_json();
+            let workload = is_workload_ref(&object_ref);
             let operation = async {
                 match precondition {
                     None => {
+                        if workload {
+                            body["spec"]["replicas"] = 0.into();
+                        }
                         let object: DynamicObject = serde_json::from_value(body)
                             .map_err(|error| KubernetesClientError::new(error.to_string()))?;
                         api.create(
@@ -136,6 +203,12 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                     }
                     Some(identity) => {
                         validate_identity(identity)?;
+                        // A raw template may leave the count to the API
+                        // server's default, which a merge patch would not
+                        // restore from zero.
+                        if workload && body["spec"]["replicas"].is_null() {
+                            body["spec"]["replicas"] = 1.into();
+                        }
                         body["metadata"]["uid"] = identity.uid.clone().into();
                         body["metadata"]["resourceVersion"] =
                             identity.resource_version.clone().into();
@@ -150,11 +223,55 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                     }
                 }
             };
-            timeout(self.config.delete_timeout, operation)
+            timeout(self.config.request_timeout, operation)
                 .await
                 .map_err(|_| {
-                    KubernetesClientError::uncertain(
-                        "Kubernetes mutation timed out; effect outcome is unknown",
+                    KubernetesClientError::stale(
+                        "Kubernetes mutation timed out; its outcome is unknown",
+                    )
+                })?
+        })
+    }
+
+    fn activate_workload<'a>(
+        &'a self,
+        object: &'a KubernetesObject,
+        identity: &'a crate::projection::LiveObjectIdentity,
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
+        Box::pin(async move {
+            validate_identity(identity)?;
+            let object_ref = rendered_object_ref(object);
+            let api = self.dynamic_api(&object_ref)?;
+            let replicas = match &object.to_kubernetes_json()["spec"]["replicas"] {
+                serde_json::Value::Null => 1.into(),
+                replicas => replicas.clone(),
+            };
+            let body = serde_json::json!({
+                "metadata": { "uid": identity.uid },
+                "spec": { "replicas": replicas },
+            });
+            let params = PatchParams {
+                field_manager: Some(self.config.field_manager.clone()),
+                ..PatchParams::default()
+            };
+            let operation = async {
+                api.patch(&object_ref.name, &params, &Patch::Merge(&body))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| match &error {
+                        // The API server refuses a UID that differs from the
+                        // live object's as an invalid change to metadata.
+                        KubeError::Api(status) if status.code == 422 => {
+                            KubernetesClientError::stale(error.to_string())
+                        }
+                        _ => mutation_error(error),
+                    })
+            };
+            timeout(self.config.request_timeout, operation)
+                .await
+                .map_err(|_| {
+                    KubernetesClientError::stale(
+                        "Kubernetes mutation timed out; its outcome is unknown",
                     )
                 })?
         })
@@ -169,7 +286,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
             validate_identity(precondition)?;
             let api = self.dynamic_api(object)?;
             if object.kind == "PersistentVolume" {
-                let live = match timeout(self.config.delete_timeout, api.get(&object.name))
+                let live = match timeout(self.config.request_timeout, api.get(&object.name))
                     .await
                     .map_err(|_| {
                         KubernetesClientError::transient("PV retention inspection timed out")
@@ -203,14 +320,12 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
                 ..DeleteParams::foreground()
             };
             match timeout(
-                self.config.delete_timeout,
+                self.config.request_timeout,
                 api.delete(&object.name, &params),
             )
             .await
             .map_err(|_| {
-                KubernetesClientError::uncertain(
-                    "Kubernetes delete timed out; effect outcome is unknown",
-                )
+                KubernetesClientError::stale("Kubernetes delete timed out; its outcome is unknown")
             })? {
                 Ok(_) => Ok(()),
                 Err(error) if is_not_found(&error) => Ok(()),
@@ -219,75 +334,50 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         })
     }
 
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async move {
-            timeout(self.config.pvc_bound_timeout, async move {
-            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
-            let deadline = Instant::now() + self.config.pvc_bound_timeout;
-
-            loop {
-                let pvc = pvcs.get(name).await.map_err(kube_error)?;
-                if pvc_phase_is_bound(&pvc) {
-                    return Ok(());
-                }
-
-                sleep_until_next_poll(
-                    deadline,
-                    self.config.poll_interval,
-                    format!("timed out waiting for PersistentVolumeClaim {namespace}/{name} to become Bound"),
-                )
-                .await?;
-            }
-            }).await.map_err(|_| KubernetesClientError::transient("Kubernetes read/wait timed out"))?
-        })
-    }
-
     fn wait_for_readiness<'a>(
         &'a self,
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<BackendEndpoint>> {
         Box::pin(async move {
-            timeout(self.config.readiness_timeout, async move {
+            let service_ref = rendered_service_ref(objects)?;
+            timeout(
+                self.config.readiness_timeout,
+                self.watch_for_ready_endpoint(service_ref),
+            )
+            .await
+            .map_err(|_| {
+                KubernetesClientError::transient(format!(
+                    "timed out waiting for a ready endpoint of Service {}/{}",
+                    service_ref.namespace, service_ref.name
+                ))
+            })?
+        })
+    }
+
+    fn ready_pod_backend<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<Option<BackendEndpoint>>> {
+        Box::pin(async move {
+            timeout(self.config.request_timeout, async move {
                 let service_ref = rendered_service_ref(objects)?;
                 let services: Api<Service> =
                     Api::namespaced(self.client.clone(), &service_ref.namespace);
                 let endpoint_slices: Api<EndpointSlice> =
                     Api::namespaced(self.client.clone(), &service_ref.namespace);
-                let deadline = Instant::now() + self.config.readiness_timeout;
-
-                loop {
-                    let service = services.get(&service_ref.name).await.map_err(kube_error)?;
-                    let backend = backend_endpoint_for_service(&service, &self.config)?;
-                    let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
-                    let slices = endpoint_slices
-                        .list(&ListParams::default().labels(&selector))
-                        .await
-                        .map_err(kube_error)?;
-
-                    if slices
-                        .iter()
-                        .any(|slice| endpoint_slice_has_ready_endpoint(&service, slice))
-                    {
-                        return Ok(backend);
-                    }
-
-                    sleep_until_next_poll(
-                        deadline,
-                        self.config.poll_interval,
-                        format!(
-                            "timed out waiting for ready EndpointSlice endpoints for Service {}/{}",
-                            service_ref.namespace, service_ref.name
-                        ),
-                    )
-                    .await?;
-                }
+                let service = services.get(&service_ref.name).await.map_err(kube_error)?;
+                let selector = format!("{SERVICE_NAME_LABEL}={}", service_ref.name);
+                let slices = endpoint_slices
+                    .list(&ListParams::default().labels(&selector))
+                    .await
+                    .map_err(kube_error)?;
+                let backend = slices
+                    .iter()
+                    .find_map(|slice| ready_pod_backend_for_slice(&service, slice, &self.config));
+                Ok(backend)
             })
             .await
-            .map_err(|_| KubernetesClientError::transient("Kubernetes read/wait timed out"))?
+            .map_err(|_| KubernetesClientError::transient("Kubernetes read timed out"))?
         })
     }
 
@@ -297,7 +387,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionObjectInspection>> {
         Box::pin(async move {
             let api = self.dynamic_api(object)?;
-            match timeout(self.config.delete_timeout, api.get(&object.name))
+            match timeout(self.config.request_timeout, api.get(&object.name))
                 .await
                 .map_err(|_| KubernetesClientError::transient("Kubernetes inspection timed out"))?
             {
@@ -333,7 +423,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            timeout(self.config.delete_timeout, async {
+            timeout(self.config.request_timeout, async {
                 let pvs: Api<k8s_openapi::api::core::v1::PersistentVolume> =
                     Api::all(self.client.clone());
                 for object in objects
@@ -393,7 +483,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         instance_id: &'a str,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            timeout(self.config.delete_timeout, async {
+            timeout(self.config.request_timeout, async {
                 let namespaces = objects
                     .iter()
                     .map(|object| object.namespace.as_str())
@@ -443,7 +533,7 @@ impl KubernetesMaterializerClient for KubeMaterializerClient {
         objects: &'a [RenderedObjectRef],
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<ProjectionReadinessInspection>> {
         Box::pin(async move {
-            timeout(self.config.delete_timeout, async move {
+            timeout(self.config.request_timeout, async move {
                 let service_ref = match rendered_service_ref(objects) {
                     Ok(service_ref) => service_ref,
                     Err(_) => return Ok(ProjectionReadinessInspection::NotObserved),
@@ -481,10 +571,8 @@ impl Default for KubeMaterializerClientConfig {
         Self {
             field_manager: DEFAULT_FIELD_MANAGER.to_owned(),
             backend_scheme: "http".to_owned(),
-            delete_timeout: Duration::from_secs(10),
-            pvc_bound_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_secs(10),
             readiness_timeout: Duration::from_secs(120),
-            poll_interval: Duration::from_secs(2),
         }
     }
 }
@@ -501,24 +589,14 @@ impl KubeMaterializerClientConfig {
                 field: "backend_scheme",
             });
         }
-        if self.delete_timeout.is_zero() {
+        if self.request_timeout.is_zero() {
             return Err(InvalidKubeMaterializerClientConfig {
-                field: "delete_timeout",
-            });
-        }
-        if self.pvc_bound_timeout.is_zero() {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "pvc_bound_timeout",
+                field: "request_timeout",
             });
         }
         if self.readiness_timeout.is_zero() {
             return Err(InvalidKubeMaterializerClientConfig {
                 field: "readiness_timeout",
-            });
-        }
-        if self.poll_interval.is_zero() {
-            return Err(InvalidKubeMaterializerClientConfig {
-                field: "poll_interval",
             });
         }
         Ok(())
@@ -589,12 +667,21 @@ fn backend_endpoint_for_service(
             KubernetesClientError::new("live Service is missing metadata.namespace")
         })?;
     let port = service_port(service)?;
+    // The ClusterIP is fixed for the Service's life, so a proxy connects
+    // without a DNS lookup. A headless Service has only its DNS name.
+    let host = match service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.cluster_ip.as_deref())
+        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+    {
+        Some(std::net::IpAddr::V4(ip)) => ip.to_string(),
+        Some(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        None => format!("{name}.{namespace}.svc.cluster.local"),
+    };
 
-    BackendEndpoint::new(format!(
-        "{}://{name}.{namespace}.svc.cluster.local:{port}",
-        backend_scheme
-    ))
-    .map_err(|error| KubernetesClientError::new(error.to_string()))
+    BackendEndpoint::new(format!("{backend_scheme}://{host}:{port}"))
+        .map_err(|error| KubernetesClientError::new(error.to_string()))
 }
 
 fn backend_scheme_for_service<'a>(
@@ -626,6 +713,58 @@ fn backend_scheme_for_service<'a>(
     Ok(&config.backend_scheme)
 }
 
+/// The address of a ready endpoint in a slice the Service owns, on the slice
+/// port that backs the Service's first port.
+fn ready_pod_backend_for_slice(
+    service: &Service,
+    slice: &EndpointSlice,
+    config: &KubeMaterializerClientConfig,
+) -> Option<BackendEndpoint> {
+    if !endpoint_slice_has_ready_endpoint(service, slice) {
+        return None;
+    }
+    let address = slice
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint_is_ready(endpoint))
+        .find_map(|endpoint| endpoint.addresses.first())?
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    let service_port = service.spec.as_ref()?.ports.as_ref()?.first()?;
+    let ports = slice.ports.as_ref()?;
+    let port = ports
+        .iter()
+        .find(|port| {
+            port.name.as_deref().unwrap_or_default()
+                == service_port.name.as_deref().unwrap_or_default()
+        })
+        .or(match ports.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })?
+        .port?;
+    let scheme = backend_scheme_for_service(service, config).ok()?;
+    BackendEndpoint::new(format!(
+        "{scheme}://{}",
+        std::net::SocketAddr::new(address, port as u16)
+    ))
+    .ok()
+}
+
+fn endpoint_is_ready(endpoint: &k8s_openapi::api::discovery::v1::Endpoint) -> bool {
+    !endpoint.addresses.is_empty()
+        && endpoint
+            .conditions
+            .as_ref()
+            .and_then(|conditions| conditions.terminating)
+            != Some(true)
+        && endpoint
+            .conditions
+            .as_ref()
+            .and_then(|conditions| conditions.ready)
+            .unwrap_or(true)
+}
+
 fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -> bool {
     let Some(uid) = service
         .metadata
@@ -653,19 +792,7 @@ fn endpoint_slice_has_ready_endpoint(service: &Service, slice: &EndpointSlice) -
     {
         return false;
     }
-    slice.endpoints.iter().any(|endpoint| {
-        !endpoint.addresses.is_empty()
-            && endpoint
-                .conditions
-                .as_ref()
-                .and_then(|conditions| conditions.terminating)
-                != Some(true)
-            && endpoint
-                .conditions
-                .as_ref()
-                .and_then(|conditions| conditions.ready)
-                .unwrap_or(true)
-    })
+    slice.endpoints.iter().any(endpoint_is_ready)
 }
 
 fn readiness_inspection_for_service(
@@ -734,31 +861,11 @@ fn service_port(service: &Service) -> KubernetesClientResult<i32> {
     Ok(port)
 }
 
-fn pvc_phase_is_bound(pvc: &PersistentVolumeClaim) -> bool {
-    pvc.status
-        .as_ref()
-        .and_then(|status| status.phase.as_deref())
-        == Some("Bound")
-}
-
-async fn sleep_until_next_poll(
-    deadline: Instant,
-    poll_interval: Duration,
-    timeout_message: String,
-) -> KubernetesClientResult<()> {
-    let now = Instant::now();
-    if now >= deadline {
-        return Err(KubernetesClientError::new(timeout_message));
-    }
-
-    sleep(poll_interval.min(deadline - now)).await;
-    Ok(())
-}
-
 fn is_not_found(error: &KubeError) -> bool {
     matches!(error, KubeError::Api(status) if status.is_not_found())
 }
 
+/// Classifies a failed read.
 fn kube_error(error: KubeError) -> KubernetesClientError {
     let message = error.to_string();
     if is_transient_kube_error(&error) {
@@ -771,7 +878,7 @@ fn kube_error(error: KubeError) -> KubernetesClientError {
 fn is_transient_kube_error(error: &KubeError) -> bool {
     match error {
         KubeError::Api(status) => {
-            status.is_conflict() || status.code == 429 || (500..=599).contains(&status.code)
+            status.code == 409 || status.code == 429 || (500..=599).contains(&status.code)
         }
         KubeError::HyperError(_) | KubeError::Service(_) | KubeError::ReadEvents(_) => true,
         _ => false,
@@ -789,13 +896,23 @@ fn validate_identity(
     Ok(())
 }
 
+/// Classifies a failed mutation. A 409 means the object exists or changed
+/// since it was inspected. A 5xx or a broken connection leaves the outcome
+/// unknown. Either way the caller inspects the object and decides again; every
+/// request it may send is conditional or creates nothing that runs.
 fn mutation_error(error: KubeError) -> KubernetesClientError {
     match &error {
-        KubeError::Api(status) if status.code < 500 => kube_error(error),
-        KubeError::BuildRequest(_) | KubeError::HttpError(_) | KubeError::Auth(_) => {
-            KubernetesClientError::new(error.to_string())
+        KubeError::Api(status) if status.code == 429 => {
+            KubernetesClientError::transient(error.to_string())
         }
-        _ => KubernetesClientError::uncertain(error.to_string()),
+        KubeError::Api(status) if status.code == 409 || status.code >= 500 => {
+            KubernetesClientError::stale(error.to_string())
+        }
+        KubeError::Api(_)
+        | KubeError::BuildRequest(_)
+        | KubeError::HttpError(_)
+        | KubeError::Auth(_) => KubernetesClientError::new(error.to_string()),
+        _ => KubernetesClientError::stale(error.to_string()),
     }
 }
 
@@ -819,8 +936,8 @@ mod tests {
 
     use super::{
         api_resource_for_ref, backend_endpoint_for_service, endpoint_slice_has_ready_endpoint,
-        is_not_found, is_valid_uri_scheme, kube_error, readiness_inspection_for_service,
-        rendered_service_ref, KubeMaterializerClientConfig,
+        is_not_found, is_valid_uri_scheme, kube_error, mutation_error,
+        readiness_inspection_for_service, rendered_service_ref, KubeMaterializerClientConfig,
     };
 
     #[test]
@@ -876,7 +993,7 @@ mod tests {
             .expect_err("PV is cluster scoped");
 
         assert!(error
-            .message()
+            .to_string()
             .contains("unsupported rendered Kubernetes object"));
     }
 
@@ -997,14 +1114,43 @@ mod tests {
 
     #[test]
     fn validates_timeout_configuration() {
-        let config = KubeMaterializerClientConfig {
-            poll_interval: Duration::ZERO,
+        let request = KubeMaterializerClientConfig {
+            request_timeout: Duration::ZERO,
+            ..KubeMaterializerClientConfig::default()
+        };
+        let readiness = KubeMaterializerClientConfig {
+            readiness_timeout: Duration::ZERO,
             ..KubeMaterializerClientConfig::default()
         };
 
-        let error = config.validate().expect_err("zero poll interval rejected");
+        assert_eq!(
+            request.validate().expect_err("zero timeout").field(),
+            "request_timeout"
+        );
+        assert_eq!(
+            readiness.validate().expect_err("zero timeout").field(),
+            "readiness_timeout"
+        );
+    }
 
-        assert_eq!(error.field(), "poll_interval");
+    #[test]
+    fn backend_uri_uses_the_service_cluster_ip() {
+        let config = KubeMaterializerClientConfig::default();
+        for (cluster_ip, expected) in [
+            (Some("10.96.0.10"), "http://10.96.0.10:80"),
+            (Some("fd00::10"), "http://[fd00::10]:80"),
+            // A headless Service and one not yet allocated have only a name.
+            (Some("None"), "http://api.apps.svc.cluster.local:80"),
+            (None, "http://api.apps.svc.cluster.local:80"),
+        ] {
+            let mut service = service("api", "apps", [80]);
+            service.spec.as_mut().unwrap().cluster_ip = cluster_ip.map(str::to_owned);
+
+            let backend =
+                backend_endpoint_for_service(&service, &config).expect("service backend endpoint");
+
+            assert_eq!(backend.uri(), expected);
+        }
     }
 
     #[test]
@@ -1048,7 +1194,7 @@ mod tests {
         })));
 
         assert!(error.is_retryable());
-        assert!(error.message().contains("resource version conflict"));
+        assert!(error.to_string().contains("resource version conflict"));
     }
 
     #[test]
@@ -1061,7 +1207,33 @@ mod tests {
         })));
 
         assert!(!error.is_retryable());
-        assert!(error.message().contains("manifest is invalid"));
+        assert!(error.to_string().contains("manifest is invalid"));
+    }
+
+    #[test]
+    fn mutation_failures_say_whether_to_resend_inspect_or_stop() {
+        let api = |code: u16, reason: &str| {
+            mutation_error(KubeError::Api(Box::new(Status {
+                code,
+                reason: reason.to_owned(),
+                ..Status::default()
+            })))
+        };
+
+        // The object exists or changed, or the outcome is unknown: inspect it.
+        for stale in [
+            api(409, "AlreadyExists"),
+            api(409, "Conflict"),
+            api(500, "InternalError"),
+            api(503, "ServiceUnavailable"),
+            api(504, "Timeout"),
+        ] {
+            assert!(!stale.is_retryable() && !stale.is_permanent(), "{stale}");
+        }
+        assert!(api(429, "TooManyRequests").is_retryable());
+        for permanent in [api(422, "Invalid"), api(403, "Forbidden")] {
+            assert!(permanent.is_permanent(), "{permanent}");
+        }
     }
 
     #[test]
