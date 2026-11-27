@@ -1,10 +1,10 @@
 //! Wake-latency measurement shared by the stateless and stateful kind drivers.
 //!
 //! A sample sends one cold request through frontline and timestamps, on this
-//! process's monotonic clock, each point the wake passes: workload created,
+//! process's monotonic clock, each point the wake passes: workload scaled up,
 //! Pod ready, EndpointSlice ready, instance Running and first response byte.
 //! The latency the platform adds is the request's whole duration minus the
-//! Pod's own start (workload created to Pod ready).
+//! Pod's own start (workload scaled up to Pod ready).
 
 use std::{
     env,
@@ -50,11 +50,14 @@ pub struct WakeSample {
 pub struct WakeLatency {
     /// Cold request sent to first response byte.
     pub total: Duration,
-    /// Workload created to Pod ready: the Pod's own start, outside the
+    /// Workload scaled up to Pod ready: the Pod's own start, outside the
     /// platform's control.
     pub pod_start: Duration,
-    /// Request sent to workload created: acceptance, pickup and apply.
-    pub request_to_workload: Duration,
+    /// Request sent to the instance leaving its cold state: route resolution
+    /// in frontline and wake acceptance.
+    pub request_to_accepted: Duration,
+    /// Wake accepted to workload scaled up: pickup and apply.
+    pub accepted_to_workload: Duration,
     /// Request sent to claim Bound, for classes with a volume.
     pub request_to_claim_bound: Option<Duration>,
     /// Pod ready to a ready EndpointSlice endpoint: Kubernetes publication.
@@ -102,16 +105,28 @@ where
 {
     let by_instance = format!("{INSTANCE_LABEL}={}", sample.instance_id);
     let by_service = format!("{SERVICE_NAME_LABEL}={}", sample.service_name);
+    // A workload is created with zero replicas and then scaled up; its Pod
+    // can start from the moment it asks for one.
     let deployment = mark(
         Api::<Deployment>::namespaced(kube.clone(), namespace),
         &by_instance,
-        |_| true,
+        |deployment| {
+            deployment
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.replicas.unwrap_or(1) > 0)
+        },
     )
     .await?;
     let stateful_set = mark(
         Api::<StatefulSet>::namespaced(kube.clone(), namespace),
         &by_instance,
-        |_| true,
+        |stateful_set| {
+            stateful_set
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.replicas.unwrap_or(1) > 0)
+        },
     )
     .await?;
     let claim_bound = mark(
@@ -158,12 +173,18 @@ where
     .await?;
 
     let host = sample.host.clone();
+    let cold_state = instance_state(sample.instance_id.clone()).await?;
     let request = Instant::now();
     let response =
         tokio::task::spawn_blocking(move || first_byte(frontline_addr, &host, SAMPLE_DEADLINE));
     let deadline = request + SAMPLE_DEADLINE;
+    let mut accepted = None;
     let running = loop {
-        if instance_state(sample.instance_id.clone()).await? == running_state {
+        let state = instance_state(sample.instance_id.clone()).await?;
+        if state != cold_state {
+            accepted.get_or_insert_with(Instant::now);
+        }
+        if state == running_state {
             break Instant::now();
         }
         if Instant::now() >= deadline {
@@ -189,13 +210,17 @@ where
     let workload = deployment
         .try_recv()
         .or_else(|_| stateful_set.try_recv())
-        .map_err(|_| "workload creation was never observed")?;
+        .map_err(|_| "workload scale-up was never observed")?;
     let claim_bound = claim_bound.try_recv().ok();
+    // The poll that saw the instance leave its cold state can trail the
+    // workload's own event by one interval.
+    let accepted = accepted.expect("Running follows acceptance").min(workload);
 
     Ok(WakeLatency {
         total: first_byte.duration_since(request),
         pod_start: pod_ready.saturating_duration_since(workload),
-        request_to_workload: workload.saturating_duration_since(request),
+        request_to_accepted: accepted.saturating_duration_since(request),
+        accepted_to_workload: workload.saturating_duration_since(accepted),
         request_to_claim_bound: claim_bound.map(|at| at.saturating_duration_since(request)),
         pod_ready_to_endpoint: endpoint_ready.saturating_duration_since(pod_ready),
         endpoint_to_running: running.saturating_duration_since(endpoint_ready),
@@ -209,12 +234,14 @@ pub fn report(label: &str, samples: &[WakeLatency]) -> TestResult<()> {
     for (index, sample) in samples.iter().enumerate() {
         eprintln!(
             "wake-latency: class={label} sample={index} added_ms={} total_ms={} pod_start_ms={} \
-             request_to_workload_ms={} request_to_claim_bound_ms={} pod_ready_to_endpoint_ms={} \
+             request_to_accepted_ms={} accepted_to_workload_ms={} request_to_claim_bound_ms={} \
+             pod_ready_to_endpoint_ms={} \
              endpoint_to_running_ms={} running_to_first_byte_ms={}",
             sample.added().as_millis(),
             sample.total.as_millis(),
             sample.pod_start.as_millis(),
-            sample.request_to_workload.as_millis(),
+            sample.request_to_accepted.as_millis(),
+            sample.accepted_to_workload.as_millis(),
             sample
                 .request_to_claim_bound
                 .map_or_else(|| "-".to_owned(), |value| value.as_millis().to_string()),
@@ -224,10 +251,14 @@ pub fn report(label: &str, samples: &[WakeLatency]) -> TestResult<()> {
         );
     }
     let (added_mean, added_worst) = mean_and_worst(samples.iter().map(WakeLatency::added));
-    let phases: [(&str, Vec<Duration>); 5] = [
+    let phases: [(&str, Vec<Duration>); 6] = [
         (
-            "request_to_workload",
-            samples.iter().map(|s| s.request_to_workload).collect(),
+            "request_to_accepted",
+            samples.iter().map(|s| s.request_to_accepted).collect(),
+        ),
+        (
+            "accepted_to_workload",
+            samples.iter().map(|s| s.accepted_to_workload).collect(),
         ),
         (
             "pod_ready_to_endpoint",
