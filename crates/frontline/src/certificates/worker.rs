@@ -3,54 +3,28 @@ use proxy_core::Shutdown;
 use sleepypods_api::{CertificateBundle, CertificateId, CertificateRevision};
 use sleepypods_certificate::{validate_certificate, validate_hostname};
 use tokio::task::JoinSet;
-use tokio_rustls::rustls::{
-    self,
-    server::{ClientHello, ResolvesServerCert},
-    sign::CertifiedKey,
-};
+use tokio_rustls::rustls;
 
 pub struct TlsCertificateWorker {
     cache: TlsCertificateStore,
     resolver: Arc<dyn CertificateResolver>,
-    receiver: mpsc::Receiver<Fetch>,
     watcher: Option<Arc<dyn CertificateWatcher>>,
-    _watch_memory: Option<OwnedSemaphorePermit>,
 }
 impl TlsCertificateWorker {
-    pub(super) fn new(
-        cache: TlsCertificateStore,
-        resolver: Arc<dyn CertificateResolver>,
-        receiver: mpsc::Receiver<Fetch>,
-    ) -> Self {
+    pub(super) fn new(cache: TlsCertificateStore, resolver: Arc<dyn CertificateResolver>) -> Self {
         Self {
             cache,
             resolver,
-            receiver,
             watcher: None,
-            _watch_memory: None,
         }
     }
     /// The native runtime supplies the same verified client as unary resolves.
-    /// Watches are lazy: an empty HTTP-only/unused TLS cache opens no stream.
-    pub fn with_watch(
-        mut self,
-        watcher: Arc<dyn CertificateWatcher>,
-    ) -> Result<Self, CertificateLookupError> {
-        // Reserve before serving/fetching so active decode work cannot starve
-        // notification delivery. This also owns the stream teardown envelope.
-        self._watch_memory = Some(
-            self.cache
-                .shared
-                .bytes
-                .clone()
-                .try_acquire_many_owned(WATCH_BYTES as u32)
-                .map_err(|_| CertificateLookupError::Capacity)?,
-        );
+    /// Watches are lazy: a cache that holds no certificate opens no stream.
+    pub fn with_watch(mut self, watcher: Arc<dyn CertificateWatcher>) -> Self {
         self.watcher = Some(watcher);
-        Ok(self)
+        self
     }
-    pub async fn run(mut self, shutdown: Shutdown) {
-        let _watch_memory = self._watch_memory.take();
+    pub async fn run(self, shutdown: Shutdown) {
         if let Some(watcher) = self.watcher.clone() {
             let cache = self.cache.clone();
             tokio::join!(
@@ -61,44 +35,119 @@ impl TlsCertificateWorker {
             self.run_fetches(shutdown).await;
         }
     }
-    /// On shutdown, cancel network work, then join every validation already
-    /// dispatched. Bounded blocking input and its byte/fetch permits survive
-    /// caller cancellation; there is no independent refresh task per hostname.
-    async fn run_fetches(mut self, shutdown: Shutdown) {
+    /// Starts queued fetches as slots free up. On shutdown, cancel network
+    /// work, then join every validation already dispatched. Bounded blocking
+    /// input and its fetch slot survive caller cancellation; there is no
+    /// independent refresh task per hostname.
+    async fn run_fetches(self, shutdown: Shutdown) {
         let mut tasks = JoinSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut refresh_turn = false;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => { self.cache.tasks(tasks.len()); },
-                Some(fetch) = self.receiver.recv(), if tasks.len() < CERTIFICATE_FETCHES => {
-                    let cache = self.cache.clone();
-                    let resolver = self.resolver.clone();
-                    let shutdown = shutdown.clone();
-                    tasks.spawn(async move {
-                        fetch_one(cache, resolver, fetch, shutdown).await;
-                    });
-                    self.cache.tasks(tasks.len());
-                },
-                _ = ticker.tick() => {
-                    let mut state = self.cache.shared.state.lock().unwrap();
-                    let due: Vec<_> = state.entries.iter()
-                        .filter(|(_, entry)| !entry.pending && (entry.refresh_requested || entry.value.as_ref()
-                            .is_some_and(|view| view.config.is_some() && Instant::now() >= view.refresh)))
-                        .map(|(hostname, _)| hostname.clone())
-                        .collect();
-                    for hostname in due {
-                        let _ = self.cache.queue_locked(&mut state, &hostname);
-                    }
-                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                _ = self.cache.shared.queued.notified() => {},
+                _ = ticker.tick() => self.cache.queue_due_refreshes(),
             }
+            while tasks.len() < CERTIFICATE_FETCHES {
+                let Some(fetch) = self.cache.next_fetch(&mut refresh_turn) else {
+                    break;
+                };
+                tasks.spawn(fetch_one(
+                    self.cache.clone(),
+                    self.resolver.clone(),
+                    fetch,
+                    shutdown.clone(),
+                ));
+            }
+            self.cache.tasks(tasks.len());
         }
         self.cache.stop();
-        self.receiver.close();
-        while self.receiver.try_recv().is_ok() {}
         while tasks.join_next().await.is_some() {
             self.cache.tasks(tasks.len());
+        }
+    }
+}
+impl TlsCertificateStore {
+    /// Queues a refresh for every certificate whose lease is due.
+    fn queue_due_refreshes(&self) {
+        let now = Instant::now();
+        let mut state = self.shared.state.lock().unwrap();
+        let State {
+            entries,
+            refreshes,
+            serial,
+            ..
+        } = &mut *state;
+        for (hostname, entry) in entries {
+            let due = entry
+                .value
+                .as_ref()
+                .is_some_and(|view| view.config.is_some() && now >= view.refresh);
+            if due && !entry.pending && entry.refresh.is_none() {
+                let Some(position) = serial.checked_add(1) else {
+                    return;
+                };
+                *serial = position;
+                entry.refresh = Some(position);
+                refreshes.insert(position, hostname.clone());
+            }
+        }
+    }
+    /// Takes a fetch slot and the next queued hostname. When both queues hold
+    /// work, `refresh_turn` says which goes first, and it flips with each
+    /// fetch.
+    fn next_fetch(&self, refresh_turn: &mut bool) -> Option<Fetch> {
+        let slot = self.shared.fetches.clone().try_acquire_owned().ok()?;
+        let mut state = self.shared.state.lock().unwrap();
+        let State {
+            entries,
+            lookups,
+            refreshes,
+            ..
+        } = &mut *state;
+        loop {
+            let refresh = if lookups.is_empty() || refreshes.is_empty() {
+                lookups.is_empty()
+            } else {
+                *refresh_turn
+            };
+            let queue = if refresh {
+                &mut *refreshes
+            } else {
+                &mut *lookups
+            };
+            let (_, hostname) = queue.pop_first()?;
+            let Some(entry) = entries.get_mut(&hostname) else {
+                continue;
+            };
+            if refresh {
+                entry.refresh = None;
+            } else {
+                entry.lookup = None;
+                // Every handshake waiting on this lookup has left.
+                if entry.refresh.is_none() && entry.changed.receiver_count() == 0 {
+                    continue;
+                }
+            }
+            if let Some(position) = entry.lookup.take() {
+                lookups.remove(&position);
+            }
+            if let Some(position) = entry.refresh.take() {
+                refreshes.remove(&position);
+            }
+            entry.pending = true;
+            entry.last_error = None;
+            *refresh_turn = !refresh;
+            return Some(Fetch {
+                hostname,
+                generation: entry.generation,
+                prior: entry.value.clone(),
+                floor: entry.floor,
+                _slot: slot,
+            });
         }
     }
 }
@@ -145,9 +194,9 @@ async fn fetch_one(
             Err(error) => metrics::outcome(*error),
         },
     );
-    // The worker task awaits this handle even after deadline/shutdown. Its
-    // memory and fetch slot move into the closure and cannot be prematurely
-    // released by an abandoned handshake or aborted outer async future.
+    // The worker task awaits this handle even after deadline/shutdown. The
+    // fetch slot moves into the closure, so an abandoned handshake or an
+    // aborted outer future leaves it held until validation ends.
     let result = match response {
         Ok(response) => {
             #[cfg(test)]
@@ -176,6 +225,7 @@ async fn fetch_one(
         return;
     };
     entry.pending = false;
+    let certified = entry.certified();
     if shutdown.is_shutdown() || Instant::now() >= deadline {
         entry.last_error = Some(CertificateLookupError::Deadline);
     } else {
@@ -196,25 +246,17 @@ async fn fetch_one(
     }
     entry.changed.send_modify(|v| *v = v.wrapping_add(1));
     let outcome = entry.last_error.map_or(Outcome::Success, metrics::outcome);
+    if entry.certified() != certified {
+        state.interests_changed.send_replace(());
+        enforce_budgets(&mut state, &hostname);
+    }
     drop(state);
     cache.event(Operation::CertificateInstall, outcome);
 }
 
-// The resolver and its permit are retained by ServerConfig, including any old
-// Arc held by an established Rustls connection after cache eviction/rotation.
-// Sessions/tickets/early data are disabled; there is no retained session cache.
-#[derive(Debug)]
-struct AccountedResolver {
-    inner: Arc<dyn ResolvesServerCert>,
-    _memory: OwnedSemaphorePermit,
-}
-impl ResolvesServerCert for AccountedResolver {
-    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.inner.resolve(hello)
-    }
-}
+/// Holds the fetch slot until validation ends.
 pub(super) fn validate_view(
-    mut fetch: Fetch,
+    fetch: Fetch,
     response: pb::ResolveTlsCertificateResponse,
     started: Instant,
     wall: i64,
@@ -236,7 +278,7 @@ pub(super) fn validate_view(
     }
     let authority = wall.max(response.observed_at_unix_millis);
     let mut ttl = response.authorization_ttl_millis.min(300_000);
-    let (config, metadata) = match response.value.ok_or_else(invalid)? {
+    let (config, bytes, metadata) = match response.value.ok_or_else(invalid)? {
         pb::resolve_tls_certificate_response::Value::Missing(_) => {
             if fetch
                 .prior
@@ -246,7 +288,7 @@ pub(super) fn validate_view(
                 return Err(invalid());
             }
             ttl = ttl.min(1000);
-            (None, None)
+            (None, 0, None)
         }
         pb::resolve_tls_certificate_response::Value::Unchanged(metadata) => {
             let prior = fetch.prior.as_ref().ok_or_else(invalid)?;
@@ -260,7 +302,7 @@ pub(super) fn validate_view(
                 return Err(invalid());
             }
             ttl = ttl.min(remaining(&metadata, authority)?);
-            (prior.config.clone(), Some(metadata))
+            (prior.config.clone(), prior.bytes, Some(metadata))
         }
         pb::resolve_tls_certificate_response::Value::Found(found) => {
             if fetch
@@ -305,10 +347,8 @@ pub(super) fn validate_view(
             ttl = ttl.min(remaining(&metadata, authority)?);
             let bytes = bundle.chain_der().iter().map(Vec::len).sum::<usize>()
                 + bundle.private_key_pkcs8_der().len();
-            let charge = CONFIG_OVERHEAD + 4 * bytes;
-            // All allocation before this split is charged at the maximum fetch
-            // reservation. The retained permit also includes metadata overhead.
-            let retained = fetch.memory.split(charge).ok_or_else(invalid)?;
+            // Sessions, tickets and early data are disabled, so a
+            // configuration retains no session cache.
             let mut config = ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
@@ -332,11 +372,7 @@ pub(super) fn validate_view(
             config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
             config.send_tls13_tickets = 0;
             config.max_early_data_size = 0;
-            config.cert_resolver = Arc::new(AccountedResolver {
-                inner: config.cert_resolver.clone(),
-                _memory: retained,
-            });
-            (Some(Arc::new(config)), Some(metadata))
+            (Some(Arc::new(config)), bytes, Some(metadata))
         }
     };
     if ttl == 0 {
@@ -351,6 +387,7 @@ pub(super) fn validate_view(
     Ok(View {
         revision: response.view_revision,
         config,
+        bytes,
         metadata,
         expires,
         // Short authorization/validity windows become due before their hard

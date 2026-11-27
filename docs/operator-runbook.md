@@ -67,10 +67,11 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
-| `sleepypods_runtime_certificate_entries` | gauge | none | Cached positive, missing and pending hostname entries. |
-| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Owned cache reservations and retained configurations; separate from process RSS. |
-| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetch permits held by queued, running, validating or completed work awaiting release. |
-| `sleepypods_runtime_certificate_queue` | gauge | none | Work waiting in the bounded certificate fetch channel. |
+| `sleepypods_runtime_certificate_entries` | gauge | none | Hostnames with a cached certificate; at most 1,024. |
+| `sleepypods_runtime_certificate_negative_entries` | gauge | none | Hostnames cached without a certificate: missing, pending or failed lookups; at most 1,024. |
+| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Chain and key bytes held by cached certificates; separate from process RSS. |
+| `sleepypods_runtime_certificate_fetches` | gauge | none | Fetches running or validating; at most three. |
+| `sleepypods_runtime_certificate_queue` | gauge | none | Handshake lookups and background refreshes awaiting a fetch slot. |
 | `sleepypods_runtime_certificate_tasks` | gauge | none | Supervisor task records, including completed tasks not yet reaped. |
 | `sleepypods_runtime_certificate_task_high_water` | gauge | none | Maximum retained supervisor task records since startup. |
 | `sleepypods_runtime_certificate_watches` | gauge | none | Watch sessions in setup, streaming or teardown. |
@@ -217,9 +218,13 @@ Build dashboards from the exact names above:
   increasing `sleepypods_runtime_certificate_expiry_risk` indicate approaching
   handshake failures. Installation errors require investigation even when fetch
   receipt succeeded. Compare cache and work gauges to their configured bounds
-  and observe process RSS separately. Watch streams normally reconnect at their
+  and observe process RSS separately. A
+  `sleepypods_runtime_certificate_queue` that stays above zero means lookups
+  or refreshes are waiting for the three fetch slots: check control-plane
+  resolve latency, and the rate of `certificate_fetch` `miss` outcomes for a
+  flood of unknown SNI names. Watch streams normally reconnect at their
   60-second lifetime; a close event alone is not an outage. Sustained absence of
-  a watch while the cache has entries calls for checking connectivity and
+  a watch while the cache holds certificates calls for checking connectivity and
   control-plane admission.
 - Load-budget gates: show the latest results from
   `docs/proxy-hot-path-budgets.md` scripts, especially p99 added latency,

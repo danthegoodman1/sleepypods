@@ -219,23 +219,43 @@ cache to disk. Restarting loses the cache; a subsequent TLS connection needs a
 successful resolution. The existing bounded control-plane connection setup still
 applies at startup. An empty cache alone does not prevent listener readiness.
 
-The cache admits at most 1,024 hostname entries, including misses and pending
-lookups, with 64 MiB of accounted memory and at most three simultaneous fetches.
-Memory accounting includes fetch scratch space and configurations still retained
-by handshakes or other references after cache eviction. It is an admission budget, not a
-process RSS limit; connection buffers and the runtime have separate costs.
-The worker reserves four MiB for structures, 32 MiB for watch decoding/state and
-eight MiB for each outstanding fetch. These conservative reservations cover
-malformed repeated protobuf fields as well as valid bundles; they do not imply
-that an idle process allocates that much physical memory. Entry and byte pressure
-can evict cached views before their leases expire.
+The cache holds at most 1,024 hostnames with a certificate. A separate budget
+holds at most 1,024 hostnames without one: authoritative misses, pending lookups
+and failed lookups. A full budget evicts its least recently handshaken hostname,
+choosing first among those with no handshake waiting. A hostname without a
+certificate therefore displaces only another hostname without one, and only a
+1,025th certificate evicts a cached one. At most three fetches run at once.
+
+Entry counts bound cache memory. Validation limits a bundle to 128 KiB and 100
+SANs, so a cached certificate retains at most about 160 KiB: 160 MiB for 1,024
+maximum-size certificates, and about 10 MiB when chains are a few KiB. A hostname
+without a certificate costs about 1 KiB at most. A resolve response is at most
+256 KiB on the wire and a watch snapshot 512 KiB; a malformed one expands to at
+most 8 MiB per fetch and 32 MiB for the watch while it is decoded and rejected.
+The worst case is about 220 MiB. A configuration that is rotated or evicted while
+connections still use it stays in memory until those connections close, so
+`SLEEPYPODS_PROXY_MAX_CONNECTIONS` bounds how many remain. Connection buffers
+and the runtime have separate costs.
+
 Identical misses share one fetch. Lookup has a three-second deadline within the
-overall five-second TLS setup bound; capacity exhaustion fails the handshake.
+overall five-second TLS setup bound. A lookup that finds all three fetch slots
+busy waits its turn in arrival order until that deadline. At most 64 handshakes
+wait on lookups at once, counting those that join a lookup already queued or in
+flight for the same hostname; a further lookup fails its handshake at once. The
+limit is half the default `SLEEPYPODS_PROXY_MAX_HANDSHAKES` of 128, so a flood
+of unknown names leaves handshake permits for hostnames whose certificates are
+cached, and those handshakes complete without waiting. Eviction passes over a
+hostname with a handshake waiting; with at most 64 waiting, a full budget always
+holds another to evict. A lookup whose handshakes have all left starts no fetch.
+Background refreshes wait for the same slots in their own queue. When both
+queues hold work the slots alternate between them, so a burst of unknown names
+leaves refreshes running and a wave of refreshes leaves new hostnames resolving.
 
 Positive views refresh after approximately 60 seconds with hostname jitter, or
-half the granted lease when that is sooner. The worker polls once per second;
-leases shorter than a poll or lookup cannot promise a completed refresh before
-expiry, and selection still fails closed at the original deadline.
+half the granted lease when that is sooner. The worker queues due refreshes once
+per second and starts them as fetch slots free up; leases shorter than a poll or
+lookup cannot promise a completed refresh before expiry, and selection still
+fails closed at the original deadline.
 Each successful authoritative resolution grants at most five minutes of service,
 capped by the effective validity of the entire chain and measured conservatively
 from the start of the RPC. Failed refreshes never extend that deadline. An
@@ -243,12 +263,16 @@ unchanged response can renew only the exact certificate view still held locally.
 Authoritative misses are cached for at most one second. During a control-plane
 outage, an existing valid view remains usable only until its original deadline.
 
-Frontline opens one native certificate watch when its cache first has interests.
-The watch pushes complete binding snapshots containing metadata only. Each
-registration supplies an ID and exact hostname list; the server acknowledges it
-with an atomic current snapshot. Eviction releases the hostname's interest;
-updates coalesce into a bounded complete replacement set. Reconnects synchronize
-all current interests through either control-plane replica.
+Frontline opens one native certificate watch when its cache first holds a
+certificate. The watch follows the hostnames that hold a certificate, so its
+interests fit the 1,024-host limit of one stream. A hostname without a
+certificate has nothing to rotate or revoke; its cached miss expires within one
+second, and the next handshake resolves it again. The watch pushes complete
+binding snapshots containing metadata only. Each registration supplies an ID and
+exact hostname list; the server acknowledges it with an atomic current snapshot.
+Eviction and removal release the hostname's interest; updates coalesce into a
+bounded complete replacement set. Reconnects synchronize all current interests
+through either control-plane replica.
 
 The server checks a private global revision and reads the requested bindings only
 when it changes, or when a new registration requires a snapshot. There is no
