@@ -3469,12 +3469,17 @@ async fn phase5_reservation_concurrency(
         let request = request.clone();
         tasks.spawn(async move { store.accept_wake(request).await });
     }
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // An accept that waited for the held row would wait until the 30-second
+    // statement timeout. The bound sits below that and well above the two
+    // seconds the accepts take when every round trip costs 140ms, as on an
+    // I/O-bound CI database.
+    tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(result) = tasks.join_next().await {
             result.unwrap().unwrap();
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "an accept waited for the unrelated held row")?;
     let elapsed = started.elapsed();
     transaction.rollback().await?;
     // Two transactions racing to acquire one key must produce one owner.
