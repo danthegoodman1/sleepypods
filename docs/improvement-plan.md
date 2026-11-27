@@ -149,7 +149,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 0A: Replace deprecated `fetch_update` calls | Commit `2c27de5`: three call sites use `try_update`; `cargo clippy --workspace --all-targets -- -D warnings` exits 0 on 1.100.0. |
 | Complete | Work | 0B: Pinned toolchain | Commit `2c27de5`: `rust-toolchain.toml` pins 1.100.0; both CI jobs run `rustup toolchain install`; the four image builds use `rust:1.100-bookworm`. |
-| Incomplete | Gate | CI green on the pinned toolchain | Missing: hosted CI run. |
+| In Progress | Gate | CI green on the pinned toolchain | Every `ci.yml` step passes locally at `720a51f`: fmt, clippy, 997 workspace tests, dependency boundaries, both checker scripts, the protocol fixture, both load-smoke checks and the real-Postgres target (46 passed, complete inventory). All fourteen kind gates and `smoke-images.sh` pass at `720a51f`. Missing: hosted CI run on the pull request. |
 
 ## Phase 1: Contain Single-Request and Single-Fault Failures in the Proxies
 
@@ -424,7 +424,7 @@ Status ledger:
 | Complete | Work | 4G: Cleanup completes when pods stop | Commits `1a2a6bd`, `8a2ff7d`: cleanup waits for absence inside the attempt; the renderer sets `terminationGracePeriodSeconds`; `a_normal_sleep_waits_for_the_pod_to_stop_and_records_no_failure`. |
 | Complete | Decision | 4H: Revive during drain | Accepted and implemented in `1a2a6bd` and `9603f06`: `postgres_wake_during_drain_grace_revives_the_projection`; the lifecycle-races kind gate's revive case passes. |
 | Complete | Work | 4I: Pod address first, with sidecar identity check and ClusterIP fallback | Commits `74814b0`, `6eb4940`, `102f0ca`: route entries carry the ready Pod address; frontline opens a Pod connection with an instance claim the sidecar must echo before any request byte is written, and falls back to the Service within 250 ms; a refused claim closes with FIN before the app sees a request. `a_ready_pod_address_serves_before_its_service_is_routable`, `a_sidecar_of_another_instance_at_the_pod_address_never_reaches_its_app`, `instances_that_share_a_pod_address_never_share_a_connection`, `tls_passthrough_keeps_the_service_address`. |
-| Complete | Gate | Wake latency and burst bounds | Burst, never-ready and sleep-wave tests pass (`crates/control-plane/src/reconciler/tests.rs`). Added latency after 4I, 10 samples, mean / worst: stateless 122 / 320 ms (baseline 2,355 / 2,943), stateful 148 / 348 ms (baseline 4,780 / 9,896); stateless, stateful, routing and protocols kind gates pass at `ff66a8b`. |
+| Complete | Gate | Wake latency and burst bounds | Burst, never-ready and sleep-wave tests pass (`crates/control-plane/src/reconciler/tests.rs`). Added latency, 10 samples per run, mean / worst: stateless 122 / 320 ms at `ff66a8b`, 77 / 89 ms at `37187a5` and 134 / 629 ms at `720a51f` (baseline 2,355 / 2,943); stateful 148 / 348 ms at `ff66a8b` and 96 / 109 ms at `720a51f` (baseline 4,780 / 9,896). The one sample over 500 ms spent 561 ms between Pod Ready and its EndpointSlice turning ready, which the Kubernetes EndpointSlice controller decides; the other 29 stateless samples added at most 320 ms. |
 | Complete | Test | Lifecycle-races and stateful kind gates | Stateless, stateful, failures, restart and lifecycle-races kind gates pass at `926a696` (after merging the route stream). |
 
 ## Phase 5: Lifecycle Recovers Without an Operator
