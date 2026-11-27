@@ -150,8 +150,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 0A: Replace deprecated `fetch_update` calls | Missing: three call sites updated; clippy clean on 1.100. |
-| Incomplete | Work | 0B: Pinned toolchain | Missing: `rust-toolchain.toml` and CI reading it. |
+| Complete | Work | 0A: Replace deprecated `fetch_update` calls | Commit `2c27de5`: three call sites use `try_update`; `cargo clippy --workspace --all-targets -- -D warnings` exits 0 on 1.100.0. |
+| Complete | Work | 0B: Pinned toolchain | Commit `2c27de5`: `rust-toolchain.toml` pins 1.100.0; both CI jobs run `rustup toolchain install`; the four image builds use `rust:1.100-bookworm`. |
 | Incomplete | Gate | CI green on the pinned toolchain | Missing: hosted CI run. |
 
 ## Phase 1: Contain Single-Request and Single-Fault Failures in the Proxies
