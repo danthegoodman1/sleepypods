@@ -250,10 +250,7 @@ async fn stateful_wake_latency_through_deployed_platform() -> TestResult<()> {
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
             class_id: LATENCY_CLASS_ID.to_owned(),
             version: 1,
-            value_schema: Some(WorkloadValueSchema {
-                fields: Default::default(),
-                allow_extra: true,
-            }),
+            value_schema: Some(required_values(&["tenant"])),
             template: Some(manifest_template(&config)),
             // Samples stay awake until the driver deletes them.
             sleep_policy: Some(WorkloadSleepPolicy {
