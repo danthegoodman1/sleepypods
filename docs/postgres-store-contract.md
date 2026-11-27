@@ -145,8 +145,8 @@ HTTP-01 resolution, `CertificateStore` certificate administration and
 resolution, `TlsWatchStore` the certificate watch and `RuntimeStore` the
 dispatcher, maintenance and metrics. The services take the composites they
 need (`ProxyServiceStore`, `OperatorServiceStore`, `WorkloadServiceStore`), and
-`ControlPlaneStore` gathers every role. A store implements each operation of a
-role it takes on; no role has a default body that fails at runtime.
+`ControlPlaneStore` gathers every role. A store implements each operation of
+every role it takes on, so a missing operation fails to compile.
 
 An `Unavailable` answer can follow a committed write, so `PostgresStore`
 repeats an operation only when a repeat is safe: reads, immutable class

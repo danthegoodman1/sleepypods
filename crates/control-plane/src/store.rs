@@ -6,8 +6,8 @@
 //! traits at the end gather what each API service and the whole control plane
 //! run on; every store that implements the parts implements them.
 //!
-//! A store implements every operation of a trait it takes on: there are no
-//! default bodies that fail at runtime.
+//! A store implements each operation of every role it takes on, so a missing
+//! operation fails to compile.
 //!
 //! ```compile_fail
 //! use control_plane::store::LifecycleReads;
