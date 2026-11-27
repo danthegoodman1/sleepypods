@@ -14,7 +14,7 @@ use crate::{
         route_events::RouteSubscriptionBroker,
     },
     http01 as domain_http01,
-    ids::{IdempotencyKey, InstanceId, MaterializationId, WorkloadClassId},
+    ids::{InstanceId, MaterializationId, WorkloadClassId},
     instance::{self as domain_instance, InstanceState},
     materialization::{
         ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
@@ -561,7 +561,6 @@ fn create_instance_request_from_proto(
         .collect::<Result<Vec<_>, Status>>()?;
 
     Ok(domain_instance::CreateInstanceRequest::new(
-        parse_idempotency_key(request.idempotency_key)?,
         parse_instance_id(request.instance_id)?,
         workload_class,
     )
@@ -622,7 +621,6 @@ fn create_route_binding_request_from_proto(
     let protocol = protocol_from_proto(request.protocol)?;
 
     Ok(domain_route::CreateRouteBindingRequest::new(
-        parse_idempotency_key(request.idempotency_key)?,
         parse_route_binding_id(request.route_binding_id)?,
         parse_instance_id(request.instance_id)?,
         identity,
@@ -1013,10 +1011,6 @@ fn system_time_from_unix_millis(value: i64) -> SystemTime {
     } else {
         UNIX_EPOCH - Duration::from_millis(value.unsigned_abs())
     }
-}
-
-fn parse_idempotency_key(value: String) -> Result<IdempotencyKey, Status> {
-    IdempotencyKey::new(value).map_err(invalid_argument_status)
 }
 
 fn parse_instance_id(value: String) -> Result<InstanceId, Status> {

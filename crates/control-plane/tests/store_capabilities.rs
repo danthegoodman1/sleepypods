@@ -501,15 +501,9 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     check!(
         1,
         create_instance,
-        CreateInstanceRequest::new(
-            IdempotencyKey::new("instance-key").unwrap(),
-            instance.clone(),
-            class.reference.clone()
+        CreateInstanceRequest::new(instance.clone(), class.reference.clone()).with_values(
+            std::collections::BTreeMap::from([("sentinel".into(), "value".into())])
         )
-        .with_values(std::collections::BTreeMap::from([(
-            "sentinel".into(),
-            "value".into()
-        )]))
     );
     check!(2, get_instance, GetInstanceRequest::new(instance.clone()));
     check!(
@@ -531,7 +525,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
         1,
         create_route_binding,
         CreateRouteBindingRequest::new(
-            IdempotencyKey::new("route-key").unwrap(),
             route.clone(),
             instance.clone(),
             identity.clone(),

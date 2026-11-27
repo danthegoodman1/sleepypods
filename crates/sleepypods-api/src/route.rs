@@ -1,7 +1,7 @@
 use std::{error::Error, fmt, time::Duration};
 
 use crate::{
-    ids::{BackendGeneration, Generation, IdempotencyKey, InstanceId, RouteBindingId},
+    ids::{BackendGeneration, Generation, InstanceId, RouteBindingId},
     instance::InstanceState,
     materialization::{BackendEndpoint, MaterializationTarget},
 };
@@ -33,7 +33,6 @@ pub struct RouteBindingRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRouteBindingRequest {
-    pub idempotency_key: IdempotencyKey,
     pub route_binding_id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
@@ -150,14 +149,12 @@ impl RouteBindingSpec {
 
 impl CreateRouteBindingRequest {
     pub fn new(
-        idempotency_key: IdempotencyKey,
         route_binding_id: RouteBindingId,
         instance_id: InstanceId,
         identity: RouteIdentity,
         protocol: ProtocolRoute,
     ) -> Self {
         Self {
-            idempotency_key,
             route_binding_id,
             instance_id,
             identity,

@@ -48,8 +48,8 @@ pub use http01::{
     PutHttp01ChallengeRequest,
 };
 pub use ids::{
-    materialization_id, BackendGeneration, Generation, IdempotencyKey, InstanceId,
-    MaterializationId, NonEmptyString, RouteBindingId, WorkloadClassId,
+    materialization_id, BackendGeneration, Generation, InstanceId, MaterializationId,
+    NonEmptyString, RouteBindingId, WorkloadClassId,
 };
 pub use instance::{
     CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,

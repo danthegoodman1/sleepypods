@@ -73,7 +73,6 @@ fn unique_violation_resource(constraint: Option<&str>) -> &'static str {
         Some("http01_challenges_pkey") => "HTTP-01 challenge",
         Some("materializations_pkey")
         | Some("materializations_instance_id_cluster_id_namespace_key") => "materialization",
-        Some("idempotency_records_pkey") => "idempotency record",
         _ => "Postgres record",
     }
 }

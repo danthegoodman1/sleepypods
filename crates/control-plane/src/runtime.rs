@@ -183,9 +183,6 @@ impl RuntimeConfig {
                 *setting = std::time::Duration::from_millis(value);
             }
         }
-        store.idempotency_retention =
-            postgres_positive_integer(&values, "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS")?
-                .map(std::time::Duration::from_millis);
         store
             .validate_limits()
             .map_err(|name| RuntimeConfigError::InvalidPostgresSetting { name })?;
@@ -1042,7 +1039,6 @@ pub(crate) mod tests {
             ("SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS", "123"),
             ("SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS", "456"),
             ("SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS", "789"),
-            ("SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS", "60000"),
         ]);
         let config = RuntimeConfig::from_key_values(env).unwrap();
         let config = config.control_plane.store;
@@ -1050,7 +1046,6 @@ pub(crate) mod tests {
         assert_eq!(config.pool_wait_timeout.as_millis(), 123);
         assert_eq!(config.connection_timeout.as_millis(), 456);
         assert_eq!(config.statement_timeout.as_millis(), 789);
-        assert_eq!(config.idempotency_retention.unwrap().as_millis(), 60000);
         for invalid in ["0", "-1", "abc", "18446744073709551615"] {
             let mut env = valid_env();
             env.push(("SLEEPYPODS_POSTGRES_MAX_CONNECTIONS", invalid));
@@ -1059,9 +1054,6 @@ pub(crate) mod tests {
                 Err(RuntimeConfigError::InvalidPostgresSetting { .. })
             ));
         }
-        let config = RuntimeConfig::from_key_values(valid_env()).unwrap();
-        let config = config.control_plane.store;
-        assert_eq!(config.idempotency_retention, None);
     }
 
     #[test]
@@ -1082,10 +1074,6 @@ pub(crate) mod tests {
             (
                 "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
                 PostgresStoreConfig::MAX_TIMEOUT.as_millis(),
-            ),
-            (
-                "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                PostgresStoreConfig::MAX_IDEMPOTENCY_RETENTION.as_millis(),
             ),
         ] {
             for value in [1, maximum] {

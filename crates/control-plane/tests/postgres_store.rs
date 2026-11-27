@@ -20,7 +20,7 @@ use control_plane::{
     CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
     DeleteMaterializationReconciliationRequest, DeleteRouteBindingRequest, EnvVarTemplate,
     FinalizeSleepReconciliationRequest, FinalizeSleepRequest, ForceReleaseExclusivityKeyRequest,
-    Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey,
+    Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey,
     IdleTimeoutOverridePolicy, InstanceId, InstanceRoute, InstanceState,
     ListMaterializationReconciliationCandidatesRequest, ManifestTemplate, MaterializationState,
     MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
@@ -176,7 +176,6 @@ async fn run_conformance(
 
     let missing_required = store
         .create_instance(CreateInstanceRequest::new(
-            IdempotencyKey::new("idem-missing-required").expect("valid idempotency key"),
             InstanceId::new("instance-missing-required").expect("valid instance ID"),
             class.reference.clone(),
         ))
@@ -189,16 +188,11 @@ async fn run_conformance(
 
     let unknown_value = store
         .create_instance(
-            create_instance_request(
-                "idem-unknown-value",
-                "instance-unknown-value",
-                class.reference.clone(),
-                vec![],
-            )
-            .with_values(BTreeMap::from([
-                ("extra".to_owned(), "value".to_owned()),
-                ("tenant".to_owned(), "instance-unknown-value".to_owned()),
-            ])),
+            create_instance_request("instance-unknown-value", class.reference.clone(), vec![])
+                .with_values(BTreeMap::from([
+                    ("extra".to_owned(), "value".to_owned()),
+                    ("tenant".to_owned(), "instance-unknown-value".to_owned()),
+                ])),
         )
         .await
         .expect_err("unknown instance values are rejected when schema disallows them");
@@ -213,7 +207,6 @@ async fn run_conformance(
     let out_of_bounds_override = store
         .create_instance(
             create_instance_request(
-                "idem-override-out-of-bounds",
                 "instance-override-out-of-bounds",
                 override_class.reference.clone(),
                 vec![],
@@ -236,7 +229,6 @@ async fn run_conformance(
     let valid_override = store
         .create_instance(
             create_instance_request(
-                "idem-override-valid",
                 "instance-override-valid",
                 override_class.reference.clone(),
                 vec![],
@@ -254,7 +246,6 @@ async fn run_conformance(
     assert_eq!(resolved_override.idle_timeout_ms, 120_000);
 
     let create = create_instance_request(
-        "idem-create-a",
         "instance-a",
         class.reference.clone(),
         vec![
@@ -274,7 +265,6 @@ async fn run_conformance(
         ])
     );
     assert_eq!(created.route_bindings.len(), 2);
-    assert!(!created.idempotency_replayed);
     let loaded_created = store
         .get_instance(GetInstanceRequest::new(
             InstanceId::new("instance-a").expect("valid instance ID"),
@@ -310,49 +300,77 @@ async fn run_conformance(
         "loaded workload class template should render durable instance Service, got {rendered_names:?}"
     );
 
-    let replayed = store.create_instance(create.clone()).await?;
-    assert!(replayed.idempotency_replayed);
-    assert_eq!(replayed.instance, created.instance);
-    assert_eq!(replayed.route_bindings, created.route_bindings);
-
-    let explicit_default_replay = create.clone().with_values(BTreeMap::from([
+    // A repeat that describes the stored instance returns it, whether the
+    // request omits a defaulted value or names it.
+    assert_eq!(store.create_instance(create.clone()).await?, created);
+    let explicit_default = create.clone().with_values(BTreeMap::from([
         ("image".to_owned(), "example/app:1".to_owned()),
         ("tenant".to_owned(), "instance-a".to_owned()),
     ]));
-    let replayed_with_explicit_default = store.create_instance(explicit_default_replay).await?;
-    assert!(replayed_with_explicit_default.idempotency_replayed);
-    assert_eq!(replayed_with_explicit_default.instance, created.instance);
-    assert_eq!(
-        replayed_with_explicit_default.route_bindings,
-        created.route_bindings
-    );
+    assert_eq!(store.create_instance(explicit_default).await?, created);
 
-    let changed_values_conflict = store
-        .create_instance(create.clone().with_values(BTreeMap::from([(
+    // Any other request for the ID is refused and changes nothing.
+    let different_requests = [
+        create.clone().with_values(BTreeMap::from([(
             "tenant".to_owned(),
             "different-tenant".to_owned(),
-        )])))
-        .await
-        .expect_err("same idempotency key with different canonical values conflicts");
-    assert!(matches!(
-        changed_values_conflict,
-        StoreError::IdempotencyConflict
-    ));
-
-    let conflict = store
-        .create_instance(create_instance_request(
-            "idem-create-a",
-            "instance-conflict",
+        )])),
+        create_instance_request("instance-a", class_v2.reference.clone(), vec![])
+            .with_route_bindings(create.route_bindings.clone()),
+        create_instance_request("instance-a", class.reference.clone(), vec![]),
+        create_instance_request(
+            "instance-a",
             class.reference.clone(),
-            vec![http_identity("conflict.example.com", None)],
-        ))
-        .await
-        .expect_err("same idempotency key with a different payload conflicts");
-    assert!(matches!(conflict, StoreError::IdempotencyConflict));
+            vec![http_identity("app.example.com", Some("/api"))],
+        ),
+        create_instance_request(
+            "instance-a",
+            class.reference.clone(),
+            vec![
+                http_identity("app.example.com", Some("/api")),
+                sni_identity("db.example.com"),
+                http_identity("extra.example.com", None),
+            ],
+        ),
+        create_instance_request(
+            "instance-a",
+            class.reference.clone(),
+            vec![
+                http_identity("other.example.com", Some("/api")),
+                sni_identity("db.example.com"),
+            ],
+        ),
+    ];
+    for different in different_requests {
+        let refused = store
+            .create_instance(different.clone())
+            .await
+            .expect_err("a different request for an existing instance ID is refused");
+        assert!(
+            matches!(
+                refused,
+                StoreError::AlreadyExists {
+                    resource: "instance"
+                }
+            ),
+            "{different:?} returned {refused:?}"
+        );
+    }
+    assert_eq!(store.create_instance(create.clone()).await?, created);
+    assert_eq!(
+        store
+            .list_route_bindings_for_instance(
+                control_plane::ListRouteBindingsForInstanceRequest::new(
+                    created.instance.id.clone()
+                )
+            )
+            .await?,
+        created.route_bindings,
+        "a refused create binds none of its routes"
+    );
 
     let duplicate_route = store
         .create_instance(create_instance_request(
-            "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
             vec![http_identity("app.example.com", Some("/api"))],
@@ -368,7 +386,6 @@ async fn run_conformance(
 
     let recovered_after_rollback = store
         .create_instance(create_instance_request(
-            "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
             vec![http_identity("rollback.example.com", None)],
@@ -390,7 +407,6 @@ async fn run_conformance(
 
     let delete_target = store
         .create_instance(create_instance_request(
-            "idem-delete",
             "instance-delete",
             class.reference.clone(),
             vec![],
@@ -433,7 +449,6 @@ async fn run_conformance(
 
     let delete_wake_race = store
         .create_instance(create_instance_request(
-            "idem-delete-wake-race",
             "instance-delete-wake-race",
             class.reference.clone(),
             vec![],
@@ -818,13 +833,9 @@ async fn exercise_instance_lifecycle(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
 ) -> Result<(), StoreError> {
-    let invalid_target = create_lifecycle_instance(
-        store,
-        workload_class.clone(),
-        "idem-lifecycle-invalid",
-        "instance-lifecycle-invalid",
-    )
-    .await?;
+    let invalid_target =
+        create_lifecycle_instance(store, workload_class.clone(), "instance-lifecycle-invalid")
+            .await?;
     assert_eq!(invalid_target.instance.generation, Generation::new(0));
 
     let invalid = store
@@ -847,7 +858,6 @@ async fn exercise_instance_lifecycle(
     let concurrent_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-lifecycle-concurrent",
         "instance-lifecycle-concurrent",
     )
     .await?;
@@ -885,7 +895,6 @@ async fn exercise_instance_lifecycle(
     let sleep_while_waking = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-lifecycle-sleep-waking",
         "instance-lifecycle-sleep-waking",
     )
     .await?;
@@ -933,7 +942,6 @@ async fn exercise_instance_lifecycle(
     let drain_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-lifecycle-drain-complete",
         "instance-lifecycle-drain-complete",
     )
     .await?;
@@ -962,7 +970,6 @@ async fn exercise_instance_lifecycle(
     let delete_draining_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-lifecycle-delete-draining",
         "instance-lifecycle-delete-draining",
     )
     .await?;
@@ -990,7 +997,6 @@ async fn exercise_instance_lifecycle(
     let failed_target = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-lifecycle-failed-retry",
         "instance-lifecycle-failed-retry",
     )
     .await?;
@@ -1023,13 +1029,8 @@ async fn exercise_instance_lifecycle(
     assert_eq!(retry.state, InstanceState::Waking);
     assert_eq!(retry.generation, Generation::new(3));
 
-    let terminal_target = create_lifecycle_instance(
-        store,
-        workload_class,
-        "idem-lifecycle-terminal",
-        "instance-lifecycle-terminal",
-    )
-    .await?;
+    let terminal_target =
+        create_lifecycle_instance(store, workload_class, "instance-lifecycle-terminal").await?;
     let deleting = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             terminal_target.instance.id.clone(),
@@ -1082,7 +1083,6 @@ async fn exercise_lease_clock_ownership(
     let target = MaterializationTarget::new("cluster-lease-clock", "apps").expect("valid target");
     let created = store
         .create_instance(create_instance_request(
-            "idem-lease-clock",
             "instance-lease-clock",
             workload_class,
             vec![],
@@ -1206,35 +1206,29 @@ async fn exercise_lease_clock_ownership(
 async fn create_lifecycle_instance(
     store: &PostgresStore,
     workload_class: WorkloadClassVersionRef,
-    idempotency_key: &str,
     instance_id: &str,
 ) -> Result<control_plane::CreateInstanceResult, StoreError> {
     store
-        .create_instance(create_instance_request(
-            idempotency_key,
-            instance_id,
-            workload_class,
-            vec![],
-        ))
+        .create_instance(create_instance_request(instance_id, workload_class, vec![]))
         .await
 }
 
 async fn create_exclusive_instance(
     store: &PostgresStore,
     workload_class: &WorkloadClassVersionRef,
-    idempotency_key: &str,
     instance_id: &str,
     volume_handle: &str,
     license_handle: &str,
 ) -> Result<control_plane::CreateInstanceResult, StoreError> {
     store
         .create_instance(
-            create_instance_request(idempotency_key, instance_id, workload_class.clone(), vec![])
-                .with_values(BTreeMap::from([
+            create_instance_request(instance_id, workload_class.clone(), vec![]).with_values(
+                BTreeMap::from([
                     ("tenant".to_owned(), instance_id.to_owned()),
                     ("volume_handle".to_owned(), volume_handle.to_owned()),
                     ("license_handle".to_owned(), license_handle.to_owned()),
-                ])),
+                ]),
+            ),
         )
         .await
 }
@@ -1246,7 +1240,6 @@ async fn exercise_rendered_object_ref_collision_rejection(
     let owner = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-collision-service-owner",
         "instance-collision-service-owner",
     )
     .await?;
@@ -1274,7 +1267,6 @@ async fn exercise_rendered_object_ref_collision_rejection(
     let contender = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-collision-service-contender",
         "instance-collision-service-contender",
     )
     .await?;
@@ -1313,13 +1305,9 @@ async fn exercise_rendered_object_ref_collision_rejection(
         InstanceState::Waking
     );
 
-    let pv_owner = create_lifecycle_instance(
-        store,
-        workload_class.clone(),
-        "idem-collision-pv-owner",
-        "instance-collision-pv-owner",
-    )
-    .await?;
+    let pv_owner =
+        create_lifecycle_instance(store, workload_class.clone(), "instance-collision-pv-owner")
+            .await?;
     let pv_owner_waking = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             pv_owner.instance.id.clone(),
@@ -1341,13 +1329,8 @@ async fn exercise_rendered_object_ref_collision_rejection(
         .record_materialization(pv_owner_materialization)
         .await?;
 
-    let pv_contender = create_lifecycle_instance(
-        store,
-        workload_class,
-        "idem-collision-pv-contender",
-        "instance-collision-pv-contender",
-    )
-    .await?;
+    let pv_contender =
+        create_lifecycle_instance(store, workload_class, "instance-collision-pv-contender").await?;
     let pv_contender_waking = store
         .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
             pv_contender.instance.id.clone(),
@@ -1400,7 +1383,6 @@ async fn exercise_exclusivity_keys(
     let owner = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-owner",
         "instance-exclusive-owner",
         "disk-a",
         "license-owner",
@@ -1468,7 +1450,6 @@ async fn exercise_exclusivity_keys(
     let contender = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-contender",
         "instance-exclusive-contender",
         "disk-a",
         "license-contender",
@@ -1509,7 +1490,6 @@ async fn exercise_exclusivity_keys(
     let restart_contender = create_exclusive_instance(
         &restarted_store,
         &workload_class.reference,
-        "idem-exclusive-restart-contender",
         "instance-exclusive-restart-contender",
         "disk-a",
         "license-restart",
@@ -1542,7 +1522,6 @@ async fn exercise_exclusivity_keys(
     let different = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-different",
         "instance-exclusive-different",
         "disk-b",
         "license-different",
@@ -1672,7 +1651,6 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
     let owner = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-release-owner",
         "instance-exclusive-release-owner",
         "disk-release",
         "license-release",
@@ -1740,7 +1718,6 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
     let contender = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-release-contender",
         "instance-exclusive-release-contender",
         "disk-release",
         "license-contender",
@@ -1772,7 +1749,6 @@ async fn exercise_no_object_apply_failure_release(store: &PostgresStore) -> Resu
     let stale_owner = create_exclusive_instance(
         store,
         &workload_class.reference,
-        "idem-exclusive-stale-release-owner",
         "instance-exclusive-stale-release-owner",
         "disk-stale-release",
         "license-stale-release",
@@ -1846,7 +1822,6 @@ async fn exercise_materialization_reconciliation_leases(
     let target = MaterializationTarget::new("cluster-reconcile", "apps").expect("valid target");
     let created = store
         .create_instance(create_instance_request(
-            "idem-reconcile-pending",
             "instance-reconcile-pending",
             workload_class.clone(),
             vec![],
@@ -2006,7 +1981,6 @@ async fn exercise_materialization_reconciliation_leases(
 
     let expired_instance = store
         .create_instance(create_instance_request(
-            "idem-reconcile-expired-pending",
             "instance-reconcile-expired-pending",
             workload_class.clone(),
             vec![],
@@ -2092,7 +2066,6 @@ async fn exercise_materialization_reconciliation_leases(
 
     let race_instance = store
         .create_instance(create_instance_request(
-            "idem-reconcile-race-pending",
             "instance-reconcile-race-pending",
             workload_class.clone(),
             vec![],
@@ -2174,7 +2147,6 @@ async fn exercise_materialization_reconciliation_leases(
 
     let delete_instance = store
         .create_instance(create_instance_request(
-            "idem-reconcile-delete",
             "instance-reconcile-delete",
             workload_class.clone(),
             vec![],
@@ -2295,7 +2267,6 @@ async fn exercise_materialization_reconciliation_leases(
 
     let expired_delete_instance = store
         .create_instance(create_instance_request(
-            "idem-reconcile-expired-delete",
             "instance-reconcile-expired-delete",
             workload_class,
             vec![],
@@ -2364,7 +2335,6 @@ async fn exercise_materialization_reconciliation_leases(
 
     let force_instance = store
         .create_instance(create_instance_request(
-            "idem-reconcile-force",
             "instance-reconcile-force",
             WorkloadClassVersionRef::new(
                 WorkloadClassId::new("class-a").expect("valid class id"),
@@ -2476,7 +2446,6 @@ async fn exercise_complete_wake(
 ) -> Result<(), StoreError> {
     let success = store
         .create_instance(create_instance_request(
-            "idem-complete-wake-success",
             "instance-complete-wake-success",
             workload_class.clone(),
             vec![http_identity("complete-wake.example.com", None)],
@@ -2696,7 +2665,6 @@ async fn exercise_complete_wake(
     let stale_sleep = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-begin-sleep-stale-materialization",
         "instance-begin-sleep-stale-materialization",
     )
     .await?;
@@ -2767,7 +2735,6 @@ async fn exercise_complete_wake(
     let stale = create_lifecycle_instance(
         store,
         workload_class.clone(),
-        "idem-complete-wake-stale",
         "instance-complete-wake-stale",
     )
     .await?;
@@ -2818,13 +2785,9 @@ async fn exercise_complete_wake(
         BackendGeneration::new(4)
     );
 
-    let cold = create_lifecycle_instance(
-        store,
-        workload_class.clone(),
-        "idem-complete-wake-cold",
-        "instance-complete-wake-cold",
-    )
-    .await?;
+    let cold =
+        create_lifecycle_instance(store, workload_class.clone(), "instance-complete-wake-cold")
+            .await?;
     let cold_id = cold.instance.id.clone();
     let cold_target = MaterializationTarget::new("cluster-complete", "cold").expect("valid target");
     let cold_error = store
@@ -2859,7 +2822,6 @@ async fn exercise_complete_wake(
 
     let rewind = store
         .create_instance(create_instance_request(
-            "idem-complete-wake-rewind",
             "instance-complete-wake-rewind",
             workload_class,
             vec![http_identity("complete-wake-rewind.example.com", None)],
@@ -2957,7 +2919,6 @@ async fn exercise_route_bindings(
 ) -> Result<(), StoreError> {
     let route_instance = store
         .create_instance(create_instance_request(
-            "idem-route-instance",
             "instance-routes",
             workload_class,
             vec![],
@@ -2970,7 +2931,6 @@ async fn exercise_route_bindings(
 
     let exact_root = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-exact-root",
             "route-exact-root",
             "instance-routes",
             RouteIdentity::Http {
@@ -2990,9 +2950,9 @@ async fn exercise_route_bindings(
         .expect("created route binding loads");
     assert_eq!(loaded_exact, exact_root);
 
-    let replayed_exact = store
+    // A repeat that describes the stored binding returns it.
+    let repeated_exact = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-exact-root",
             "route-exact-root",
             "instance-routes",
             RouteIdentity::Http {
@@ -3002,26 +2962,41 @@ async fn exercise_route_bindings(
             ProtocolRoute::Http,
         ))
         .await?;
-    assert_eq!(replayed_exact, exact_root);
+    assert_eq!(repeated_exact, exact_root);
 
-    let idempotency_conflict = store
-        .create_route_binding(create_route_binding_request(
-            "idem-route-exact-root",
-            "route-conflicting-replay",
+    // Any other request for the binding ID is refused and changes nothing.
+    for (instance_id, identity) in [
+        (
             "instance-routes",
             http_identity("conflict.routes.example.com", None),
-            ProtocolRoute::Http,
-        ))
-        .await
-        .expect_err("same idempotency key with different route payload conflicts");
-    assert!(matches!(
-        idempotency_conflict,
-        StoreError::IdempotencyConflict
-    ));
+        ),
+        ("instance-a", http_identity("app.routes.example.com", None)),
+    ] {
+        let refused = store
+            .create_route_binding(create_route_binding_request(
+                "route-exact-root",
+                instance_id,
+                identity,
+                ProtocolRoute::Http,
+            ))
+            .await
+            .expect_err("a different request for an existing binding ID is refused");
+        assert!(matches!(
+            refused,
+            StoreError::AlreadyExists {
+                resource: "route binding"
+            }
+        ));
+    }
+    assert_eq!(
+        store
+            .get_route_binding(GetRouteBindingRequest::new(exact_root.id.clone()))
+            .await?,
+        Some(exact_root.clone())
+    );
 
     let duplicate_identity = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-duplicate-identity",
             "route-duplicate-identity",
             "instance-routes",
             http_identity("APP.ROUTES.EXAMPLE.COM.", None),
@@ -3038,7 +3013,6 @@ async fn exercise_route_bindings(
 
     let duplicate_id = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-duplicate-id",
             "route-exact-root",
             "instance-routes",
             http_identity("duplicate-id.routes.example.com", None),
@@ -3055,7 +3029,6 @@ async fn exercise_route_bindings(
 
     let missing_instance = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-missing-instance",
             "route-missing-instance",
             "missing-instance",
             http_identity("missing.routes.example.com", None),
@@ -3072,7 +3045,6 @@ async fn exercise_route_bindings(
 
     let protocol_mismatch = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-protocol-mismatch",
             "route-protocol-mismatch",
             "instance-routes",
             http_identity("mismatch.routes.example.com", None),
@@ -3087,7 +3059,6 @@ async fn exercise_route_bindings(
 
     let exact_api = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-exact-api",
             "route-exact-api",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api")),
@@ -3096,7 +3067,6 @@ async fn exercise_route_bindings(
         .await?;
     let exact_api_v1 = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-exact-api-v1",
             "route-exact-api-v1",
             "instance-routes",
             http_identity("app.routes.example.com", Some("/api/v1")),
@@ -3105,7 +3075,6 @@ async fn exercise_route_bindings(
         .await?;
     let wildcard_broad = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-wildcard-broad",
             "route-wildcard-broad",
             "instance-routes",
             RouteIdentity::Http {
@@ -3117,7 +3086,6 @@ async fn exercise_route_bindings(
         .await?;
     let wildcard_specific = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-wildcard-specific",
             "route-wildcard-specific",
             "instance-routes",
             RouteIdentity::Http {
@@ -3168,7 +3136,6 @@ async fn exercise_route_bindings(
 
     let sni_exact = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-sni-exact",
             "route-sni-exact",
             "instance-routes",
             sni_identity("DB.Routes.Example.COM."),
@@ -3177,7 +3144,6 @@ async fn exercise_route_bindings(
         .await?;
     let sni_wildcard = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-sni-wildcard",
             "route-sni-wildcard",
             "instance-routes",
             RouteIdentity::Sni {
@@ -3188,7 +3154,6 @@ async fn exercise_route_bindings(
         .await?;
     let duplicate_sni = store
         .create_route_binding(create_route_binding_request(
-            "idem-route-sni-duplicate",
             "route-sni-duplicate",
             "instance-routes",
             sni_identity("db.routes.example.com"),
@@ -3375,7 +3340,6 @@ fn composed_text(prefix: &str, field: &str) -> TemplateText {
 }
 
 fn create_instance_request(
-    idempotency_key: &str,
     instance_id: &str,
     workload_class: WorkloadClassVersionRef,
     route_identities: Vec<RouteIdentity>,
@@ -3390,7 +3354,6 @@ fn create_instance_request(
         })
         .collect();
     CreateInstanceRequest::new(
-        IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         InstanceId::new(instance_id).expect("valid instance ID"),
         workload_class,
     )
@@ -3402,14 +3365,12 @@ fn create_instance_request(
 }
 
 fn create_route_binding_request(
-    idempotency_key: &str,
     route_binding_id: &str,
     instance_id: &str,
     identity: RouteIdentity,
     protocol: ProtocolRoute,
 ) -> CreateRouteBindingRequest {
     CreateRouteBindingRequest::new(
-        IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         RouteBindingId::new(route_binding_id).expect("valid route binding ID"),
         InstanceId::new(instance_id).expect("valid instance ID"),
         identity,
@@ -3547,7 +3508,6 @@ async fn phase5_contracts(store: &PostgresStore, config: &PostgresStoreConfig) -
         .await?;
     phase5_single_slot_pool_and_cancelled_migration(config, &class).await?;
     phase5_reservation_concurrency(store, config, &class).await?;
-    phase5_idempotency_lifetime(store, config, &class).await?;
     phase5_route_scale_snapshot_and_target(store, config, &class).await?;
     Ok(())
 }
@@ -3611,7 +3571,7 @@ async fn phase5_reservation_concurrency(
     let mut requests = Vec::new();
     for index in 0..26 {
         let id = format!("phase5-reservation-{index}");
-        let instance = create_lifecycle_instance(store, class.reference.clone(), &id, &id)
+        let instance = create_lifecycle_instance(store, class.reference.clone(), &id)
             .await?
             .instance;
         let mut request = RecordMaterializationRequest::new(
@@ -3730,128 +3690,12 @@ async fn phase5_reservation_concurrency(
     Ok(())
 }
 
-async fn phase5_idempotency_lifetime(
-    store: &PostgresStore,
-    config: &PostgresStoreConfig,
-    class: &WorkloadClassVersion,
-) -> TestResult {
-    let request = create_instance_request(
-        "phase5-permanent",
-        "phase5-permanent",
-        class.reference.clone(),
-        vec![],
-    );
-    let created = store.create_instance(request.clone()).await?;
-    let deleting = store
-        .compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(
-            created.instance.id.clone(),
-            created.instance.generation,
-            InstanceState::Deleting,
-            StateTransitionReason::DeleteRequested,
-        ))
-        .await?;
-    store
-        .delete_instance(DeleteInstanceRequest::new(deleting.id))
-        .await?;
-    assert!(matches!(
-        store.create_instance(request.clone()).await,
-        Err(StoreError::IdempotencyResourceDeleted {
-            resource: "instance"
-        })
-    ));
-    let recreated = create_instance_request(
-        "phase5-recreated",
-        "phase5-permanent",
-        class.reference.clone(),
-        vec![],
-    );
-    store.create_instance(recreated).await?;
-    assert!(
-        matches!(
-            store.create_instance(request).await,
-            Err(StoreError::IdempotencyResourceDeleted { .. })
-        ),
-        "old key never replays a same-name replacement"
-    );
-    let route = create_route_binding_request(
-        "phase5-route-key",
-        "phase5-route",
-        "phase5-permanent",
-        http_identity("phase5.example.com", None),
-        ProtocolRoute::Http,
-    );
-    store.create_route_binding(route.clone()).await?;
-    store
-        .delete_route_binding(DeleteRouteBindingRequest::new(
-            route.route_binding_id.clone(),
-        ))
-        .await?;
-    assert!(matches!(
-        store.create_route_binding(route).await,
-        Err(StoreError::IdempotencyResourceDeleted {
-            resource: "route binding"
-        })
-    ));
-    let mut finite = config.clone();
-    finite.idempotency_retention = Some(Duration::from_secs(60));
-    let finite_store = PostgresStore::connect(&finite).await?;
-    let finite_request = create_instance_request(
-        "phase5-finite",
-        "phase5-finite",
-        class.reference.clone(),
-        vec![],
-    );
-    finite_store.create_instance(finite_request.clone()).await?;
-    let raw = raw_client(config).await?;
-    let before = raw.query_one("SELECT created_at_unix_millis, expires_at_unix_millis FROM idempotency_records WHERE idempotency_key = 'phase5-finite'", &[]).await?;
-    let expiry: i64 = before.get(1);
-    let created_at: i64 = before.get(0);
-    assert!((59_999..=60_001).contains(&(expiry - created_at)));
-    finite_store.create_instance(finite_request.clone()).await?;
-    assert_eq!(expiry, raw.query_one("SELECT expires_at_unix_millis FROM idempotency_records WHERE idempotency_key = 'phase5-finite'", &[]).await?.get::<_, i64>(0));
-    assert_eq!(finite_store.expire_idempotency_records(1).await?, 0);
-    raw.execute("UPDATE idempotency_records SET expires_at_unix_millis = 0 WHERE idempotency_key IN ('phase5-finite', 'phase5-route-key')", &[]).await?;
-    assert_eq!(store.expire_idempotency_records(1).await?, 1);
-    assert_eq!(store.expire_idempotency_records(1).await?, 1);
-    assert_eq!(store.expire_idempotency_records(1).await?, 0);
-    assert_eq!(
-        raw.query_one(
-            "SELECT count(*) FROM idempotency_records WHERE idempotency_key = 'phase5-permanent'",
-            &[]
-        )
-        .await?
-        .get::<_, i64>(0),
-        1
-    );
-    // A key is reusable after its explicit window expires, with a different
-    // resource ID so live-resource uniqueness remains independently enforced.
-    let changed = create_instance_request(
-        "phase5-finite",
-        "phase5-after-expiry",
-        class.reference.clone(),
-        vec![],
-    );
-    assert!(
-        !finite_store
-            .create_instance(changed)
-            .await?
-            .idempotency_replayed
-    );
-    eprintln!("phase5 idempotency_lifetime passed; permanent tombstones, fixed opt-in expiry, bounded GC, replay after ID replacement");
-    Ok(())
-}
-
 async fn phase5_route_scale_snapshot_and_target(
     store: &PostgresStore,
     config: &PostgresStoreConfig,
     class: &WorkloadClassVersion,
 ) -> TestResult {
-    let request = create_instance_request(
-        "phase5-routing",
-        "phase5-routing",
-        class.reference.clone(),
-        vec![],
-    );
+    let request = create_instance_request("phase5-routing", class.reference.clone(), vec![]);
     let instance = store.create_instance(request).await?.instance;
     let mut raw = raw_client(config).await?;
     raw.execute("INSERT INTO route_bindings(route_binding_id, instance_id, identity_key, identity_kind, host_kind, host, protocol) SELECT 'bulk-'||n, $1, 'bulk-'||n, 'http', 'exact', 'bulk-'||n||'.example.net', 'http' FROM generate_series(1, 100000) n", &[&instance.id.as_str()]).await?;
@@ -3887,7 +3731,6 @@ async fn phase5_route_scale_snapshot_and_target(
     for (name, identity) in &rules {
         store
             .create_route_binding(create_route_binding_request(
-                &format!("key-{name}"),
                 name,
                 instance.id.as_str(),
                 identity.clone(),
@@ -4154,7 +3997,19 @@ async fn postgres_migration_backfill_and_collision_rejection() -> TestResult {
                 1,
                 "duplicate refs within one materialization normalize"
             );
-            assert!(raw.query_one("SELECT resource_deleted_at_unix_millis IS NOT NULL AND expires_at_unix_millis IS NULL FROM idempotency_records", &[]).await?.get::<_, bool>(0));
+            assert!(
+                raw.query_one(
+                    "SELECT retired FROM instance_generation_watermarks WHERE instance_id = 'absent'",
+                    &[]
+                )
+                .await?
+                .get::<_, bool>(0),
+                "an instance ID deleted before fencing existed stays retired"
+            );
+            assert!(raw
+                .query_one("SELECT to_regclass('idempotency_records') IS NULL", &[])
+                .await?
+                .get::<_, bool>(0));
             let row = raw.query_one("SELECT drain_not_before_unix_millis > state_entered_at_unix_millis, next_attempt_at_unix_millis = drain_not_before_unix_millis FROM materializations WHERE materialization_id = 'legacy-mat'", &[]).await?;
             assert!(row.get::<_, bool>(0));
             assert!(row.get::<_, bool>(1));
@@ -4337,14 +4192,7 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
     let client = LifecycleKubernetes::default();
     let materializer = KubernetesMaterializer::new(client.clone());
     let api = StoreBackedProxyApi::new(store.clone(), materializer.clone(), target.clone());
-    let create = |id: &str| {
-        create_instance_request(
-            &format!("create-{id}"),
-            id,
-            class.reference.clone(),
-            Vec::new(),
-        )
-    };
+    let create = |id: &str| create_instance_request(id, class.reference.clone(), Vec::new());
     let cold = store
         .create_instance(create("accepted-wake"))
         .await?
@@ -4535,7 +4383,6 @@ async fn durable_lifecycle_checks(store: PostgresStore) -> TestResult {
             .is_none());
         let replacement = store
             .create_instance(create_instance_request(
-                &format!("replacement-{id}"),
                 &id,
                 class.reference.clone(),
                 Vec::new(),
@@ -4697,7 +4544,7 @@ async fn postgres_effect_barriers_and_same_owner_attempt_fencing() -> TestResult
     let result: TestResult = async {
         let class = workload_class("effect-class", 1);
         store.create_workload_class_version(CreateWorkloadClassVersionRequest::new(class.clone())).await?;
-        let cold = store.create_instance(create_instance_request("effect-create", "effect-instance", class.reference, vec![])).await?.instance;
+        let cold = store.create_instance(create_instance_request( "effect-instance", class.reference, vec![])).await?.instance;
         let waking = store.compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(cold.id.clone(), cold.generation, InstanceState::Waking, StateTransitionReason::WakeRequested)).await?;
         let target = MaterializationTarget::new("effects-cluster", "apps")?;
         let mut request = RecordMaterializationRequest::new(waking.id, waking.generation, target.clone(), MaterializationState::Pending, BackendGeneration::new(1));
@@ -4804,7 +4651,7 @@ pending.instance_generation,
         store.request_instance_deletion(control_plane::instance::RequestInstanceDeletion { instance_id: pending.instance_id.clone(), expected_generation: pending.instance_generation }).await?;
         store.finalize_instance_deletions(10).await?;
         assert!(store.get_instance(GetInstanceRequest::new(pending.instance_id.clone())).await?.is_none());
-        let recreated = store.create_instance(create_instance_request("effect-recreate", pending.instance_id.as_str(), workload_class("effect-class",1).reference, vec![])).await?.instance;
+        let recreated = store.create_instance(create_instance_request( pending.instance_id.as_str(), workload_class("effect-class",1).reference, vec![])).await?.instance;
         let recreated_waking = store.compare_and_swap_instance_state(CompareAndSwapInstanceStateRequest::new(recreated.id, recreated.generation, InstanceState::Waking, StateTransitionReason::WakeRequested)).await?;
         let mut new_request = RecordMaterializationRequest::new(recreated_waking.id, recreated_waking.generation, pending.target.clone(), MaterializationState::Pending, BackendGeneration::new(1));
         new_request.rendered_objects = pending.rendered_objects.clone(); new_request.exclusivity_keys = pending.exclusivity_keys.clone();
@@ -4837,6 +4684,9 @@ mod runtime_work;
 
 #[path = "postgres_store/retry_boundaries.rs"]
 mod retry_boundaries;
+
+#[path = "postgres_store/create_repeat.rs"]
+mod create_repeat;
 
 #[path = "postgres_store/activation_idle.rs"]
 mod activation_idle;

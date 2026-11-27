@@ -74,12 +74,9 @@ a pooled connection cannot retain a manually opened migration transaction.
 | `SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS` | 5000 | Maximum checkout queue wait |
 | `SLEEPYPODS_POSTGRES_CONNECTION_TIMEOUT_MS` | 5000 | Connection creation and recycling budget |
 | `SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS` | 30000 | Server statement deadline, including lock waits |
-| `SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS` | unset | Optional replay lifetime for newly created keys |
 
 Pool capacity must be 1–1,024. Timeouts must be whole milliseconds between 1ms
-and 24 hours. Optional idempotency retention must be whole milliseconds between
-1ms and 100 years (365 days per year); this bound also keeps expiry timestamp
-addition within Postgres integer limits. Environment values are positive integers.
+and 24 hours. Environment values are positive integers.
 The same limits apply to `PostgresStoreConfig`, including rejecting fractional
 milliseconds, and are checked before pool allocation or connection attempts.
 A one-connection pool is supported;
@@ -103,7 +100,8 @@ batch limit.
 
 The following mutations run once and return uncertain errors to their caller:
 
-- Instance/route creation: a configured replay record can expire during a retry.
+- Instance/route creation: a retry after a concurrent delete would create the
+  resource again.
 - Legacy instance deletion, route deletion, challenge put/delete and operator
   force deletion/key release: a reused name or key can refer to a replacement.
 - Materialization recording: the upsert can overwrite newer same-generation
@@ -124,37 +122,33 @@ same lifecycle assertions also run against PostgreSQL, alongside actual
 commit/response-loss/replacement tests. The fixture does not model database
 transactions, retention or distributed effect ownership.
 
-## Idempotency lifetime and deleted resources
+## Repeated creates
 
-By default, keys are retained for the lifetime of the database. A matching replay
-returns the current live resource, preserving the existing behavior; it does not
-recreate removed routes or restore the original creation-time resource snapshot.
-A different request under the same key is an idempotency conflict. Once the
-created resource is deleted, the key becomes a durable tombstone and replay
-returns `IdempotencyResourceDeleted` (`FailedPrecondition` on the API). This also
-prevents a matching old key from returning a newly created resource with the
-same resource ID. Bundled routes are part of the instance creation request;
-deleting only one bundled route does not delete the instance's replay record.
+`create_instance` and `create_route_binding` insert the resource under its
+caller-chosen ID and keep no record of the request. When the ID is taken, the
+store compares the request with the stored resource:
 
-Setting a finite retention value explicitly opts new keys into a shorter
-window. Expiry is fixed at the first successful creation; replay and later
-configuration changes do not extend or shorten an existing key's lifetime.
-Legacy keys remain permanent. After expiry, the key may be reused, including for
-a different request. Resource-ID/route uniqueness is enforced independently and
-can still reject the new creation. This retention setting is therefore an API
-contract change that callers must account for when deciding how long to retry.
+- An instance matches when its class version, its values after schema defaults
+  and its current route bindings (IDs and identities) equal the request's. A
+  route binding matches when it names the same instance and identity.
+- A matching request returns the stored resource in its current state,
+  including an instance whose deletion is pending.
+- Any other request returns `AlreadyExists` and changes nothing.
 
-`PostgresStore::expire_idempotency_records(limit)` deletes at most 1–10,000 expired
-records per call, skipping locked records and preserving permanent and unexpired
-keys, including tombstones. A create also expires its own requested key before
-attempting reuse. Supervised runtime maintenance collects bounded batches every
-five seconds; expiry correctness does not depend on that schedule. If collection
-wins a race with an expiring replay, the store can return `Unavailable`; the
-caller must account for the new key lifetime before choosing to submit again.
+The comparison reads current state from one snapshot. Once a route is added to
+or removed from an instance, the request that created the instance differs
+from it.
 
-Idempotency tombstones alone do not prohibit reusing an instance ID under a new
-key. Lifecycle incarnation fencing must independently reject stale sidecar and
-worker observations across such a replacement.
+A create that follows a completed delete creates the resource again. The
+instance generation watermark starts the new incarnation above every generation
+the deleted one used, so stale sidecar and worker observations and stale
+`expected_generation` values are rejected. The retry wrapper therefore sends a
+create once: a delete that lands after a lost response stays in effect unless
+the caller repeats the create.
+
+A repeat that arrives while the first create is uncommitted waits for it and
+then compares with what it stored. A refused or failed create leaves no row and
+leaves the generation watermark where it was.
 
 Validation and measurements: [Phase 5 evidence](review-evidence/phase5/README.md).
 

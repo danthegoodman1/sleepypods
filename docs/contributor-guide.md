@@ -155,6 +155,9 @@ Targeted gates live in `scripts/`:
 - Keep provider-specific semantics behind traits such as `ControlPlaneStore`
   and `KubernetesMaterializerClient`.
 - `WorkloadClassVersion` is immutable; instances pin a class version.
+- A create inserts under the caller-chosen ID or compares with the stored
+  resource: the same request returns it and any other returns `AlreadyExists`.
+  The store keeps no request log.
 - A create RPC accepts only what a wake can render. `CreateWorkloadClassVersion`
   and `CreateInstance` dry-run the renderer, so a new template rule belongs in
   `manifest/render.rs`, where both the create call and the wake enforce it.

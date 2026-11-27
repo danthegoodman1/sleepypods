@@ -189,7 +189,6 @@ async fn restart_during_wake_recovers_without_stale_backend(
             host: WAKE_HOST,
             target: "wake",
         },
-        "wake",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -294,7 +293,6 @@ async fn restart_during_sleep_report_recovers(
             host: SLEEP_HOST,
             target: "sleep",
         },
-        "sleep",
     )
     .await?;
     eprintln!("==> restart E2E: sleep recovery setup created");
@@ -359,7 +357,6 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             host: DELETE_HOST,
             target: "delete",
         },
-        "delete",
     )
     .await?;
     wait_for_instance_response(
@@ -605,28 +602,13 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
     kube: Client,
     config: &E2eConfig,
 ) -> TestResult<()> {
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "restart-reassign-old",
-        "old",
-        "reassign-old",
-    )
-    .await?;
-    create_instance(
-        operator,
-        NORMAL_CLASS_ID,
-        "restart-reassign-new",
-        "new",
-        "reassign-new",
-    )
-    .await?;
+    create_instance(operator, NORMAL_CLASS_ID, "restart-reassign-old", "old").await?;
+    create_instance(operator, NORMAL_CLASS_ID, "restart-reassign-new", "new").await?;
     create_route(
         operator,
         "restart-reassign-old-route",
         "restart-reassign-old",
         REASSIGN_HOST,
-        "reassign-old",
     )
     .await?;
     let aliases = [
@@ -644,7 +626,7 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
         ),
     ];
     for (route_id, instance_id, host, _) in aliases {
-        create_route(operator, route_id, instance_id, host, route_id).await?;
+        create_route(operator, route_id, instance_id, host).await?;
     }
     // Prewarm both backends without resolving REASSIGN_HOST through the
     // frontend. Its first later lookup will have a fresh positive cache TTL.
@@ -733,7 +715,6 @@ async fn route_reassignment_after_restart_does_not_serve_stale_backend(
             "restart-reassign-new-route",
             "restart-reassign-new",
             REASSIGN_HOST,
-            "reassign-new",
         )
         .await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -819,7 +800,6 @@ async fn http01_challenges_survive_restart_and_cleanup(
             host: HTTP01_HOST,
             target: "http01",
         },
-        "http01",
     )
     .await?;
     wait_for_instance_response(
@@ -1015,24 +995,9 @@ async fn create_workload_class(
 async fn create_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
     spec: InstanceRouteSpec<'_>,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
-    create_instance(
-        operator,
-        spec.class_id,
-        spec.instance_id,
-        spec.target,
-        idempotency_suffix,
-    )
-    .await?;
-    create_route(
-        operator,
-        spec.route_id,
-        spec.instance_id,
-        spec.host,
-        idempotency_suffix,
-    )
-    .await
+    create_instance(operator, spec.class_id, spec.instance_id, spec.target).await?;
+    create_route(operator, spec.route_id, spec.instance_id, spec.host).await
 }
 
 async fn create_instance(
@@ -1040,11 +1005,9 @@ async fn create_instance(
     class_id: &str,
     instance_id: &str,
     target: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-instance"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: class_id.to_owned(),
@@ -1063,11 +1026,9 @@ async fn create_route(
     route_id: &str,
     instance_id: &str,
     host: &str,
-    idempotency_suffix: &str,
 ) -> TestResult<()> {
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-restart-{idempotency_suffix}-route"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),

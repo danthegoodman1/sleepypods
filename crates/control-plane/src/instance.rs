@@ -3,7 +3,7 @@ pub use sleepypods_api::InstanceState;
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    ids::{Generation, IdempotencyKey, InstanceId, RouteBindingId},
+    ids::{Generation, InstanceId, RouteBindingId},
     manifest::{
         render_manifests_with_options, ManifestRenderError, RenderManifestOptions,
         RenderManifestRequest,
@@ -26,7 +26,6 @@ pub struct InstanceRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateInstanceRequest {
-    pub idempotency_key: IdempotencyKey,
     pub instance_id: InstanceId,
     pub workload_class: WorkloadClassVersionRef,
     pub values: InstanceValues,
@@ -44,7 +43,6 @@ pub struct InstanceRoute {
 pub struct CreateInstanceResult {
     pub instance: InstanceRecord,
     pub route_bindings: Vec<RouteBindingRecord>,
-    pub idempotency_replayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,13 +175,8 @@ impl fmt::Display for InvalidStateTransition {
 impl Error for InvalidStateTransition {}
 
 impl CreateInstanceRequest {
-    pub fn new(
-        idempotency_key: IdempotencyKey,
-        instance_id: InstanceId,
-        workload_class: WorkloadClassVersionRef,
-    ) -> Self {
+    pub fn new(instance_id: InstanceId, workload_class: WorkloadClassVersionRef) -> Self {
         Self {
-            idempotency_key,
             instance_id,
             workload_class,
             values: InstanceValues::new(),
@@ -309,7 +302,7 @@ impl CompareAndSwapInstanceStateRequest {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ids::{Generation, IdempotencyKey, InstanceId, WorkloadClassId},
+        ids::{Generation, InstanceId, WorkloadClassId},
         manifest::{
             ContainerPortTemplate, ContainerTemplate, ManifestTemplate, ServicePortTemplate,
             ServiceTemplate, SidecarTemplate, TemplateText, WorkloadKind, WorkloadTemplate,
@@ -599,7 +592,6 @@ mod tests {
 
     fn create_request() -> CreateInstanceRequest {
         CreateInstanceRequest::new(
-            IdempotencyKey::new("key-1").expect("valid key"),
             InstanceId::new("instance-1").expect("valid instance ID"),
             WorkloadClassVersionRef::new(
                 WorkloadClassId::new("class-1").expect("valid class ID"),

@@ -317,7 +317,6 @@ async fn create_tls_termination_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-tls-create-termination-instance".to_owned(),
             instance_id: TERMINATION_INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: TERMINATION_CLASS_ID.to_owned(),
@@ -330,7 +329,6 @@ async fn create_tls_termination_resources(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-tls-create-termination-route".to_owned(),
             route_binding_id: TERMINATION_ROUTE_ID.to_owned(),
             instance_id: TERMINATION_INSTANCE_ID.to_owned(),
             identity: Some(http_route_identity(
@@ -353,7 +351,6 @@ async fn create_sni_passthrough_resources(
     for spec in passthrough_specs() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-tls-create-instance-{}", spec.target),
                 instance_id: spec.instance_id.to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: PASSTHROUGH_CLASS_ID.to_owned(),
@@ -366,7 +363,6 @@ async fn create_sni_passthrough_resources(
 
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-tls-create-route-{}", spec.target),
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(sni_route_identity(spec.host_kind, spec.host)),

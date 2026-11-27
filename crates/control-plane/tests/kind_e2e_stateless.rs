@@ -340,7 +340,6 @@ async fn create_operator_resources(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-create-instance".to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),
@@ -353,7 +352,6 @@ async fn create_operator_resources(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: "kind-e2e-create-route".to_owned(),
             route_binding_id: ROUTE_ID.to_owned(),
             instance_id: INSTANCE_ID.to_owned(),
             identity: Some(RouteIdentity {
@@ -378,7 +376,6 @@ async fn begin_abandoned_wake(
 ) -> TestResult<Instant> {
     let created = operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-create-abandoned-instance".to_owned(),
             instance_id: ABANDONED_INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: CLASS_ID.to_owned(),

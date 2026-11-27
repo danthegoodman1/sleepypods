@@ -125,7 +125,6 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
     for (index, id) in IDS.iter().enumerate() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("create-{id}"),
                 instance_id: (*id).into(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: "dynamic-web".into(),
@@ -141,7 +140,6 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
         }
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("route-{id}"),
                 route_binding_id: format!("route-{id}"),
                 instance_id: (*id).into(),
                 identity: Some(identity),

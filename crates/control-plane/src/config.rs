@@ -19,9 +19,6 @@ pub struct PostgresStoreConfig {
     pub connection_timeout: Duration,
     pub statement_timeout: Duration,
     pub operation_timeout: Duration,
-    /// None preserves deduplication for the lifetime of the database. A finite
-    /// lifetime is an explicit opt-in and is fixed when each key is created.
-    pub idempotency_retention: Option<Duration>,
 }
 
 impl ControlPlaneConfig {
@@ -33,7 +30,6 @@ impl ControlPlaneConfig {
 impl PostgresStoreConfig {
     pub const MAX_CONNECTIONS: usize = 1024;
     pub const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-    pub const MAX_IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
     pub fn new(connection_url: impl Into<String>) -> Result<Self, EmptyStringError> {
         Ok(Self {
@@ -43,7 +39,6 @@ impl PostgresStoreConfig {
             connection_timeout: Duration::from_secs(5),
             statement_timeout: Duration::from_secs(30),
             operation_timeout: Duration::from_secs(600),
-            idempotency_retention: None,
         })
     }
 
@@ -77,12 +72,6 @@ impl PostgresStoreConfig {
                 "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
                 self.statement_timeout,
                 Self::MAX_TIMEOUT,
-            ),
-            (
-                "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                self.idempotency_retention
-                    .unwrap_or(Duration::from_millis(1)),
-                Self::MAX_IDEMPOTENCY_RETENTION,
             ),
         ] {
             if value < Duration::from_millis(1)
@@ -128,7 +117,7 @@ mod tests {
     #[test]
     fn postgres_durations_are_bounded_whole_milliseconds() {
         type SetDuration = fn(&mut PostgresStoreConfig, Duration);
-        let settings: [(&str, SetDuration, Duration); 4] = [
+        let settings: [(&str, SetDuration, Duration); 3] = [
             (
                 "SLEEPYPODS_POSTGRES_POOL_WAIT_TIMEOUT_MS",
                 |config, value| config.pool_wait_timeout = value,
@@ -143,11 +132,6 @@ mod tests {
                 "SLEEPYPODS_POSTGRES_STATEMENT_TIMEOUT_MS",
                 |config, value| config.statement_timeout = value,
                 PostgresStoreConfig::MAX_TIMEOUT,
-            ),
-            (
-                "SLEEPYPODS_POSTGRES_IDEMPOTENCY_RETENTION_MS",
-                |config, value| config.idempotency_retention = Some(value),
-                PostgresStoreConfig::MAX_IDEMPOTENCY_RETENTION,
             ),
         ];
         for (name, set_duration, maximum) in settings {

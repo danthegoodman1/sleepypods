@@ -335,7 +335,6 @@ async fn create_operator_resources(
     for spec in route_specs() {
         operator
             .create_instance(CreateInstanceRequest {
-                idempotency_key: format!("kind-e2e-protocols-create-instance-{}", spec.target),
                 instance_id: spec.instance_id.to_owned(),
                 workload_class: Some(WorkloadClassVersionRef {
                     class_id: spec.class_id.to_owned(),
@@ -348,7 +347,6 @@ async fn create_operator_resources(
 
         operator
             .create_route_binding(CreateRouteBindingRequest {
-                idempotency_key: format!("kind-e2e-protocols-create-route-{}", spec.target),
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(http_route_identity(spec.host, Some(spec.path_prefix))),

@@ -316,7 +316,6 @@ impl ControlPlaneStore for TestStore {
             Ok(CreateInstanceResult {
                 instance,
                 route_bindings,
-                idempotency_replayed: false,
             })
         })
     }
@@ -1183,7 +1182,6 @@ pub async fn lifecycle_conformance(store: &dyn ControlPlaneStore) -> StoreResult
         .await?;
     let created = store
         .create_instance(CreateInstanceRequest::new(
-            IdempotencyKey::new("shared-conformance").unwrap(),
             InstanceId::new("shared-conformance").unwrap(),
             class.reference,
         ))

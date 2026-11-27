@@ -158,7 +158,6 @@ async fn bad_route_misses_without_materializing_unrelated_instance(
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        "good",
     )
     .await?;
 
@@ -286,7 +285,6 @@ async fn wake_readiness_failure_is_bounded_and_rejects_stale_proxy_generation(
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        "readiness",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -403,7 +401,6 @@ async fn duplicate_volume_inventory_is_rejected_at_class_creation(
     }
     let error = operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: "kind-e2e-failure-duplicate-volume-instance".to_owned(),
             instance_id: DUPLICATE_VOLUME_INSTANCE_ID.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: DUPLICATE_VOLUME_CLASS_ID.to_owned(),
@@ -472,7 +469,6 @@ async fn missing_pvc_binding_fails_materialization_without_ready_backend(
             volumes: Vec::new(),
             raw_objects: unbound_static_inventory(&config.namespace),
         },
-        "unbound",
     )
     .await?;
     let created = wait_for_instance_state(
@@ -591,7 +587,6 @@ fn workload_class_request(spec: ClassInstanceRoute<'_>) -> CreateWorkloadClassVe
 async fn create_class_instance_and_route(
     operator: &mut OperatorControlPlaneClient<Channel>,
     spec: ClassInstanceRoute<'_>,
-    idempotency_prefix: &str,
 ) -> TestResult<()> {
     let (class_id, instance_id, route_id, route_host) = (
         spec.class_id,
@@ -605,7 +600,6 @@ async fn create_class_instance_and_route(
 
     operator
         .create_instance(CreateInstanceRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-instance"),
             instance_id: instance_id.to_owned(),
             workload_class: Some(WorkloadClassVersionRef {
                 class_id: class_id.to_owned(),
@@ -618,7 +612,6 @@ async fn create_class_instance_and_route(
 
     operator
         .create_route_binding(CreateRouteBindingRequest {
-            idempotency_key: format!("kind-e2e-failure-{idempotency_prefix}-route"),
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(RouteIdentity {
