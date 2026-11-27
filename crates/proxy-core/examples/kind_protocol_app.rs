@@ -170,13 +170,9 @@ async fn serve_websocket(stream: PrefixedTcpStream) -> AppResult<()> {
                 response.extend_from_slice(&bytes);
                 websocket.send(Message::Binary(response.into())).await?;
             }
-            Message::Close(frame) => {
-                websocket.send(Message::Close(frame)).await?;
-                websocket.flush().await?;
-                break;
-            }
             Message::Ping(bytes) => websocket.send(Message::Pong(bytes)).await?,
-            Message::Pong(_) | Message::Frame(_) => {}
+            // tungstenite queues the close reply; the next read sends it and ends the stream.
+            Message::Close(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
 
