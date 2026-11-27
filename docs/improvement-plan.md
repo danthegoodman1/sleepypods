@@ -554,14 +554,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: Render at create time | Missing: dry-run render, declared-value check, added limits. |
-| Incomplete | Work | 6B: 16-hex name suffix | Missing: constant change and collision test. |
-| Incomplete | Work | 6C: Inert API removed | Missing: proto and store changes; `routes` on `CreateInstance`; admin RPCs by instance. |
-| Incomplete | Work | 6D: gRPC-Web TLS and configured origins | Missing: TLS on the web listener and origin configuration. |
-| Incomplete | Work | 6E: Sealing key completeness | Missing: startup check and bulk re-encrypt. |
-| Incomplete | Work | 6F: Quiet control-plane logging | Missing: filtered sink and auth counter. |
-| Incomplete | Gate | Accepted means renderable | Missing: per-input rejection tests and the render property test. |
-| Incomplete | Doc | Operator guide | Missing: updates for removed fields, TLS on gRPC-Web and key rotation. |
+| Complete | Work | 6A: Render at create time | Commit `3c09124`: `CreateInstance` dry-runs the render and class creation renders with placeholders; twelve rejection tests in `crates/control-plane/tests/api_transport/create_validation.rs`, plus manifest tests for the hostPath boundary, raw-object suffix and name limits. |
+| Complete | Work | 6B: 16-hex name suffix | Commit `9a1e36f`: `ten_million_sequential_instance_ids_render_distinct_names` (ignored by default, zero collisions in 39 s) and `colliding_32_bit_prefixes_render_distinct_names`. |
+| Complete | Work | 6C: Inert API removed | Commits `87170fe`, `78aa212`: `default_values`, class `idempotency_key`, `template_generation`, `ExpireHttp01Challenges` and the placeholder service are gone; `create_instance_creates_its_routes_with_the_instance`; admin RPCs take `instance_id`. `ProtocolRoute` goes with Phase 3. |
+| Complete | Work | 6D: gRPC-Web TLS and configured origins | Commits `4cce567`, `8760681`: `grpc_web_listener_refuses_plaintext_when_tls_is_configured`, `grpc_web_listener_serves_allowed_origins_and_refuses_others`. |
+| Complete | Work | 6E: Sealing key completeness | Commits `1321320`, `cb36fc4`: `postgres_startup_requires_every_sealing_key_in_use` and `postgres_sealing_key_rotation_reencrypts_certificates_in_bulk` (`ReencryptCertificates`). |
+| Complete | Work | 6F: Quiet control-plane logging | Commit `833940b`: `successful_rpc_writes_no_stderr_line` and `accepted_decisions_are_counted_and_write_no_log_event`. |
+| In Progress | Gate | Accepted means renderable | Property test `every_accepted_instance_renders_at_wake` (175 accepted instances, all render) and the rejection tests pass; workspace 962 passed, real-Postgres target 28 passed at `42222f3`. Missing: the gRPC-Web kind gate over TLS. |
+| Complete | Doc | Operator guide | Commit `7e0701b`. |
 
 ## Phase 7: Store Cost and Shape
 
