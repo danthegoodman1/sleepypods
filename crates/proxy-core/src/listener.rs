@@ -129,6 +129,15 @@ mod tests {
             .expect("served connection writes");
     }
 
+    /// Echoes every byte until the client closes its side.
+    async fn echo_until_closed(mut stream: TcpStream) {
+        while let Ok(byte) = stream.read_u8().await {
+            if stream.write_u8(byte).await.is_err() {
+                return;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn accept_errors_leave_the_listener_serving() {
         let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,25 +176,32 @@ mod tests {
         let server = tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
-                serve_listener(listener, &shutdown, |stream, _| Some(echo_one_byte(stream))).await
+                serve_listener(listener, &shutdown, |stream, _| {
+                    Some(echo_until_closed(stream))
+                })
+                .await
             }
         });
-        let mut open = TcpStream::connect(addr).await.unwrap();
-        // The server accepted this connection once its echo arrives.
-        open.write_u8(1).await.unwrap();
-        assert_eq!(open.read_u8().await.unwrap(), 1);
         let mut draining = TcpStream::connect(addr).await.unwrap();
+        // The server accepted this connection once its echo arrives.
+        draining.write_u8(1).await.unwrap();
+        assert_eq!(draining.read_u8().await.unwrap(), 1);
 
         shutdown.shutdown();
         let mut connections = server.await.unwrap();
 
         let refused = TcpStream::connect(addr).await.unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
-        if let Some(task) = connections.join_next().await {
-            task.unwrap();
-        }
-        drop(connections);
-        let _ = draining.read_u8().await;
+        // The accepted connection keeps being served while it drains.
+        draining.write_u8(2).await.unwrap();
+        assert_eq!(draining.read_u8().await.unwrap(), 2);
+        drop(draining);
+        let task = connections
+            .join_next()
+            .await
+            .expect("draining connection task");
+        task.unwrap();
+        assert!(connections.join_next().await.is_none());
     }
 
     #[tokio::test]
