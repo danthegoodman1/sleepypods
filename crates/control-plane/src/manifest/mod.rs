@@ -3,24 +3,16 @@ use std::{error::Error, fmt};
 use crate::{instance::InstanceRecord, sleep_policy::ResolvedSleepPolicy};
 
 mod bind;
-mod objects;
+mod object;
 mod render;
-mod serialize;
 mod template;
 
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 mod tests;
 
-pub use objects::{
-    ApplyOrder, Container, ContainerPort, CsiPersistentVolumeSource, CsiSecretReference,
-    Deployment, DeploymentSpec, EnvVar, EnvVarSource, HostPathPersistentVolumeSource,
-    HttpReadinessProbe, KubernetesObject, LabelSelector, ObjectMeta, PersistentVolume,
-    PersistentVolumeClaim, PersistentVolumeClaimRef, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, PersistentVolumeSource, PersistentVolumeSpec, PodSpec,
-    PodTemplateMetadata, PodTemplateSpec, PodVolume, RawKubernetesObject, RenderedManifest,
-    RenderedManifestObject, Secret, SecretKeyRef, Service, ServicePort, ServiceSpec, StatefulSet,
-    StatefulSetSpec, VolumeMount, VolumeResourceRequirements,
-};
+pub use object::{ApplyOrder, KubernetesObject, RenderedManifest, RenderedManifestObject};
 pub use render::render_manifests;
 pub(crate) use render::render_manifests_with_options;
 pub use template::{

@@ -1,0 +1,374 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolume",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "6349b7eabc87295e"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "pv-acme-80a707af7dc77ee1"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce"
+      ],
+      "capacity": {
+        "storage": "10Gi"
+      },
+      "claimRef": {
+        "name": "pvc-acme-80a707af7dc77ee1",
+        "namespace": "apps"
+      },
+      "csi": {
+        "controllerExpandSecretRef": {
+          "name": "controller-expand",
+          "namespace": "storage-secrets"
+        },
+        "controllerPublishSecretRef": {
+          "name": "controller-publish",
+          "namespace": "storage-secrets"
+        },
+        "driver": "csi.example.com",
+        "fsType": "ext4",
+        "nodeExpandSecretRef": {
+          "name": "node-expand",
+          "namespace": "storage-secrets"
+        },
+        "nodePublishSecretRef": {
+          "name": "node-publish",
+          "namespace": "storage-secrets"
+        },
+        "nodeStageSecretRef": {
+          "name": "node-stage",
+          "namespace": "storage-secrets"
+        },
+        "readOnly": false,
+        "volumeAttributes": {
+          "tenant": "acme"
+        },
+        "volumeHandle": "vol-123"
+      },
+      "persistentVolumeReclaimPolicy": "Retain",
+      "storageClassName": "manual"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolume",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "067802c534e11e03"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "scratch-pv-acme-80a707af7dc77ee1"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce",
+        "ReadOnlyMany"
+      ],
+      "capacity": {
+        "storage": "1Gi"
+      },
+      "claimRef": {
+        "name": "scratch-pvc-acme-80a707af7dc77ee1",
+        "namespace": "apps"
+      },
+      "hostPath": {
+        "path": "/var/local/sleepypods/acme",
+        "type": "DirectoryOrCreate"
+      },
+      "persistentVolumeReclaimPolicy": "Retain"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolumeClaim",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "b4c508f7c376e86b"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "pvc-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce"
+      ],
+      "resources": {
+        "requests": {
+          "storage": "10Gi"
+        }
+      },
+      "storageClassName": "manual",
+      "volumeName": "pv-acme-80a707af7dc77ee1"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "PersistentVolumeClaim",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "164659feb344829a"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "scratch-pvc-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "accessModes": [
+        "ReadWriteOnce",
+        "ReadOnlyMany"
+      ],
+      "resources": {
+        "requests": {
+          "storage": "1Gi"
+        }
+      },
+      "volumeName": "scratch-pv-acme-80a707af7dc77ee1"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/backend-scheme": "tcp",
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "44901e394b0d89de"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "db-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "ports": [
+        {
+          "port": 5432,
+          "targetPort": 15000
+        }
+      ],
+      "selector": {
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      }
+    }
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "8f724c3ec1cd4d7d"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+      },
+      "name": "db-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "sleepypods.io/instance-id": "tenant-a",
+          "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+        }
+      },
+      "serviceName": "db-acme-80a707af7dc77ee1",
+      "template": {
+        "metadata": {
+          "annotations": {
+            "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+            "sleepypods.io/rendered-hash": "8f724c3ec1cd4d7d"
+          },
+          "labels": {
+            "app.kubernetes.io/managed-by": "sleepypods",
+            "sleepypods.io/instance-generation": "7",
+            "sleepypods.io/instance-id": "tenant-a",
+            "sleepypods.io/workload-class-id": "web",
+            "sleepypods.io/workload-class-version": "3",
+            "sleepypods.io/workload-name": "db-acme-80a707af7dc77ee1"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [],
+              "image": "postgres:17",
+              "name": "postgres",
+              "ports": [
+                {
+                  "containerPort": 5432,
+                  "name": "postgres"
+                }
+              ],
+              "securityContext": {
+                "allowPrivilegeEscalation": false
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/var/lib/postgresql/data",
+                  "name": "data"
+                },
+                {
+                  "mountPath": "/scratch",
+                  "name": "scratch"
+                }
+              ]
+            },
+            {
+              "env": [
+                {
+                  "name": "SLEEPYPODS_POD_UID",
+                  "valueFrom": {
+                    "fieldRef": {
+                      "apiVersion": "v1",
+                      "fieldPath": "metadata.uid"
+                    }
+                  }
+                },
+                {
+                  "name": "SLEEPYPODS_LISTEN_PORT",
+                  "value": "15000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_LISTEN_ADDR",
+                  "value": "0.0.0.0:15000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR",
+                  "value": "0.0.0.0:15001"
+                },
+                {
+                  "name": "SLEEPYPODS_APP_PORT",
+                  "value": "5432"
+                },
+                {
+                  "name": "SLEEPYPODS_INSTANCE_ID",
+                  "value": "tenant-a"
+                },
+                {
+                  "name": "SLEEPYPODS_INSTANCE_GENERATION",
+                  "value": "7"
+                },
+                {
+                  "name": "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
+                  "value": "http://sleepypods-control-plane.apps.svc.cluster.local:50051"
+                },
+                {
+                  "name": "SLEEPYPODS_IDLE_TIMEOUT_MS",
+                  "value": "120000"
+                },
+                {
+                  "name": "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS",
+                  "value": "5000"
+                },
+                {
+                  "name": "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS",
+                  "value": "30000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_MODE",
+                  "value": "tcp"
+                }
+              ],
+              "image": "sleepypods/sidecar:test",
+              "name": "sleepypods-sidecar",
+              "ports": [
+                {
+                  "containerPort": 15000,
+                  "name": "sleepypods"
+                },
+                {
+                  "containerPort": 15001
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 1,
+                "httpGet": {
+                  "path": "/ready",
+                  "port": 15001
+                },
+                "periodSeconds": 1,
+                "timeoutSeconds": 1
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false
+              },
+              "volumeMounts": []
+            }
+          ],
+          "securityContext": {
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "terminationGracePeriodSeconds": 90,
+          "volumes": [
+            {
+              "name": "data",
+              "persistentVolumeClaim": {
+                "claimName": "pvc-acme-80a707af7dc77ee1"
+              }
+            },
+            {
+              "name": "scratch",
+              "persistentVolumeClaim": {
+                "claimName": "scratch-pvc-acme-80a707af7dc77ee1"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+]

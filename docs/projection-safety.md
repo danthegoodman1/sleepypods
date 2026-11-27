@@ -18,8 +18,8 @@ its lease without any record of the mutations it sent.
   checked.
 - A patch or delete carries the UID and resourceVersion the driver observed.
   The API server refuses it once the object changes or is replaced.
-- A create has no precondition, so it creates nothing that runs. A Deployment
-  or StatefulSet, structured or raw, is created with zero replicas. The driver
+- A create has no precondition, so it creates nothing that runs. The
+  Deployment or StatefulSet is created with zero replicas. The driver
   then reads the created object's UID and scales that object up with a patch
   conditional on the UID. Only the driver that saw the create succeed knows
   the UID, and cleanup removes the object before it proves absence. This one
@@ -53,10 +53,10 @@ holds the Pod until the volume is bound.
 ## Readiness
 
 The primary Service keeps its stable instance and workload selector. Only the
-structured primary Pod template receives its workload-name label; raw auxiliary
-Deployment and StatefulSet templates receive cleanup ownership without that
-label. Explicit raw uses of the reserved primary selector key are rejected, and
-raw standalone Pods are unsupported.
+structured workload and its Pod template receive the workload-name label. Raw
+objects receive cleanup ownership without it, and a raw label or selector that
+names the reserved key is rejected. A class has no raw Pod, Deployment or
+StatefulSet, so the structured workload is the only source of Pods.
 
 The injected sidecar has a private HTTP readiness probe on a separate declared
 port. Its health listener becomes available only after the proxy binds;
