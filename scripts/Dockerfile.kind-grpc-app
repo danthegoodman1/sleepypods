@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.13-slim
+
+RUN pip install --no-cache-dir grpcio==1.71.0
+COPY scripts/kind-grpc-app.py /app/kind-grpc-app.py
+
+USER 65532:65532
+EXPOSE 8080
+CMD ["python", "/app/kind-grpc-app.py"]
