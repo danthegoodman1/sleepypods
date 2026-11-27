@@ -58,7 +58,7 @@ mod tests {
             .expect("metrics listener binds");
         let addr = listener.local_addr().expect("local addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(serve_prometheus_listener_with_collector(
+        let task = tokio::spawn(serve_prometheus_listener(
             listener,
             sink,
             async move {

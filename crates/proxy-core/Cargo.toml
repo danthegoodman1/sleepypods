@@ -26,6 +26,7 @@ futures-util = { workspace = true, default-features = false, features = ["sink",
 http-body-util = { workspace = true, default-features = false }
 hyper = { workspace = true, default-features = false, features = ["server"] }
 libc = "0.2.186"
+sleepypods-observability = { path = "../sleepypods-observability", features = ["test-support"] }
 socket2 = "0.6.4"
 tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }

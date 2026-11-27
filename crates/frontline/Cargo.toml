@@ -28,6 +28,7 @@ hyper-util = { workspace = true, default-features = false, features = ["client-l
 rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
 rustls-pemfile = "2.2.0"
 sidecar = { path = "../sidecar" }
+sleepypods-observability = { path = "../sleepypods-observability", features = ["test-support"] }
 tokio = { workspace = true, default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
 tonic = { workspace = true, features = ["server", "router"] }

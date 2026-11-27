@@ -11,7 +11,7 @@ use sleepypods_observability::{
         EXCLUSIVITY_KEYS_HELD, MATERIALIZATIONS_NONTERMINAL,
         MATERIALIZATION_OLDEST_NONTERMINAL_AGE_SECONDS,
     },
-    prometheus::{serve_prometheus_metrics_with_collector, PrometheusMetricsSink},
+    prometheus::{serve_prometheus_metrics, PrometheusMetricsSink},
     recorder::{
         CompositeObservabilitySink, FilteredStderrObservabilitySink, MetricObservation,
         ObservabilityRecorder,
@@ -597,7 +597,7 @@ where
         let metrics_shutdown = native_shutdown.clone();
         let store = Arc::clone(&store);
         listeners.spawn(async move {
-            serve_prometheus_metrics_with_collector(
+            serve_prometheus_metrics(
                 metrics_addr,
                 prometheus,
                 wait_for_shutdown(metrics_shutdown),

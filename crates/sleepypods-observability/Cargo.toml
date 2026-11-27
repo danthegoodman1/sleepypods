@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[features]
+# InMemoryObservability and other helpers for other crates' tests.
+test-support = []
+
 [dependencies]
 bytes.workspace = true
 http.workspace = true

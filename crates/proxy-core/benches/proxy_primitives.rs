@@ -5,11 +5,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use futures_util::{SinkExt, StreamExt};
 use http::{Request, Uri};
 use proxy_core::{
-    observability::{
-        Operation, Outcome, Protocol, ProxyState, TlsClientHelloOutcome, TrafficDirection,
-    },
     parse_tls_client_hello_sni, prepare_reverse_proxy_request, proxy_streams_with_timeouts,
-    strip_hop_by_hop_headers, ActiveConnectionCounter, AdmissionLimiter, TlsClientHelloError,
+    strip_hop_by_hop_headers, ActiveConnectionCounter, AdmissionLimiter,
 };
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
@@ -217,31 +214,6 @@ fn admission_and_accounting(c: &mut Criterion) {
     });
 }
 
-fn observability_helpers(c: &mut Criterion) {
-    let tls_error: Result<proxy_core::TlsClientHelloSni, _> = Err(TlsClientHelloError::Malformed);
-
-    c.bench_function("observability/label_as_str_and_outcome_mapping", |b| {
-        b.iter(|| {
-            for value in Protocol::ALL {
-                black_box(value.as_str());
-            }
-            for value in TrafficDirection::ALL {
-                black_box(value.as_str());
-            }
-            for value in Operation::ALL {
-                black_box(value.as_str());
-            }
-            for value in Outcome::ALL {
-                black_box(value.as_str());
-            }
-            for value in ProxyState::ALL {
-                black_box(value.as_str());
-            }
-            black_box(TlsClientHelloOutcome::from_result(black_box(&tls_error)));
-        })
-    });
-}
-
 fn runtime() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -355,7 +327,6 @@ criterion_group!(
     http_helpers,
     websocket_relay,
     tls_sni,
-    admission_and_accounting,
-    observability_helpers
+    admission_and_accounting
 );
 criterion_main!(benches);

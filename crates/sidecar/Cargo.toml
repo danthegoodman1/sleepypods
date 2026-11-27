@@ -20,6 +20,7 @@ tonic = { workspace = true, features = ["channel", "codegen"] }
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 hyper = { workspace = true, default-features = false, features = ["client", "http1", "http2"] }
 hyper-util = { workspace = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+sleepypods-observability = { path = "../sleepypods-observability", features = ["test-support"] }
 tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time", "test-util"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
 tonic = { workspace = true, features = ["server", "router"] }

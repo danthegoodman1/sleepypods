@@ -8,8 +8,7 @@ use frontline::{
 use proxy_core::{
     observability::{
         prometheus::{
-            serve_prometheus_metrics_with_collector, PrometheusMetricsSink,
-            RuntimeActiveStreamsCollector,
+            serve_prometheus_metrics, PrometheusMetricsSink, RuntimeActiveStreamsCollector,
         },
         recorder::{
             CompositeObservabilitySink, FilteredStderrObservabilitySink, ObservabilityRecorder,
@@ -130,7 +129,7 @@ async fn run_with_shutdown(
                         .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)
                     },
                     async {
-                        serve_prometheus_metrics_with_collector(
+                        serve_prometheus_metrics(
                             metrics_addr,
                             prometheus,
                             metrics_shutdown.cancelled(),

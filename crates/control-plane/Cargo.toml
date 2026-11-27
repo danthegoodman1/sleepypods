@@ -37,6 +37,7 @@ http-body-util = { workspace = true, default-features = true }
 hyper = { workspace = true, default-features = false, features = ["client", "http2"] }
 hyper-util = { workspace = true, default-features = false, features = ["tokio"] }
 rcgen = "0.14"
+sleepypods-observability = { path = "../sleepypods-observability", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util", "time"], default-features = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
