@@ -137,9 +137,32 @@ pub struct WorkloadTemplate {
     pub name: TemplateText,
     pub replicas: Option<u32>,
     pub app_container: ContainerTemplate,
+    /// Seconds Kubernetes waits between SIGTERM and SIGKILL when the pod stops.
+    #[serde(default)]
+    pub termination_grace_period_seconds: Option<u32>,
 }
 
 impl WorkloadTemplate {
+    pub const DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS: u32 = 30;
+    /// Half the cleanup deadline, so one termination fits a cleanup attempt.
+    pub const MAX_TERMINATION_GRACE_PERIOD_SECONDS: u32 = 300;
+
+    pub fn termination_grace_period_seconds(&self) -> Result<u32, ManifestRenderError> {
+        let seconds = self
+            .termination_grace_period_seconds
+            .unwrap_or(Self::DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS);
+        if seconds > Self::MAX_TERMINATION_GRACE_PERIOD_SECONDS {
+            return Err(ManifestRenderError::InvalidField {
+                field: "workload.termination_grace_period_seconds",
+                message: format!(
+                    "{seconds} seconds exceeds the maximum of {}",
+                    Self::MAX_TERMINATION_GRACE_PERIOD_SECONDS
+                ),
+            });
+        }
+        Ok(seconds)
+    }
+
     /// Every sidecar observation must describe the whole supported workload.
     pub fn validate_replicas(&self) -> Result<(), ManifestRenderError> {
         let replicas = self.replicas.unwrap_or(1);
@@ -186,6 +209,26 @@ pub struct SidecarTemplate {
     pub image: TemplateText,
     pub listen_port: u16,
     pub mode: Option<String>,
+    #[serde(default)]
+    pub app_protocol: AppProtocol,
+}
+
+/// The protocol the sidecar speaks to the app container in http mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppProtocol {
+    #[default]
+    Http1,
+    H2c,
+}
+
+impl AppProtocol {
+    /// The value of the sidecar's `SLEEPYPODS_APP_PROTOCOL` setting.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::H2c => "h2c",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

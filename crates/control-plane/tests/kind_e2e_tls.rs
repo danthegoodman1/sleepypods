@@ -802,12 +802,14 @@ fn manifest_template(
                     },
                 ],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: sidecar_mode.map(str::to_owned),
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("e2e-tls-", "")),

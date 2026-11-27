@@ -2935,12 +2935,14 @@ fn stateful_manifest_template_proto() -> ManifestTemplate {
                     value: Some(instance_value_text("tenant")),
                 }],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:test")),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(composed_text("db-", "tenant")),

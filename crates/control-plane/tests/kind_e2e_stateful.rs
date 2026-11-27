@@ -2234,12 +2234,14 @@ fn manifest_template(config: &E2eConfig) -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text(WORKLOAD_NAME)),

@@ -277,6 +277,9 @@ message WorkloadTemplate {
   TemplateText name = 2;
   optional uint32 replicas = 3;
   ContainerTemplate app_container = 4;
+  // Seconds Kubernetes waits between SIGTERM and SIGKILL when the pod stops.
+  // Unset means 30; the maximum is 300.
+  optional uint32 termination_grace_period_seconds = 5;
 }
 
 enum WorkloadKind {
@@ -307,6 +310,15 @@ message SidecarTemplate {
   TemplateText image = 2;
   uint32 listen_port = 3;
   optional string mode = 4;
+  // The protocol the sidecar speaks to the app container in http mode.
+  AppProtocol app_protocol = 5;
+}
+
+enum AppProtocol {
+  // HTTP/1.1, the default.
+  APP_PROTOCOL_HTTP1 = 0;
+  // HTTP/2 without TLS, for apps such as gRPC servers.
+  APP_PROTOCOL_H2C = 1;
 }
 
 message ServiceTemplate {

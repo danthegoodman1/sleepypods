@@ -185,12 +185,14 @@ fn kind_manifest(namespace: &str, pv_name: &str) -> TestResult<RenderedManifest>
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         sidecar: SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("nginx:1.27-alpine"),
             listen_port: 80,
             mode: None,
+            app_protocol: Default::default(),
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal(WORKLOAD_NAME),

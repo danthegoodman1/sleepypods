@@ -24,7 +24,7 @@ pub use objects::{
 pub use render::render_manifests;
 pub(crate) use render::render_manifests_with_options;
 pub use template::{
-    ContainerPortTemplate, ContainerTemplate, CsiSecretRefTemplate, EnvVarTemplate,
+    AppProtocol, ContainerPortTemplate, ContainerTemplate, CsiSecretRefTemplate, EnvVarTemplate,
     ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
     PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate, ServicePortTemplate,
     ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,

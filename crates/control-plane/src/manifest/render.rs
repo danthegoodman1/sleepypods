@@ -10,10 +10,10 @@ use crate::{
 };
 
 use super::{
-    bind::PlaceholderDocument, ApplyOrder, Container, ContainerPort, ContainerTemplate,
-    CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference, Deployment,
-    DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject, LabelSelector,
-    ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
+    bind::PlaceholderDocument, AppProtocol, ApplyOrder, Container, ContainerPort,
+    ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference,
+    Deployment, DeploymentSpec, EnvVar, HostPathPersistentVolumeSource, KubernetesObject,
+    LabelSelector, ManifestRenderError, ManifestTemplate, ObjectMeta, PersistentVolume,
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimRef,
     PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeReclaimPolicy,
     PersistentVolumeSource, PersistentVolumeSourceTemplate, PersistentVolumeSpec, PodSpec,
@@ -38,6 +38,7 @@ const ENV_IDLE_TIMEOUT_MS: &str = "SLEEPYPODS_IDLE_TIMEOUT_MS";
 const ENV_IDLE_RETRY_BACKOFF_MS: &str = "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS";
 const ENV_DRAIN_GRACE_TIMEOUT_MS: &str = "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS";
 const ENV_SIDECAR_MODE: &str = "SLEEPYPODS_SIDECAR_MODE";
+const ENV_APP_PROTOCOL: &str = "SLEEPYPODS_APP_PROTOCOL";
 const ENV_CONTROL_PLANE_SIDECAR_TOKEN: &str = "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN";
 const SIDECAR_TOKEN_SECRET_KEY: &str = "token";
 const ANNOTATION_BACKEND_SCHEME: &str = "sleepypods.io/backend-scheme";
@@ -55,6 +56,10 @@ pub(crate) fn render_manifests_with_options(
     request.template.workload.validate_replicas()?;
     request.template.validate_storage_retention()?;
     validate_namespace(request.namespace)?;
+    let termination_grace_period_seconds = request
+        .template
+        .workload
+        .termination_grace_period_seconds()?;
 
     let suffix = instance_suffix(&request.instance.id);
     let mut instance = request.instance.clone();
@@ -218,6 +223,7 @@ pub(crate) fn render_manifests_with_options(
                     },
                 })
                 .collect(),
+            termination_grace_period_seconds,
         },
     };
 
@@ -681,6 +687,8 @@ struct SidecarRenderConfig {
     app_port: u16,
     readiness_port: u16,
     mode: Option<String>,
+    /// Set in http mode, the only mode that speaks an application protocol.
+    app_protocol: Option<AppProtocol>,
 }
 
 fn render_sidecar_config(
@@ -731,6 +739,13 @@ fn render_sidecar_config(
             });
         }
     }
+    let tcp = template.sidecar.mode.as_deref() == Some("tcp");
+    if tcp && template.sidecar.app_protocol != AppProtocol::default() {
+        return Err(ManifestRenderError::InvalidField {
+            field: "sidecar.app_protocol",
+            message: "an app protocol applies to http mode; tcp mode relays bytes".to_owned(),
+        });
+    }
 
     Ok(SidecarRenderConfig {
         listen_port: template.sidecar.listen_port,
@@ -741,6 +756,7 @@ fn render_sidecar_config(
         app_port,
         readiness_port: readiness_port(template, instance)?,
         mode: template.sidecar.mode.clone(),
+        app_protocol: (!tcp).then_some(template.sidecar.app_protocol),
     })
 }
 
@@ -1058,6 +1074,13 @@ fn render_sidecar_container(
         env.push(EnvVar {
             name: ENV_SIDECAR_MODE.to_owned(),
             value: mode.clone(),
+            value_from: None,
+        });
+    }
+    if let Some(app_protocol) = config.app_protocol {
+        env.push(EnvVar {
+            name: ENV_APP_PROTOCOL.to_owned(),
+            value: app_protocol.as_str().to_owned(),
             value_from: None,
         });
     }

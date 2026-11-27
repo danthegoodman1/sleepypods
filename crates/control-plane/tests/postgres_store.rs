@@ -3345,12 +3345,14 @@ fn workload_manifest_template() -> ManifestTemplate {
                     value: TemplateText::instance_value("tenant"),
                 }],
             },
+            termination_grace_period_seconds: None,
         },
         sidecar: SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         service: Some(ServiceTemplate {
             name: composed_text("svc-", "tenant"),

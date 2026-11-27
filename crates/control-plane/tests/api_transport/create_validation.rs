@@ -65,12 +65,14 @@ fn web_class(class_id: &str) -> CreateWorkloadClassVersionRequest {
                     }],
                     env: vec![],
                 }),
+                termination_grace_period_seconds: None,
             }),
             sidecar: Some(SidecarTemplate {
                 name: "sleepypods-sidecar".to_owned(),
                 image: Some(literal_text("sleepypods/sidecar:test")),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             }),
             service: Some(ServiceTemplate {
                 name: Some(composed_text("web-", "tenant")),
@@ -171,6 +173,45 @@ async fn class_and_instance_that_render_are_accepted() {
         .await
         .expect("a renderable instance is accepted");
     assert!(store.instance_exists("tenant-a"));
+}
+
+#[tokio::test]
+async fn class_round_trips_app_protocol_and_termination_grace_period() {
+    let (_, api) = service();
+    let mut class = web_class("grpc");
+    template(&mut class)
+        .sidecar
+        .as_mut()
+        .expect("sidecar")
+        .app_protocol = control_plane::api::pb::AppProtocol::H2c as i32;
+    template(&mut class)
+        .workload
+        .as_mut()
+        .expect("workload")
+        .termination_grace_period_seconds = Some(45);
+    let created = api
+        .create_workload_class_version(tonic::Request::new(class.clone()))
+        .await
+        .expect("class is accepted")
+        .into_inner();
+    assert_eq!(created.template, class.template);
+
+    let mut class = web_class("slow-stop");
+    template(&mut class)
+        .workload
+        .as_mut()
+        .expect("workload")
+        .termination_grace_period_seconds = Some(301);
+    assert_rejected(
+        create_class(&api, class).await,
+        "exceeds the maximum of 300",
+    );
+
+    let mut class = web_class("tcp-h2c");
+    let sidecar = template(&mut class).sidecar.as_mut().expect("sidecar");
+    sidecar.mode = Some("tcp".to_owned());
+    sidecar.app_protocol = control_plane::api::pb::AppProtocol::H2c as i32;
+    assert_rejected(create_class(&api, class).await, "sidecar.app_protocol");
 }
 
 #[tokio::test]

@@ -3,15 +3,15 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::{
-    render_manifests, render_manifests_with_options, ApplyOrder, ContainerPortTemplate,
-    ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate, CsiSecretReference, EnvVar,
-    EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject, ManifestRenderError,
-    ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-    PersistentVolumeSource, PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate,
-    RawKubernetesObject, RenderManifestOptions, RenderManifestRequest, RenderedManifest,
-    ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-    VolumeTemplate, WorkloadKind, WorkloadTemplate, INSTANCE_SUFFIX_VALUE,
-    LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
+    render_manifests, render_manifests_with_options, AppProtocol, ApplyOrder,
+    ContainerPortTemplate, ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate,
+    CsiSecretReference, EnvVar, EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject,
+    ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
+    RawKubernetesManifestTemplate, RawKubernetesObject, RenderManifestOptions,
+    RenderManifestRequest, RenderedManifest, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind, WorkloadTemplate,
+    INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
     LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
 use crate::materializer::{rendered_object_ref, rendered_object_refs};
@@ -419,6 +419,74 @@ fn renders_optional_sidecar_mode_env() {
         &deployment.spec.template.spec.containers[1].env,
         "SLEEPYPODS_SIDECAR_MODE",
         "tcp",
+    );
+}
+
+#[test]
+fn sidecar_carries_the_declared_app_protocol() {
+    let sidecar_env = |mode: Option<&str>, app_protocol: AppProtocol| {
+        let mut template = deployment_template();
+        template.sidecar.mode = mode.map(str::to_owned);
+        template.sidecar.app_protocol = app_protocol;
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+        })
+        .map(|rendered| match &rendered.objects[1].object {
+            KubernetesObject::Deployment(deployment) => {
+                deployment.spec.template.spec.containers[1].env.clone()
+            }
+            other => panic!("expected Deployment, got {}", other.kind()),
+        })
+    };
+
+    for (mode, app_protocol, expected) in [
+        (None, AppProtocol::Http1, "http1"),
+        (Some("http"), AppProtocol::Http1, "http1"),
+        (None, AppProtocol::H2c, "h2c"),
+        (Some("http"), AppProtocol::H2c, "h2c"),
+    ] {
+        let env = sidecar_env(mode, app_protocol).expect("http mode renders an app protocol");
+        assert_env(&env, "SLEEPYPODS_APP_PROTOCOL", expected);
+    }
+
+    let env = sidecar_env(Some("tcp"), AppProtocol::Http1).expect("tcp mode renders");
+    assert_env_absent(&env, "SLEEPYPODS_APP_PROTOCOL");
+    assert_invalid_field(
+        sidecar_env(Some("tcp"), AppProtocol::H2c)
+            .expect_err("tcp mode has no application protocol to choose"),
+        "sidecar.app_protocol",
+        "http mode",
+    );
+}
+
+#[test]
+fn pod_carries_an_explicit_termination_grace_period() {
+    let render = |seconds: Option<u32>| {
+        let mut template = deployment_template();
+        template.workload.termination_grace_period_seconds = seconds;
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+        })
+        .map(|rendered| {
+            rendered.to_kubernetes_json_values()[1]["spec"]["template"]["spec"]
+                ["terminationGracePeriodSeconds"]
+                .clone()
+        })
+    };
+
+    assert_eq!(render(None).expect("default renders"), json!(30));
+    assert_eq!(render(Some(0)).expect("zero renders"), json!(0));
+    assert_eq!(render(Some(300)).expect("the maximum renders"), json!(300));
+    assert_invalid_field(
+        render(Some(301)).expect_err("a grace period over the maximum is rejected"),
+        "workload.termination_grace_period_seconds",
+        "exceeds the maximum of 300",
     );
 }
 
@@ -2490,6 +2558,7 @@ fn deployment_template() -> ManifestTemplate {
                     value: TemplateText::instance_value("tenant"),
                 }],
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: composed("svc-", "tenant"),
@@ -2520,6 +2589,7 @@ fn stateful_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: composed("db-", "tenant"),
@@ -2622,6 +2692,7 @@ fn sidecar_template() -> SidecarTemplate {
         image: TemplateText::literal("sleepypods/sidecar:test"),
         listen_port: 15000,
         mode: None,
+        app_protocol: Default::default(),
     }
 }
 

@@ -577,6 +577,7 @@ fn workload_class_request(spec: ClassInstanceRoute<'_>) -> CreateWorkloadClassVe
                 image: Some(literal_text(spec.sidecar_image)),
                 listen_port: SIDECAR_PORT,
                 mode: None,
+                app_protocol: Default::default(),
             }),
             service: Some(service_template(spec.workload_name)),
             volumes: spec.volumes,
@@ -1087,6 +1088,7 @@ fn workload_template(kind: WorkloadKind, name: &str, image: &str) -> WorkloadTem
             }],
             env: Vec::new(),
         }),
+        termination_grace_period_seconds: None,
     }
 }
 
@@ -1096,6 +1098,7 @@ fn sidecar_template(config: &E2eConfig) -> SidecarTemplate {
         image: Some(literal_text(&config.sidecar_image)),
         listen_port: SIDECAR_PORT,
         mode: None,
+        app_protocol: Default::default(),
     }
 }
 
@@ -1187,12 +1190,14 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         sidecar: domain::SidecarTemplate {
             name: "sleepypods-sidecar".into(),
             image: domain::TemplateText::literal("fixture-sidecar"),
             listen_port: SIDECAR_PORT as u16,
             mode: None,
+            app_protocol: Default::default(),
         },
         service: Some(domain::ServiceTemplate {
             name: domain::TemplateText::literal(UNBOUND_WORKLOAD_NAME),

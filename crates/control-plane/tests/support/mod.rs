@@ -1146,6 +1146,7 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(control_plane::ServiceTemplate {
                 name: control_plane::TemplateText::literal("svc"),
@@ -1160,6 +1161,7 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
                 image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             volumes: Vec::new(),
             raw_objects: Vec::new(),

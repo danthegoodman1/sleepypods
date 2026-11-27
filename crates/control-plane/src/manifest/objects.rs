@@ -103,6 +103,7 @@ pub struct PodTemplateMetadata {
 pub struct PodSpec {
     pub containers: Vec<Container>,
     pub volumes: Vec<PodVolume>,
+    pub termination_grace_period_seconds: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

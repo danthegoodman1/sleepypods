@@ -2191,6 +2191,7 @@ mod tests {
                         value: TemplateText::instance_value("tenant"),
                     }],
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(ServiceTemplate {
                 name: composed("svc-", "tenant"),
@@ -2221,6 +2222,7 @@ mod tests {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(ServiceTemplate {
                 name: composed("db-", "tenant"),
@@ -2263,6 +2265,7 @@ mod tests {
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         }
     }
 

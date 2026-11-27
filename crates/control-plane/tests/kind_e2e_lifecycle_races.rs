@@ -1936,6 +1936,7 @@ fn workload_template(kind: WorkloadKind, _name: &str, image: &str) -> WorkloadTe
                 value: Some(target_text("", "")),
             }],
         }),
+        termination_grace_period_seconds: None,
     }
 }
 
@@ -1945,6 +1946,7 @@ fn sidecar_template(image: &str) -> SidecarTemplate {
         image: Some(literal_text(image)),
         listen_port: SIDECAR_PORT,
         mode: None,
+        app_protocol: Default::default(),
     }
 }
 

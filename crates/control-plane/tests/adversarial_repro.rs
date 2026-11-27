@@ -492,6 +492,7 @@ fn base_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal("svc"),
@@ -506,6 +507,7 @@ fn base_template() -> ManifestTemplate {
             image: TemplateText::literal("example/sidecar:1"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         volumes: Vec::new(),
         raw_objects: Vec::new(),

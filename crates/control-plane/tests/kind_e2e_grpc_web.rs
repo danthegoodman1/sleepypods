@@ -602,12 +602,14 @@ fn manifest_template() -> ManifestTemplate {
                 }],
                 env: Vec::new(),
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:kind-e2e-grpc-web")),
             listen_port: 15_000,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(literal_text("grpc-web-kind")),

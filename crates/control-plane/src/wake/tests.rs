@@ -333,6 +333,7 @@ fn deployment_template() -> ManifestTemplate {
                     value: TemplateText::literal("acme"),
                 }],
             },
+            termination_grace_period_seconds: None,
         },
         service: Some(ServiceTemplate {
             name: TemplateText::literal("svc-acme"),
@@ -347,6 +348,7 @@ fn deployment_template() -> ManifestTemplate {
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         volumes: Vec::new(),
         raw_objects: Vec::new(),
