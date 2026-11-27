@@ -96,6 +96,9 @@ impl ControlPlaneStore for PostgresStore {
     fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
         Box::pin(super::runtime_work::revision(self))
     }
+    fn route_change_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.route_changes.subscribe()
+    }
     fn load_materialization_work_status(
         &self,
         id: crate::ids::MaterializationId,

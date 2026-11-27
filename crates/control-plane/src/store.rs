@@ -88,6 +88,13 @@ pub trait ControlPlaneStore: Send + Sync {
 
     fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>>;
 
+    /// Wakes its waiter when route-change history may have advanced. A store
+    /// that cannot push returns a signal that stays quiet, and the caller's
+    /// poll finds the change.
+    fn route_change_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
+
     fn load_materialization_work_status(
         &self,
         id: crate::ids::MaterializationId,
@@ -462,6 +469,9 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         retry_store_operation(&self.inner, self.policy, |store| {
             store.load_route_change_revision()
         })
+    }
+    fn route_change_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.route_change_signal()
     }
     fn load_materialization_work_status(
         &self,

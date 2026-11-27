@@ -29,6 +29,10 @@ BEGIN
     UPDATE route_change_revision SET revision = revision + event_count WHERE singleton RETURNING revision INTO next_revision;
     EXECUTE 'INSERT INTO route_change_outbox(revision, payload) SELECT $1 + row_number() OVER (), payload FROM (' || payload_query || ') p' USING next_revision - event_count;
     DELETE FROM route_change_outbox WHERE revision <= next_revision - 100000;
+    -- Delivered at commit; wakes each replica's dispatcher to read the outbox.
+    -- The channel is scoped to this schema, so stores sharing a database wake
+    -- only their own dispatchers.
+    PERFORM pg_notify('sleepypods_routes_' || md5(TG_TABLE_SCHEMA), '');
     RETURN NULL;
 END;
 $$;

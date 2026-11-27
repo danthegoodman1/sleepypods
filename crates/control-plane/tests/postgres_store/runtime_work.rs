@@ -96,8 +96,25 @@ async fn ordered_notifications(
         "rollback removes both state and intent"
     );
 
-    // Each dispatcher anchors on the revision current when it starts, so neither
+    // The store pushes: a commit wakes the signal with no poll involved. The
+    // first wake is the listener reporting that its connection is ready.
+    let changed = store.route_change_signal();
+    tokio::time::timeout(Duration::from_secs(5), changed.notified()).await?;
+    first.execute("UPDATE instances SET state = 'waking', generation = generation + 1 WHERE instance_id = 'order-b'", &[]).await?;
+    tokio::time::timeout(Duration::from_secs(5), changed.notified()).await?;
+    let tx = first.transaction().await?;
+    tx.execute("UPDATE instances SET state = 'failed', generation = generation + 1 WHERE instance_id = 'order-b'", &[]).await?;
+    tx.rollback().await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), changed.notified())
+            .await
+            .is_err(),
+        "a rolled-back change wakes nobody"
+    );
+
+    // Each dispatcher starts from the revision its caller loaded, so neither
     // replays the history already committed above.
+    let anchor = store.load_route_change_revision().await?;
     let left = RouteSubscriptionBroker::new();
     let right = RouteSubscriptionBroker::new();
     let mut left_events = left.subscribe();
@@ -106,16 +123,18 @@ async fn ordered_notifications(
     let a = tokio::spawn(control_plane::runtime::dispatch_route_changes(
         store.clone(),
         left,
+        anchor,
         receiver.clone(),
     ));
     let b = tokio::spawn(control_plane::runtime::dispatch_route_changes(
         store.clone(),
         right,
+        anchor,
         receiver,
     ));
 
-    // Both must anchor before the change below, or the assertion that they
-    // deliver it would also pass on a dispatcher that simply replayed history.
+    // Neither publishes anything before the change below, or the assertion that
+    // they deliver it would also pass on a dispatcher that simply replayed history.
     for events in [&mut left_events, &mut right_events] {
         assert!(
             tokio::time::timeout(Duration::from_millis(750), events.recv())

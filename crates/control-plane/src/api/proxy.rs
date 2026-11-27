@@ -219,17 +219,7 @@ where
                     },
                 )),
             },
-            Err(error) => {
-                if let Some(instance) = failed_wake_instance(&error) {
-                    notify_instance_routes_changed(
-                        self.store.as_ref(),
-                        &self.route_events,
-                        instance.id.clone(),
-                    )
-                    .await?;
-                }
-                proxy_wake_error_response(instance_id, error)?
-            }
+            Err(error) => proxy_wake_error_response(instance_id, error)?,
         };
 
         Ok(Response::new(response))
@@ -316,29 +306,6 @@ where
                 lifetime: self.route_events.limits.subscription_lifetime,
             });
         Ok(response)
-    }
-}
-
-async fn notify_instance_routes_changed(
-    _store: &dyn ControlPlaneStore,
-    route_events: &RouteSubscriptionBroker,
-    instance_id: InstanceId,
-) -> Result<(), Status> {
-    route_events.notify_instance_changed(instance_id);
-    Ok(())
-}
-
-fn failed_wake_instance(error: &WakeInstanceError) -> Option<&crate::instance::InstanceRecord> {
-    match error {
-        WakeInstanceError::WorkloadClassNotFound { instance }
-        | WakeInstanceError::Render { instance, .. }
-        | WakeInstanceError::SleepPolicy { instance, .. }
-        | WakeInstanceError::Materializer { instance, .. } => Some(instance),
-        WakeInstanceError::NotFound
-        | WakeInstanceError::GenerationConflict { .. }
-        | WakeInstanceError::Unavailable { .. }
-        | WakeInstanceError::ReadyMaterializationNotFound { .. }
-        | WakeInstanceError::Store(_) => None,
     }
 }
 

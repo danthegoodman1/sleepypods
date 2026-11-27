@@ -12,12 +12,9 @@ use tower::layer::util::{Identity, Stack};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
-    api::{
-        pb::{
-            self,
-            operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
-        },
-        route_events::RouteSubscriptionBroker,
+    api::pb::{
+        self,
+        operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
     },
     http01 as domain_http01,
     ids::{IdempotencyKey, InstanceId, MaterializationId, WorkloadClassId},
@@ -73,7 +70,6 @@ pub struct StoreBackedOperatorApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
 }
 
 impl OperatorApiPlaceholder {
@@ -88,20 +84,10 @@ impl<C> StoreBackedOperatorApi<C> {
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
-        Self::with_route_events(store, materializer, target, RouteSubscriptionBroker::new())
-    }
-
-    pub fn with_route_events(
-        store: Arc<dyn ControlPlaneStore>,
-        materializer: KubernetesMaterializer<C>,
-        target: MaterializationTarget,
-        route_events: RouteSubscriptionBroker,
-    ) -> Self {
         Self {
             store,
             materializer,
             target,
-            route_events,
         }
     }
 }
@@ -160,31 +146,9 @@ pub fn operator_grpc_service_with_store<C>(
 where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
-    operator_grpc_service_with_store_and_route_events(
-        store,
-        materializer,
-        target,
-        RouteSubscriptionBroker::new(),
-    )
-}
-
-pub fn operator_grpc_service_with_store_and_route_events<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
-) -> StoreBackedOperatorGrpcService<C>
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    OperatorControlPlaneServer::new(StoreBackedOperatorApi::with_route_events(
-        store,
-        materializer,
-        target,
-        route_events,
-    ))
-    .max_decoding_message_size(256 * 1024)
-    .max_encoding_message_size(1024 * 1024)
+    OperatorControlPlaneServer::new(StoreBackedOperatorApi::new(store, materializer, target))
+        .max_decoding_message_size(256 * 1024)
+        .max_encoding_message_size(1024 * 1024)
 }
 
 pub fn operator_grpc_server_builder() -> Server {
@@ -465,8 +429,6 @@ where
             .await
             .map_err(store_error_to_status)?;
 
-        self.route_events
-            .notify_routes_changed(&result.route_bindings);
         Ok(Response::new(instance_to_proto(result.instance)))
     }
 
@@ -504,15 +466,11 @@ where
             instance_id: parse_instance_id(request.instance_id)?,
             expected_generation: crate::ids::Generation::new(expected_generation),
         };
-        let instance_id = request.instance_id.clone();
         let deleted = self
             .store
             .request_instance_deletion(request)
             .await
             .map_err(store_error_to_status)?;
-        if deleted {
-            self.route_events.notify_instance_changed(instance_id);
-        }
 
         Ok(Response::new(pb::DeleteInstanceResponse {
             accepted: deleted,
@@ -530,8 +488,6 @@ where
             )?)
             .await
             .map_err(store_error_to_status)?;
-        self.route_events
-            .notify_route_changed(route_binding.id.clone(), route_binding.identity.clone());
 
         Ok(Response::new(route_binding_to_proto(route_binding)))
     }
@@ -558,15 +514,12 @@ where
         request: Request<pb::DeleteRouteBindingRequest>,
     ) -> Result<Response<pb::DeleteRouteBindingResponse>, Status> {
         let route_binding_id = parse_route_binding_id(request.into_inner().route_binding_id)?;
-        let request = domain_route::DeleteRouteBindingRequest::new(route_binding_id.clone());
+        let request = domain_route::DeleteRouteBindingRequest::new(route_binding_id);
         let deleted = self
             .store
             .delete_route_binding(request)
             .await
             .map_err(store_error_to_status)?;
-        if deleted {
-            self.route_events.notify_route_removed(route_binding_id);
-        }
 
         Ok(Response::new(pb::DeleteRouteBindingResponse { deleted }))
     }

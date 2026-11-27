@@ -24,9 +24,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     api::{
-        operator_grpc_service_with_store_and_route_events,
-        proxy_grpc_service_with_store_and_route_events,
-        sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
+        operator_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
+        sidecar_grpc_service_with_store, RouteSubscriptionBroker,
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
     config::{ControlPlaneConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName},
@@ -324,12 +323,7 @@ where
             ),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            sidecar_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            sidecar_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::SIDECAR_SERVICE_NAME,
                 crate::auth::CallerRole::Sidecar,
@@ -352,12 +346,7 @@ where
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
     Ok(grpc_server(route_events.clone(), tls)?.add_service(
         tonic::service::interceptor::InterceptedService::new(
-            operator_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            operator_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
@@ -419,12 +408,7 @@ where
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            operator_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            operator_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
@@ -528,8 +512,10 @@ where
         config.target.clone(),
         MaterializationReconcilerConfig::default(),
         ObservabilityRecorder::global(),
-    )
-    .with_route_events(route_events.clone());
+    );
+    // The cursor is fixed before any listener serves: a subscriber resolves
+    // only after this point, so every later change is dispatched to it.
+    let route_change_cursor = store.load_route_change_revision().await?;
     let mut listeners = JoinSet::new();
     listeners.spawn(async move {
         reconciler
@@ -541,7 +527,13 @@ where
     let dispatcher_events = route_events.clone();
     let dispatcher_shutdown = shutdown_tx.subscribe();
     listeners.spawn(async move {
-        dispatch_route_changes(dispatcher_store, dispatcher_events, dispatcher_shutdown).await
+        dispatch_route_changes(
+            dispatcher_store,
+            dispatcher_events,
+            route_change_cursor,
+            dispatcher_shutdown,
+        )
+        .await
     });
     let maintenance_store = store.clone();
     let maintenance_shutdown = shutdown_tx.subscribe();
@@ -675,46 +667,48 @@ async fn shutdown_signal() {
     }
 }
 
+/// The fallback poll for route changes; a store notification normally wakes
+/// the dispatcher first.
+const ROUTE_CHANGE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const ROUTE_CHANGE_BATCH: u32 = 1024;
+
+/// Publishes committed route changes after `cursor` to this replica's
+/// subscribers. A failed read keeps the cursor, so the next wake retries and
+/// subscribers lose nothing; history that was pruned past the cursor resets
+/// them.
 pub async fn dispatch_route_changes(
     store: Arc<dyn ControlPlaneStore>,
     events: RouteSubscriptionBroker,
+    mut cursor: u64,
     mut shutdown: watch::Receiver<bool>,
 ) -> RuntimeResult<()> {
-    // Subscribers attach after this process starts and resolve against current
-    // state, so retained history predating it carries no information they lack.
-    // Replaying it also bursts the broadcast channel at the moment the control
-    // plane is coldest, and a subscriber that lags is dropped and made to reset.
-    let mut cursor: Option<u64> = None;
-    let mut failures = 0;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let changed = store.route_change_signal();
+    let mut poll = tokio::time::interval(ROUTE_CHANGE_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => { events.shutdown(); return Ok(()); },
-            _ = interval.tick() => {
-                let Some(start) = cursor else {
-                    match store.load_route_change_revision().await {
-                        Ok(revision) => { failures = 0; cursor = Some(revision); },
-                        Err(error) => {
-                            failures += 1;
-                            if failures >= 5 { return Err(Box::new(error)); }
-                        }
-                    }
-                    continue;
-                };
-                let batch = match store.load_route_changes(start, 1024).await {
-                    Ok(batch) => { failures = 0; batch },
-                    Err(error) => {
-                        events.reset(); failures += 1;
-                        if failures >= 5 { return Err(Box::new(error)); }
-                        continue;
-                    }
-                };
-                if batch.reset { events.reset(); }
-                for event in batch.events { events.publish_durable(&event)?; }
-                cursor = Some(batch.cursor);
+            _ = changed.notified() => {},
+            _ = poll.tick() => {},
+        }
+        while let Ok(batch) = store.load_route_changes(cursor, ROUTE_CHANGE_BATCH).await {
+            if batch.reset {
+                events.reset();
             }
+            let full = batch.events.len() == ROUTE_CHANGE_BATCH as usize;
+            for event in &batch.events {
+                if events.publish_durable(event).is_err() {
+                    // An unreadable record may name any subscription.
+                    events.reset();
+                }
+            }
+            cursor = batch.cursor;
+            if !full {
+                break;
+            }
+            // Subscribers drain the broadcast between batches.
+            tokio::task::yield_now().await;
         }
     }
 }

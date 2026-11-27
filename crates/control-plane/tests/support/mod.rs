@@ -1,8 +1,9 @@
 //! Shared transport fixture, deliberately smaller than PostgreSQL.
 //!
 //! Seeded rows support API mapping, state transitions and fault injection. This
-//! fixture does not model SQL transactions, durable change delivery, retention or
+//! fixture does not model SQL transactions, change-history retention or
 //! distributed ownership: those contracts remain covered by real Postgres tests.
+//! Its route-change log holds what a test records, plus route binding writes.
 #![allow(dead_code)]
 
 use control_plane::InstanceState as DomainInstanceState;
@@ -23,6 +24,9 @@ pub struct TestStore {
     route_resolution: Mutex<Option<FakeRouteResolution>>,
     resolve_route_requests: Mutex<usize>,
     resolve_gate: Mutex<Option<Arc<Notify>>>,
+    route_changes: Mutex<Vec<serde_json::Value>>,
+    route_change_read_failures: Mutex<usize>,
+    route_change_signal: Arc<Notify>,
     fail_ready_materialization_lookup: bool,
     get_error: Mutex<Option<&'static str>>,
     transition_requests: Mutex<Vec<CompareAndSwapInstanceStateRequest>>,
@@ -55,6 +59,26 @@ impl TestStore {
             fail_ready_materialization_lookup: true,
             ..Self::default()
         }
+    }
+    /// Appends an instance change to the route-change log and wakes the dispatcher.
+    pub fn record_instance_change(&self, instance_id: &str) {
+        self.record_route_change(
+            serde_json::json!({"kind": "instance", "instance_id": instance_id}),
+        );
+    }
+    pub fn record_route_change(&self, payload: serde_json::Value) {
+        self.route_changes.lock().unwrap().push(payload);
+        self.route_change_signal.notify_one();
+    }
+    /// Appends without waking, as a store with no push notification would.
+    pub fn record_instance_change_quietly(&self, instance_id: &str) {
+        self.route_changes
+            .lock()
+            .unwrap()
+            .push(serde_json::json!({"kind": "instance", "instance_id": instance_id}));
+    }
+    pub fn fail_route_change_reads(&self, count: usize) {
+        *self.route_change_read_failures.lock().unwrap() = count;
     }
     pub fn set_resolve_gate(&self, gate: Arc<Notify>) {
         *self.resolve_gate.lock().unwrap() = Some(gate);
@@ -251,6 +275,26 @@ fn fake_materialization_record(request: RecordMaterializationRequest) -> Materia
     }
 }
 
+/// The payload the Postgres route-change trigger writes for a route binding.
+pub fn route_change_payload(record: &RouteBindingRecord, removed: bool) -> serde_json::Value {
+    let (identity_kind, host, path_prefix) = match &record.identity {
+        RouteIdentity::Http { host, path } => {
+            ("http", host, path.as_ref().map(|path| path.as_str()))
+        }
+        RouteIdentity::Sni { host } => ("sni", host, None),
+    };
+    serde_json::json!({
+        "kind": "route",
+        "removed": removed,
+        "route_binding_id": record.id.as_str(),
+        "instance_id": record.instance_id.as_str(),
+        "identity_kind": identity_kind,
+        "host_kind": if host.is_wildcard() { "wildcard_suffix" } else { "exact" },
+        "host": host.as_str(),
+        "path_prefix": path_prefix,
+    })
+}
+
 impl ControlPlaneStore for TestStore {
     // Transport fixtures do not pretend to supply persistence/runtime semantics.
     unexpected_store_methods!(
@@ -262,12 +306,43 @@ impl ControlPlaneStore for TestStore {
         resolve_tls_certificate,
         reencrypt_certificate,
         snapshot_tls_bindings,
-        load_route_changes,
-        load_route_change_revision,
         maintain_runtime_records,
         load_materialization_operational_metrics,
         lookup_route_dependencies
     );
+    fn load_route_changes(
+        &self,
+        cursor: u64,
+        limit: u32,
+    ) -> StoreFuture<'_, StoreResult<control_plane::runtime_work::DurableRouteChanges>> {
+        Box::pin(async move {
+            let mut failures = self.route_change_read_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(StoreError::unavailable(
+                    "route change history is unavailable",
+                ));
+            }
+            let changes = self.route_changes.lock().unwrap();
+            let events: Vec<_> = changes
+                .iter()
+                .skip(cursor as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(control_plane::runtime_work::DurableRouteChanges {
+                cursor: cursor + events.len() as u64,
+                reset: false,
+                events,
+            })
+        })
+    }
+    fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>> {
+        Box::pin(async move { Ok(self.route_changes.lock().unwrap().len() as u64) })
+    }
+    fn route_change_signal(&self) -> Arc<Notify> {
+        self.route_change_signal.clone()
+    }
     fn create_instance<'a>(
         &'a self,
         request: control_plane::CreateInstanceRequest,
@@ -361,6 +436,7 @@ impl ControlPlaneStore for TestStore {
                 .lock()
                 .expect("fake store lock is available")
                 .insert(record.id.as_str().to_owned(), record.clone());
+            self.record_route_change(route_change_payload(&record, false));
 
             Ok(record)
         })
@@ -385,12 +461,15 @@ impl ControlPlaneStore for TestStore {
         request: control_plane::DeleteRouteBindingRequest,
     ) -> StoreFuture<'a, StoreResult<bool>> {
         Box::pin(async move {
-            Ok(self
+            let removed = self
                 .route_bindings
                 .lock()
                 .expect("fake store lock is available")
-                .remove(request.route_binding_id.as_str())
-                .is_some())
+                .remove(request.route_binding_id.as_str());
+            if let Some(record) = &removed {
+                self.record_route_change(route_change_payload(record, true));
+            }
+            Ok(removed.is_some())
         })
     }
 

@@ -3,7 +3,7 @@ use crate::{InstanceId, RouteBindingId, RouteBindingRecord, RouteIdentity};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 
-const ROUTE_EVENT_BUFFER: usize = 1024;
+const ROUTE_EVENT_BUFFER: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct RouteSubscriptionBroker {
