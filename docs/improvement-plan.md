@@ -384,6 +384,14 @@ Scope:
   returns the materialization to Ready and the instance to Running in one
   transaction; the sidecar re-arms its idle detector
   (`crates/control-plane/src/postgres/lifecycle_ops.rs:132-157`).
+- 4I: Frontline connects to the ready Pod address first and falls back to the
+  Service ClusterIP. The sidecar verifies the instance ID that frontline sends
+  and answers 421 before the app sees a request meant for another instance,
+  because Pod addresses are reused outside the control plane's control. TCP
+  and SNI passthrough routes carry no identity and keep the ClusterIP. With
+  readiness watched (4C), the first connect lands before kube-proxy has
+  programmed the Service: in kind, Running-to-first-byte rose from 41 ms to
+  1,099 ms mean while endpoint-to-Running fell from 1,583 ms to 18 ms.
 
 Out of scope:
 - Pod start time itself (image pulls, scheduling).
@@ -409,7 +417,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Test | 4A: Wake-latency gate and baseline | Missing: measurement in the kind scripts and a recorded baseline. |
+| In Progress | Test | 4A: Wake-latency gate and baseline | Lifecycle stream measured the unmodified code in kind (12 samples): stateless adds 2,355 ms mean and 2,943 ms worst; stateful 4,780 ms and 9,896 ms. Missing: merged measurement code and the recorded per-phase baseline. |
 | Incomplete | Work | 4B: Reconciler signalled on new work | Missing: in-process signal from acceptance, finalization and job completion. |
 | Incomplete | Work | 4C: Readiness by watch; no PVC Bound wait | Missing: EndpointSlice watch and reordered apply. |
 | Incomplete | Work | 4D: Separate wake and cleanup capacity | Missing: per-state `claim_next`, slot release during readiness wait, configuration. |
@@ -417,6 +425,7 @@ Status ledger:
 | Incomplete | Work | 4F: Parked waiters per instance | Missing: resolve-only flights, per-instance waiter set, cancellation on last waiter. |
 | Incomplete | Work | 4G: Cleanup completes when pods stop | Missing: in-attempt absence wait, rendered termination grace, failure counter untouched by normal sleeps. |
 | Incomplete | Decision | 4H: Revive during drain | Needs: owner decision. Recommended: accept. |
+| Incomplete | Work | 4I: Pod address first, with sidecar identity check and ClusterIP fallback | Missing: Pod address on the route entry, identity header and 421 in the sidecar, fallback connect, and the 4A measurement after it. |
 | Incomplete | Gate | Wake latency and burst bounds | Missing: 4A results at or under 200 ms mean and 500 ms worst; burst, never-ready and sleep-wave tests. |
 | Incomplete | Test | Lifecycle-races and stateful kind gates | Missing: passing runs after 4C, 4G and 4H. |
 
