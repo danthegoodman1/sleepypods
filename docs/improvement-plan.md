@@ -219,17 +219,17 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: Bound host and path in frontline | Missing: length check, 400/414 response and regression test. |
-| Incomplete | Work | 1B: Per-request Subscribe errors and terminal flights | Missing: proto reply, stream kept on lookup failure, flight retry bound, waiter-less flight cancellation. |
-| Incomplete | Work | 1C: Agreeing, validated defaults and eager reconnect | Missing: TTL above lifetime, capacity within stream cap, startup validation, reconnect without backoff after a clean end. |
-| Incomplete | Work | 1D: Lossy ends clear authority; cursor before serving | Missing: terminal status on `Lagged`/`Reset`, streams kept on read failure, cursor load ahead of listeners. |
+| Complete | Work | 1A: Bound host and path in frontline | Commit `41ce06a`: `an_oversized_path_or_host_is_refused_before_any_lookup`; route bindings are bounded the same way at creation (`c36d6ed`, `route_creation_bounds_the_path_prefix_by_the_longest_routed_path`). |
+| Complete | Work | 1B: Per-request Subscribe errors and terminal flights | Commits `41ce06a`, `cf005ea`: `a_failed_store_lookup_ends_that_subscription_and_the_stream_stays_up` and its invalid-request, timeout and limit siblings; `a_flight_ends_when_its_last_waiter_leaves`; `a_lookup_with_no_answer_fails_at_its_deadline`. |
+| Complete | Work | 1C: Agreeing, validated defaults and eager reconnect | Commit `41ce06a`: 60 s lifetime and 90 s TTL validated at startup (`route_cache_ttl_outlasts_a_stream_rotation`); frontline capacity 1,024 against a 2,048 per-stream cap, with a smaller learned cap met by releasing the oldest hosts; `an_orderly_stream_end_keeps_hosts_serving_and_registers_them_again`. |
+| Complete | Work | 1D: Lossy ends clear authority; cursor before serving | Commits `5d02303`, `41ce06a`: `lost_route_changes_end_the_stream_with_data_loss`, `a_failed_stream_clears_the_cache_before_the_next_request_is_served`, `dispatcher_read_failure_keeps_subscribers_and_delivers_after_recovery`, `dispatcher_publishes_only_changes_committed_after_its_cursor`. |
 | Complete | Work | 1E: Shared resilient accept helper | Commit `9603f06`: `proxy_core::serve_listener` serves all six loops; `accept_errors_leave_the_listener_serving`, `shutdown_closes_the_listener_while_connections_drain`, and the sidecar and frontline equivalents inject `EMFILE` and `ECONNABORTED`. |
 | Complete | Work | 1F: Outbound liveness | Commit `9603f06`: HTTP/2 and TCP keepalive on the control-plane channel and the frontline-to-sidecar hop; a header timeout poisons its pooled connection; `a_silent_control_plane_connection_fails_the_report_at_the_keepalive_deadline`, `a_report_that_never_answers_ends_at_its_deadline_and_retries`. The sidecar sends no HTTP/2 pings to the app, because gRPC servers close connections that ping too often. |
 | Complete | Work | 1G: Count-bounded certificate cache | Commits `5da8ab7`, `9a4da04`, `e73bd7f`, `1e287de`: 1,024 certificates and 1,024 negative entries in separate budgets; lookups queue for a fetch slot, at most 64 handshakes waiting; worst-case memory about 220 MiB, stated in the operator guide. |
 | Complete | Work | 1H: WebSocket message cap | Superseded by 8C (`9603f06`): the relay tunnels bytes and holds no message; `a_withheld_final_fragment_reaches_the_upstream_as_it_arrives`. |
-| Incomplete | Gate | Unrelated cached routes keep serving through each fault | Missing: the composed regression tests above, passing. |
+| Complete | Gate | Unrelated cached routes keep serving through each fault | `crates/control-plane/tests/proxy_api_transport/route_edge.rs` joins the frontline coordinator to the real Subscribe service: `a_5000_byte_path_is_refused_and_256_hot_hosts_stay_cached`, `a_failed_store_lookup_fails_its_own_host_and_256_hot_hosts_stay_cached`, `the_control_planes_subscription_limit_is_met_locally_and_hot_hosts_stay_cached`, `stream_rotations_keep_250_hot_hosts_served_from_the_cache`, `lost_route_changes_clear_the_cache_before_the_next_request_is_served`; the listener faults are covered by 1E. |
 | Complete | Test | 1,024 certificates across a refresh cycle | `full_cache_stays_warm_through_a_refresh_cycle_with_three_fetches_in_flight` (the earlier code kept 407 of 1,024), `unknown_hostnames_leave_every_certificate_cached`, and `a_full_lookup_wait_serves_cached_hostnames_and_fails_further_lookups_at_once` in `crates/frontline/src/certificates/capacity_tests.rs`. |
-| Incomplete | Test | Routing kind gate | Missing: passing `scripts/test-kind-e2e-routing.sh` run. |
+| Complete | Test | Routing kind gate | `scripts/test-kind-e2e-routing.sh` passed at `4731fe9` (`routing_and_http01_through_deployed_platform`, 32 s). |
 
 ## Phase 2: Deliver Every Client Protocol to the App
 
@@ -335,13 +335,13 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Decision | 3A: Cache authority by host | Accepted by the owner on 2026-11-27. |
-| Incomplete | Work | 3B: Host rule-set resolution, dependencies and push | Missing: proto, store query, per-host dependency index, concurrent lookups. |
-| Incomplete | Work | 3C: Host-keyed frontline cache with local matching | Missing: re-keyed cache and flights, synchronous read path, atomic hit counter. |
-| Incomplete | Work | 3D: One ordered event channel; test-only resolver removed | Missing: actor-owned reconnect, single session number, deleted modules, ported tests. |
-| Incomplete | Gate | Path cardinality costs one lookup per host | Missing: 10,000-path test and authority-equivalence suite. |
-| Incomplete | Test | Local match equals `resolve_route` | Missing: property test against real Postgres. |
-| Incomplete | Test | `route_lookup` scaling | Missing: before/after Criterion results at 1, 8 and 32 tasks. |
-| Incomplete | Doc | North-star cache section | Missing: rewrite for host rule sets. |
+| Complete | Work | 3B: Host rule-set resolution, dependencies and push | Commits `41ce06a`, `c36d6ed`: `proxy_subscribe_returns_the_complete_rule_set_for_the_host_most_specific_first`, `a_binding_change_for_the_host_or_one_of_its_suffixes_pushes_the_new_rule_set`, `an_instance_change_pushes_…`, `lookups_on_one_stream_run_sixteen_at_a_time`; creation keeps each name within 256 rules and 1 MiB (`tests/postgres_store/host_rule_bounds.rs`). |
+| Complete | Work | 3C: Host-keyed frontline cache with local matching | Commits `41ce06a`, `d02bd2c`: cache, flights and subscriptions keyed by (kind, host); `HostRules` in `sleepypods-api` ranks for both the store and frontline; the read path is an `arc-swap` snapshot; the per-request lookup event is gone. |
+| Complete | Work | 3D: One ordered event channel; test-only resolver removed | Commit `41ce06a`: `matcher.rs`, `resolver.rs`, `RouteObservations` and the test-only coordinator path are deleted; the actor owns one stream, and proxy-chosen subscription IDs are never reused, so no session number is needed. 43 coordinator tests in `crates/frontline/src/route/tests.rs`. |
+| Complete | Gate | Path cardinality costs one lookup per host | `ten_thousand_paths_on_one_host_cost_one_lookup_and_one_subscription`; `a_request_gets_the_same_route_in_every_warm_up_order` (all 720 orders of six HTTP and SNI requests); `a_binding_committed_after_warm_up_takes_the_requests_it_ranks_first_for`. |
+| Complete | Test | Local match equals `resolve_route` | `local_matching_equals_postgres_for_random_binding_sets` (40 sets × 24 requests among 100k routes) and `local_matching_equals_the_control_planes_resolution_for_random_binding_sets` (150 sets × 24 requests). |
+| Complete | Test | `route_lookup` scaling | Release, 24 cores, one hit per task: 1 task 118 ns → 68 ns; 8 tasks 2.13 µs → 87 ns; 32 tasks 7.71 µs → 182 ns. |
+| Complete | Doc | North-star cache section | Commit `de619d4`. |
 
 ## Phase 4: Event-Driven, Unthrottled Wake and Sleep
 
@@ -418,8 +418,8 @@ Status ledger:
 | Incomplete | Work | 4B: Reconciler signalled on new work | Missing: in-process signal from acceptance, finalization and job completion. |
 | Incomplete | Work | 4C: Readiness by watch; no PVC Bound wait | Missing: EndpointSlice watch and reordered apply. |
 | Incomplete | Work | 4D: Separate wake and cleanup capacity | Missing: per-state `claim_next`, slot release during readiness wait, configuration. |
-| Incomplete | Work | 4E: Dispatcher woken by `NOTIFY` | Missing: listener connection, fallback poll, removal of direct notifies. |
-| Incomplete | Work | 4F: Parked waiters per instance | Missing: resolve-only flights, per-instance waiter set, cancellation on last waiter. |
+| Complete | Work | 4E: Dispatcher woken by `NOTIFY` | Commit `5d02303`: `dispatcher_reads_on_the_store_signal_without_waiting_for_its_poll`; the direct in-process notifies are deleted. |
+| Complete | Work | 4F: Parked waiters per instance | Commit `41ce06a`: `sixty_four_hosts_on_waking_instances_leave_an_unrelated_miss_served_and_stop_with_their_clients` (miss answered in zero virtual time; no lookups or wakes for 30 s after clients leave). |
 | Incomplete | Work | 4G: Cleanup completes when pods stop | Missing: in-attempt absence wait, rendered termination grace, failure counter untouched by normal sleeps. |
 | In Progress | Decision | 4H: Revive during drain | Accepted by the owner. Sidecar side in `9603f06`: `an_idle_pod_reports_again_every_backoff_after_an_accepted_report`. Missing: the control-plane transition. |
 | Incomplete | Work | 4I: Pod address first, with sidecar identity check and ClusterIP fallback | Missing: Pod address on the route entry, identity header and 421 in the sidecar, fallback connect, and the 4A measurement after it. |
