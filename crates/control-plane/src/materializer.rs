@@ -339,14 +339,6 @@ impl<C> RetryingKubernetesMaterializerClient<C> {
     pub fn with_default_policy(inner: C) -> Self {
         Self::new(inner, RetryPolicy::default())
     }
-
-    pub fn inner(&self) -> &C {
-        &self.inner
-    }
-
-    pub fn policy(&self) -> RetryPolicy {
-        self.policy
-    }
 }
 
 impl<C> KubernetesMaterializerClient for RetryingKubernetesMaterializerClient<C>
@@ -634,10 +626,6 @@ impl KubernetesClientError {
             message: message.into(),
             kind: KubernetesClientErrorKind::Stale,
         }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
     }
 
     pub fn is_retryable(&self) -> bool {

@@ -993,7 +993,7 @@ mod tests {
             .expect_err("PV is cluster scoped");
 
         assert!(error
-            .message()
+            .to_string()
             .contains("unsupported rendered Kubernetes object"));
     }
 
@@ -1194,7 +1194,7 @@ mod tests {
         })));
 
         assert!(error.is_retryable());
-        assert!(error.message().contains("resource version conflict"));
+        assert!(error.to_string().contains("resource version conflict"));
     }
 
     #[test]
@@ -1207,7 +1207,7 @@ mod tests {
         })));
 
         assert!(!error.is_retryable());
-        assert!(error.message().contains("manifest is invalid"));
+        assert!(error.to_string().contains("manifest is invalid"));
     }
 
     #[test]

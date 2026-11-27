@@ -40,6 +40,8 @@ const POD_START: Duration = Duration::from_secs(3);
 const POD_STOP: Duration = Duration::from_secs(20);
 /// The plan's bound on what the control plane may add to a wake under load.
 const WAKE_BOUND: Duration = Duration::from_secs(5);
+const SERVICE_BACKEND: &str = "http://10.96.0.10:80";
+const POD_BACKEND: &str = "http://10.244.0.9:8080";
 
 // ---------------------------------------------------------------- fixtures
 
@@ -531,6 +533,7 @@ impl ControlPlaneStore for FakeStore {
             row.record.state = MaterializationState::Ready;
             row.record.instance_generation = instance.generation;
             row.record.backend = Some(request.complete.backend);
+            row.record.pod_backend = request.complete.pod_backend;
             let materialization = row.record.clone();
             state.running_at.insert(instance_id, Instant::now());
             Ok(CompleteWakeResult {
@@ -884,12 +887,24 @@ impl KubernetesMaterializerClient for FakeCluster {
                 };
                 match ready_at {
                     Some(ready_at) if ready_at <= Instant::now() => {
-                        return Ok(BackendEndpoint::new("http://10.96.0.10:80").expect("backend"));
+                        return Ok(BackendEndpoint::new(SERVICE_BACKEND).expect("backend"));
                     }
                     Some(ready_at) => tokio::time::sleep_until(ready_at).await,
                     None => tokio::time::sleep(Duration::from_millis(100)).await,
                 }
             }
+        })
+    }
+
+    fn ready_pod_backend<'a>(
+        &'a self,
+        objects: &'a [RenderedObjectRef],
+    ) -> KubernetesClientFuture<'a, KubernetesClientResult<Option<BackendEndpoint>>> {
+        Box::pin(async move {
+            let running = objects
+                .iter()
+                .any(|object| is_workload_ref(object) && self.running(object));
+            Ok(running.then(|| BackendEndpoint::new(POD_BACKEND).expect("backend")))
         })
     }
 
@@ -1031,7 +1046,17 @@ async fn wake_creates_the_workload_idle_then_scales_it_up_and_completes() {
     // Service and Deployment are created; only the Deployment is then patched.
     assert_eq!(cluster.mutations(), (2, 1, 0));
     assert!(cluster.running(&workload_ref(&wake)));
-    assert_eq!(store.row_state(&wake), MaterializationState::Ready);
+    let ready = store.state().rows[wake.id.as_str()].record.clone();
+    assert_eq!(ready.state, MaterializationState::Ready);
+    // Routes use the Service; the ready Pod's own address is recorded beside it.
+    assert_eq!(
+        ready.backend.as_ref().map(BackendEndpoint::uri),
+        Some(SERVICE_BACKEND)
+    );
+    assert_eq!(
+        ready.pod_backend.as_ref().map(BackendEndpoint::uri),
+        Some(POD_BACKEND)
+    );
     assert_eq!(harness.failures(), 0);
     harness.stop().await.expect("clean shutdown");
 }
@@ -1382,6 +1407,9 @@ async fn a_thirty_second_store_outage_delays_a_wake_and_a_sleep_without_failing_
         "each first attempt survived the outage"
     );
     assert_eq!(harness.failures(), 0);
+    assert!(harness
+        .metric(RUNTIME_MATERIALIZATION_FAILURES_TOTAL.name())
+        .is_empty());
     assert!(!harness.task.is_finished());
     assert!(harness
         .metric(CONTROL_PLANE_STORE_AVAILABLE.name())
