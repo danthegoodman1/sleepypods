@@ -337,13 +337,12 @@ impl HostSubscriptions {
         match result {
             Err(error) => {
                 self.remove(id);
-                let code = match error {
-                    StoreError::InvalidArgument { .. } => {
-                        pb::ProxySubscribeErrorCode::InvalidArgument
-                    }
+                let status = super::store_error_to_status(error);
+                let code = match status.code() {
+                    tonic::Code::InvalidArgument => pb::ProxySubscribeErrorCode::InvalidArgument,
                     _ => pb::ProxySubscribeErrorCode::Unavailable,
                 };
-                self.reject(id, code, &error.to_string()).await
+                self.reject(id, code, status.message()).await
             }
             Ok(rules) if rules.is_empty() => {
                 self.remove(id);

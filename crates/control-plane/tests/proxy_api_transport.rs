@@ -706,6 +706,7 @@ async fn a_failed_store_lookup_ends_that_subscription_and_the_stream_stays_up() 
     let error = stream.error().await;
     assert_eq!(error.subscription_id, 1);
     assert_eq!(error.code, ProxySubscribeErrorCode::Unavailable as i32);
+    assert_eq!(error.message, "control-plane store is unavailable");
 
     // The same stream, and the same ID, serve the host once the store is back.
     store.clear_route_error();
