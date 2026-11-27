@@ -156,20 +156,40 @@ where
     let serving = Serving::start(&config, client);
     let upgrades: Upgrades = Arc::new(Mutex::new(JoinSet::new()));
 
+    let setup_timeout = config.admission.config().setup_timeout();
+    let instance_id: Arc<str> = config.instance_id.as_str().into();
     let connections = serve_listener(listener, &shutdown, |stream, _| {
         let stream = config.admission.admit_io(stream).ok()?;
         let handshake = config.admission.handshakes.try_acquire().ok()?;
         let initial_work = serving.drain.try_acquire().ok()?;
         let proxy = serving.proxy.clone();
         let upgrades = upgrades.clone();
-        Some(proxy_core::serve_http_connection_admitted(
-            stream,
-            shutdown.clone(),
-            config.admission.clone(),
-            handshake,
-            Some(initial_work),
-            move |request| forward_or_error(proxy.clone(), request, upgrades.clone()),
-        ))
+        let (admission, shutdown) = (config.admission.clone(), shutdown.clone());
+        let instance_id = instance_id.clone();
+        Some(async move {
+            // A connection that claims another instance closes before any
+            // request reaches the app.
+            let claimed = tokio::time::timeout(
+                setup_timeout,
+                proxy_core::accept_instance_claim(stream, &instance_id),
+            );
+            let stream = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                claimed = claimed => match claimed {
+                    Ok(Ok(stream)) => stream,
+                    _ => return,
+                },
+            };
+            proxy_core::serve_http_connection_admitted(
+                stream,
+                shutdown,
+                admission,
+                handshake,
+                Some(initial_work),
+                move |request| forward_or_error(proxy.clone(), request, upgrades.clone()),
+            )
+            .await
+        })
     })
     .await;
 

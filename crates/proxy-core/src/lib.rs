@@ -8,6 +8,7 @@ pub mod drain;
 pub mod http;
 pub mod listener;
 pub mod observability;
+pub mod pod_route;
 pub mod resources;
 pub mod shutdown;
 pub mod tcp;
@@ -25,6 +26,7 @@ pub use http::{
     HttpProxy, HttpProxyError, InvalidAppProtocol, ReverseProxyRequestError, TrackedBody,
 };
 pub use listener::{configure_socket, serve_listener, Accept};
+pub use pod_route::{accept_instance_claim, InvalidPodRoute, PodRoute, SidecarIo};
 pub use resources::{AdmittedIo, InvalidProxyResourceConfig, ProxyAdmission, ProxyResourceConfig};
 pub use shutdown::Shutdown;
 pub use tcp::{proxy_streams_with_timeouts, TcpProxy, TcpProxyConfig, TcpProxyError};

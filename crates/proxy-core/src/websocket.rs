@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use crate::{
     drain::{DrainError, DrainPermit, DrainTracker},
     http::{header_contains_token, strip_hop_by_hop_headers},
+    pod_route::{authority_without_userinfo, PodRoute, PodRoutes},
     tcp::proxy_streams_with_timeouts,
 };
 
@@ -53,10 +54,14 @@ impl Default for WebSocketProxyConfig {
     }
 }
 
+/// Upgrades to the origin each request names. An origin that carries a
+/// [`crate::PodRoute`] reaches the Pod first and its Service when the Pod
+/// address fails.
 #[derive(Clone, Debug)]
 pub struct WebSocketProxy {
     drain: DrainTracker,
     config: WebSocketProxyConfig,
+    pod_routes: PodRoutes,
 }
 
 /// An upgrade the upstream accepted. The session starts once the caller has
@@ -89,7 +94,11 @@ impl WebSocketProxy {
     }
 
     pub fn with_config(drain: DrainTracker, config: WebSocketProxyConfig) -> Self {
-        Self { drain, config }
+        Self {
+            drain,
+            config,
+            pod_routes: PodRoutes::default(),
+        }
     }
 
     pub fn drain_tracker(&self) -> &DrainTracker {
@@ -113,7 +122,12 @@ impl WebSocketProxy {
         let handshake = upstream_handshake(request, upstream_origin)?;
         let (accepted, upstream) = timeout(
             self.config.handshake_timeout,
-            connect_upstream(upstream_origin, handshake, self.config.handshake_timeout),
+            connect_upstream(
+                upstream_origin,
+                handshake,
+                self.config.handshake_timeout,
+                &self.pod_routes,
+            ),
         )
         .await
         .map_err(|_| {
@@ -163,7 +177,7 @@ fn upstream_handshake<B>(
     *handshake.headers_mut() = end_to_end_headers(request.headers().clone());
     mark_upgrade(handshake.headers_mut());
     if !handshake.headers().contains_key(HOST) {
-        let host = HeaderValue::from_str(authority.as_str())
+        let host = HeaderValue::from_str(authority_without_userinfo(authority))
             .expect("a URI authority is a valid header value");
         handshake.headers_mut().insert(HOST, host);
     }
@@ -188,6 +202,7 @@ async fn connect_upstream(
     upstream_origin: &Uri,
     handshake: Request<Empty<Bytes>>,
     setup_budget: Duration,
+    pod_routes: &PodRoutes,
 ) -> Result<(HeaderMap, Upgraded), WebSocketProxyError> {
     let connect = |error: io::Error| WebSocketProxyError::UpstreamConnect(error);
     let aborted = |error: hyper::Error| {
@@ -204,9 +219,20 @@ async fn connect_upstream(
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(host);
     let port = upstream_origin.port_u16().unwrap_or(80);
-    let stream = crate::connect::connect_tcp_attempts((host, port), setup_budget)
+    let started = tokio::time::Instant::now();
+    let pod = match PodRoute::from_origin(upstream_origin) {
+        Some(route) => pod_routes.connect(&route, setup_budget).await,
+        None => None,
+    };
+    let stream = match pod {
+        Some(stream) => stream,
+        None => crate::connect::connect_tcp_attempts(
+            (host, port),
+            setup_budget.saturating_sub(started.elapsed()),
+        )
         .await
-        .map_err(connect)?;
+        .map_err(connect)?,
+    };
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
         .max_buf_size(MAX_REJECTION_BODY)
         .handshake(TokioIo::new(stream))

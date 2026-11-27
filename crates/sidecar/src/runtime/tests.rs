@@ -225,6 +225,46 @@ async fn http_keep_alive_reuses_connection_without_holding_idle_permit() {
 }
 
 #[tokio::test]
+async fn a_claim_for_another_instance_closes_before_the_app_and_a_claim_for_this_one_is_served() {
+    let (upstream_addr, upstream_connections, upstream_task) = spawn_keep_alive_upstream().await;
+    let shutdown = Shutdown::new();
+    let (runtime_addr, runtime_task) = spawn_runtime(
+        upstream_addr.port(),
+        FakeReportIdleClient::new(),
+        shutdown.clone(),
+    )
+    .await;
+
+    let mut stale = TcpStream::connect(runtime_addr).await.unwrap();
+    stale
+        .write_all(b"\0sleepypods-instance other-instance\n")
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    let _ = stale.read_to_end(&mut reply).await;
+    assert!(reply.is_empty(), "{reply:?}");
+    assert_eq!(upstream_connections.load(Ordering::Acquire), 0);
+
+    let claim = b"\0sleepypods-instance test-instance\n";
+    let mut own = TcpStream::connect(runtime_addr).await.unwrap();
+    own.write_all(claim).await.unwrap();
+    let mut echo = [0; 35];
+    own.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, claim);
+    for path in ["/keepalive-one", "/keepalive-two"] {
+        write_http_request(&mut own, path).await;
+        let response = read_http_response(&mut own, path[1..].as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    }
+    assert_eq!(upstream_connections.load(Ordering::Acquire), 1);
+
+    drop(own);
+    shutdown.shutdown();
+    runtime_task.await.unwrap().unwrap();
+    upstream_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn idle_report_fires_without_http_activity() {
     let upstream_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
