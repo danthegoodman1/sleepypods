@@ -2,8 +2,13 @@ pub use sleepypods_api::auth::{BearerToken, InvalidBearerToken, OptionalBearerTo
 
 use std::{error::Error, fmt, sync::Arc};
 
-use sleepypods_observability::recorder::{
-    LifecycleLogEvent, LogField, ObservabilityRecorder, EVENT_CONTROL_PLANE_AUTH,
+use sleepypods_observability::{
+    metrics::CONTROL_PLANE_AUTH_DECISIONS_TOTAL,
+    recorder::{
+        LifecycleLogEvent, LogField, MetricObservation, ObservabilityRecorder,
+        EVENT_CONTROL_PLANE_AUTH,
+    },
+    Outcome,
 };
 use tonic::{metadata::MetadataMap, service::Interceptor, Request, Status};
 
@@ -227,6 +232,8 @@ impl ControlPlaneAuth {
         }
     }
 
+    /// Counts every decision and logs the rejected ones: an accepted call is
+    /// the common case and its handler reports anything worth a line.
     fn record_decision(
         &self,
         service_name: &'static str,
@@ -234,13 +241,23 @@ impl ControlPlaneAuth {
         caller_role: Option<CallerRole>,
         reason: &'static str,
     ) {
-        let decision = if reason == "accepted" {
-            "accepted"
+        let accepted = reason == "accepted";
+        let outcome = if accepted {
+            Outcome::Success
         } else {
-            "rejected"
+            Outcome::Rejected
         };
+        self.observability.record_metric(MetricObservation::new(
+            CONTROL_PLANE_AUTH_DECISIONS_TOTAL,
+            vec![outcome.metric_label()],
+            1.0,
+        ));
+        if accepted {
+            return;
+        }
+
         let mut fields = vec![
-            LogField::auth_decision(decision),
+            LogField::auth_decision("rejected"),
             LogField::auth_reason(reason),
             LogField::auth_required_role(required_role),
             LogField::grpc_service(service_name),
@@ -248,7 +265,6 @@ impl ControlPlaneAuth {
         if let Some(caller_role) = caller_role {
             fields.push(LogField::auth_caller_role(caller_role));
         }
-
         self.observability
             .record_log(LifecycleLogEvent::new(EVENT_CONTROL_PLANE_AUTH, fields));
     }
@@ -465,24 +481,50 @@ mod tests {
     }
 
     #[test]
-    fn no_auth_mode_accepts_without_credentials_and_records_explicit_decision() {
-        let sink = InMemoryObservability::default();
-        let auth = ControlPlaneAuth::from_config(AuthConfig::NoAuth, sink.recorder());
-        let mut interceptor = auth.interceptor(SERVICE, CallerRole::Sidecar);
+    fn accepted_decisions_are_counted_and_write_no_log_event() {
+        for config in [
+            AuthConfig::NoAuth,
+            AuthConfig::static_bearer_tokens(tokens()),
+        ] {
+            let sink = InMemoryObservability::default();
+            let auth = ControlPlaneAuth::from_config(config, sink.recorder());
+            let mut interceptor = auth.interceptor(SERVICE, CallerRole::Sidecar);
 
-        interceptor
-            .call(Request::new(()))
-            .expect("no-auth mode accepts missing authorization");
+            interceptor
+                .call(request_with_metadata(metadata("Bearer sidecar-secret")))
+                .expect("the sidecar credential is accepted");
+
+            assert_eq!(decision_outcomes(&sink.events()), ["success"]);
+            assert!(logged_reasons(&sink.events()).is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_decisions_are_counted_and_logged_with_their_context() {
+        let sink = InMemoryObservability::default();
+        let auth = ControlPlaneAuth::from_config(
+            AuthConfig::static_bearer_tokens(tokens()),
+            sink.recorder(),
+        );
+
+        let _ = auth
+            .interceptor(SERVICE, CallerRole::Proxy)
+            .call(request_with_metadata(metadata("Bearer operator-secret")));
 
         let events = sink.events();
-        let ObservabilityEvent::Log(event) = &events[0] else {
-            panic!("auth decision should be a log event");
-        };
+        assert_eq!(decision_outcomes(&events), ["rejected"]);
+        let event = events
+            .iter()
+            .find_map(|event| match event {
+                ObservabilityEvent::Log(event) => Some(event),
+                ObservabilityEvent::Metric(_) => None,
+            })
+            .expect("a rejected decision is logged");
         assert_eq!(event.name(), EVENT_CONTROL_PLANE_AUTH);
-        assert_eq!(event.field_value(FIELD_AUTH_DECISION), Some("accepted"));
-        assert_eq!(event.field_value(FIELD_AUTH_REASON), Some("accepted"));
-        assert_eq!(event.field_value(FIELD_AUTH_REQUIRED_ROLE), Some("sidecar"));
-        assert_eq!(event.field_value(FIELD_AUTH_CALLER_ROLE), Some("sidecar"));
+        assert_eq!(event.field_value(FIELD_AUTH_DECISION), Some("rejected"));
+        assert_eq!(event.field_value(FIELD_AUTH_REASON), Some("wrong_role"));
+        assert_eq!(event.field_value(FIELD_AUTH_REQUIRED_ROLE), Some("proxy"));
+        assert_eq!(event.field_value(FIELD_AUTH_CALLER_ROLE), Some("operator"));
         assert_eq!(event.field_value(FIELD_GRPC_SERVICE), Some(SERVICE));
     }
 
@@ -529,19 +571,14 @@ mod tests {
             .call(request_with_metadata(metadata("Bearer operator-secret")));
 
         let events = sink.events();
-        let reasons = events
-            .iter()
-            .map(|event| {
-                let ObservabilityEvent::Log(event) = event else {
-                    panic!("auth decisions should be log events");
-                };
-                event
-                    .field_value(FIELD_AUTH_REASON)
-                    .expect("auth reason")
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(reasons, ["accepted", "missing", "invalid", "wrong_role"]);
+        assert_eq!(
+            decision_outcomes(&events),
+            ["success", "rejected", "rejected", "rejected"]
+        );
+        assert_eq!(
+            logged_reasons(&events),
+            ["missing", "invalid", "wrong_role"]
+        );
 
         let debug = format!("{events:?}");
         for secret in [
@@ -572,6 +609,35 @@ mod tests {
             })
         ));
         assert!(!format!("{:?}", tokens()).contains("operator-secret"));
+    }
+
+    fn decision_outcomes(events: &[ObservabilityEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ObservabilityEvent::Metric(metric) => {
+                    assert_eq!(metric.name(), CONTROL_PLANE_AUTH_DECISIONS_TOTAL.name());
+                    assert_eq!(metric.value(), 1.0);
+                    Some(metric.labels()[0].value())
+                }
+                ObservabilityEvent::Log(_) => None,
+            })
+            .collect()
+    }
+
+    fn logged_reasons(events: &[ObservabilityEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ObservabilityEvent::Log(event) => Some(
+                    event
+                        .field_value(FIELD_AUTH_REASON)
+                        .expect("auth reason")
+                        .to_owned(),
+                ),
+                ObservabilityEvent::Metric(_) => None,
+            })
+            .collect()
     }
 
     fn tokens() -> StaticBearerTokens {

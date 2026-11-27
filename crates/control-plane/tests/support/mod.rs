@@ -268,6 +268,7 @@ impl ControlPlaneStore for TestStore {
         remove_certificate,
         resolve_tls_certificate,
         reencrypt_certificate,
+        reencrypt_certificates_sealed_by,
         snapshot_tls_bindings,
         load_route_changes,
         load_route_change_revision,
@@ -291,10 +292,30 @@ impl ControlPlaneStore for TestStore {
                 .lock()
                 .expect("fake store lock is available")
                 .insert(instance.id.as_str().to_owned(), instance.clone());
+            let route_bindings = request
+                .route_bindings
+                .into_iter()
+                .map(|route| control_plane::RouteBindingRecord {
+                    id: route.id,
+                    instance_id: instance.id.clone(),
+                    protocol: match route.identity {
+                        RouteIdentity::Http { .. } => ProtocolRoute::Http,
+                        RouteIdentity::Sni { .. } => ProtocolRoute::TlsSni,
+                    },
+                    identity: route.identity,
+                })
+                .collect::<Vec<_>>();
+            let mut stored = self
+                .route_bindings
+                .lock()
+                .expect("fake store lock is available");
+            for record in &route_bindings {
+                stored.insert(record.id.as_str().to_owned(), record.clone());
+            }
 
             Ok(CreateInstanceResult {
                 instance,
-                route_bindings: Vec::new(),
+                route_bindings,
                 idempotency_replayed: false,
             })
         })
@@ -472,27 +493,6 @@ impl ControlPlaneStore for TestStore {
                     request.key().token().to_owned(),
                 ))
                 .is_some())
-        })
-    }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: control_plane::ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        Box::pin(async move {
-            let mut records = self.http01.lock().expect("fake store lock is available");
-            let expired_keys = records
-                .iter()
-                .filter(|(_, record)| record.expires_at() <= request.now)
-                .take(request.limit.unwrap_or(usize::MAX))
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            let expired = expired_keys.len();
-            for key in expired_keys {
-                records.remove(&key);
-            }
-
-            Ok(expired)
         })
     }
 
@@ -1133,7 +1133,6 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
             control_plane::WorkloadClassId::new("class-1").expect("class id is valid"),
             Generation::new(1),
         ),
-        template_generation: Generation::new(1),
         template: control_plane::ManifestTemplate {
             workload: control_plane::WorkloadTemplate {
                 kind: control_plane::WorkloadKind::Deployment,
@@ -1148,6 +1147,7 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
                     }],
                     env: Vec::new(),
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(control_plane::ServiceTemplate {
                 name: control_plane::TemplateText::literal("svc"),
@@ -1162,11 +1162,11 @@ pub fn workload_class() -> control_plane::WorkloadClassVersion {
                 image: control_plane::TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             volumes: Vec::new(),
             raw_objects: Vec::new(),
         },
-        default_values: BTreeMap::new(),
         value_schema: control_plane::WorkloadValueSchema::new(true),
         sleep_policy: control_plane::WorkloadSleepPolicy::new(120_000, 5_000, 30_000)
             .expect("sleep policy is valid"),

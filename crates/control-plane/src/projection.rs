@@ -1450,6 +1450,7 @@ mod tests {
                         value: TemplateText::literal("acme"),
                     }],
                 },
+                termination_grace_period_seconds: None,
             },
             service: Some(ServiceTemplate {
                 name: TemplateText::literal("svc"),
@@ -1464,6 +1465,7 @@ mod tests {
                 image: TemplateText::literal("sleepypods/sidecar:test"),
                 listen_port: 15000,
                 mode: None,
+                app_protocol: Default::default(),
             },
             volumes: Vec::new(),
             raw_objects: Vec::new(),
@@ -1487,7 +1489,6 @@ mod tests {
                 drain_grace_timeout_ms: 30_000,
             },
             namespace: "apps",
-            template_generation: Some(Generation::new(3)),
         })
         .expect("manifest renders")
     }

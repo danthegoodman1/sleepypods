@@ -73,6 +73,13 @@ impl PostgresStore {
         self
     }
 
+    /// Sealing key IDs that active certificates use and the configured key ring
+    /// lacks. Those certificates stay unreadable until the keys return, so the
+    /// control plane refuses to start while any are listed.
+    pub async fn missing_sealing_key_ids(&self) -> StoreResult<Vec<String>> {
+        super::certificate_ops::missing_sealing_key_ids(self).await
+    }
+
     /// Removes at most `limit` keys whose explicitly configured lifetime expired.
     /// Permanent keys and unexpired tombstones are never removed.
     pub async fn expire_idempotency_records(&self, limit: u32) -> StoreResult<u64> {

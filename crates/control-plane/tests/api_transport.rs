@@ -1,6 +1,12 @@
 #[macro_use]
 #[path = "support/unexpected_store.rs"]
 mod unexpected_store;
+#[path = "api_transport/create_validation.rs"]
+mod create_validation;
+#[path = "api_transport/grpc_web_tls.rs"]
+mod grpc_web_tls;
+#[path = "api_transport/quiet_logging.rs"]
+mod quiet_logging;
 mod support;
 use control_plane::api::pb::proxy_control_plane_server::ProxyControlPlane;
 use support::TestStore as FakeInstanceStore;
@@ -13,8 +19,7 @@ use std::{
 
 use bytes::{BufMut, Bytes, BytesMut};
 use control_plane::api::{
-    operator_grpc_server_builder, operator_grpc_service, operator_grpc_service_with_store,
-    operator_grpc_web_cors_layer, operator_grpc_web_server_builder,
+    operator_grpc_service_with_store_and_route_events, operator_grpc_web_cors_layer,
     pb::{
         operator_control_plane_server::{OperatorControlPlane, OperatorControlPlaneServer},
         persistent_volume_source_template, route_identity, template_text_part,
@@ -22,21 +27,20 @@ use control_plane::api::{
         CreateWorkloadClassVersionRequest, CsiSecretRefTemplate, CsiVolumeSourceTemplate,
         DeleteHttp01ChallengeRequest, DeleteHttp01ChallengeResponse, DeleteInstanceRequest,
         DeleteInstanceResponse, DeleteRouteBindingRequest, DeleteRouteBindingResponse,
-        EnvVarTemplate, ExpireHttp01ChallengesRequest, ForceDeleteMaterializationRequest,
-        ForceReleaseExclusivityKeyRequest, GetInstanceRequest, GetRouteBindingRequest,
-        GetWorkloadClassVersionRequest, HostPathVolumeSourceTemplate, Http01Challenge,
-        Http01ChallengeKey, HttpRouteIdentity, IdleTimeoutOverridePolicy, Instance, InstanceState,
-        ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-        PersistentVolumeSourceTemplate, ProtocolRoute, PutHttp01ChallengeRequest,
-        RawKubernetesManifestTemplate, ReconcileMaterializationRequest,
-        ReconcileMaterializationResponse, ResolveHttp01ChallengeRequest,
-        ResolveHttp01ChallengeResponse, RouteBinding, RouteHost, RouteHostKind, RouteIdentity,
-        ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
-        TemplateTextPart, VolumeTemplate, WorkloadClassVersion, WorkloadClassVersionRef,
-        WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-        WorkloadValueFieldRule, WorkloadValueSchema,
+        EnvVarTemplate, ForceDeleteMaterializationRequest, ForceReleaseExclusivityKeyRequest,
+        GetInstanceRequest, GetRouteBindingRequest, GetWorkloadClassVersionRequest,
+        HostPathVolumeSourceTemplate, Http01Challenge, Http01ChallengeKey, HttpRouteIdentity,
+        IdleTimeoutOverridePolicy, Instance, InstanceRoute, InstanceState, ManifestTemplate,
+        PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
+        ProtocolRoute, PutHttp01ChallengeRequest, RawKubernetesManifestTemplate,
+        ReconcileMaterializationRequest, ReconcileMaterializationResponse,
+        ResolveHttp01ChallengeRequest, ResolveHttp01ChallengeResponse, RouteBinding, RouteHost,
+        RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
+        SniRouteIdentity, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersion,
+        WorkloadClassVersionRef, WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy,
+        WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
     },
-    OperatorApiPlaceholder, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME, OPERATOR_UNARY_METHODS,
+    RouteSubscriptionBroker, StoreBackedOperatorApi, OPERATOR_SERVICE_NAME,
 };
 use control_plane::projection::{
     LiveObjectMetadata, ProjectionObjectInspection, ProjectionReadinessInspection,
@@ -81,135 +85,17 @@ fn store_proxy_api(
 fn store_operator_grpc_service(
     store: Arc<dyn ControlPlaneStore>,
 ) -> control_plane::api::server::StoreBackedOperatorGrpcService<FakeKubernetesClient> {
-    operator_grpc_service_with_store(
+    operator_grpc_service_with_store_and_route_events(
         store,
         KubernetesMaterializer::new(FakeKubernetesClient::default()),
         target(),
+        RouteSubscriptionBroker::new(),
     )
 }
 
-#[tokio::test]
-async fn manual_http01_expiry_is_deterministic_after_background_collection() {
-    for background_collected in [false, true] {
-        let store = Arc::new(FakeInstanceStore::default());
-        let service = store_operator_api(store.clone());
-        let now = SystemTime::now();
-        let now_millis =
-            i64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
-        let target_expiry = now_millis + 3_600_000;
-        let key = |token: &str| Http01ChallengeKey {
-            host: "manual-expiry.example.com".into(),
-            token: token.into(),
-        };
-        for (token, expiry) in [
-            ("natural", now_millis + 30_000),
-            ("manual", target_expiry),
-            ("sentinel", target_expiry + 3_600_000),
-        ] {
-            service
-                .put_http01_challenge(tonic::Request::new(PutHttp01ChallengeRequest {
-                    key: Some(key(token)),
-                    key_authorization: token.into(),
-                    expires_at_unix_millis: expiry,
-                }))
-                .await
-                .unwrap();
-        }
-        if background_collected {
-            // Deterministic interleaving of the maintenance operation before
-            // the caller's expiry request at a controlled +60s cutoff.
-            // Inserts remain valid future expiries; no scheduler sleep.
-            assert_eq!(
-                store
-                    .expire_http01_challenges(
-                        control_plane::ExpireHttp01ChallengesRequest::new(
-                            now + Duration::from_secs(60)
-                        )
-                        .with_limit(1024)
-                    )
-                    .await
-                    .unwrap(),
-                1
-            );
-        }
-        let natural = service
-            .expire_http01_challenges(tonic::Request::new(ExpireHttp01ChallengesRequest {
-                now_unix_millis: now_millis + 60_000,
-                limit: Some(1),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        // Both are valid manual results depending on the background sweep.
-        assert_eq!(natural.expired, if background_collected { 0 } else { 1 });
-        for token in ["manual", "sentinel"] {
-            let record = store_proxy_api(store.clone())
-                .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
-                    key: Some(key(token)),
-                }))
-                .await
-                .unwrap()
-                .into_inner()
-                .challenge
-                .unwrap();
-            assert_eq!(record.key_authorization, token);
-        }
-        let request = ExpireHttp01ChallengesRequest {
-            now_unix_millis: target_expiry,
-            limit: Some(1),
-        };
-        assert_eq!(
-            service
-                .expire_http01_challenges(tonic::Request::new(request))
-                .await
-                .unwrap()
-                .into_inner()
-                .expired,
-            1
-        );
-        for (token, expected) in [("manual", None), ("sentinel", Some("sentinel"))] {
-            let record = store_proxy_api(store.clone())
-                .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
-                    key: Some(key(token)),
-                }))
-                .await
-                .unwrap()
-                .into_inner()
-                .challenge;
-            assert_eq!(
-                record.as_ref().map(|v| v.key_authorization.as_str()),
-                expected
-            );
-        }
-        assert_eq!(
-            service
-                .expire_http01_challenges(tonic::Request::new(request))
-                .await
-                .unwrap()
-                .into_inner()
-                .expired,
-            0
-        );
-        assert!(
-            service
-                .delete_http01_challenge(tonic::Request::new(DeleteHttp01ChallengeRequest {
-                    key: Some(key("sentinel"))
-                }))
-                .await
-                .unwrap()
-                .into_inner()
-                .deleted
-        );
-        assert!(store_proxy_api(store.clone())
-            .resolve_http01_challenge(tonic::Request::new(ResolveHttp01ChallengeRequest {
-                key: Some(key("sentinel"))
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .challenge
-            .is_none());
-    }
+/// The origin `grpc_web_operator_request` sends.
+fn browser_origins() -> [HeaderValue; 1] {
+    [HeaderValue::from_static("https://operator.example")]
 }
 
 fn auth_config() -> AuthConfig {
@@ -362,6 +248,7 @@ fn generated_api_contains_expected_v1_resource_shape() {
         instance_id: "instance-1".to_owned(),
         workload_class: None,
         values: [("tenant".to_owned(), "acme".to_owned())].into(),
+        routes: Vec::new(),
     };
     let route_binding = CreateRouteBindingRequest {
         idempotency_key: "create-route-1".to_owned(),
@@ -371,22 +258,9 @@ fn generated_api_contains_expected_v1_resource_shape() {
         protocol: ProtocolRoute::Http as i32,
     };
     let workload_class = CreateWorkloadClassVersionRequest {
-        idempotency_key: "create-class-1".to_owned(),
         class_id: "class-1".to_owned(),
         version: 1,
-        default_values: [("image".to_owned(), "example/app:1".to_owned())].into(),
-        value_schema: Some(WorkloadValueSchema {
-            fields: [(
-                "tenant".to_owned(),
-                WorkloadValueFieldRule {
-                    required: true,
-                    default_value: None,
-                },
-            )]
-            .into(),
-            allow_extra: false,
-        }),
-        template_generation: 1,
+        value_schema: Some(stateful_value_schema()),
         template: Some(stateful_manifest_template_proto()),
         sleep_policy: Some(sleep_policy_proto()),
         exclusivity_keys: vec![],
@@ -436,21 +310,8 @@ fn generated_api_contains_expected_v1_resource_shape() {
 }
 
 #[tokio::test]
-async fn placeholder_methods_are_explicitly_unimplemented() {
-    let service = OperatorApiPlaceholder::new();
-
-    let error = service
-        .create_instance(tonic::Request::new(CreateInstanceRequest::default()))
-        .await
-        .expect_err("2B does not implement store-backed CRUD");
-
-    assert_eq!(error.code(), Code::Unimplemented);
-    assert!(error.message().contains("transport is scaffolded"));
-}
-
-#[tokio::test]
 async fn store_backed_instance_methods_create_get_and_delete_instances() {
-    let store = Arc::new(FakeInstanceStore::default());
+    let store = store_with_class("class-1", 7);
     let service = store_operator_api(store.clone());
 
     let created = service
@@ -462,6 +323,7 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
                 version: 7,
             }),
             values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes: Vec::new(),
         }))
         .await
         .expect("create instance succeeds")
@@ -518,6 +380,69 @@ async fn store_backed_instance_methods_create_get_and_delete_instances() {
 }
 
 #[tokio::test]
+async fn create_instance_creates_its_routes_with_the_instance() {
+    let store = store_with_class("class-1", 7);
+    let service = store_operator_api(store.clone());
+    let request = |instance_id: &str, routes: Vec<InstanceRoute>| {
+        tonic::Request::new(CreateInstanceRequest {
+            idempotency_key: format!("create-{instance_id}"),
+            instance_id: instance_id.to_owned(),
+            workload_class: Some(WorkloadClassVersionRef {
+                class_id: "class-1".to_owned(),
+                version: 7,
+            }),
+            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            routes,
+        })
+    };
+
+    service
+        .create_instance(request(
+            "routed",
+            vec![
+                InstanceRoute {
+                    route_binding_id: "routed-web".to_owned(),
+                    identity: Some(http_identity("App.Example.com", Some("/api"))),
+                },
+                InstanceRoute {
+                    route_binding_id: "routed-db".to_owned(),
+                    identity: Some(sni_identity("db.example.com")),
+                },
+            ],
+        ))
+        .await
+        .expect("create instance with routes succeeds");
+
+    for (route_binding_id, identity) in [
+        ("routed-web", http_identity("app.example.com", Some("/api"))),
+        ("routed-db", sni_identity("db.example.com")),
+    ] {
+        let route = service
+            .get_route_binding(tonic::Request::new(GetRouteBindingRequest {
+                route_binding_id: route_binding_id.to_owned(),
+            }))
+            .await
+            .expect("route created with the instance loads")
+            .into_inner();
+        assert_eq!(route.instance_id, "routed");
+        assert_eq!(route.identity, Some(identity));
+    }
+
+    let error = service
+        .create_instance(request(
+            "unrouted",
+            vec![InstanceRoute {
+                route_binding_id: "unrouted-web".to_owned(),
+                identity: None,
+            }],
+        ))
+        .await
+        .expect_err("a route without an identity is rejected");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(!store.instance_exists("unrouted"));
+}
+
+#[tokio::test]
 async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
     let store = Arc::new(FakeInstanceStore::default());
     let service = store_operator_api(store);
@@ -531,6 +456,7 @@ async fn store_backed_create_instance_rejects_invalid_kubernetes_instance_id() {
                 version: 7,
             }),
             values: [("tenant".to_owned(), "tenant-one".to_owned())].into(),
+            routes: Vec::new(),
         }))
         .await
         .expect_err("invalid instance IDs are rejected at the API boundary");
@@ -943,7 +869,7 @@ async fn operator_delete_restart_replays_cleanup_then_finalizes_store_delete() {
 async fn reconcile_materialization_surfaces_inspect_failed_projection_observation() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-inspect-fails", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.fail_inspect();
@@ -952,7 +878,7 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response surfaces inspect error")
@@ -978,7 +904,7 @@ async fn reconcile_materialization_surfaces_inspect_failed_projection_observatio
 async fn reconcile_materialization_reports_ready_readiness_without_repairing_ready_row() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-ready-observed", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -997,7 +923,7 @@ async fn reconcile_materialization_reports_ready_readiness_without_repairing_rea
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response includes readiness observation")
@@ -1037,7 +963,7 @@ async fn reconcile_materialization_reports_ready_readiness_without_repairing_rea
 async fn reconcile_materialization_reports_unready_readiness_without_repairing_ready_row() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-unready-observed", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -1053,7 +979,7 @@ async fn reconcile_materialization_reports_unready_readiness_without_repairing_r
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization response includes unready observation")
@@ -1083,7 +1009,7 @@ async fn reconcile_materialization_reports_unready_readiness_without_repairing_r
 async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_without_repair() {
     let store = Arc::new(FakeInstanceStore::default());
     let materialization = ready_materialization("instance-reconcile-ready-drift", 8);
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -1102,7 +1028,7 @@ async fn reconcile_materialization_reports_ready_metadata_drift_and_finalizers_w
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id,
+            instance_id,
         }))
         .await
         .expect("reconcile materialization reports Ready metadata drift")
@@ -1143,7 +1069,7 @@ async fn force_delete_materialization_returns_projection_observations_without_ku
         target(),
         MaterializationState::Deleting,
     );
-    let materialization_id = materialization.id.as_str().to_owned();
+    let instance_id = materialization.instance_id.as_str().to_owned();
     store.seed_materialization(materialization.clone());
     let client = FakeKubernetesClient::default();
     client.seed_materialization(&materialization);
@@ -1152,7 +1078,7 @@ async fn force_delete_materialization_returns_projection_observations_without_ku
 
     let force_deleted = service
         .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
-            materialization_id,
+            instance_id,
             operator: "operator-a".to_owned(),
             reason: "manual cleanup already inspected".to_owned(),
         }))
@@ -1231,12 +1157,9 @@ async fn workload_class_api_rejects_zero_and_multiple_replicas() {
             let error = service
                 .create_workload_class_version(tonic::Request::new(
                     CreateWorkloadClassVersionRequest {
-                        idempotency_key: format!("unsupported-{kind:?}-{replicas}"),
                         class_id: format!("unsupported-{replicas}"),
                         version: 1,
-                        default_values: Default::default(),
                         value_schema: None,
-                        template_generation: 1,
                         template: Some(template),
                         sleep_policy: Some(sleep_policy_proto()),
                         exclusivity_keys: vec![],
@@ -1258,22 +1181,9 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
     let created_class = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-class-1".to_owned(),
             class_id: "class-1".to_owned(),
             version: 1,
-            default_values: [("image".to_owned(), "example/app:1".to_owned())].into(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
-            template_generation: 9,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1281,7 +1191,6 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .await
         .expect("create workload class succeeds")
         .into_inner();
-    assert_eq!(created_class.template_generation, 9);
     assert_eq!(created_class.template, Some(template.clone()));
     assert_eq!(created_class.sleep_policy, Some(sleep_policy_proto()));
 
@@ -1299,12 +1208,9 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
     let missing_template = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-class-missing-template".to_owned(),
             class_id: "class-missing-template".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: None,
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1316,12 +1222,9 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
     let missing_policy = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-class-missing-policy".to_owned(),
             class_id: "class-missing-policy".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template.clone()),
             sleep_policy: None,
             exclusivity_keys: vec![],
@@ -1335,12 +1238,9 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
 
     let invalid_policy = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-class-invalid-policy".to_owned(),
             class_id: "class-invalid-policy".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template.clone()),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 0,
@@ -1430,16 +1330,6 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         .expect("challenge resolves");
     assert_eq!(resolved.key_authorization, "key-auth-a");
 
-    let expired = service
-        .expire_http01_challenges(tonic::Request::new(ExpireHttp01ChallengesRequest {
-            now_unix_millis: 1,
-            limit: Some(10),
-        }))
-        .await
-        .expect("expire HTTP-01 challenges succeeds")
-        .into_inner();
-    assert_eq!(expired.expired, 0);
-
     let deleted = service
         .delete_http01_challenge(tonic::Request::new(DeleteHttp01ChallengeRequest {
             key: Some(Http01ChallengeKey {
@@ -1468,11 +1358,12 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         MaterializationState::Deleting,
     );
     let reconcile_materialization_id = reconcile_materialization.id.as_str().to_owned();
+    let reconcile_instance_id = reconcile_materialization.instance_id.as_str().to_owned();
     store.seed_materialization(reconcile_materialization);
     let reconciled = service
         .reconcile_materialization(tonic::Request::new(ReconcileMaterializationRequest {
             status_only: false,
-            materialization_id: reconcile_materialization_id.clone(),
+            instance_id: reconcile_instance_id.clone(),
         }))
         .await
         .expect("reconcile materialization succeeds")
@@ -1501,10 +1392,11 @@ async fn store_backed_operator_methods_cover_workload_routes_and_http01() {
         MaterializationState::Deleting,
     );
     let force_materialization_id = force_materialization.id.as_str().to_owned();
+    let force_instance_id = force_materialization.instance_id.as_str().to_owned();
     store.seed_materialization(force_materialization);
     let force_deleted = service
         .force_delete_materialization(tonic::Request::new(ForceDeleteMaterializationRequest {
-            materialization_id: force_materialization_id.clone(),
+            instance_id: force_instance_id.clone(),
             operator: "operator-a".to_owned(),
             reason: "inspected cleanup completed".to_owned(),
         }))
@@ -1556,12 +1448,9 @@ async fn store_backed_workload_class_api_round_trips_host_path_template() {
 
     let created = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-host-path-class".to_owned(),
             class_id: "host-path-class".to_owned(),
             version: 1,
-            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
-            value_schema: None,
-            template_generation: 1,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1602,12 +1491,9 @@ async fn store_backed_workload_class_api_round_trips_csi_secret_refs() {
 
     let created = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-csi-secret-ref-class".to_owned(),
             class_id: "csi-secret-ref-class".to_owned(),
             version: 1,
-            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
-            value_schema: None,
-            template_generation: 1,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1661,18 +1547,23 @@ async fn store_backed_workload_class_api_round_trips_raw_manifest_templates() {
                 TemplateTextPart {
                     kind: Some(template_text_part::Kind::InstanceValue("tenant".to_owned())),
                 },
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::Literal("-".to_owned())),
+                },
+                TemplateTextPart {
+                    kind: Some(template_text_part::Kind::InstanceValue(
+                        control_plane::manifest::INSTANCE_SUFFIX_VALUE.to_owned(),
+                    )),
+                },
             ],
         }),
     }];
 
     let created = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-raw-manifest-class".to_owned(),
             class_id: "raw-manifest-class".to_owned(),
             version: 1,
-            default_values: [("tenant".to_owned(), "acme".to_owned())].into(),
-            value_schema: None,
-            template_generation: 1,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1721,22 +1612,9 @@ async fn store_backed_workload_class_api_round_trips_exclusivity_keys() {
 
     let created = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-exclusive-class".to_owned(),
             class_id: "exclusive-class".to_owned(),
             version: 1,
-            default_values: Default::default(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "volume_handle".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
-            template_generation: 1,
+            value_schema: Some(value_schema(&["tenant", "volume", "volume_handle"])),
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![key.clone()],
@@ -1774,12 +1652,9 @@ async fn store_backed_workload_class_api_rejects_invalid_exclusivity_keys() {
 
     let invalid_name = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-invalid-exclusive-name".to_owned(),
             class_id: "invalid-exclusive-name".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![WorkloadExclusivityKey {
@@ -1794,12 +1669,9 @@ async fn store_backed_workload_class_api_rejects_invalid_exclusivity_keys() {
 
     let missing_value = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-missing-exclusive-value".to_owned(),
             class_id: "missing-exclusive-value".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![WorkloadExclusivityKey {
@@ -1814,12 +1686,9 @@ async fn store_backed_workload_class_api_rejects_invalid_exclusivity_keys() {
 
     let empty_parts = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-empty-exclusive-value".to_owned(),
             class_id: "empty-exclusive-value".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![WorkloadExclusivityKey {
@@ -1834,12 +1703,9 @@ async fn store_backed_workload_class_api_rejects_invalid_exclusivity_keys() {
 
     let blank_instance_value = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-blank-exclusive-value-field".to_owned(),
             class_id: "blank-exclusive-value-field".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(stateful_manifest_template_proto()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![WorkloadExclusivityKey {
@@ -1875,12 +1741,9 @@ async fn store_backed_workload_class_api_rejects_empty_template_static_strings()
 
     let error = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-empty-container-name-class".to_owned(),
             class_id: "empty-container-name-class".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1904,12 +1767,9 @@ async fn store_backed_workload_class_api_rejects_empty_template_text_parts() {
 
     let error = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-empty-template-text-class".to_owned(),
             class_id: "empty-template-text-class".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1940,12 +1800,9 @@ async fn store_backed_workload_class_api_rejects_incomplete_csi_secret_ref() {
 
     let error = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-incomplete-csi-secret-ref-class".to_owned(),
             class_id: "incomplete-csi-secret-ref-class".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1967,12 +1824,9 @@ async fn store_backed_workload_class_api_rejects_incomplete_raw_manifest_templat
 
     let error = service
         .create_workload_class_version(tonic::Request::new(CreateWorkloadClassVersionRequest {
-            idempotency_key: "create-incomplete-raw-manifest-class".to_owned(),
             class_id: "incomplete-raw-manifest-class".to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: None,
-            template_generation: 1,
             template: Some(template),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
@@ -1988,7 +1842,7 @@ async fn store_backed_workload_class_api_rejects_incomplete_raw_manifest_templat
 
 #[tokio::test]
 async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
-    let response = store_operator_grpc_service(Arc::new(FakeInstanceStore::default()))
+    let response = store_operator_grpc_service(store_with_class("class-transport", 3))
         .oneshot(grpc_create_instance_request(
             CreateInstanceRequest {
                 idempotency_key: "create-instance-transport".to_owned(),
@@ -1998,6 +1852,7 @@ async fn native_grpc_request_dispatches_to_store_backed_create_instance() {
                     version: 3,
                 }),
                 values: [("tenant".to_owned(), "transport".to_owned())].into(),
+                routes: Vec::new(),
             },
             "application/grpc",
             Version::HTTP_2,
@@ -2160,18 +2015,8 @@ async fn native_grpc_request_dispatches_to_store_backed_create_route_binding() {
 }
 
 #[test]
-fn native_grpc_server_can_be_constructed_with_operator_service() {
-    let _router = operator_grpc_server_builder().add_service(operator_grpc_service());
-
-    assert_eq!(
-        <control_plane::api::server::OperatorGrpcService as NamedService>::NAME,
-        OPERATOR_SERVICE_NAME
-    );
-}
-
-#[test]
 fn native_grpc_server_can_be_constructed_with_store_backed_operator_service() {
-    let _router = operator_grpc_server_builder().add_service(store_operator_grpc_service(
+    let _router = tonic::transport::Server::builder().add_service(store_operator_grpc_service(
         Arc::new(FakeInstanceStore::default()),
     ));
 
@@ -2179,16 +2024,6 @@ fn native_grpc_server_can_be_constructed_with_store_backed_operator_service() {
         <control_plane::api::server::StoreBackedOperatorGrpcService<
             FakeKubernetesClient,
         > as NamedService>::NAME,
-        OPERATOR_SERVICE_NAME
-    );
-}
-
-#[test]
-fn grpc_web_server_wraps_same_operator_service_surface() {
-    let _router = operator_grpc_web_server_builder().add_service(operator_grpc_service());
-
-    assert_eq!(
-        <control_plane::api::server::OperatorGrpcService as NamedService>::NAME,
         OPERATOR_SERVICE_NAME
     );
 }
@@ -2202,29 +2037,15 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateWorkloadClassVersion",
         CreateWorkloadClassVersionRequest {
-            idempotency_key: "grpc-web-create-class".to_owned(),
             class_id: "class-grpc-web".to_owned(),
             version: 11,
-            default_values: [("image".to_owned(), "example/app:grpc-web".to_owned())].into(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
-            template_generation: 5,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
         },
     )
     .await;
-    assert_eq!(created_class.template_generation, 5);
 
     let loaded_class: WorkloadClassVersion = grpc_web_store_unary(
         Arc::clone(&store),
@@ -2249,7 +2070,12 @@ async fn grpc_web_store_backed_requests_cover_operator_api_parity() {
                 class_id: "class-grpc-web".to_owned(),
                 version: 11,
             }),
-            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            values: [
+                ("tenant".to_owned(), "acme".to_owned()),
+                ("volume".to_owned(), "vol-1".to_owned()),
+            ]
+            .into(),
+            routes: Vec::new(),
         },
     )
     .await;
@@ -2372,29 +2198,15 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
         Arc::clone(&store),
         "CreateWorkloadClassVersion",
         CreateWorkloadClassVersionRequest {
-            idempotency_key: "native-create-class".to_owned(),
             class_id: "class-native".to_owned(),
             version: 13,
-            default_values: [("image".to_owned(), "example/app:native".to_owned())].into(),
-            value_schema: Some(WorkloadValueSchema {
-                fields: [(
-                    "tenant".to_owned(),
-                    WorkloadValueFieldRule {
-                        required: true,
-                        default_value: None,
-                    },
-                )]
-                .into(),
-                allow_extra: false,
-            }),
-            template_generation: 6,
+            value_schema: Some(stateful_value_schema()),
             template: Some(template.clone()),
             sleep_policy: Some(sleep_policy_proto()),
             exclusivity_keys: vec![],
         },
     )
     .await;
-    assert_eq!(created_class.template_generation, 6);
 
     let loaded_class: WorkloadClassVersion = grpc_store_unary(
         Arc::clone(&store),
@@ -2419,7 +2231,12 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
                 class_id: "class-native".to_owned(),
                 version: 13,
             }),
-            values: [("tenant".to_owned(), "acme".to_owned())].into(),
+            values: [
+                ("tenant".to_owned(), "acme".to_owned()),
+                ("volume".to_owned(), "vol-1".to_owned()),
+            ]
+            .into(),
+            routes: Vec::new(),
         },
     )
     .await;
@@ -2535,7 +2352,7 @@ async fn native_grpc_store_backed_requests_cover_operator_api_parity() {
 
 #[tokio::test]
 async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
@@ -2551,7 +2368,7 @@ async fn grpc_web_cors_preflight_allows_browser_operator_headers() {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .expect("allow-origin is returned"),
-        "*"
+        "https://operator.example"
     );
     let allow_methods = response
         .headers()
@@ -2593,6 +2410,7 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
                     version: 1,
                 }),
                 values: Default::default(),
+                routes: Vec::new(),
             },
         ))
         .await
@@ -2620,7 +2438,7 @@ async fn grpc_web_preserves_operator_metadata_headers_at_api_boundary() {
 
 #[tokio::test]
 async fn grpc_web_store_backed_errors_return_structured_status() {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(Arc::new(
                 FakeInstanceStore::default(),
@@ -2652,10 +2470,10 @@ async fn grpc_web_store_backed_errors_return_structured_status() {
 #[tokio::test]
 async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failures_without_mutation(
 ) {
-    let store = Arc::new(FakeInstanceStore::default());
+    let store = store_with_class("class-auth", 1);
     let store_for_service: Arc<dyn ControlPlaneStore> = store.clone();
 
-    let valid_response = operator_grpc_web_cors_layer()
+    let valid_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
                 &store_for_service,
@@ -2671,6 +2489,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                     version: 1,
                 }),
                 values: Default::default(),
+                routes: Vec::new(),
             },
         ))
         .await
@@ -2689,10 +2508,11 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                 version: 1,
             }),
             values: Default::default(),
+            routes: Vec::new(),
         },
     );
     missing_request.headers_mut().remove(header::AUTHORIZATION);
-    let missing_response = operator_grpc_web_cors_layer()
+    let missing_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(Arc::clone(
                 &store_for_service,
@@ -2705,7 +2525,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
     assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "16");
     assert!(!store.instance_exists("grpc-web-auth-missing"));
 
-    let wrong_response = operator_grpc_web_cors_layer()
+    let wrong_response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(
             tonic_web::GrpcWebLayer::new().layer(authenticated_operator_service(store_for_service)),
         )
@@ -2720,6 +2540,7 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
                         version: 1,
                     }),
                     values: Default::default(),
+                    routes: Vec::new(),
                 },
             ),
             "Bearer proxy-token",
@@ -2732,91 +2553,27 @@ async fn grpc_web_operator_auth_accepts_browser_authorization_and_rejects_failur
 }
 
 #[tokio::test]
-async fn native_grpc_and_grpc_web_requests_dispatch_to_same_placeholder_method() {
-    let native_response = operator_grpc_service()
-        .oneshot(grpc_request("application/grpc", Version::HTTP_2))
-        .await
-        .expect("native gRPC request should route through generated service");
-    let native_headers = native_response.headers().clone();
-    let native_body = native_response
-        .into_body()
-        .collect()
-        .await
-        .expect("native response body should collect");
-    let native_trailers = native_body.trailers();
-    let native_status = native_trailers
-        .and_then(|trailers| trailers.get("grpc-status"))
-        .or_else(|| native_headers.get("grpc-status"))
-        .expect("unimplemented gRPC status is returned");
-    let native_message = native_trailers
-        .and_then(|trailers| trailers.get("grpc-message"))
-        .or_else(|| native_headers.get("grpc-message"))
-        .expect("unimplemented gRPC message is returned");
-
-    assert_eq!(native_status, "12");
-    assert!(native_message
-        .to_str()
-        .expect("grpc-message is valid")
-        .contains("CreateInstance%20transport%20is%20scaffolded"));
-
-    let web_response = tonic_web::GrpcWebLayer::new()
-        .layer(operator_grpc_service())
-        .oneshot(grpc_request("application/grpc-web+proto", Version::HTTP_11))
-        .await
-        .expect("gRPC-Web request should route through generated service");
-    let web_headers = web_response.headers().clone();
-    let web_content_type = web_response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .expect("gRPC-Web content type")
-        .clone();
-    let web_body = web_response
-        .into_body()
-        .collect()
-        .await
-        .expect("gRPC-Web response body should collect")
-        .trailers()
-        .cloned();
-    let web_status = web_body
-        .as_ref()
-        .and_then(|trailers| trailers.get("grpc-status"))
-        .or_else(|| web_headers.get("grpc-status"))
-        .expect("gRPC-Web status is returned");
-    let web_message = web_body
-        .as_ref()
-        .and_then(|trailers| trailers.get("grpc-message"))
-        .or_else(|| web_headers.get("grpc-message"))
-        .expect("gRPC-Web message is returned");
-
-    assert_eq!(web_content_type, "application/grpc-web+proto");
-    assert_eq!(web_status, "12");
-    assert!(web_message
-        .to_str()
-        .expect("grpc-message is valid")
-        .contains("CreateInstance%20transport%20is%20scaffolded"));
-}
-
-#[test]
-fn operator_grpc_web_surface_is_unary_and_does_not_expose_proxy_subscribe() {
-    assert_eq!(OPERATOR_UNARY_METHODS.len(), 20);
-    assert!(OPERATOR_UNARY_METHODS.contains(&"CreateWorkloadClassVersion"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"GetWorkloadClassVersion"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"CreateInstance"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"GetInstance"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteInstance"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"CreateRouteBinding"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"GetRouteBinding"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"DeleteRouteBinding"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveHttp01Challenge"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ReconcileMaterialization"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ForceDeleteMaterialization"));
-    assert!(OPERATOR_UNARY_METHODS.contains(&"ForceReleaseExclusivityKey"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"WakeInstance"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"Subscribe"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"ResolveRoute"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"LookupRouteDependencies"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"RecordMaterialization"));
-    assert!(!OPERATOR_UNARY_METHODS.contains(&"CompareAndSwapInstanceState"));
+async fn operator_service_answers_unimplemented_for_proxy_and_sidecar_methods() {
+    for path in [
+        "/sleepypods.controlplane.v1.OperatorControlPlane/ResolveHttp01Challenge",
+        "/sleepypods.controlplane.v1.OperatorControlPlane/WakeInstance",
+        "/sleepypods.controlplane.v1.OperatorControlPlane/Subscribe",
+        "/sleepypods.controlplane.v1.OperatorControlPlane/ReportIdle",
+        "/sleepypods.controlplane.v1.ProxyControlPlane/Subscribe",
+        "/sleepypods.controlplane.v1.SidecarControlPlane/ReportIdle",
+    ] {
+        let mut request = grpc_web_operator_request("GetInstance", GetInstanceRequest::default());
+        *request.uri_mut() = path.parse().expect("method path parses");
+        let response = tonic_web::GrpcWebLayer::new()
+            .layer(store_operator_grpc_service(Arc::new(
+                FakeInstanceStore::default(),
+            )))
+            .oneshot(request)
+            .await
+            .expect("gRPC-Web request reaches the operator service");
+        let (headers, trailers, body) = collect_grpc_response_parts(response).await;
+        assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "12");
+    }
 }
 
 async fn grpc_web_store_unary<M, R>(
@@ -2828,7 +2585,7 @@ where
     M: Message + Default,
     R: Message,
 {
-    let response = operator_grpc_web_cors_layer()
+    let response = operator_grpc_web_cors_layer(&browser_origins())
         .layer(tonic_web::GrpcWebLayer::new().layer(store_operator_grpc_service(store)))
         .oneshot(grpc_web_operator_request(method, request))
         .await
@@ -2919,10 +2676,6 @@ where
     assert_grpc_status(&headers, trailers.as_ref(), body.as_ref(), "0");
 
     decode_grpc_message(body.as_ref())
-}
-
-fn grpc_request(content_type: &'static str, version: Version) -> Request<Body> {
-    grpc_create_instance_request(CreateInstanceRequest::default(), content_type, version)
 }
 
 fn grpc_create_instance_request(
@@ -3137,6 +2890,42 @@ fn sni_identity(host: &str) -> RouteIdentity {
     }
 }
 
+/// A schema that requires each named value.
+fn value_schema(fields: &[&str]) -> WorkloadValueSchema {
+    WorkloadValueSchema {
+        fields: fields
+            .iter()
+            .map(|field| {
+                (
+                    (*field).to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )
+            })
+            .collect(),
+        allow_extra: false,
+    }
+}
+
+/// The values `stateful_manifest_template_proto` reads.
+fn stateful_value_schema() -> WorkloadValueSchema {
+    value_schema(&["tenant", "volume"])
+}
+
+/// A store holding one class whose instances render with any values.
+fn store_with_class(class_id: &str, version: u64) -> Arc<FakeInstanceStore> {
+    let store = FakeInstanceStore::default();
+    let mut class = support::workload_class();
+    class.reference = control_plane::WorkloadClassVersionRef::new(
+        control_plane::WorkloadClassId::new(class_id).expect("valid class ID"),
+        Generation::new(version),
+    );
+    store.seed_workload_class(class);
+    Arc::new(store)
+}
+
 fn stateful_manifest_template_proto() -> ManifestTemplate {
     ManifestTemplate {
         workload: Some(WorkloadTemplate {
@@ -3155,12 +2944,14 @@ fn stateful_manifest_template_proto() -> ManifestTemplate {
                     value: Some(instance_value_text("tenant")),
                 }],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text("sleepypods/sidecar:test")),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(composed_text("db-", "tenant")),
@@ -3330,6 +3121,13 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
         panic!("unexpected certificate operation")
     }
 
+    async fn reencrypt_certificates(
+        &self,
+        _: tonic::Request<control_plane::api::pb::ReencryptCertificatesRequest>,
+    ) -> Result<Response<control_plane::api::pb::ReencryptCertificatesResponse>, Status> {
+        panic!("unexpected certificate operation")
+    }
+
     async fn create_workload_class_version(
         &self,
         _request: tonic::Request<CreateWorkloadClassVersionRequest>,
@@ -3415,15 +3213,6 @@ impl OperatorControlPlane for MetadataCapturingOperatorApi {
         &self,
         _request: tonic::Request<DeleteHttp01ChallengeRequest>,
     ) -> Result<Response<DeleteHttp01ChallengeResponse>, Status> {
-        Err(Status::unimplemented(
-            "metadata test only implements CreateInstance",
-        ))
-    }
-
-    async fn expire_http01_challenges(
-        &self,
-        _request: tonic::Request<ExpireHttp01ChallengesRequest>,
-    ) -> Result<Response<control_plane::api::pb::ExpireHttp01ChallengesResponse>, Status> {
         Err(Status::unimplemented(
             "metadata test only implements CreateInstance",
         ))

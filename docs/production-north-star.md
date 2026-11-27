@@ -157,7 +157,9 @@ explicitly added.
 Template rendering should be structured and constrained. Prefer typed `WorkloadClass` fields plus limited substitution from validated
 `Instance.values` over arbitrary text templating or user-supplied executable
 logic. Store a rendered generation hash so the controller can reject stale
-updates and explain what was materialized.
+updates and explain what was materialized. A create call accepts only a class or
+instance the renderer can render, so the operator who sent the request receives
+the error and a wake meets no template error.
 
 Control-plane authentication and authorization are operator policy. The platform
 should expose clear API boundaries, but tenant/user/org permission models are

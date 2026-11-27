@@ -80,7 +80,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-normal-app",
             volumes: Vec::new(),
-            idempotency_suffix: "normal",
         },
     )
     .await?;
@@ -93,7 +92,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-sleep-waking-app",
             volumes: Vec::new(),
-            idempotency_suffix: "sleep-waking",
         },
     )
     .await?;
@@ -110,7 +108,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
                 "lifecycle-delete-waking-pvc",
                 "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-waking",
             ),
-            idempotency_suffix: "delete-waking",
         },
     )
     .await?;
@@ -127,7 +124,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
                 "lifecycle-delete-draining-pvc",
                 "/tmp/sleepypods-kind-e2e-lifecycle-races/delete-draining",
             ),
-            idempotency_suffix: "delete-draining",
         },
     )
     .await?;
@@ -140,7 +136,6 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
             kind: WorkloadKind::Deployment,
             workload_name: "lifecycle-failed-retry-app",
             volumes: Vec::new(),
-            idempotency_suffix: "failed-retry",
         },
     )
     .await?;
@@ -313,7 +308,7 @@ async fn concurrent_wake_calls_converge(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-concurrent-6fce159e",
+        "lifecycle-concurrent-6fce159ec951c7bc",
         running.generation,
     )
     .await?;
@@ -390,7 +385,7 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     delete_workload_pods(
         kube.clone(),
         &config.namespace,
-        "lifecycle-sleep-waking-aea16aec",
+        "lifecycle-sleep-waking-aea16aec68686788",
     )
     .await?;
     let _ = timeout(Duration::from_secs(5), wake).await;
@@ -413,7 +408,7 @@ async fn report_idle_while_waking_cannot_finalize_cleanup(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-sleep-waking-aea16aec",
+        "lifecycle-sleep-waking-aea16aec68686788",
         running.generation,
     )
     .await?;
@@ -456,9 +451,9 @@ async fn delete_while_waking_cleans_pending_objects(
     wait_for_stateful_objects_present(
         kube.clone(),
         &config.namespace,
-        "lifecycle-delete-waking-0b1fe29d",
-        "lifecycle-delete-waking-pvc-0b1fe29d",
-        "lifecycle-delete-waking-pv-0b1fe29d",
+        "lifecycle-delete-waking-0b1fe29dcffd6483",
+        "lifecycle-delete-waking-pvc-0b1fe29dcffd6483",
+        "lifecycle-delete-waking-pv-0b1fe29dcffd6483",
         60,
     )
     .await?;
@@ -468,9 +463,9 @@ async fn delete_while_waking_cleans_pending_objects(
     wait_for_stateful_objects_absent(
         kube,
         &config.namespace,
-        "lifecycle-delete-waking-0b1fe29d",
-        "lifecycle-delete-waking-pvc-0b1fe29d",
-        "lifecycle-delete-waking-pv-0b1fe29d",
+        "lifecycle-delete-waking-0b1fe29dcffd6483",
+        "lifecycle-delete-waking-pvc-0b1fe29dcffd6483",
+        "lifecycle-delete-waking-pv-0b1fe29dcffd6483",
         60,
     )
     .await?;
@@ -519,22 +514,17 @@ async fn delete_while_draining_cleans_deleting_materialization(
     wait_for_stateful_objects_present(
         kube.clone(),
         &config.namespace,
-        "lifecycle-delete-draining-3cf19f0e",
-        "lifecycle-delete-draining-pvc-3cf19f0e",
-        "lifecycle-delete-draining-pv-3cf19f0e",
+        "lifecycle-delete-draining-3cf19f0ede4c361d",
+        "lifecycle-delete-draining-pvc-3cf19f0ede4c361d",
+        "lifecycle-delete-draining-pv-3cf19f0ede4c361d",
         60,
     )
     .await?;
 
     let workloads: Api<StatefulSet> = Api::namespaced(kube.clone(), &config.namespace);
-    let workload = workloads.get("lifecycle-delete-draining-3cf19f0e").await?;
-    let materialization_id = workload
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|annotations| annotations.get("sleepypods.io/materialization-id"))
-        .ok_or("current StatefulSet has no materialization identity")?
-        .clone();
+    workloads
+        .get("lifecycle-delete-draining-3cf19f0ede4c361d")
+        .await?;
     let mut removed_delete_permission = false;
     let blocked_result: TestResult<()> = async {
         // Record the owned change before dispatch so an ambiguous Role update
@@ -613,7 +603,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
         loop {
             let status = operator
                 .reconcile_materialization(ReconcileMaterializationRequest {
-                    materialization_id: materialization_id.clone(),
+                    instance_id: "lifecycle-delete-draining".to_owned(),
                     status_only: true,
                 })
                 .await?
@@ -627,7 +617,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
             {
                 let message = status.failure_message.to_ascii_lowercase();
                 if !message.contains("failed to delete statefulset")
-                    || !message.contains("lifecycle-delete-draining-3cf19f0e")
+                    || !message.contains("lifecycle-delete-draining-3cf19f0ede4c361d")
                     || !(message.contains("forbidden") || message.contains("403"))
                 {
                     return Err(format!(
@@ -674,7 +664,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
     // then observe completion without replaying DeleteInstance.
     let recovery = operator
         .reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id,
+            instance_id: "lifecycle-delete-draining".to_owned(),
             status_only: false,
         })
         .await?
@@ -687,9 +677,9 @@ async fn delete_while_draining_cleans_deleting_materialization(
     wait_for_stateful_objects_absent(
         kube,
         &config.namespace,
-        "lifecycle-delete-draining-3cf19f0e",
-        "lifecycle-delete-draining-pvc-3cf19f0e",
-        "lifecycle-delete-draining-pv-3cf19f0e",
+        "lifecycle-delete-draining-3cf19f0ede4c361d",
+        "lifecycle-delete-draining-pvc-3cf19f0ede4c361d",
+        "lifecycle-delete-draining-pv-3cf19f0ede4c361d",
         60,
     )
     .await?;
@@ -739,7 +729,7 @@ async fn failed_wake_retry_rejects_stale_generation(
     delete_workload_pods(
         kube.clone(),
         &config.namespace,
-        "lifecycle-failed-retry-8f1a6842",
+        "lifecycle-failed-retry-8f1a684251a07297",
     )
     .await?;
     wait_for_instance_response(
@@ -783,7 +773,7 @@ async fn failed_wake_retry_rejects_stale_generation(
     assert_workload_generation(
         kube,
         &config.namespace,
-        "lifecycle-failed-retry-8f1a6842",
+        "lifecycle-failed-retry-8f1a684251a07297",
         running.generation,
     )
     .await?;
@@ -843,7 +833,7 @@ async fn stale_sidecar_report_is_rejected(
     wait_for_workload_absent(
         kube.clone(),
         &config.namespace,
-        "lifecycle-stale-sidecar-7f9f001b",
+        "lifecycle-stale-sidecar-7f9f001b25a83ecd",
         60,
     )
     .await?;
@@ -1300,7 +1290,6 @@ struct WorkloadClassFixture<'a> {
     kind: WorkloadKind,
     workload_name: &'a str,
     volumes: Vec<VolumeTemplate>,
-    idempotency_suffix: &'a str,
 }
 
 async fn create_workload_class(
@@ -1309,10 +1298,8 @@ async fn create_workload_class(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-lifecycle-{}-class", fixture.idempotency_suffix),
             class_id: fixture.class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -1323,7 +1310,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(ManifestTemplate {
                 workload: Some(workload_template(
                     fixture.kind,
@@ -1371,6 +1357,7 @@ async fn create_instance(
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), target.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
     Ok(())
@@ -1949,6 +1936,7 @@ fn workload_template(kind: WorkloadKind, _name: &str, image: &str) -> WorkloadTe
                 value: Some(target_text("", "")),
             }],
         }),
+        termination_grace_period_seconds: None,
     }
 }
 
@@ -1958,6 +1946,7 @@ fn sidecar_template(image: &str) -> SidecarTemplate {
         image: Some(literal_text(image)),
         listen_port: SIDECAR_PORT,
         mode: None,
+        app_protocol: Default::default(),
     }
 }
 

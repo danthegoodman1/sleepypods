@@ -293,6 +293,14 @@ pub const MATERIALIZATION_FAILURES_BLOCKED: MetricDescriptor = MetricDescriptor:
     &[],
 );
 
+pub const CONTROL_PLANE_AUTH_DECISIONS_TOTAL: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_control_plane_auth_decisions_total",
+    MetricKind::Counter,
+    Some("decisions"),
+    "Control-plane caller authentication decisions.",
+    OUTCOME_LABELS,
+);
+
 pub const RUNTIME_CERTIFICATE_ENTRIES: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_runtime_certificate_entries",
     MetricKind::Gauge,
@@ -385,6 +393,7 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     KUBERNETES_OPERATION_DURATION_SECONDS,
     MATERIALIZATION_EFFECTS_UNCERTAIN,
     MATERIALIZATION_FAILURES_BLOCKED,
+    CONTROL_PLANE_AUTH_DECISIONS_TOTAL,
     RUNTIME_CERTIFICATE_ENTRIES,
     RUNTIME_CERTIFICATE_ACCOUNTED_BYTES,
     RUNTIME_CERTIFICATE_FETCHES,
@@ -691,6 +700,12 @@ mod tests {
                 MetricKind::Gauge,
                 Some("materializations"),
                 &[],
+            ),
+            (
+                "sleepypods_control_plane_auth_decisions_total",
+                MetricKind::Counter,
+                Some("decisions"),
+                &[LabelKey::Outcome],
             ),
             (
                 "sleepypods_runtime_certificate_entries",

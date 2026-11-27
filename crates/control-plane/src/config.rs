@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, str::FromStr, time::Duration};
+use std::time::Duration;
 
 use crate::{
     auth::AuthConfig,
@@ -7,13 +7,8 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlPlaneConfig {
-    pub store: StoreProviderConfig,
+    pub store: PostgresStoreConfig,
     pub auth: AuthConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoreProviderConfig {
-    Postgres(PostgresStoreConfig),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,27 +24,9 @@ pub struct PostgresStoreConfig {
     pub idempotency_retention: Option<Duration>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreProviderName {
-    Postgres,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownStoreProvider {
-    value: String,
-}
-
 impl ControlPlaneConfig {
-    pub fn new(store: StoreProviderConfig, auth: AuthConfig) -> Self {
+    pub fn new(store: PostgresStoreConfig, auth: AuthConfig) -> Self {
         Self { store, auth }
-    }
-}
-
-impl StoreProviderConfig {
-    pub fn provider_name(&self) -> StoreProviderName {
-        match self {
-            Self::Postgres(_) => StoreProviderName::Postgres,
-        }
     }
 }
 
@@ -119,66 +96,11 @@ impl PostgresStoreConfig {
     }
 }
 
-impl StoreProviderName {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Postgres => "postgres",
-        }
-    }
-}
-
-impl FromStr for StoreProviderName {
-    type Err = UnknownStoreProvider;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "postgres" => Ok(Self::Postgres),
-            _ => Err(UnknownStoreProvider {
-                value: value.to_owned(),
-            }),
-        }
-    }
-}
-
-impl fmt::Display for StoreProviderName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl UnknownStoreProvider {
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
-impl fmt::Display for UnknownStoreProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown store provider {:?}", self.value)
-    }
-}
-
-impl Error for UnknownStoreProvider {}
-
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, time::Duration};
+    use std::time::Duration;
 
-    use super::{AuthConfig, PostgresStoreConfig, StoreProviderConfig, StoreProviderName};
-
-    #[test]
-    fn parses_postgres_provider_name_case_insensitively() {
-        assert_eq!(
-            StoreProviderName::from_str(" PostgreSQL ")
-                .expect_err("only canonical name is accepted")
-                .value(),
-            " PostgreSQL "
-        );
-        assert_eq!(
-            StoreProviderName::from_str("Postgres").expect("postgres provider is supported"),
-            StoreProviderName::Postgres
-        );
-    }
+    use super::{AuthConfig, PostgresStoreConfig};
 
     #[test]
     fn validates_postgres_connection_url_presence() {
@@ -250,19 +172,8 @@ mod tests {
     }
 
     #[test]
-    fn store_config_reports_selected_provider() {
-        let config = StoreProviderConfig::Postgres(
-            PostgresStoreConfig::new("postgres://example").expect("valid URL"),
-        );
-
-        assert_eq!(config.provider_name(), StoreProviderName::Postgres);
-    }
-
-    #[test]
     fn control_plane_config_requires_explicit_auth_config() {
-        let store = StoreProviderConfig::Postgres(
-            PostgresStoreConfig::new("postgres://example").expect("valid URL"),
-        );
+        let store = PostgresStoreConfig::new("postgres://example").expect("valid URL");
         let config = super::ControlPlaneConfig::new(store.clone(), AuthConfig::NoAuth);
 
         assert_eq!(config.store, store);

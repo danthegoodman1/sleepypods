@@ -184,6 +184,24 @@ pub(crate) async fn reencrypt(
             .map_err(store_error)?,
     )))
 }
+pub(crate) async fn reencrypt_sealed_by(
+    store: &dyn ControlPlaneStore,
+    request: Request<pb::ReencryptCertificatesRequest>,
+) -> Result<Response<pb::ReencryptCertificatesResponse>, Status> {
+    require_secure(&request, CallerRole::Operator)?;
+    let result = store
+        .reencrypt_certificates_sealed_by(request.into_inner().sealing_key_id)
+        .await
+        .map_err(|error| match error {
+            // The store's reasons name the key ring's state and carry no material.
+            StoreError::InvalidArgument { message } => Status::invalid_argument(message),
+            error => store_error(error),
+        })?;
+    Ok(Response::new(pb::ReencryptCertificatesResponse {
+        reencrypted: result.reencrypted,
+        remaining: result.remaining,
+    }))
+}
 pub(crate) async fn resolve(
     store: &dyn ControlPlaneStore,
     request: Request<pb::ResolveTlsCertificateRequest>,

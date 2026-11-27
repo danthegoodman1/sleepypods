@@ -45,7 +45,7 @@ pub async fn delete_with_original_deadline(
     let status = timeout_at(
         cap,
         operator.reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id: materialization_id.to_owned(),
+            instance_id: current.instance_id.clone(),
             status_only: true,
         }),
     )

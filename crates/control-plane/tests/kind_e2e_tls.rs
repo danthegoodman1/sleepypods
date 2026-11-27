@@ -308,6 +308,7 @@ async fn create_tls_termination_resources(
                 version: 1,
             }),
             values: HashMap::from([("target".to_owned(), TERMINATION_TARGET.to_owned())]),
+            routes: Vec::new(),
         })
         .await?;
 
@@ -343,6 +344,7 @@ async fn create_sni_passthrough_resources(
                     version: 1,
                 }),
                 values: HashMap::from([("target".to_owned(), spec.target.to_owned())]),
+                routes: Vec::new(),
             })
             .await?;
 
@@ -369,10 +371,8 @@ async fn create_workload_class(
 ) -> TestResult<()> {
     operator
         .create_workload_class_version(CreateWorkloadClassVersionRequest {
-            idempotency_key: format!("kind-e2e-tls-create-class-{class_id}"),
             class_id: class_id.to_owned(),
             version: 1,
-            default_values: Default::default(),
             value_schema: Some(WorkloadValueSchema {
                 fields: HashMap::from([(
                     "target".to_owned(),
@@ -383,7 +383,6 @@ async fn create_workload_class(
                 )]),
                 allow_extra: false,
             }),
-            template_generation: 1,
             template: Some(manifest_template(config, app_mode, sidecar_mode)),
             sleep_policy: Some(WorkloadSleepPolicy {
                 idle_timeout_ms: 900_000,
@@ -803,12 +802,14 @@ fn manifest_template(
                     },
                 ],
             }),
+            termination_grace_period_seconds: None,
         }),
         sidecar: Some(SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: Some(literal_text(&config.sidecar_image)),
             listen_port: SIDECAR_PORT,
             mode: sidecar_mode.map(str::to_owned),
+            app_protocol: Default::default(),
         }),
         service: Some(ServiceTemplate {
             name: Some(target_text("e2e-tls-", "")),

@@ -3,8 +3,8 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     http01::{
-        DeleteHttp01ChallengeRequest, ExpireHttp01ChallengesRequest, Http01ChallengeKey,
-        Http01ChallengeRecord, PutHttp01ChallengeRequest,
+        DeleteHttp01ChallengeRequest, Http01ChallengeKey, Http01ChallengeRecord,
+        PutHttp01ChallengeRequest,
     },
     instance::{
         CompareAndSwapInstanceStateRequest, CreateInstanceRequest, CreateInstanceResult,
@@ -73,6 +73,12 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         request: ReencryptCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>>;
+    /// Re-seals a batch of the active certificates held under `sealing_key_id`
+    /// with the active key.
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>>;
 
     fn snapshot_tls_bindings(
         &self,
@@ -288,11 +294,6 @@ pub trait ControlPlaneStore: Send + Sync {
         &'a self,
         request: DeleteHttp01ChallengeRequest,
     ) -> StoreFuture<'a, StoreResult<bool>>;
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>>;
 }
 
 #[derive(Clone)]
@@ -437,6 +438,12 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         request: ReencryptCertificateRequest,
     ) -> StoreFuture<'_, StoreResult<CertificateMetadata>> {
         self.inner.reencrypt_certificate(request)
+    }
+    fn reencrypt_certificates_sealed_by(
+        &self,
+        sealing_key_id: String,
+    ) -> StoreFuture<'_, StoreResult<SealingKeyReencryption>> {
+        self.inner.reencrypt_certificates_sealed_by(sealing_key_id)
     }
 
     fn snapshot_tls_bindings(
@@ -811,15 +818,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         // The same host/token may already contain a replacement challenge.
         self.inner.delete_http01_challenge(request)
     }
-
-    fn expire_http01_challenges<'a>(
-        &'a self,
-        request: ExpireHttp01ChallengesRequest,
-    ) -> StoreFuture<'a, StoreResult<usize>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.expire_http01_challenges(request.clone())
-        })
-    }
 }
 
 fn retry_store_operation<'a, T, O, Fut>(
@@ -1019,6 +1017,7 @@ mod tests {
             remove_certificate,
             resolve_tls_certificate,
             reencrypt_certificate,
+            reencrypt_certificates_sealed_by,
             snapshot_tls_bindings,
             load_route_changes,
             load_route_change_revision,
@@ -1194,13 +1193,6 @@ mod tests {
             &'a self,
             _request: DeleteHttp01ChallengeRequest,
         ) -> StoreFuture<'a, StoreResult<bool>> {
-            not_implemented()
-        }
-
-        fn expire_http01_challenges<'a>(
-            &'a self,
-            _request: ExpireHttp01ChallengesRequest,
-        ) -> StoreFuture<'a, StoreResult<usize>> {
             not_implemented()
         }
     }

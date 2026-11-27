@@ -19,19 +19,19 @@ use control_plane::{
     ContainerTemplate, ControlPlaneStore, CreateInstanceRequest, CreateRouteBindingRequest,
     CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
     DeleteMaterializationReconciliationRequest, DeleteRouteBindingRequest, EnvVarTemplate,
-    ExpireHttp01ChallengesRequest, FinalizeSleepReconciliationRequest, FinalizeSleepRequest,
-    ForceReleaseExclusivityKeyRequest, Generation, GetInstanceRequest, GetRouteBindingRequest,
-    Http01ChallengeKey, IdempotencyKey, IdleTimeoutOverridePolicy, InstanceId, InstanceState,
+    FinalizeSleepReconciliationRequest, FinalizeSleepRequest, ForceReleaseExclusivityKeyRequest,
+    Generation, GetInstanceRequest, GetRouteBindingRequest, Http01ChallengeKey, IdempotencyKey,
+    IdleTimeoutOverridePolicy, InstanceId, InstanceRoute, InstanceState,
     ListMaterializationReconciliationCandidatesRequest, ManifestTemplate, MaterializationState,
     MaterializationTarget, PathPrefix, PostgresStore, PostgresStoreConfig, ProtocolRoute,
     PutHttp01ChallengeRequest, RecordMaterializationRequest,
     ReleaseMaterializationReconciliationLeaseRequest, RenderManifestRequest,
     RenderedExclusivityKey, RenderedObjectRef, RenewMaterializationReconciliationLeaseRequest,
-    ResolveRouteRequest, RouteBindingId, RouteBindingSpec, RouteDependencyLookup, RouteHost,
-    RouteIdentity, RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    StateTransitionReason, StoreError, TemplateText, TemplateTextPart, WorkloadClassId,
-    WorkloadClassVersion, WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    ResolveRouteRequest, RouteBindingId, RouteDependencyLookup, RouteHost, RouteIdentity,
+    RouteResolution, ServicePortTemplate, ServiceTemplate, SidecarTemplate, StateTransitionReason,
+    StoreError, TemplateText, TemplateTextPart, WorkloadClassId, WorkloadClassVersion,
+    WorkloadClassVersionRef, WorkloadExclusivityKeyTemplate, WorkloadKind, WorkloadSleepPolicy,
+    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use tokio_postgres::NoTls;
 
@@ -112,7 +112,7 @@ async fn run_conformance(
     assert_eq!(duplicate, class);
 
     let mut changed_class = class.clone();
-    changed_class.template_generation = Generation::new(2);
+    changed_class.value_schema.allow_extra = !changed_class.value_schema.allow_extra;
     let conflict = store
         .create_workload_class_version(CreateWorkloadClassVersionRequest::new(changed_class))
         .await
@@ -258,8 +258,8 @@ async fn run_conformance(
         "instance-a",
         class.reference.clone(),
         vec![
-            http_route("app.example.com", Some("/api")),
-            sni_route("db.example.com"),
+            http_identity("app.example.com", Some("/api")),
+            sni_identity("db.example.com"),
         ],
     );
     let created = store.create_instance(create.clone()).await?;
@@ -290,7 +290,6 @@ async fn run_conformance(
             .resolve(&created.instance.values)
             .map_err(|error| StoreError::internal(error.to_string()))?,
         namespace: "apps",
-        template_generation: Some(loaded.template_generation),
     })
     .map_err(|error| StoreError::internal(error.to_string()))?;
     let rendered_names = rendered
@@ -301,13 +300,13 @@ async fn run_conformance(
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-69856ec0"),
+            .any(|(kind, name)| *kind == "Deployment" && name == "app-instance-a-69856ec0faae6daf"),
         "loaded workload class template should render durable instance Deployment, got {rendered_names:?}"
     );
     assert!(
         rendered_names
             .iter()
-            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-69856ec0"),
+            .any(|(kind, name)| *kind == "Service" && name == "svc-instance-a-69856ec0faae6daf"),
         "loaded workload class template should render durable instance Service, got {rendered_names:?}"
     );
 
@@ -345,7 +344,7 @@ async fn run_conformance(
             "idem-create-a",
             "instance-conflict",
             class.reference.clone(),
-            vec![http_route("conflict.example.com", None)],
+            vec![http_identity("conflict.example.com", None)],
         ))
         .await
         .expect_err("same idempotency key with a different payload conflicts");
@@ -356,7 +355,7 @@ async fn run_conformance(
             "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
-            vec![http_route("app.example.com", Some("/api"))],
+            vec![http_identity("app.example.com", Some("/api"))],
         ))
         .await
         .expect_err("duplicate route identity is rejected");
@@ -372,7 +371,7 @@ async fn run_conformance(
             "idem-rollback",
             "instance-rollback",
             class.reference.clone(),
-            vec![http_route("rollback.example.com", None)],
+            vec![http_identity("rollback.example.com", None)],
         ))
         .await?;
     assert_eq!(
@@ -801,13 +800,16 @@ async fn exercise_http01(store: &PostgresStore) -> Result<(), StoreError> {
         .await?
         .is_none());
 
-    let expired = store
-        .expire_http01_challenges(
-            ExpireHttp01ChallengesRequest::new(SystemTime::now()).with_limit(1),
-        )
-        .await?;
-    assert_eq!(expired, 1);
-    assert!(store.resolve_http01_challenge(expired_key).await?.is_none());
+    // Runtime maintenance collects the expired row; an explicit delete then
+    // finds nothing left.
+    store.maintain_runtime_records(1024).await?;
+    assert!(
+        !store
+            .delete_http01_challenge(control_plane::DeleteHttp01ChallengeRequest::new(
+                expired_key
+            ))
+            .await?
+    );
 
     Ok(())
 }
@@ -2477,7 +2479,7 @@ async fn exercise_complete_wake(
             "idem-complete-wake-success",
             "instance-complete-wake-success",
             workload_class.clone(),
-            vec![http_route("complete-wake.example.com", None)],
+            vec![http_identity("complete-wake.example.com", None)],
         ))
         .await?;
     let instance_id = success.instance.id.clone();
@@ -2860,7 +2862,7 @@ async fn exercise_complete_wake(
             "idem-complete-wake-rewind",
             "instance-complete-wake-rewind",
             workload_class,
-            vec![http_route("complete-wake-rewind.example.com", None)],
+            vec![http_identity("complete-wake-rewind.example.com", None)],
         ))
         .await?;
     let rewind_id = rewind.instance.id.clone();
@@ -3275,9 +3277,7 @@ fn workload_class(class_id: &str, version: u64) -> WorkloadClassVersion {
             WorkloadClassId::new(class_id).expect("valid workload class ID"),
             Generation::new(version),
         ),
-        template_generation: Generation::new(1),
         template: workload_manifest_template(),
-        default_values: BTreeMap::from([("image".to_owned(), image.clone())]),
         value_schema: WorkloadValueSchema::new(false)
             .with_field("tenant", WorkloadValueFieldRule::required())
             .with_field(
@@ -3345,12 +3345,14 @@ fn workload_manifest_template() -> ManifestTemplate {
                     value: TemplateText::instance_value("tenant"),
                 }],
             },
+            termination_grace_period_seconds: None,
         },
         sidecar: SidecarTemplate {
             name: "sleepypods-sidecar".to_owned(),
             image: TemplateText::literal("sleepypods/sidecar:test"),
             listen_port: 15000,
             mode: None,
+            app_protocol: Default::default(),
         },
         service: Some(ServiceTemplate {
             name: composed_text("svc-", "tenant"),
@@ -3376,8 +3378,17 @@ fn create_instance_request(
     idempotency_key: &str,
     instance_id: &str,
     workload_class: WorkloadClassVersionRef,
-    route_bindings: Vec<RouteBindingSpec>,
+    route_identities: Vec<RouteIdentity>,
 ) -> CreateInstanceRequest {
+    let route_bindings = route_identities
+        .into_iter()
+        .enumerate()
+        .map(|(index, identity)| InstanceRoute {
+            id: RouteBindingId::new(format!("{instance_id}:route:{}", index + 1))
+                .expect("valid route binding ID"),
+            identity,
+        })
+        .collect();
     CreateInstanceRequest::new(
         IdempotencyKey::new(idempotency_key).expect("valid idempotency key"),
         InstanceId::new(instance_id).expect("valid instance ID"),
@@ -3417,25 +3428,6 @@ fn sni_identity(host: &str) -> RouteIdentity {
     RouteIdentity::Sni {
         host: RouteHost::exact(host).expect("valid host"),
     }
-}
-
-fn http_route(host: &str, path: Option<&str>) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Http {
-            host: RouteHost::exact(host).expect("valid host"),
-            path: path.map(|path| PathPrefix::new(path).expect("valid path prefix")),
-        },
-        ProtocolRoute::Http,
-    )
-}
-
-fn sni_route(host: &str) -> RouteBindingSpec {
-    RouteBindingSpec::new(
-        RouteIdentity::Sni {
-            host: RouteHost::exact(host).expect("valid host"),
-        },
-        ProtocolRoute::TlsSni,
-    )
 }
 
 fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
