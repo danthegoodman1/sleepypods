@@ -20,6 +20,7 @@ Start here:
 - [Development plan](docs/development-plan.md)
 - [Dynamic certificate delivery plan](docs/dynamic-certificates-plan.md)
 - [Codebase review and remediation plan](docs/review-remediation-plan.md)
+- [Improvement plan](docs/improvement-plan.md)
 - [Operator guide](docs/operator-guide.md)
 - [Operator runbook](docs/operator-runbook.md)
 - [Contributor and agent guide](docs/contributor-guide.md)

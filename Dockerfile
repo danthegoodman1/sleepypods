@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_IMAGE=rust:1-bookworm
+ARG RUST_IMAGE=rust:1.100-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot
 
 FROM ${RUST_IMAGE} AS chef

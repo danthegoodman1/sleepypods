@@ -64,7 +64,7 @@ impl<C: KubernetesMaterializerClient> FencedKubernetesClient<C> {
         // Acquired attempts are never resumed by a replacement process. The
         // process-wide sequence distinguishes every operation within that fence.
         let effect_id = NEXT_EFFECT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1).filter(|next| *next <= i64::MAX as u64)
             })
             .map_err(|_| KubernetesClientError::new("effect identity sequence exhausted"))?;
