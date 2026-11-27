@@ -88,6 +88,8 @@ pub struct RuntimeConfig {
 #[derive(Debug)]
 pub enum RuntimeConfigError {
     InvalidSecurity(&'static str),
+    /// Sealing key IDs that active certificates use and the key ring lacks.
+    MissingSealingKeys(Vec<String>),
     MissingEnv {
         name: &'static str,
     },
@@ -839,13 +841,20 @@ where
     materializer.with_sidecar_control_plane_token(auth_config.sidecar_bearer_token().cloned())
 }
 
-async fn connect_store(
+/// Connects the store the control plane serves from. Every sealing key an
+/// active certificate uses must be in the key ring, because a certificate
+/// sealed under an absent key cannot be served.
+pub async fn connect_store(
     config: &PostgresStoreConfig,
     sealer: Option<Arc<crate::certificate::CertificateSealer>>,
-) -> Result<Arc<dyn ControlPlaneStore>, crate::StoreError> {
+) -> RuntimeResult<Arc<dyn ControlPlaneStore>> {
     let mut store = PostgresStore::connect(config).await?;
     if let Some(sealer) = sealer {
         store = store.with_certificate_sealer(sealer);
+    }
+    let missing = store.missing_sealing_key_ids().await?;
+    if !missing.is_empty() {
+        return Err(RuntimeConfigError::MissingSealingKeys(missing).into());
     }
     let store: Arc<dyn ControlPlaneStore> = Arc::new(store);
     Ok(Arc::new(RetryingControlPlaneStore::with_default_policy(
@@ -944,6 +953,11 @@ impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSecurity(reason) => f.write_str(reason),
+            Self::MissingSealingKeys(key_ids) => write!(
+                f,
+                "active certificates are sealed under keys missing from the sealing key ring: {}",
+                key_ids.join(", ")
+            ),
             Self::MissingEnv { name } => write!(f, "{name} is required"),
             Self::InvalidListenAddr {
                 name,
@@ -977,6 +991,7 @@ impl Error for RuntimeConfigError {
             Self::MissingEnv { .. }
             | Self::InvalidPostgresSetting { .. }
             | Self::InvalidAuthMode { .. }
+            | Self::MissingSealingKeys(_)
             | Self::InvalidSecurity(_) => None,
         }
     }
