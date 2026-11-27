@@ -191,18 +191,27 @@ cache to disk. Restarting loses the cache; a subsequent TLS connection needs a
 successful resolution. The existing bounded control-plane connection setup still
 applies at startup. An empty cache alone does not prevent listener readiness.
 
-The cache admits at most 1,024 hostname entries, including misses and pending
-lookups, with 64 MiB of accounted memory and at most three simultaneous fetches.
-Memory accounting includes fetch scratch space and configurations still retained
-by handshakes or other references after cache eviction. It is an admission budget, not a
-process RSS limit; connection buffers and the runtime have separate costs.
-The worker reserves four MiB for structures, 32 MiB for watch decoding/state and
-eight MiB for each outstanding fetch. These conservative reservations cover
-malformed repeated protobuf fields as well as valid bundles; they do not imply
-that an idle process allocates that much physical memory. Entry and byte pressure
-can evict cached views before their leases expire.
+The cache holds at most 1,024 hostnames with a certificate. A separate budget
+holds at most 1,024 hostnames without one: authoritative misses, pending lookups
+and failed lookups. Each budget evicts its own least recently handshaken
+hostname when it is full. Unknown SNI names therefore displace only each other,
+and a cached certificate leaves before its lease expires only when a 1,025th
+certificate arrives. At most three fetches run at once.
+
+Entry counts bound cache memory. Validation limits a bundle to 128 KiB and 100
+SANs, so a cached certificate retains at most about 160 KiB: 160 MiB for 1,024
+maximum-size certificates, and about 10 MiB when chains are a few KiB. A hostname
+without a certificate costs under 1 KiB. A resolve response is at most 256 KiB
+on the wire and a watch snapshot 512 KiB; a malformed one expands to at most
+8 MiB per fetch and 32 MiB for the watch while it is decoded and rejected. The
+worst case is about 220 MiB. A configuration that is rotated or evicted while
+connections still use it stays in memory until those connections close, so
+`SLEEPYPODS_PROXY_MAX_CONNECTIONS` bounds how many remain. Connection buffers
+and the runtime have separate costs.
+
 Identical misses share one fetch. Lookup has a three-second deadline within the
-overall five-second TLS setup bound; capacity exhaustion fails the handshake.
+overall five-second TLS setup bound; a lookup that finds all three fetch slots
+busy fails the handshake.
 
 Positive views refresh after approximately 60 seconds with hostname jitter, or
 half the granted lease when that is sooner. The worker polls once per second;
@@ -215,12 +224,16 @@ unchanged response can renew only the exact certificate view still held locally.
 Authoritative misses are cached for at most one second. During a control-plane
 outage, an existing valid view remains usable only until its original deadline.
 
-Frontline opens one native certificate watch when its cache first has interests.
-The watch pushes complete binding snapshots containing metadata only. Each
-registration supplies an ID and exact hostname list; the server acknowledges it
-with an atomic current snapshot. Eviction releases the hostname's interest;
-updates coalesce into a bounded complete replacement set. Reconnects synchronize
-all current interests through either control-plane replica.
+Frontline opens one native certificate watch when its cache first holds a
+certificate. The watch follows the hostnames that hold a certificate, so its
+interests fit the 1,024-host limit of one stream. A hostname without a
+certificate has nothing to rotate or revoke; its cached miss expires within one
+second, and the next handshake resolves it again. The watch pushes complete
+binding snapshots containing metadata only. Each registration supplies an ID and
+exact hostname list; the server acknowledges it with an atomic current snapshot.
+Eviction and removal release the hostname's interest; updates coalesce into a
+bounded complete replacement set. Reconnects synchronize all current interests
+through either control-plane replica.
 
 The server checks a private global revision and reads the requested bindings only
 when it changes, or when a new registration requires a snapshot. There is no

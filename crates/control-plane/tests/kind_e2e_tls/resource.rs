@@ -80,7 +80,9 @@ async fn metrics(peer: &Peer, phase: &str) -> TestResult<HashMap<String, f64>> {
     }
     for (key, cap) in [
         ("entries", 1024.0),
-        ("accounted_bytes", 67108864.0),
+        ("negative_entries", 1024.0),
+        // 1,024 certificates at the 128 KiB bundle limit.
+        ("accounted_bytes", 134217728.0),
         ("fetches", 3.0),
         ("queue", 3.0),
         ("tasks", 3.0),
@@ -437,6 +439,6 @@ pub(super) async fn run(
         artifact.path.with_file_name("resource-sampling.done"),
         now().to_string(),
     )?;
-    artifact.record("bounded-miss-warm-rotation-workload",serde_json::json!({"cycles":3,"flood_seconds_per_pod_cycle":10,"quiescent_tail_seconds":7,"warm_lane":1,"miss_lanes":15,"verified_post_wave_warm_successes":192,"driver_max_tls_tasks":16,"concurrent_operator_futures":1,"cache_entry_cap":1024,"accounted_byte_cap":67108864,"fetch_queue_task_cap":3,"samples":path.file_name().unwrap(),"rss":"separate process sampler"}))?;
+    artifact.record("bounded-miss-warm-rotation-workload",serde_json::json!({"cycles":3,"flood_seconds_per_pod_cycle":10,"quiescent_tail_seconds":7,"warm_lane":1,"miss_lanes":15,"verified_post_wave_warm_successes":192,"driver_max_tls_tasks":16,"concurrent_operator_futures":1,"cache_entry_cap":1024,"negative_entry_cap":1024,"accounted_byte_cap":134217728,"fetch_queue_task_cap":3,"samples":path.file_name().unwrap(),"rss":"separate process sampler"}))?;
     Ok(())
 }

@@ -60,8 +60,9 @@ Low-cardinality label keys are `protocol`, `direction`, `operation`,
 | `sleepypods_runtime_active_streams` | gauge | none | Active drain work, including initial public HTTP setup and streams; these may briefly overlap for one request. |
 | `sleepypods_runtime_drain_duration_seconds` | histogram | `outcome` | Runtime drain duration. |
 | `sleepypods_runtime_http01_results_total` | counter | `outcome` | HTTP-01 challenge hits, misses, and errors. |
-| `sleepypods_runtime_certificate_entries` | gauge | none | Cached positive, missing and pending hostname entries. |
-| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Owned cache reservations and retained configurations; separate from process RSS. |
+| `sleepypods_runtime_certificate_entries` | gauge | none | Hostnames with a cached certificate; at most 1,024. |
+| `sleepypods_runtime_certificate_negative_entries` | gauge | none | Hostnames cached without a certificate: missing, pending or failed lookups; at most 1,024. |
+| `sleepypods_runtime_certificate_accounted_bytes` | gauge | none | Chain and key bytes held by cached certificates; separate from process RSS. |
 | `sleepypods_runtime_certificate_fetches` | gauge | none | Fetch permits held by queued, running, validating or completed work awaiting release. |
 | `sleepypods_runtime_certificate_queue` | gauge | none | Work waiting in the bounded certificate fetch channel. |
 | `sleepypods_runtime_certificate_tasks` | gauge | none | Supervisor task records, including completed tasks not yet reaped. |

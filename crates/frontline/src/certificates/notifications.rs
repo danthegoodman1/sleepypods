@@ -23,20 +23,29 @@ struct Registration {
     incarnations: HashMap<String, u64>,
     request: pb::WatchTlsCertificatesRequest,
 }
+/// The watch follows the hostnames that hold a certificate. Their budget
+/// equals the interest limit of one stream, and a hostname without a
+/// certificate has nothing to rotate or revoke.
 fn registration(cache: &TlsCertificateStore, id: u64) -> Registration {
     let state = cache.shared.state.lock().unwrap();
+    let incarnations: HashMap<String, u64> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.certified())
+        .map(|(hostname, entry)| (hostname.clone(), entry.incarnation))
+        .collect();
     Registration {
         id,
-        incarnations: state
-            .entries
-            .iter()
-            .map(|(h, e)| (h.clone(), e.incarnation))
-            .collect(),
         request: pb::WatchTlsCertificatesRequest {
             registration: id,
-            hostnames: state.entries.keys().cloned().collect(),
+            hostnames: incarnations.keys().cloned().collect(),
         },
+        incarnations,
     }
+}
+fn has_interests(cache: &TlsCertificateStore) -> bool {
+    let state = cache.shared.state.lock().unwrap();
+    state.entries.values().any(Entry::certified)
 }
 pub(super) async fn run(
     cache: TlsCertificateStore,
@@ -60,7 +69,7 @@ pub(super) async fn run(
         if shutdown.is_shutdown() {
             return;
         }
-        if cache.shared.state.lock().unwrap().entries.is_empty() {
+        if !has_interests(&cache) {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = changed.changed() => {},
@@ -191,6 +200,7 @@ fn apply(
         .ok_or(CertificateLookupError::Capacity)?;
     let serial = state.serial;
     let entry = state.entries.get_mut(hostname).unwrap();
+    let certified = entry.certified();
     entry.floor = revision;
     entry.generation = serial;
     entry.pending = false;
@@ -199,6 +209,10 @@ fn apply(
         entry.value = None;
     }
     entry.changed.send_modify(|v| *v = v.wrapping_add(1));
+    if certified && !retain {
+        state.interests_changed.send_replace(());
+        enforce_budgets(&mut state, hostname);
+    }
     // Capacity pressure may postpone fetch, never postpone the invalidation.
     let _ = cache.queue_locked(&mut state, hostname);
     Ok(())

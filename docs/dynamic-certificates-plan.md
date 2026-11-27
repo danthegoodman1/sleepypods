@@ -38,7 +38,7 @@ only to its recorded source, images and workload.
   conditional re-encryption preserves certificate and hostname view revisions.
 - Keep parsing, cryptography and network calls off warm handshakes. Reuse the
   existing TLS configuration replacement, admission and deadline mechanisms.
-- Bound entries, bytes, fetches, decoded messages, queues and server work. A
+- Bound entries, fetches, decoded messages, queues and server work. A
   canceled operation retains capacity until blocking work or SQL cleanup ends.
   Preserve capacity for ordinary routing and lifecycle requests.
 - Use one metadata-only certificate watch response containing a registration ID
@@ -73,14 +73,15 @@ monotonic time. A partition may delay invalidation until the original lease ends
 TLS 1.2 and 1.3 use full handshakes; sessions, tickets and early data cannot bypass
 current SNI authorization.
 
-Resource limits remain 1,024 hostname views, 64 MiB accounted cache memory, three
-concurrent fetches, 128 KiB bundles, 16 chain entries and 100 SANs. Accounted memory
-includes conservative decoding/validation reservations and configurations retained
-by live connections; it is not a process RSS prediction. The watch admits at most
-16 streams per control plane, 1,024 interests per stream, 512 KiB messages and two
-queued responses. Registration/query work has a three-second bound, delivery one
-second, and a server session at most 60 seconds. Polls occur at most once per 250 ms
-per stream through the existing single watch SQL slot and bounded FIFO admission.
+Resource limits are 1,024 hostnames with a certificate, a separate 1,024
+hostnames without one, three concurrent fetches, 128 KiB bundles, 16 chain
+entries and 100 SANs. These counts and the 256 KiB resolve and 512 KiB watch
+message caps bound cache memory at about 220 MiB in the worst case; the operator
+guide derives it. The watch admits at most 16 streams per control plane, 1,024
+interests per stream, 512 KiB messages and two queued responses.
+Registration/query work has a three-second bound, delivery one second, and a
+server session at most 60 seconds. Polls occur at most once per 250 ms per
+stream through the existing single watch SQL slot and bounded FIFO admission.
 These bounds do not promise database throughput.
 
 ## Testing strategy

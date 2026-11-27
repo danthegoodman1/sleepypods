@@ -83,7 +83,6 @@ impl Rig {
         tasks.spawn(
             worker
                 .with_watch(Arc::new(Watch(watch)))
-                .unwrap()
                 .run(shutdown.clone()),
         );
         Self {
@@ -252,16 +251,23 @@ async fn peer(cache: &TlsCertificateStore, host: &str, cert: &CertificateDer<'st
     assert_eq!(server.stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
 }
 #[tokio::test]
-async fn cached_miss_then_registration_snapshot_closes_publish_race_with_real_peer() {
+async fn cached_miss_expires_into_a_lookup_and_only_a_certificate_opens_the_watch() {
     let mut rig = Rig::new();
-    assert!(rig.opened.try_recv().is_err(), "empty cache must not watch");
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
-    let mut watch = rig.open().await;
     let cert = rig.publish("app.example", 2, "A", 1);
-    sync(&mut watch, vec![("app.example", 2, Some("A"))]).await;
-    until(|| revision(&rig, "app.example") == Some(2)).await;
+    assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
+    assert_eq!(rig.api.api.requests.lock().unwrap().len(), 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert!(
+        rig.opened.try_recv().is_err(),
+        "a hostname without a certificate must not watch"
+    );
+    tokio::time::advance(Duration::from_millis(401)).await;
     peer(&rig.cache, "app.example", &cert).await;
     assert_eq!(rig.api.api.requests.lock().unwrap().len(), 2);
+    let mut watch = rig.open().await;
+    sync(&mut watch, vec![("app.example", 2, Some("A"))]).await;
     rig.finish().await;
 }
 #[tokio::test]
@@ -328,28 +334,32 @@ async fn rotation_fences_held_unchanged_and_preserves_only_original_view_until_r
 async fn received_removal_fences_late_found_and_rebind_accepts_lower_certificate_version() {
     let mut rig = Rig::new();
     rig.publish("app.example", 9, "A", 9);
-    let release = rig.hold();
-    let mut callers = JoinSet::new();
-    let cache = rig.cache.clone();
-    callers.spawn(async move { cache.resolve("app.example").await });
-    until(|| rig.api.api.requests.lock().unwrap().len() == 1).await;
+    rig.cache.resolve("app.example").await.unwrap();
     let mut watch = rig.open().await;
-    // Initial snapshot still observes A; its authoritative fetch supersedes the
-    // original cold fetch without letting that held response restore removal.
     sync(&mut watch, vec![("app.example", 9, Some("A"))]).await;
-    until(|| revision(&rig, "app.example") == Some(9)).await;
-    rig.missing("app.example", 10);
-    push(&mut watch, "app.example", 10, None, true).await;
-    until(|| revision(&rig, "app.example") == Some(10)).await;
+    // A rotation starts a fetch whose Found response stays in flight.
+    rig.publish("app.example", 10, "A", 10);
+    let release = rig.hold();
+    push(&mut watch, "app.example", 10, Some("A"), false).await;
+    until(|| rig.api.api.requests.lock().unwrap().len() == 2).await;
+    rig.missing("app.example", 11);
+    push(&mut watch, "app.example", 11, None, true).await;
+    until(|| revision(&rig, "app.example") == Some(11)).await;
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
+    assert_eq!(rig.cache.usage().certificates, 0);
+    assert_eq!(rig.cache.usage().negative_entries, 1);
     release.send(()).unwrap();
     until(|| rig.cache.usage().fetches == 0).await;
-    while callers.join_next().await.is_some() {}
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
-    let cert = rig.publish("app.example", 11, "B", 1);
-    push(&mut watch, "app.example", 11, Some("B"), true).await;
-    until(|| revision(&rig, "app.example") == Some(11)).await;
+    // The hostname left the watch with its certificate. A handshake after the
+    // cached miss expires finds the new binding and watches it again.
+    until(|| watch.events.is_closed()).await;
+    let cert = rig.publish("app.example", 12, "B", 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(1001)).await;
     peer(&rig.cache, "app.example", &cert).await;
+    let mut watch = rig.open().await;
+    sync(&mut watch, vec![("app.example", 12, Some("B"))]).await;
     rig.finish().await;
 }
 #[tokio::test]
@@ -370,10 +380,9 @@ async fn independent_host_revisions_and_duplicate_snapshots_never_renew() {
     rig.publish("b.example", 4, "B", 2);
     push(&mut watch, "b.example", 4, Some("B"), false).await;
     until(|| revision(&rig, "b.example") == Some(4)).await;
-    rig.missing("a.example", 3);
-    push(&mut watch, "a.example", 3, None, true).await;
+    rig.publish("a.example", 3, "A", 2);
+    push(&mut watch, "a.example", 3, Some("A"), false).await;
     until(|| revision(&rig, "a.example") == Some(3)).await;
-    assert!(rig.cache.resolve("a.example").await.unwrap().is_none());
     let expiry = rig.cache.shared.state.lock().unwrap().entries["b.example"]
         .value
         .as_ref()
@@ -382,8 +391,8 @@ async fn independent_host_revisions_and_duplicate_snapshots_never_renew() {
     send_snapshot(&watch).await;
     // The next distinct host event is a causal receive-order barrier; sending
     // a snapshot alone would not prove the duplicate had been processed.
-    rig.missing("a.example", 5);
-    push(&mut watch, "a.example", 5, None, true).await;
+    rig.publish("a.example", 5, "A", 3);
+    push(&mut watch, "a.example", 5, Some("A"), false).await;
     until(|| revision(&rig, "a.example") == Some(5)).await;
     assert_eq!(
         rig.cache.shared.state.lock().unwrap().entries["b.example"]
@@ -435,11 +444,11 @@ async fn reconnect_snapshot_preserves_low_host_revision_and_original_lease() {
 #[tokio::test]
 async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream() {
     let mut rig = Rig::new();
-    assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
+    rig.publish("app.example", 1, "A", 1);
+    rig.cache.resolve("app.example").await.unwrap();
     let mut open = rig.open().await;
     let old_request = open.requests.recv().await.unwrap();
-    assert!(evict_one(&mut rig.cache.shared.state.lock().unwrap(), None));
-    rig.publish("app.example", 1, "A", 1);
+    evict(&mut rig.cache.shared.state.lock().unwrap(), "app.example");
     rig.cache.resolve("app.example").await.unwrap();
     let incarnation = rig.cache.shared.state.lock().unwrap().entries["app.example"].incarnation;
     open.events
@@ -480,16 +489,17 @@ async fn eviction_incarnation_fences_old_snapshot_and_releases_interest_stream()
         .unwrap();
     until(|| revision(&rig, "app.example") == Some(2)).await;
     peer(&rig.cache, "app.example", &new).await;
+    let mut host = "app.example".to_owned();
     for cycle in 0..4 {
-        while evict_one(&mut rig.cache.shared.state.lock().unwrap(), None) {}
+        evict(&mut rig.cache.shared.state.lock().unwrap(), &host);
         until(|| open.events.is_closed()).await;
-        assert_eq!(rig.cache.usage().entries, 0);
-        let host = format!("cycle{cycle}.example");
-        assert!(rig.cache.resolve(&host).await.unwrap().is_none());
+        assert_eq!(rig.cache.usage().certificates, 0);
+        host = format!("cycle{cycle}.example");
+        rig.publish(&host, 1, "A", 1);
+        assert!(rig.cache.resolve(&host).await.unwrap().is_some());
         open = rig.open().await;
-        sync(&mut open, vec![(&host, 0, None)]).await;
-        assert_eq!(rig.cache.usage().entries, 1);
-        assert!(rig.cache.usage().accounted_bytes < CERTIFICATE_CACHE_BYTES);
+        sync(&mut open, vec![(&host, 1, Some("A"))]).await;
+        assert_eq!(rig.cache.usage().certificates, 1);
     }
     rig.finish().await;
     assert!(open.events.is_closed());
@@ -553,36 +563,28 @@ async fn invalid_replacement_and_watch_outage_cannot_extend_original_hard_lease(
 }
 
 #[tokio::test]
-async fn watch_decode_reserve_and_three_fetch_owners_survive_until_joined_shutdown() {
+async fn the_watch_and_three_fetch_owners_survive_until_joined_shutdown() {
     let mut rig = Rig::new();
-    assert_eq!(
-        rig.cache.usage().accounted_bytes,
-        STRUCTURE_BYTES + WATCH_BYTES
-    );
+    rig.publish("app.example", 1, "A", 1);
+    rig.cache.resolve("app.example").await.unwrap();
+    let open = rig.open().await;
     let mut callers = JoinSet::new();
     let mut releases = Vec::new();
     for i in 0..CERTIFICATE_FETCHES {
         releases.push(rig.hold());
         let cache = rig.cache.clone();
         callers.spawn(async move { cache.resolve(&format!("held{i}.example")).await });
-        until(|| rig.api.api.requests.lock().unwrap().len() == i + 1).await;
+        until(|| rig.api.api.requests.lock().unwrap().len() == i + 2).await;
     }
     assert_eq!(rig.cache.usage().fetches, CERTIFICATE_FETCHES);
-    assert!(
-        rig.cache.usage().accounted_bytes
-            >= STRUCTURE_BYTES + WATCH_BYTES + CERTIFICATE_FETCHES * FETCH_BYTES
-    );
-    assert!(rig.cache.usage().accounted_bytes <= CERTIFICATE_CACHE_BYTES);
     assert!(matches!(
         rig.cache.resolve("excess.example").await,
         Err(CertificateLookupError::Capacity)
     ));
-    let open = rig.open().await;
-    let cache = rig.cache.clone();
+    assert!(!open.events.is_closed());
     rig.finish().await;
     while callers.join_next().await.is_some() {}
     assert!(open.events.is_closed());
-    assert_eq!(cache.usage().accounted_bytes, STRUCTURE_BYTES);
     assert!(releases.into_iter().all(|r| r.send(()).is_err()));
 }
 

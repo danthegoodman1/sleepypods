@@ -297,14 +297,21 @@ pub const RUNTIME_CERTIFICATE_ENTRIES: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_runtime_certificate_entries",
     MetricKind::Gauge,
     Some("entries"),
-    "Certificate cache entries, including positive, missing and pending interests.",
+    "Hostnames with a cached certificate.",
+    NO_LABELS,
+);
+pub const RUNTIME_CERTIFICATE_NEGATIVE_ENTRIES: MetricDescriptor = MetricDescriptor::new(
+    "sleepypods_runtime_certificate_negative_entries",
+    MetricKind::Gauge,
+    Some("entries"),
+    "Hostnames cached without a certificate: missing, pending or failed lookups.",
     NO_LABELS,
 );
 pub const RUNTIME_CERTIFICATE_ACCOUNTED_BYTES: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_runtime_certificate_accounted_bytes",
     MetricKind::Gauge,
     Some("bytes"),
-    "Certificate cache accounted ownership bytes; not process RSS.",
+    "Chain and key bytes held by cached certificates; not process RSS.",
     NO_LABELS,
 );
 pub const RUNTIME_CERTIFICATE_FETCHES: MetricDescriptor = MetricDescriptor::new(
@@ -386,6 +393,7 @@ pub const ALL_METRICS: &[MetricDescriptor] = &[
     MATERIALIZATION_EFFECTS_UNCERTAIN,
     MATERIALIZATION_FAILURES_BLOCKED,
     RUNTIME_CERTIFICATE_ENTRIES,
+    RUNTIME_CERTIFICATE_NEGATIVE_ENTRIES,
     RUNTIME_CERTIFICATE_ACCOUNTED_BYTES,
     RUNTIME_CERTIFICATE_FETCHES,
     RUNTIME_CERTIFICATE_QUEUE,
@@ -694,6 +702,12 @@ mod tests {
             ),
             (
                 "sleepypods_runtime_certificate_entries",
+                MetricKind::Gauge,
+                Some("entries"),
+                &[],
+            ),
+            (
+                "sleepypods_runtime_certificate_negative_entries",
                 MetricKind::Gauge,
                 Some("entries"),
                 &[],

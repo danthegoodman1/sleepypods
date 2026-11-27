@@ -25,18 +25,13 @@ impl TlsCertificateStore {
                 })
             })
             .count();
-        let entries = state.entries.len();
         drop(state);
+        let usage = self.usage();
         for (descriptor, value) in [
-            (RUNTIME_CERTIFICATE_ENTRIES, entries),
-            (
-                RUNTIME_CERTIFICATE_ACCOUNTED_BYTES,
-                CERTIFICATE_CACHE_BYTES - self.shared.bytes.available_permits(),
-            ),
-            (
-                RUNTIME_CERTIFICATE_FETCHES,
-                CERTIFICATE_FETCHES - self.shared.fetches.available_permits(),
-            ),
+            (RUNTIME_CERTIFICATE_ENTRIES, usage.certificates),
+            (RUNTIME_CERTIFICATE_NEGATIVE_ENTRIES, usage.negative_entries),
+            (RUNTIME_CERTIFICATE_ACCOUNTED_BYTES, usage.certificate_bytes),
+            (RUNTIME_CERTIFICATE_FETCHES, usage.fetches),
             (
                 RUNTIME_CERTIFICATE_QUEUE,
                 self.sender.max_capacity() - self.sender.capacity(),
@@ -149,7 +144,7 @@ mod tests {
             Arc::new(Resolver(send)),
             ObservabilityRecorder::new(Arc::new(sink.clone())),
         );
-        let worker = worker.with_watch(Arc::new(PendingWatch)).unwrap();
+        let worker = worker.with_watch(Arc::new(PendingWatch));
         let shutdown = Shutdown::new();
         let mut tasks = JoinSet::new();
         tasks.spawn(worker.run(shutdown.clone()));
@@ -157,16 +152,17 @@ mod tests {
         let lookup = cache.clone();
         callers.spawn(async move { lookup.resolve("secret-host.example").await });
         let (request, reply) = requests.recv().await.unwrap();
-        until(|| cache.shared.watches.load(Ordering::Relaxed) == 1).await;
         cache.collect_metrics(&sink);
         let pending = sink.render();
         for sample in [
-            "entries 1",
+            "entries 0",
+            "negative_entries 1",
+            "accounted_bytes 0",
             "fetches 1",
             "queue 0",
             "tasks 1",
             "task_high_water 1",
-            "watches 1",
+            "watches 0",
             "expiry_risk 0",
         ] {
             assert!(
@@ -175,11 +171,13 @@ mod tests {
             );
         }
         let cert = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+        let key = cert.signing_key.serialize_der();
+        let material = cert.cert.der().len() + key.len();
         let mut found = crate::certificates::test_support::response(
             &request.server_name,
             1,
             vec![cert.cert.der().clone()],
-            PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+            PrivatePkcs8KeyDer::from(key).into(),
         );
         found.authorization_ttl_millis = 10_000;
         reply.send(Ok(found)).unwrap();
@@ -191,10 +189,21 @@ mod tests {
             .unwrap()
             .is_some());
         until(|| cache.shared.retained_tasks.load(Ordering::Relaxed) == 0).await;
+        until(|| cache.shared.watches.load(Ordering::Relaxed) == 1).await;
         cache.collect_metrics(&sink);
-        assert!(sink
-            .render()
-            .contains("sleepypods_runtime_certificate_expiry_risk 1\n"));
+        let installed = sink.render();
+        for sample in [
+            "entries 1".to_owned(),
+            "negative_entries 0".to_owned(),
+            format!("accounted_bytes {material}"),
+            "watches 1".to_owned(),
+            "expiry_risk 1".to_owned(),
+        ] {
+            assert!(
+                installed.contains(&format!("sleepypods_runtime_certificate_{sample}\n")),
+                "missing {sample}"
+            );
+        }
         let before_warm = sink.render();
         for _ in 0..10 {
             assert!(cache
@@ -235,7 +244,15 @@ mod tests {
         }
         cache.collect_metrics(&sink);
         let finished = sink.render();
-        for sample in ["entries 0", "fetches 0", "queue 0", "tasks 0", "watches 0"] {
+        for sample in [
+            "entries 0",
+            "negative_entries 0",
+            "accounted_bytes 0",
+            "fetches 0",
+            "queue 0",
+            "tasks 0",
+            "watches 0",
+        ] {
             assert!(finished.contains(&format!("sleepypods_runtime_certificate_{sample}\n")));
         }
         for sample in [

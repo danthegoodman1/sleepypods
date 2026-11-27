@@ -1,11 +1,16 @@
 //! Demand-loaded application certificates. The worker owns all asynchronous
 //! work; the handle only accesses bounded memory and queues bounded fetches.
+//!
+//! Entry counts bound the cache. Hostnames holding a certificate and hostnames
+//! without one have separate budgets, so unknown names evict only each other.
 mod client;
 mod metrics;
 mod notifications;
 mod worker;
 pub use client::GrpcCertificateResolver;
 pub use notifications::{CertificateWatchFuture, CertificateWatchStream, CertificateWatcher};
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod handshake_tests;
 #[cfg(test)]
@@ -30,23 +35,26 @@ use tokio::{
 use tokio_rustls::rustls::ServerConfig;
 pub use worker::TlsCertificateWorker;
 
+/// Hostnames that may hold a certificate.
 pub const CERTIFICATE_CACHE_ENTRIES: usize = 1024;
-pub const CERTIFICATE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Hostnames cached without a certificate: missing, pending or failed lookups.
+pub const CERTIFICATE_NEGATIVE_ENTRIES: usize = 1024;
 pub const CERTIFICATE_FETCHES: usize = 3;
 pub const CERTIFICATE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CERTIFICATE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const ENTRY_BYTES: usize = 1024;
-// Retained hash-table buckets, bounded channels/task records and state remain
-// allocated even when entries are evicted. Includes one 512KiB watch response,
-// one queued/request snapshot, registration maps and coalesced interest state.
-const STRUCTURE_BYTES: usize = 4 * 1024 * 1024;
-// Includes bounded wire response, validation scratch, DER/key copies and the
-// replacement config. On installation this is reduced to the retained charge.
-const FETCH_BYTES: usize = 8 * 1024 * 1024;
-// Malformed bounded Prost snapshots can retain old/new vector allocations
-// during growth; retain the conservative existing notification envelope.
-const WATCH_BYTES: usize = 32 * 1024 * 1024;
-const CONFIG_OVERHEAD: usize = 128 * 1024;
+// Worst-case memory follows from these counts and the message caps, about
+// 220 MiB in total:
+// - Validation admits a bundle of at most 128 KiB with 100 SANs, so a cached
+//   certificate retains at most about 160 KiB: 160 MiB for a full cache, and
+//   about 10 MiB when chains are a few KiB.
+// - A negative entry holds a hostname and bookkeeping, under 1 KiB.
+// - A resolve response is at most 256 KiB on the wire. Decoding a malformed
+//   one of minimal repeated fields expands it to at most 8 MiB before
+//   validation rejects it, so three fetches hold at most 24 MiB.
+// - A watch snapshot is at most 512 KiB on the wire and expands to at most
+//   32 MiB the same way.
+// A configuration replaced or evicted while connections still use it lives
+// until the last of them closes; the connection limit bounds how many.
 
 pub type CertificateResolveFuture = Pin<
     Box<
@@ -91,7 +99,6 @@ impl fmt::Debug for TlsCertificateStore {
     }
 }
 struct Shared {
-    _structures: OwnedSemaphorePermit,
     #[cfg(test)]
     validation_gate: Mutex<
         Option<(
@@ -105,7 +112,6 @@ struct Shared {
     observability: ObservabilityRecorder,
     wall: Arc<dyn Fn() -> i64 + Send + Sync>,
     state: Mutex<State>,
-    bytes: Arc<Semaphore>,
     fetches: Arc<Semaphore>,
 }
 struct State {
@@ -124,12 +130,22 @@ struct Entry {
     pending: bool,
     changed: watch::Sender<u64>,
     last_error: Option<CertificateLookupError>,
-    _memory: OwnedSemaphorePermit,
+}
+impl Entry {
+    /// Whether the entry holds a certificate. This decides its budget and its
+    /// place in the watch.
+    fn certified(&self) -> bool {
+        self.value
+            .as_ref()
+            .is_some_and(|view| view.config.is_some())
+    }
 }
 #[derive(Clone)]
 struct View {
     revision: u64,
     config: Option<Arc<ServerConfig>>,
+    /// Chain and key bytes behind `config`.
+    bytes: usize,
     metadata: Option<pb::CertificateMetadata>,
     expires: Instant,
     refresh: Instant,
@@ -139,13 +155,16 @@ struct Fetch {
     generation: u64,
     prior: Option<View>,
     floor: u64,
-    memory: OwnedSemaphorePermit,
     _slot: OwnedSemaphorePermit,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CertificateCacheUsage {
-    pub entries: usize,
-    pub accounted_bytes: usize,
+    /// Hostnames holding a certificate.
+    pub certificates: usize,
+    /// Hostnames cached without one.
+    pub negative_entries: usize,
+    /// Chain and key bytes held by cached certificates.
+    pub certificate_bytes: usize,
     pub fetches: usize,
 }
 
@@ -171,13 +190,7 @@ impl TlsCertificateStore {
         wall: Arc<dyn Fn() -> i64 + Send + Sync>,
         observability: ObservabilityRecorder,
     ) -> (Self, TlsCertificateWorker) {
-        let bytes = Arc::new(Semaphore::new(CERTIFICATE_CACHE_BYTES));
-        let structures = bytes
-            .clone()
-            .try_acquire_many_owned(STRUCTURE_BYTES as u32)
-            .unwrap();
         let shared = Arc::new(Shared {
-            _structures: structures,
             #[cfg(test)]
             validation_gate: Mutex::new(None),
             task_high_water: std::sync::atomic::AtomicUsize::new(0),
@@ -191,7 +204,6 @@ impl TlsCertificateStore {
                 serial: 0,
                 stopped: false,
             }),
-            bytes,
             fetches: Arc::new(Semaphore::new(CERTIFICATE_FETCHES)),
         });
         let (sender, receiver) = mpsc::channel(CERTIFICATE_FETCHES);
@@ -212,9 +224,16 @@ impl TlsCertificateStore {
         cache
     }
     pub fn usage(&self) -> CertificateCacheUsage {
+        let state = self.shared.state.lock().unwrap();
+        let certified = || state.entries.values().filter(|entry| entry.certified());
+        let certificates = certified().count();
         CertificateCacheUsage {
-            entries: self.shared.state.lock().unwrap().entries.len(),
-            accounted_bytes: CERTIFICATE_CACHE_BYTES - self.shared.bytes.available_permits(),
+            certificates,
+            negative_entries: state.entries.len() - certificates,
+            certificate_bytes: certified()
+                .filter_map(|entry| entry.value.as_ref())
+                .map(|view| view.bytes)
+                .sum(),
             fetches: CERTIFICATE_FETCHES - self.shared.fetches.available_permits(),
         }
     }
@@ -246,15 +265,6 @@ impl TlsCertificateStore {
                     }
                 }
             } else {
-                if state.entries.len() == CERTIFICATE_CACHE_ENTRIES {
-                    evict_one(&mut state, None);
-                }
-                let memory = self
-                    .shared
-                    .bytes
-                    .clone()
-                    .try_acquire_many_owned(ENTRY_BYTES as u32)
-                    .map_err(|_| CertificateLookupError::Capacity)?;
                 let (changed, _) = watch::channel(0);
                 state.entries.insert(
                     hostname.clone(),
@@ -268,11 +278,10 @@ impl TlsCertificateStore {
                         pending: false,
                         changed,
                         last_error: None,
-                        _memory: memory,
                     },
                 );
+                enforce_budgets(&mut state, &hostname);
             }
-            state.interests_changed.send_replace(());
             self.queue_locked(&mut state, &hostname)?;
             state.entries[&hostname].changed.subscribe()
         };
@@ -317,26 +326,12 @@ impl TlsCertificateStore {
             .clone()
             .try_acquire_owned()
             .map_err(|_| CertificateLookupError::Capacity)?;
-        let memory = loop {
-            if let Ok(p) = self
-                .shared
-                .bytes
-                .clone()
-                .try_acquire_many_owned(FETCH_BYTES as u32)
-            {
-                break p;
-            }
-            if !evict_one(state, Some(hostname)) {
-                return Err(CertificateLookupError::Capacity);
-            }
-        };
         let entry = state.entries.get_mut(hostname).unwrap();
         let fetch = Fetch {
             hostname: hostname.to_owned(),
             generation: entry.generation,
             prior: entry.value.clone(),
             floor: entry.floor,
-            memory,
             _slot: slot,
         };
         self.sender
@@ -354,19 +349,43 @@ impl TlsCertificateStore {
         state.interests_changed.send_replace(());
     }
 }
-fn evict_one(state: &mut State, exclude: Option<&str>) -> bool {
-    let victim = state
+/// Holds each kind of entry to its budget by evicting the least recently
+/// handshaken entry of that kind. Call it after inserting `keep` or after
+/// `keep` gains or loses its certificate; `keep` itself stays.
+fn enforce_budgets(state: &mut State, keep: &str) {
+    if state.entries.len() <= CERTIFICATE_CACHE_ENTRIES.min(CERTIFICATE_NEGATIVE_ENTRIES) {
+        return;
+    }
+    for (certified, budget) in [
+        (true, CERTIFICATE_CACHE_ENTRIES),
+        (false, CERTIFICATE_NEGATIVE_ENTRIES),
+    ] {
+        let kind = || {
+            state
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.certified() == certified)
+        };
+        if kind().count() <= budget {
+            continue;
+        }
+        let victim = kind()
+            .filter(|(hostname, _)| hostname.as_str() != keep)
+            .min_by_key(|(_, entry)| entry.touched)
+            .map(|(hostname, _)| hostname.clone());
+        if let Some(hostname) = victim {
+            evict(state, &hostname);
+        }
+    }
+}
+/// Removing a certificate changes what the watch should follow.
+fn evict(state: &mut State, hostname: &str) {
+    if state
         .entries
-        .iter()
-        .filter(|(key, _)| Some(key.as_str()) != exclude)
-        .min_by_key(|(_, v)| v.touched)
-        .map(|(k, _)| k.clone());
-    if let Some(key) = victim {
-        state.entries.remove(&key);
+        .remove(hostname)
+        .is_some_and(|entry| entry.certified())
+    {
         state.interests_changed.send_replace(());
-        true
-    } else {
-        false
     }
 }
 
