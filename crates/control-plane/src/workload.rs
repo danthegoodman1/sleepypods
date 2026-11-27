@@ -249,6 +249,7 @@ impl WorkloadValueSchema {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_field(mut self, name: impl Into<String>, rule: WorkloadValueFieldRule) -> Self {
         self.fields.insert(name.into(), rule);
         self
@@ -335,6 +336,7 @@ impl Default for WorkloadValueSchema {
 }
 
 impl WorkloadValueFieldRule {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn required() -> Self {
         Self {
             required: true,
@@ -342,6 +344,7 @@ impl WorkloadValueFieldRule {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn optional() -> Self {
         Self {
             required: false,
@@ -349,6 +352,7 @@ impl WorkloadValueFieldRule {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn optional_with_default(default: impl Into<String>) -> Self {
         Self {
             required: false,
@@ -397,6 +401,7 @@ impl WorkloadExclusivityKeyTemplate {
 }
 
 impl RenderedExclusivityKey {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -455,10 +460,12 @@ impl fmt::Display for ValueSchemaError {
 impl Error for ValueSchemaError {}
 
 impl WorkloadExclusivityKeyError {
+    #[cfg(test)]
     pub fn index(&self) -> usize {
         self.index
     }
 
+    #[cfg(test)]
     pub fn field(&self) -> &'static str {
         self.field
     }

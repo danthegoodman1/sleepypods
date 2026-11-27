@@ -232,7 +232,6 @@ pub struct FinalizeSleepResult {
 pub enum MaterializationState {
     Pending,
     Ready,
-    Failed,
     Deleting,
     Deleted,
 }
@@ -538,14 +537,12 @@ impl ForceReleaseExclusivityKeyRequest {
 
 impl MaterializationState {
     pub const BACKLOG_STATES: &'static [Self] = &[Self::Pending, Self::Deleting];
-    pub const HELD_KEY_STATES: &'static [Self] =
-        &[Self::Pending, Self::Ready, Self::Failed, Self::Deleting];
+    pub const HELD_KEY_STATES: &'static [Self] = &[Self::Pending, Self::Ready, Self::Deleting];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Ready => "ready",
-            Self::Failed => "failed",
             Self::Deleting => "deleting",
             Self::Deleted => "deleted",
         }

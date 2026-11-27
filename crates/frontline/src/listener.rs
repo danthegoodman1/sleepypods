@@ -116,6 +116,7 @@ impl FrontlineTlsTerminationListenerConfig {
         Self { listen_addr }
     }
 
+    #[cfg(test)]
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
@@ -126,6 +127,7 @@ impl FrontlineTlsPassthroughListenerConfig {
         Self { listen_addr }
     }
 
+    #[cfg(test)]
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
@@ -160,10 +162,12 @@ impl FrontlineListenersConfig {
         self.http
     }
 
+    #[cfg(test)]
     pub fn tls_termination(&self) -> Option<FrontlineTlsTerminationListenerConfig> {
         self.tls_termination
     }
 
+    #[cfg(test)]
     pub fn tls_passthrough(&self) -> Option<FrontlineTlsPassthroughListenerConfig> {
         self.tls_passthrough
     }
@@ -201,6 +205,7 @@ impl FrontlineListeners {
 
 impl<L> FrontlineListeners<L> {
     /// A frontline that serves plain HTTP only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn http(http: L) -> Self {
         Self {
             http,

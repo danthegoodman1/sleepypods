@@ -513,8 +513,7 @@ async fn mutation_timeouts_require_inspection_and_read_timeouts_are_retryable() 
         readiness_timeout: Duration::from_millis(5),
         ..Default::default()
     };
-    let client =
-        KubeMaterializerClient::with_config(kube::Client::new(service, "apps"), config).unwrap();
+    let client = KubeMaterializerClient::with_config(kube::Client::new(service, "apps"), config);
     let plan = plan();
     let object = &plan.manifest().unwrap().objects[0].object;
     let identity = LiveObjectIdentity {
@@ -755,8 +754,7 @@ async fn production_readiness_waits_for_current_service_nonterminating_ready_mem
             readiness_timeout: Duration::from_secs(10),
             ..Default::default()
         },
-    )
-    .unwrap();
+    );
     let refs = plan().object_refs();
     for step in 0..8 {
         snapshot.store(step, Ordering::SeqCst);
@@ -862,8 +860,7 @@ async fn readiness_paces_its_rounds_when_watches_end_at_once() {
             readiness_timeout: Duration::from_secs(1),
             ..Default::default()
         },
-    )
-    .unwrap();
+    );
 
     let error = client
         .wait_for_readiness(&plan().object_refs())

@@ -347,6 +347,7 @@ name = "control-plane"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "control-plane",
  "deadpool-postgres",
  "frontline",
  "futures-util",
@@ -720,6 +721,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "criterion",
+ "frontline",
  "futures-util",
  "http",
  "http-body",
@@ -1895,6 +1897,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "pin-project-lite",
+ "proxy-core",
  "sleepypods-api",
  "sleepypods-observability",
  "socket2",

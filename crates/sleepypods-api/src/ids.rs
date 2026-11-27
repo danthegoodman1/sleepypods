@@ -14,7 +14,6 @@ pub struct EmptyStringError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidInstanceIdError {
-    value: String,
     message: &'static str,
 }
 
@@ -32,10 +31,6 @@ macro_rules! string_newtype {
 
             pub fn as_str(&self) -> &str {
                 &self.0
-            }
-
-            pub fn into_inner(self) -> String {
-                self.0
             }
         }
 
@@ -100,13 +95,11 @@ impl InstanceId {
         let value = value.into();
         if value.trim().is_empty() {
             return Err(InvalidInstanceIdError {
-                value,
                 message: "must not be empty",
             });
         }
         if !is_dns_label(&value) {
             return Err(InvalidInstanceIdError {
-                value,
                 message: "must be a Kubernetes DNS label: lowercase a-z, digits, or hyphen, start and end alphanumeric, and at most 63 characters",
             });
         }
@@ -117,19 +110,11 @@ impl InstanceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    pub fn into_inner(self) -> String {
-        self.0
-    }
 }
 
 impl InvalidInstanceIdError {
     pub fn field(&self) -> &'static str {
         "InstanceId"
-    }
-
-    pub fn value(&self) -> &str {
-        &self.value
     }
 }
 
@@ -201,10 +186,6 @@ impl BackendGeneration {
     pub const fn get(self) -> u64 {
         self.0
     }
-
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
-    }
 }
 
 impl fmt::Display for Generation {
@@ -275,13 +256,11 @@ mod tests {
             let error = InstanceId::new(value).expect_err("invalid instance ID");
 
             assert_eq!(error.field(), "InstanceId");
-            assert_eq!(error.value(), value);
         }
         let overlong = "a".repeat(64);
-        let error = InstanceId::new(overlong.clone()).expect_err("invalid instance ID");
+        let error = InstanceId::new(overlong).expect_err("invalid instance ID");
 
         assert_eq!(error.field(), "InstanceId");
-        assert_eq!(error.value(), overlong);
     }
 
     #[test]

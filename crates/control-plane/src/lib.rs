@@ -48,9 +48,7 @@ pub use instance::{
     CreateInstanceRequest, CreateInstanceResult, CreateInstanceValidationError, GetInstanceRequest,
     InstanceRecord, InstanceRoute, InstanceState, InstanceValues,
 };
-pub use kube_materializer::{
-    InvalidKubeMaterializerClientConfig, KubeMaterializerClient, KubeMaterializerClientConfig,
-};
+pub use kube_materializer::KubeMaterializerClient;
 pub use kubernetes_name::render_instance_scoped_name;
 pub use manifest::{
     render_manifests, ApplyOrder, ContainerPortTemplate, ContainerTemplate, EnvVarTemplate,

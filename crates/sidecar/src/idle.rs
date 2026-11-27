@@ -85,6 +85,7 @@ impl IdleReportConfig {
 }
 
 impl IdleObservation {
+    #[cfg(test)]
     pub fn zero_active() -> Self {
         Self { active_count: 0 }
     }

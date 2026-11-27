@@ -73,6 +73,7 @@ impl PostgresStore {
 
     /// Sets how operations that are safe to repeat repeat while the
     /// database is unavailable.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_retry_policy(mut self, retry: crate::RetryPolicy) -> Self {
         self.retry = retry;
         self

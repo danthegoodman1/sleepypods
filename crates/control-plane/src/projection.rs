@@ -225,6 +225,7 @@ impl ProjectionPlan {
         }
     }
 
+    #[cfg(test)]
     pub fn materialization_id(&self) -> &MaterializationId {
         &self.materialization_id
     }
@@ -233,6 +234,7 @@ impl ProjectionPlan {
         &self.instance_id
     }
 
+    #[cfg(test)]
     pub fn instance_generation(&self) -> Generation {
         self.instance_generation
     }
@@ -296,6 +298,7 @@ impl ExpectedOwnershipStamp {
 }
 
 impl LiveObjectMetadata {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_rendered_object(object: &KubernetesObject) -> Self {
         Self {
             persistent_volume_reclaim_policy: object
@@ -314,6 +317,7 @@ impl LiveObjectMetadata {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn deleting(mut self, finalizers: impl Into<Vec<String>>) -> Self {
         self.deleting = true;
         self.finalizers = finalizers.into();

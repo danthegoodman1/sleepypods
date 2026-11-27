@@ -1594,7 +1594,6 @@ pub(crate) mod tests {
             "0",
         );
         assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "ready", "3");
-        assert_state_sample(&rendered, "sleepypods_exclusivity_keys_held", "failed", "1");
     }
 
     fn assert_state_sample(rendered: &str, metric: &str, state: &str, value: &str) {
@@ -1821,16 +1820,10 @@ pub(crate) mod tests {
                             Some(std::time::Duration::from_secs(7)),
                         ),
                     ],
-                    vec![
-                        MaterializationHeldKeysOperationalMetrics::new(
-                            MaterializationState::Ready,
-                            3,
-                        ),
-                        MaterializationHeldKeysOperationalMetrics::new(
-                            MaterializationState::Failed,
-                            1,
-                        ),
-                    ],
+                    vec![MaterializationHeldKeysOperationalMetrics::new(
+                        MaterializationState::Ready,
+                        3,
+                    )],
                 ))
             })
         }

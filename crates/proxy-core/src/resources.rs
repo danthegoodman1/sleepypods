@@ -239,14 +239,9 @@ impl ProxyResourceConfig {
         }
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn max_connections(self) -> usize {
         self.max_connections
-    }
-    pub fn max_requests(self) -> usize {
-        self.max_requests
-    }
-    pub fn max_handshakes(self) -> usize {
-        self.max_handshakes
     }
     pub fn max_http2_streams(self) -> u32 {
         self.max_http2_streams

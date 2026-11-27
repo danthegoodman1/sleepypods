@@ -55,6 +55,7 @@ pub struct HttpProxy {
     http1_client: UpstreamClient,
     http2_client: UpstreamClient,
     config: ProxyResourceConfig,
+    #[cfg(any(test, feature = "test-support"))]
     upstream_connections: crate::AdmissionLimiter,
 }
 
@@ -159,10 +160,12 @@ impl HttpProxy {
             http1_client,
             http2_client,
             config,
+            #[cfg(any(test, feature = "test-support"))]
             upstream_connections,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upstream_connections(&self) -> &crate::AdmissionLimiter {
         &self.upstream_connections
     }
@@ -334,6 +337,7 @@ impl AppHttpProxy {
 }
 
 impl AppProtocol {
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Http1 => "http1",

@@ -323,12 +323,14 @@ pub struct CsiSecretRefTemplate {
 }
 
 impl TemplateText {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn literal(value: impl Into<String>) -> Self {
         Self {
             parts: vec![TemplateTextPart::Literal(value.into())],
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn instance_value(field: impl Into<String>) -> Self {
         Self {
             parts: vec![TemplateTextPart::InstanceValue(field.into())],

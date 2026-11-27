@@ -95,14 +95,12 @@ impl<T> GrpcSidecarControlPlaneClient<T> {
         self
     }
 
+    #[cfg(test)]
     pub fn inner(&self) -> &SidecarControlPlaneClient<T> {
         &self.client
     }
 
-    pub fn inner_mut(&mut self) -> &mut SidecarControlPlaneClient<T> {
-        &mut self.client
-    }
-
+    #[cfg(test)]
     pub fn into_inner(self) -> SidecarControlPlaneClient<T> {
         self.client
     }

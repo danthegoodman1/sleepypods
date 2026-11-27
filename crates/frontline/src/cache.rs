@@ -50,6 +50,7 @@ impl HostEntry {
         self.used.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn subscription(&self) -> Option<SubscriptionId> {
         self.subscription
     }
@@ -86,10 +87,12 @@ impl RouteSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.http.len() + self.sni.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -111,11 +114,6 @@ impl Displaced {
             }
         }
         self.entries.push(entry);
-    }
-
-    pub fn absorb(&mut self, other: Displaced) {
-        self.entries.extend(other.entries);
-        self.unsubscribe.extend(other.unsubscribe);
     }
 }
 
@@ -148,6 +146,7 @@ impl RouteTable {
         }
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -161,6 +160,7 @@ impl RouteTable {
         self.positive_order.len()
     }
 
+    #[cfg(test)]
     pub fn negative_len(&self) -> usize {
         self.negative_order.len()
     }
@@ -266,6 +266,7 @@ impl RouteTable {
         displaced
     }
 
+    #[cfg(test)]
     pub fn next_expiry(&self) -> Option<Instant> {
         self.expiry.keys().next().map(|(expires_at, _)| *expires_at)
     }

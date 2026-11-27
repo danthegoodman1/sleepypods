@@ -88,6 +88,7 @@ impl PodRoute {
         })
     }
 
+    #[cfg(test)]
     pub fn address(&self) -> SocketAddr {
         self.address
     }

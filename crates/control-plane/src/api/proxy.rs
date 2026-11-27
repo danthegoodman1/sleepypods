@@ -30,46 +30,18 @@ pub struct StoreBackedProxyApi<C> {
 }
 
 impl<C> StoreBackedProxyApi<C> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         store: Arc<dyn ProxyServiceStore>,
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
-        Self::with_observability(
-            store,
-            materializer,
-            target,
-            ObservabilityRecorder::default(),
-        )
-    }
-
-    pub fn with_observability(
-        store: Arc<dyn ProxyServiceStore>,
-        materializer: KubernetesMaterializer<C>,
-        target: MaterializationTarget,
-        observability: ObservabilityRecorder,
-    ) -> Self {
         Self::with_observability_and_route_events(
             store,
             materializer,
             target,
-            observability,
+            ObservabilityRecorder::default(),
             RouteSubscriptionBroker::new(),
-        )
-    }
-
-    pub fn with_route_events(
-        store: Arc<dyn ProxyServiceStore>,
-        materializer: KubernetesMaterializer<C>,
-        target: MaterializationTarget,
-        route_events: RouteSubscriptionBroker,
-    ) -> Self {
-        Self::with_observability_and_route_events(
-            store,
-            materializer,
-            target,
-            ObservabilityRecorder::default(),
-            route_events,
         )
     }
 
@@ -95,22 +67,6 @@ pub type StoreBackedProxyGrpcService<C> = ProxyControlPlaneServer<StoreBackedPro
 /// The largest message the proxy service sends, sized for the largest host rule
 /// set route creation admits. A message over it would end its stream.
 pub(super) const MAX_PROXY_RESPONSE_BYTES: usize = crate::route::MAX_HOST_RULES_BYTES;
-
-pub fn proxy_grpc_service_with_store<C>(
-    store: Arc<dyn ProxyServiceStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-) -> StoreBackedProxyGrpcService<C>
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    proxy_grpc_service_with_store_and_route_events(
-        store,
-        materializer,
-        target,
-        RouteSubscriptionBroker::new(),
-    )
-}
 
 pub fn proxy_grpc_service_with_store_and_route_events<C>(
     store: Arc<dyn ProxyServiceStore>,

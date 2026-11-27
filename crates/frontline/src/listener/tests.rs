@@ -803,10 +803,11 @@ async fn listener_non_challenge_request_bypasses_http01_resolver_lock() {
         .expect("listener binds");
     let addr = listener.local_addr().expect("listener addr");
     let shutdown = Shutdown::new();
-    let runtime = FrontlineHttpRuntime::with_http01_resolver(
+    let runtime = FrontlineHttpRuntime::with_http01_resolver_and_observability(
         FrontlineRouteCoordinator::new(4, route_client.clone(), FakeWake::default()),
         http01_resolver.clone(),
         DrainTracker::new(Duration::from_secs(5)),
+        proxy_core::observability::recorder::ObservabilityRecorder::default(),
     );
     let task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));
 

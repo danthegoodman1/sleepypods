@@ -17,9 +17,7 @@ pub const EVENT_CONTROL_PLANE_AUTH: &str = "control_plane.auth.decision";
 pub const EVENT_CONTROL_PLANE_STORE_ERROR: &str = "control_plane.store.error";
 
 pub const FIELD_INSTANCE_ID: &str = "instance.id";
-pub const FIELD_SUBSCRIPTION_ID: &str = "subscription.id";
 pub const FIELD_GENERATION: &str = "generation";
-pub const FIELD_BACKEND_GENERATION: &str = "backend.generation";
 pub const FIELD_CLUSTER_ID: &str = "cluster.id";
 pub const FIELD_NAMESPACE: &str = "namespace";
 pub const FIELD_ERROR_REASON: &str = "error.reason";
@@ -155,16 +153,8 @@ impl LogField {
         Self::new(FIELD_INSTANCE_ID, value)
     }
 
-    pub fn subscription_id(value: impl ToString) -> Self {
-        Self::new(FIELD_SUBSCRIPTION_ID, value)
-    }
-
     pub fn generation(value: impl ToString) -> Self {
         Self::new(FIELD_GENERATION, value)
-    }
-
-    pub fn backend_generation(value: impl ToString) -> Self {
-        Self::new(FIELD_BACKEND_GENERATION, value)
     }
 
     pub fn cluster_id(value: impl ToString) -> Self {

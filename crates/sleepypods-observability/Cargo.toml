@@ -5,7 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [features]
-# InMemoryObservability and other helpers for other crates' tests.
+# The in-memory sink and other helpers for tests.
 test-support = []
 
 [dependencies]

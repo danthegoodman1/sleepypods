@@ -29,6 +29,7 @@ impl AdmissionLimiter {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_flight(&self) -> usize {
         self.limit - self.semaphore.available_permits()
     }
