@@ -32,9 +32,75 @@ pub struct TestStore {
     sleep_requests: Mutex<Vec<BeginSleepRequest>>,
     defer_sleep_for: Mutex<Option<Duration>>,
     ready_age: Mutex<Option<Duration>>,
+    /// Materializations whose last attempt failed. A store schedules their
+    /// next attempt after a backoff; this fixture never reaches it.
+    failed_attempts: Mutex<Vec<control_plane::ids::MaterializationId>>,
+}
+
+/// A reconciler configuration whose periodic scan suits a test's patience.
+pub fn reconciler_config() -> control_plane::MaterializationReconcilerConfig {
+    control_plane::MaterializationReconcilerConfig {
+        interval: Duration::from_millis(20),
+        ..Default::default()
+    }
+}
+
+/// Runs the production reconciler loop until `done` holds, then stops it.
+pub async fn reconcile_until<C, Done, DoneFuture>(
+    reconciler: control_plane::MaterializationReconciler<C>,
+    mut done: Done,
+) where
+    C: control_plane::KubernetesMaterializerClient + Clone + 'static,
+    Done: FnMut() -> DoneFuture,
+    DoneFuture: std::future::Future<Output = bool>,
+{
+    let (shutdown, stopped) = tokio::sync::watch::channel(false);
+    let driver = tokio::spawn(reconciler.run_until_shutdown(stopped));
+    let reached = tokio::time::timeout(Duration::from_secs(60), async {
+        while !done().await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    shutdown.send_replace(true);
+    driver
+        .await
+        .expect("reconciler task joins")
+        .expect("reconciler stops cleanly");
+    reached.expect("reconciler reached the expected state");
 }
 
 impl TestStore {
+    /// Makes every failed attempt due again, as an elapsed backoff does.
+    pub fn retry_failed_attempts(&self) {
+        self.failed_attempts.lock().unwrap().clear();
+    }
+    /// True once the reconciler for `target` has nothing left to start: every
+    /// wake and cleanup has completed or recorded a failed attempt, no lease
+    /// is held, and every instance deletion without cleanup is finalized.
+    pub fn lifecycle_settled(&self, target: &MaterializationTarget) -> bool {
+        let failed = self.failed_attempts.lock().unwrap();
+        let instances = self.instances.lock().unwrap();
+        let records = self.materializations.lock().unwrap();
+        let work_settled = records
+            .iter()
+            .filter(|record| &record.target == target)
+            .all(|record| {
+                record.reconciliation_lease.is_none()
+                    && (!matches!(
+                        record.state,
+                        MaterializationState::Pending | MaterializationState::Deleting
+                    ) || failed.contains(&record.id))
+            });
+        let deletions_finalized = instances.values().all(|instance| {
+            instance.state != DomainInstanceState::Deleting
+                || records.iter().any(|record| {
+                    record.instance_id == instance.id
+                        && record.state != MaterializationState::Deleted
+                })
+        });
+        work_settled && deletions_finalized
+    }
     pub fn sleep_requests(&self) -> Vec<BeginSleepRequest> {
         self.sleep_requests.lock().unwrap().clone()
     }
@@ -199,7 +265,9 @@ impl TestStore {
                 && record.state != MaterializationState::Deleted
         })?;
         record.state = state;
-        record.backend = None;
+        if state == MaterializationState::Deleted {
+            record.backend = None;
+        }
         if let Some(generation) = instance_generation {
             record.instance_generation = generation;
         }
@@ -238,6 +306,7 @@ fn protocol_for_identity(identity: &RouteIdentity) -> ProtocolRoute {
 }
 fn fake_materialization_record(request: RecordMaterializationRequest) -> MaterializationRecord {
     MaterializationRecord {
+        pod_backend: None,
         id: MaterializationId::new(format!(
             "{}:{}:{}",
             request.instance_id,
@@ -557,31 +626,6 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        request: control_plane::ListMaterializationReconciliationCandidatesRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
-        Box::pin(async move {
-            Ok(self
-                .materializations
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record.state,
-                        MaterializationState::Pending | MaterializationState::Deleting
-                    ) && request
-                        .target
-                        .as_ref()
-                        .is_none_or(|target| &record.target == target)
-                })
-                .take(request.limit)
-                .cloned()
-                .collect())
-        })
-    }
-
     fn resolve_route<'a>(
         &'a self,
         request: control_plane::ResolveRouteRequest,
@@ -719,6 +763,10 @@ impl ControlPlaneStore for TestStore {
         &self,
         request: control_plane::runtime_work::RecordMaterializationFailure,
     ) -> StoreFuture<'_, StoreResult<bool>> {
+        self.failed_attempts
+            .lock()
+            .unwrap()
+            .push(request.materialization_id.clone());
         self.release_materialization_reconciliation_lease(
             ReleaseMaterializationReconciliationLeaseRequest::new(
                 request.materialization_id,
@@ -897,27 +945,26 @@ impl ControlPlaneStore for TestStore {
         })
     }
 
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         Box::pin(async move {
             let mut records = self.materializations.lock().unwrap();
-            let Some(record) = records
-                .iter_mut()
-                .find(|record| record.id == request.materialization_id)
-            else {
-                return Ok(None);
-            };
             // A store compares stored expiry against its own clock.
             let now = SystemTime::now();
-            if record
-                .reconciliation_lease
-                .as_ref()
-                .is_some_and(|lease| lease.expires_at > now)
-            {
+            let failed = self.failed_attempts.lock().unwrap();
+            let Some(record) = records.iter_mut().find(|record| {
+                record.state == request.state
+                    && record.target == request.target
+                    && !failed.contains(&record.id)
+                    && record
+                        .reconciliation_lease
+                        .as_ref()
+                        .is_none_or(|lease| lease.expires_at <= now)
+            }) else {
                 return Ok(None);
-            }
+            };
             self.reconciliation_claim_owners
                 .lock()
                 .unwrap()
@@ -1000,6 +1047,7 @@ impl ControlPlaneStore for TestStore {
                 })
                 .map_or(instance.generation, |record| record.projection_generation);
             let mut materialization = fake_materialization_record(RecordMaterializationRequest {
+                pod_backend: None,
                 instance_id: request.instance_id,
                 instance_generation: instance.generation,
                 projection_generation,
@@ -1108,22 +1156,6 @@ impl ControlPlaneStore for TestStore {
                 affected_materializations: affected,
             })
         })
-    }
-
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        request: control_plane::materialization::MaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        let _ = request; // Durable effect ambiguity is exercised against PostgreSQL, not this transport fixture.
-        Box::pin(async { Ok(true) })
-    }
-
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: control_plane::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        let _ = request;
-        Box::pin(async { Ok(true) })
     }
 }
 
@@ -1255,7 +1287,11 @@ pub async fn lifecycle_conformance(store: &dyn ControlPlaneStore) -> StoreResult
         ))
         .await?;
     assert_eq!(draining.instance.state, InstanceState::Draining);
-    assert!(draining.materialization.as_ref().unwrap().backend.is_none());
+    assert_eq!(
+        draining.materialization.as_ref().unwrap().backend,
+        ready.materialization.backend,
+        "a draining projection keeps its backend, so a wake inside the grace can revive it"
+    );
     assert_eq!(
         draining
             .materialization

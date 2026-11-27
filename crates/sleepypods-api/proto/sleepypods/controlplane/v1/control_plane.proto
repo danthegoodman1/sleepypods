@@ -50,28 +50,40 @@ service SidecarControlPlane {
 
 message SidecarReportIdleRequest {
   string instance_id = 1;
+  // The projection generation the sidecar was rendered with. It is fixed for
+  // the Pod's life, a revive during drain included, while the instance
+  // generation advances with every transition.
   uint64 expected_generation = 2;
   uint64 active_count = 3;
   // Required for automatic sleep. Legacy reports without a member identity fail closed.
   string pod_uid = 4;
 }
 
+// A sidecar keeps reporting while it stays idle after accepted or
+// already_draining: a wake before the drain deadline returns its Pod to
+// Running, and a later idle interval starts the next sleep.
 message SidecarReportIdleResponse {
   oneof outcome {
+    // The report started the drain.
     SidecarReportIdleAccepted accepted = 1;
+    // The instance is draining on the reporting projection.
     SidecarReportIdleAlreadyDraining already_draining = 2;
+    // The report names a projection other than the instance's active one.
     SidecarReportIdleGenerationConflict generation_conflict = 3;
+    // The instance has no Running projection to sleep; reason names its state.
     SidecarReportIdleUnavailable unavailable = 4;
   }
 }
 
 message SidecarReportIdleAccepted {
   string instance_id = 1;
+  // The instance's generation as Draining.
   uint64 instance_generation = 2;
 }
 
 message SidecarReportIdleAlreadyDraining {
   string instance_id = 1;
+  // The instance's generation as Draining.
   uint64 instance_generation = 2;
 }
 
@@ -557,6 +569,9 @@ message ReconcileMaterializationResponse {
   bool found = 1;
   string materialization_id = 2;
   string state = 3;
+  // The request scheduled the work again, no earlier than its drain deadline.
+  // False with status_only, for another target, for a Ready or Deleted
+  // materialization, and while an attempt holds the lease.
   bool attempted = 4;
   string lease_owner = 5;
   int64 lease_expires_at_unix_millis = 6;
@@ -566,22 +581,13 @@ message ReconcileMaterializationResponse {
   int64 next_attempt_at_unix_millis = 10;
   int64 operation_deadline_unix_millis = 11;
   uint32 failure_count = 12;
+  // transient: the work retries after a backoff. permanent: a wake that cannot
+  // succeed, or a cleanup parked by an object another owner holds. deadline: a
+  // wake that passed its operation deadline. Empty when no failure is recorded.
   string failure_kind = 13;
   string failure_message = 14;
-  UncertainMaterializationEffect uncertain_effect = 15;
-  string wake_failure_message = 16;
-}
-
-message UncertainMaterializationEffect {
-  uint64 instance_generation = 1;
-  string owner = 2;
-  uint64 lease_attempt = 3;
-  uint64 effect_id = 4;
-  string operation = 5;
-  RenderedObjectRef object = 6;
-  string expected_uid = 7;
-  string expected_resource_version = 8;
-  int64 started_at_unix_millis = 9;
+  // Why the last wake ended in failure; kept while its cleanup retries.
+  string wake_failure_message = 15;
 }
 
 message ForceDeleteMaterializationRequest {
@@ -590,10 +596,16 @@ message ForceDeleteMaterializationRequest {
   string reason = 3;
 }
 
+// The materialization's record, inventory and exclusivity keys are removed
+// without touching Kubernetes, and its instance is left where the next wake
+// can start: Waking becomes Failed, Running becomes Cold, and Draining becomes
+// Cold with its deferred wake started.
 message ForceDeleteMaterializationResponse {
   bool found = 1;
   string materialization_id = 2;
+  // The refs recorded before the row was cleared.
   repeated RenderedObjectRef observed_refs = 3;
+  // Best-effort live observations of those refs.
   repeated ProjectionObservation projection_observations = 4;
 }
 

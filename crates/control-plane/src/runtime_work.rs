@@ -1,8 +1,5 @@
 //! Durable scheduling and coalesced notification contracts.
-use crate::{
-    ids::{Generation, MaterializationId},
-    materialization::RenderedObjectRef,
-};
+use crate::ids::{Generation, MaterializationId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MaterializationWorkStatus {
@@ -19,20 +16,6 @@ pub struct MaterializationWorkStatus {
     pub failure_kind: Option<String>,
     pub failure_message: String,
     pub wake_failure_message: String,
-    pub uncertain_effect: Option<UncertainMaterializationEffect>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UncertainMaterializationEffect {
-    pub generation: Generation,
-    pub owner: String,
-    pub attempt: u64,
-    pub effect_id: u64,
-    pub operation: String,
-    pub object: RenderedObjectRef,
-    pub expected_uid: Option<String>,
-    pub expected_resource_version: Option<String>,
-    pub started_at_unix_millis: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +34,21 @@ pub struct DurableRouteChanges {
     pub cursor: u64,
     pub reset: bool,
     pub events: Vec<serde_json::Value>,
+}
+
+static LIFECYCLE_WORK: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Tells this process's reconciler that lifecycle work was committed, so it
+/// claims the work at once. Signals coalesce. Work another replica commits is
+/// found by the reconciler's periodic scan.
+pub(crate) fn signal_lifecycle_work() {
+    LIFECYCLE_WORK.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+}
+
+/// A receiver that changes each time lifecycle work is signalled.
+pub(crate) fn lifecycle_work() -> tokio::sync::watch::Receiver<u64> {
+    LIFECYCLE_WORK.subscribe()
 }
 
 /// Cancellation is owned by the supervised caller; no Drop task is spawned.

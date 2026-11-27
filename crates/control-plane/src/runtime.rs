@@ -526,7 +526,7 @@ where
         Arc::clone(&store),
         materializer.clone(),
         config.target.clone(),
-        MaterializationReconcilerConfig::default(),
+        MaterializationReconcilerConfig::from_env()?,
         ObservabilityRecorder::global(),
     )
     .with_route_events(route_events.clone());
@@ -719,19 +719,20 @@ pub async fn dispatch_route_changes(
     }
 }
 
+/// Expires idempotency records, HTTP-01 challenges and route-change history.
+/// A failed pass is retried at the next interval: the records only accumulate
+/// while the store is unavailable.
 async fn maintain_runtime(
     store: Arc<dyn ControlPlaneStore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> RuntimeResult<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut failures = 0;
     loop {
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
-            _ = interval.tick() => match store.maintain_runtime_records(1024).await {
-                Ok(_) => failures = 0,
-                Err(error) => { failures += 1; if failures >= 5 { return Err(Box::new(error)); } }
+            _ = interval.tick() => {
+                let _ = store.maintain_runtime_records(1024).await;
             }
         }
     }
@@ -782,15 +783,11 @@ async fn record_materialization_operational_metrics(
         return;
     };
 
-    use sleepypods_observability::metrics::{
-        MATERIALIZATION_EFFECTS_UNCERTAIN, MATERIALIZATION_FAILURES_BLOCKED,
-    };
-    for (descriptor, count) in [
-        (MATERIALIZATION_EFFECTS_UNCERTAIN, metrics.uncertain_effects),
-        (MATERIALIZATION_FAILURES_BLOCKED, metrics.blocked_failures),
-    ] {
-        sink.record_observation(MetricObservation::new(descriptor, vec![], count as f64));
-    }
+    sink.record_observation(MetricObservation::new(
+        sleepypods_observability::metrics::MATERIALIZATION_FAILURES_BLOCKED,
+        vec![],
+        metrics.blocked_failures as f64,
+    ));
     for state in metrics.backlog_states {
         let label = state.state.metric_label();
         sink.record_observation(MetricObservation::new(
@@ -1665,14 +1662,6 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn wait_for_pvc_bound<'a>(
-            &'a self,
-            _namespace: &'a str,
-            _name: &'a str,
-        ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-
         fn wait_for_readiness<'a>(
             &'a self,
             _objects: &'a [RenderedObjectRef],
@@ -1769,10 +1758,7 @@ mod tests {
             complete_wake,
             begin_sleep,
             finalize_sleep,
-            list_materialization_reconciliation_candidates,
-            claim_materialization_reconciliation,
-            begin_materialization_effect,
-            acknowledge_materialization_effect,
+            claim_next_materialization_reconciliation,
             renew_materialization_reconciliation_lease,
             release_materialization_reconciliation_lease,
             complete_wake_reconciliation,
@@ -1840,11 +1826,8 @@ mod tests {
             finalize_instance_deletions,
             list_route_bindings_for_instance,
             load_materialization,
-            list_materialization_reconciliation_candidates,
             load_materialization_operational_metrics,
-            claim_materialization_reconciliation,
-            begin_materialization_effect,
-            acknowledge_materialization_effect,
+            claim_next_materialization_reconciliation,
             renew_materialization_reconciliation_lease,
             release_materialization_reconciliation_lease,
             complete_wake_reconciliation,

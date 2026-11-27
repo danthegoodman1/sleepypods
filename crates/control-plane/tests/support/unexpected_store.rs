@@ -277,15 +277,6 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (list_materialization_reconciliation_candidates $(, $rest:ident)* $(,)?) => {
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        _request: control_plane::ListMaterializationReconciliationCandidatesRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<Vec<control_plane::MaterializationRecord>>> {
-        panic!("unexpected test store capability: list_materialization_reconciliation_candidates")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
     (load_materialization_operational_metrics $(, $rest:ident)* $(,)?) => {
     fn load_materialization_operational_metrics(
         &self,
@@ -294,30 +285,12 @@ macro_rules! unexpected_store_methods {
     }
         unexpected_store_methods!($($rest),*);
     };
-    (claim_materialization_reconciliation $(, $rest:ident)* $(,)?) => {
-    fn claim_materialization_reconciliation<'a>(
+    (claim_next_materialization_reconciliation $(, $rest:ident)* $(,)?) => {
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        _request: control_plane::ClaimMaterializationReconciliationRequest,
+        _request: control_plane::ClaimNextMaterializationRequest,
     ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<Option<control_plane::MaterializationRecord>>> {
-        panic!("unexpected test store capability: claim_materialization_reconciliation")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (begin_materialization_effect $(, $rest:ident)* $(,)?) => {
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        _request: control_plane::materialization::MaterializationEffectRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<bool>> {
-        panic!("unexpected test store capability: begin_materialization_effect")
-    }
-        unexpected_store_methods!($($rest),*);
-    };
-    (acknowledge_materialization_effect $(, $rest:ident)* $(,)?) => {
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        _request: control_plane::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> control_plane::StoreFuture<'a, control_plane::StoreResult<bool>> {
-        panic!("unexpected test store capability: acknowledge_materialization_effect")
+        panic!("unexpected test store capability: claim_next_materialization_reconciliation")
     }
         unexpected_store_methods!($($rest),*);
     };

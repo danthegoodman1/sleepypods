@@ -245,15 +245,24 @@ fn target() -> MaterializationTarget {
     MaterializationTarget::new("cluster-a", "apps").expect("target is valid")
 }
 
+/// Runs the reconciler until every wake, cleanup and instance deletion it can
+/// start has completed or recorded a failed attempt.
 async fn reconcile_operator_work(store: Arc<FakeInstanceStore>, client: FakeKubernetesClient) {
-    control_plane::MaterializationReconciler::new(
-        store,
-        operator_materializer(client),
-        target(),
-        Default::default(),
-        sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+    store.retry_failed_attempts();
+    let observed = store.clone();
+    support::reconcile_until(
+        control_plane::MaterializationReconciler::new(
+            store,
+            operator_materializer(client),
+            target(),
+            support::reconciler_config(),
+            sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+        ),
+        || {
+            let settled = observed.lifecycle_settled(&target());
+            async move { settled }
+        },
     )
-    .run_once()
     .await;
 }
 
@@ -286,6 +295,7 @@ fn materialization(
     state: MaterializationState,
 ) -> MaterializationRecord {
     MaterializationRecord {
+        pod_backend: None,
         id: MaterializationId::new(format!(
             "{}:{}:{}",
             instance_id,
@@ -3585,14 +3595,6 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
                 .push(object.clone());
             Ok(())
         })
-    }
-
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        _namespace: &'a str,
-        _name: &'a str,
-    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
     }
 
     fn wait_for_readiness<'a>(

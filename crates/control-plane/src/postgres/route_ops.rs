@@ -360,7 +360,7 @@ pub(crate) async fn load_ready_materialization(
         .query_opt(
             "
             SELECT materialization_id, instance_id, instance_generation, projection_generation, cluster_id,
-                namespace, state, backend_uri, backend_generation, rendered_objects,
+                namespace, state, backend_uri, pod_backend_uri, backend_generation, rendered_objects,
                 exclusivity_keys, reconcile_owner,
                 reconcile_lease_expires_at_unix_millis, reconcile_attempt
             FROM materializations

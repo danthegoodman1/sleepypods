@@ -92,19 +92,52 @@ where
     }
 
     let current = load_instance(store, request.instance_id.clone()).await?;
-    if current.state == InstanceState::Running {
-        verify_idle_member(store, materializer, &target, &request, &current).await?;
-        return begin_running_sleep(store, target, request, &current).await;
-    }
-    if current.generation != request.expected_generation {
-        return generation_mismatch_result(&request, current);
-    }
-
     match current.state {
-        InstanceState::Running => unreachable!("running generation handled above"),
+        InstanceState::Running => {
+            verify_idle_member(store, materializer, &target, &request, &current).await?;
+            begin_running_sleep(store, target, request, &current).await
+        }
+        InstanceState::Draining => already_draining(store, &target, &request, current).await,
         state => Ok(ReportIdleResult::Unavailable {
             instance: current,
             reason: unavailable_reason_for_state(state),
+        }),
+    }
+}
+
+/// Answers a report for an instance that is already draining.
+///
+/// A sidecar holds its projection generation for the Pod's life, while the
+/// instance's revision advances with every transition, a revive included. The
+/// report is the draining Pod's own when the projection matches.
+async fn already_draining<S>(
+    store: &S,
+    target: &MaterializationTarget,
+    request: &ReportIdleRequest,
+    current: InstanceRecord,
+) -> Result<ReportIdleResult, ReportIdleError>
+where
+    S: ControlPlaneStore + ?Sized,
+{
+    let projection = store
+        .load_active_materialization(LoadActiveMaterializationRequest::new(
+            current.id.clone(),
+            target.clone(),
+        ))
+        .await
+        .map_err(ReportIdleError::Store)?
+        .map(|materialization| materialization.projection_generation);
+    match projection {
+        Some(projection) if projection == request.expected_generation => {
+            Ok(ReportIdleResult::AlreadyDraining { instance: current })
+        }
+        Some(actual) => Err(ReportIdleError::GenerationConflict {
+            expected: request.expected_generation,
+            actual,
+        }),
+        None => Ok(ReportIdleResult::Unavailable {
+            instance: current,
+            reason: ReportIdleUnavailableReason::Draining,
         }),
     }
 }
@@ -135,14 +168,12 @@ where
     {
         Ok(begin) => Ok(begin),
         Err(StoreError::NotFound { .. }) => Err(ReportIdleError::NotFound),
+        // Another report or lifecycle request moved the instance first.
         Err(StoreError::GenerationConflict { expected, actual }) => {
-            if actual == expected.next() {
-                let current = load_instance(store, request.instance_id.clone()).await?;
-                if current.generation == actual {
-                    return generation_mismatch_result(&request, current);
-                }
+            let current = load_instance(store, request.instance_id.clone()).await?;
+            if current.state == InstanceState::Draining {
+                return already_draining(store, &target, &request, current).await;
             }
-
             Err(ReportIdleError::GenerationConflict { expected, actual })
         }
         Err(error) => Err(ReportIdleError::Store(error)),
@@ -150,28 +181,6 @@ where
 
     Ok(ReportIdleResult::Accepted {
         instance: begin.instance,
-    })
-}
-
-fn generation_mismatch_result(
-    request: &ReportIdleRequest,
-    current: InstanceRecord,
-) -> Result<ReportIdleResult, ReportIdleError> {
-    if Some(current.generation.get()) == request.expected_generation.get().checked_add(1)
-        && current.state == InstanceState::Draining
-    {
-        return Ok(ReportIdleResult::AlreadyDraining { instance: current });
-    }
-
-    if Some(current.generation.get()) == request.expected_generation.get().checked_add(2)
-        && current.state == InstanceState::Cold
-    {
-        return Ok(ReportIdleResult::Accepted { instance: current });
-    }
-
-    Err(ReportIdleError::GenerationConflict {
-        expected: request.expected_generation,
-        actual: current.generation,
     })
 }
 

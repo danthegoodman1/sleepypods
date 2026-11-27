@@ -10,6 +10,10 @@ use crate::{
 
 use super::migrations;
 
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const KEEPALIVE_RETRIES: u32 = 3;
+
 #[derive(Clone, Debug)]
 pub struct PostgresStore {
     pub(crate) pool: Pool,
@@ -30,11 +34,20 @@ impl PostgresStore {
         let operation_timeout = config.operation_timeout.as_millis();
         let mut pg_config = parse_connection_url(config.connection_url())?;
         pg_config.connect_timeout(config.connection_timeout);
+        // A session that sits inside a transaction holds row locks every other
+        // writer waits on. No transaction here idles longer than a statement
+        // may run, so the same bound ends a frozen one. Keepalives detect a
+        // peer that vanished without closing the connection.
         let options = format!(
-            "{} -c statement_timeout={statement_timeout} -c sleepypods.operation_timeout_ms={operation_timeout}",
+            "{} -c statement_timeout={statement_timeout} -c idle_in_transaction_session_timeout={statement_timeout} -c sleepypods.operation_timeout_ms={operation_timeout}",
             pg_config.get_options().unwrap_or("")
         );
         pg_config.options(&options);
+        pg_config
+            .keepalives(true)
+            .keepalives_idle(KEEPALIVE_IDLE)
+            .keepalives_interval(KEEPALIVE_INTERVAL)
+            .keepalives_retries(KEEPALIVE_RETRIES);
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };

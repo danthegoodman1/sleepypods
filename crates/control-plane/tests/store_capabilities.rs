@@ -234,40 +234,19 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>> {
         self.fail("finalize_sleep", format!("{request:?}"))
     }
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        request: ListMaterializationReconciliationCandidatesRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
-        self.fail(
-            "list_materialization_reconciliation_candidates",
-            format!("{request:?}"),
-        )
-    }
     fn load_materialization_operational_metrics(
         &self,
     ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
         self.fail("load_materialization_operational_metrics", "()".to_owned())
     }
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         self.fail(
-            "claim_materialization_reconciliation",
+            "claim_next_materialization_reconciliation",
             format!("{request:?}"),
         )
-    }
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        request: control_plane::materialization::MaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        self.fail("begin_materialization_effect", format!("{request:?}"))
-    }
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: control_plane::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        self.fail("acknowledge_materialization_effect", format!("{request:?}"))
     }
     fn renew_materialization_reconciliation_lease<'a>(
         &'a self,
@@ -589,11 +568,6 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
             .with_minimum_ready_age(Duration::from_secs(190))
     );
     check!(2, finalize_sleep, finalize.clone());
-    check!(
-        2,
-        list_materialization_reconciliation_candidates,
-        ListMaterializationReconciliationCandidatesRequest::new(23).for_target(target.clone())
-    );
     assert!(store
         .load_materialization_operational_metrics()
         .await
@@ -601,46 +575,13 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     probe.check("load_materialization_operational_metrics", "()".into(), 2);
     check!(
         1,
-        claim_materialization_reconciliation,
-        ClaimMaterializationReconciliationRequest::new(
-            materialization.clone(),
+        claim_next_materialization_reconciliation,
+        ClaimNextMaterializationRequest::new(
+            MaterializationState::Pending,
+            target.clone(),
             "claim-owner",
             Duration::from_secs(41)
         )
-    );
-    check!(
-        1,
-        begin_materialization_effect,
-        MaterializationEffectRequest {
-            effect_id: 41,
-            materialization_id: materialization.clone(),
-            owner: "effect-owner".into(),
-            attempt: 43,
-            instance_generation: generation,
-            expected_state: MaterializationState::Pending,
-            operation: "apply",
-            object: RenderedObjectRef {
-                api_version: "v1".into(),
-                kind: "Service".into(),
-                namespace: "apps".into(),
-                name: "capability".into()
-            },
-            precondition: Some(control_plane::projection::LiveObjectIdentity {
-                uid: "uid-47".into(),
-                resource_version: "rv-53".into()
-            }),
-        }
-    );
-    check!(
-        2,
-        acknowledge_materialization_effect,
-        AcknowledgeMaterializationEffectRequest {
-            effect_id: 59,
-            materialization_id: materialization.clone(),
-            owner: "ack-owner".into(),
-            attempt: 61,
-            instance_generation: generation
-        }
     );
     check!(
         2,

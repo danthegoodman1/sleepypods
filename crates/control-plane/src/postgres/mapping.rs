@@ -127,6 +127,7 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
     let namespace: String = row.get("namespace");
     let state: String = row.get("state");
     let backend_uri: Option<String> = row.get("backend_uri");
+    let pod_backend_uri: Option<String> = row.get("pod_backend_uri");
     let backend_generation: i64 = row.get("backend_generation");
     let rendered_objects: Value = row.get("rendered_objects");
     let exclusivity_keys: Value = row.get("exclusivity_keys");
@@ -143,6 +144,10 @@ pub(crate) fn materialization_from_row(row: &Row) -> StoreResult<Materialization
         target: MaterializationTarget::new(cluster_id, namespace).map_err(invalid_stored_data)?,
         state: materialization_state_from_db(&state)?,
         backend: backend_uri
+            .map(BackendEndpoint::new)
+            .transpose()
+            .map_err(invalid_stored_data)?,
+        pod_backend: pod_backend_uri
             .map(BackendEndpoint::new)
             .transpose()
             .map_err(invalid_stored_data)?,

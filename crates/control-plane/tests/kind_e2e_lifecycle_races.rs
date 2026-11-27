@@ -49,6 +49,7 @@ const SLEEP_WHILE_WAKING_CLASS_ID: &str = "lifecycle-sleep-waking";
 const DELETE_WHILE_WAKING_CLASS_ID: &str = "lifecycle-delete-waking";
 const DELETE_WHILE_DRAINING_CLASS_ID: &str = "lifecycle-delete-draining";
 const FAILED_RETRY_CLASS_ID: &str = "lifecycle-failed-retry";
+const REVIVE_CLASS_ID: &str = "lifecycle-revive";
 const SIDECAR_PORT: u32 = 15_000;
 const APP_PORT: u32 = 8080;
 const APP_MARKER: &str = "sleepypods-routing-app";
@@ -156,6 +157,10 @@ async fn lifecycle_races_through_deployed_platform() -> TestResult<()> {
 
     eprintln!("==> lifecycle race E2E: delete while draining");
     delete_while_draining_cleans_deleting_materialization(&mut operator, kube.clone(), &config)
+        .await?;
+
+    eprintln!("==> lifecycle race E2E: wake during drain grace");
+    wake_during_drain_grace_is_served_by_the_running_pod(&mut operator, kube.clone(), &config)
         .await?;
 
     eprintln!("==> lifecycle race E2E: failed wake retry");
@@ -606,9 +611,8 @@ async fn delete_while_draining_cleans_deleting_materialization(
         if deleting.generation != draining.generation + 1 {
             return Err("Delete acceptance must advance the draining generation once".into());
         }
-        // A definite forbidden delete is permanent until an operator corrects
-        // permissions and explicitly enqueues recovery. Wait until no old denied
-        // attempt can publish a later failure over that recovery enqueue.
+        // A forbidden delete fails the attempt and keeps the inventory;
+        // cleanup stays scheduled and retries after its backoff.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let status = operator
@@ -620,9 +624,8 @@ async fn delete_while_draining_cleans_deleting_materialization(
                 .into_inner();
             if status.found
                 && status.state == "Deleting"
-                && status.failure_kind == "permanent"
+                && status.failure_kind == "transient"
                 && status.lease_owner.is_empty()
-                && status.uncertain_effect.is_none()
                 && !status.observed_refs.is_empty()
             {
                 let message = status.failure_message.to_ascii_lowercase();
@@ -631,7 +634,7 @@ async fn delete_while_draining_cleans_deleting_materialization(
                     || !(message.contains("forbidden") || message.contains("403"))
                 {
                     return Err(format!(
-                        "terminal cleanup failed for an unexpected reason: {}",
+                        "denied cleanup failed for an unexpected reason: {}",
                         status.failure_message
                     )
                     .into());
@@ -670,19 +673,10 @@ async fn delete_while_draining_cleans_deleting_materialization(
             .into());
         }
     }
-    // Resume the permanent permission failure through the ordinary scheduler,
-    // then observe completion without replaying DeleteInstance.
-    let recovery = operator
-        .reconcile_materialization(ReconcileMaterializationRequest {
-            materialization_id,
-            status_only: false,
-        })
-        .await?
-        .into_inner();
-    if !recovery.attempted {
-        return Err("corrected permanent cleanup failure must accept scheduler recovery".into());
-    }
-    wait_for_instance_deleted(operator, "lifecycle-delete-draining", 60).await?;
+    // With the permission restored, the next scheduled attempt finishes the
+    // deletion: no operator call, and no replay of DeleteInstance. The backoff
+    // between attempts is at most 32 seconds.
+    wait_for_instance_deleted(operator, "lifecycle-delete-draining", 120).await?;
     assert_instance_not_found(operator, "lifecycle-delete-draining").await?;
     wait_for_stateful_objects_absent(
         kube,
@@ -702,6 +696,140 @@ async fn delete_while_draining_cleans_deleting_materialization(
     .await?;
 
     Ok(())
+}
+
+/// A request that arrives inside the drain grace returns the instance to
+/// Running on the Pod that is still up, under the projection generation that
+/// Pod's sidecar holds.
+async fn wake_during_drain_grace_is_served_by_the_running_pod(
+    operator: &mut OperatorControlPlaneClient<Channel>,
+    kube: Client,
+    config: &E2eConfig,
+) -> TestResult<()> {
+    const INSTANCE: &str = "lifecycle-revive";
+    const HOST: &str = "revive.lifecycle.sleepypods.test";
+    operator
+        .create_workload_class_version(CreateWorkloadClassVersionRequest {
+            idempotency_key: "kind-e2e-lifecycle-revive-class".to_owned(),
+            class_id: REVIVE_CLASS_ID.to_owned(),
+            version: 1,
+            default_values: Default::default(),
+            value_schema: Some(WorkloadValueSchema {
+                fields: HashMap::from([(
+                    "target".to_owned(),
+                    WorkloadValueFieldRule {
+                        required: true,
+                        default_value: None,
+                    },
+                )]),
+                allow_extra: false,
+            }),
+            template_generation: 1,
+            template: Some(ManifestTemplate {
+                workload: Some(workload_template(
+                    WorkloadKind::Deployment,
+                    "lifecycle-revive-app",
+                    &config.app_image,
+                )),
+                sidecar: Some(sidecar_template(&config.sidecar_image)),
+                service: Some(service_template("lifecycle-revive-app")),
+                volumes: Vec::new(),
+                raw_objects: vec![],
+            }),
+            // The drain grace outlasts this case, so teardown never starts.
+            sleep_policy: Some(WorkloadSleepPolicy {
+                drain_grace_timeout_ms: 300_000,
+                ..sleep_policy()
+            }),
+            exclusivity_keys: vec![],
+        })
+        .await?;
+    create_instance_and_route(
+        operator,
+        REVIVE_CLASS_ID,
+        INSTANCE,
+        "lifecycle-revive-route",
+        HOST,
+        "revive",
+        "revive",
+    )
+    .await?;
+    wait_for_instance_response(config, "revive first wake", HOST, "/", "revive", 180).await?;
+    let running = wait_for_instance_state(operator, INSTANCE, PbInstanceState::Running, 30).await?;
+    let (pod_uid, pod_generation) =
+        current_idle_member(kube.clone(), &config.namespace, INSTANCE).await?;
+    age_ready_for_controlled_lifecycle_case(config, INSTANCE, running.generation, pod_generation)
+        .await?;
+
+    let mut sidecar = connect_sidecar(&config.workload_endpoint).await?;
+    let report = || SidecarReportIdleRequest {
+        pod_uid: pod_uid.clone(),
+        instance_id: INSTANCE.to_owned(),
+        expected_generation: pod_generation,
+        active_count: 0,
+    };
+    let accepted = sidecar.report_idle(report()).await?.into_inner();
+    if !matches!(
+        accepted.outcome,
+        Some(sidecar_report_idle_response::Outcome::Accepted(_))
+    ) {
+        return Err(format!("idle report was not accepted: {accepted:?}").into());
+    }
+    let draining =
+        wait_for_instance_state(operator, INSTANCE, PbInstanceState::Draining, 30).await?;
+    // The instance revision moved; the Pod's own repeated report still names
+    // its projection and is answered as the draining member's.
+    let repeated = sidecar.report_idle(report()).await?.into_inner();
+    if !matches!(
+        repeated.outcome,
+        Some(sidecar_report_idle_response::Outcome::AlreadyDraining(_))
+    ) {
+        return Err(format!("repeated idle report while draining: {repeated:?}").into());
+    }
+
+    let asked = Instant::now();
+    let response = http_get(config.frontline_addr, HOST, "/").await?;
+    assert_response_identifies(&response, "revive")?;
+    if asked.elapsed() > Duration::from_secs(5) {
+        return Err(format!(
+            "a request during drain grace waited {:?} for a Pod that was running",
+            asked.elapsed()
+        )
+        .into());
+    }
+    let revived = wait_for_instance_state(operator, INSTANCE, PbInstanceState::Running, 5).await?;
+    if revived.generation != draining.generation + 1 {
+        return Err(format!(
+            "revive must advance the draining generation {} once, got {}",
+            draining.generation, revived.generation
+        )
+        .into());
+    }
+    let (revived_uid, revived_generation) =
+        current_idle_member(kube.clone(), &config.namespace, INSTANCE).await?;
+    if revived_uid != pod_uid || revived_generation != pod_generation {
+        return Err("a revive must keep the Pod and its projection generation".into());
+    }
+
+    // The revive restarts the activation floor, so the same Pod's next report
+    // is deferred and the instance stays up.
+    let deferred = sidecar
+        .report_idle(report())
+        .await
+        .expect_err("an idle report inside the restarted activation floor is deferred");
+    if deferred.code() != tonic::Code::FailedPrecondition
+        || deferred
+            .metadata()
+            .get(sleepypods_api::IDLE_RETRY_AFTER_METADATA)
+            .is_none()
+    {
+        return Err(format!("idle report after a revive was not deferred: {deferred:?}").into());
+    }
+    assert_state(
+        &get_instance(operator, INSTANCE).await?,
+        PbInstanceState::Running,
+    )?;
+    delete_instance_until_deleted(operator, INSTANCE, 120).await
 }
 
 async fn failed_wake_retry_rejects_stale_generation(

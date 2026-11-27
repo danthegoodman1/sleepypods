@@ -64,6 +64,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dynamic_certificates",
         sql: include_str!("../../migrations/0011_dynamic_certificates.sql"),
     },
+    Migration {
+        version: 13,
+        name: "lifecycle_recovery",
+        sql: include_str!("../../migrations/0013_lifecycle_recovery.sql"),
+    },
 ];
 
 pub(crate) async fn run(client: &mut deadpool_postgres::Client) -> StoreResult<()> {

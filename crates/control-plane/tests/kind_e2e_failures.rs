@@ -1238,6 +1238,7 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
     // The projection plan adds the same final managed-by/ownership stamps used
     // by the production reconciler; the pure renderer alone does not add them.
     let materialization = domain::MaterializationRecord {
+        pod_backend: None,
         id: domain::MaterializationId::new("fixture-unbound")?,
         instance_id: pending.instance_id,
         instance_generation: pending.instance_generation,

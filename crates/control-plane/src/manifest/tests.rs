@@ -778,6 +778,7 @@ spec:
         .expect("raw service rendered")
         .to_kubernetes_json();
     let materialization = crate::materialization::MaterializationRecord {
+        pod_backend: None,
         id: crate::ids::MaterializationId::new("instance-a:cluster:apps").unwrap(),
         instance_id: InstanceId::new("instance-a").unwrap(),
         instance_generation: Generation::new(7),

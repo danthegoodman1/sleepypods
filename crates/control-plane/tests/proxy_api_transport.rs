@@ -168,7 +168,11 @@ async fn proxy_wake_cold_instance_accepts_before_driver_publishes_ready_backend(
         "http://svc-acme-69856ec0.apps.svc.cluster.local:80"
     );
     assert_eq!(ready.backend_generation, 44);
-    assert_eq!(client.applied_objects_len(), 2);
+    assert_eq!(
+        client.applied_objects_len(),
+        3,
+        "the Service and the workload are created, then the workload is scaled up"
+    );
 }
 
 #[tokio::test]
@@ -1446,7 +1450,11 @@ async fn accepted_proxy_wake_survives_api_drop_and_completes_in_fresh_driver() {
         .expect("fresh driver completed accepted work");
     assert_eq!(ready.projection_generation, Generation::new(7));
     assert_eq!(ready.backend_generation, BackendGeneration::new(6));
-    assert_eq!(client.applied_objects_len(), 2);
+    assert_eq!(
+        client.applied_objects_len(),
+        3,
+        "the Service and the workload are created, then the workload is scaled up"
+    );
 }
 
 #[tokio::test]
@@ -2279,14 +2287,6 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         })
     }
 
-    fn wait_for_pvc_bound<'a>(
-        &'a self,
-        _namespace: &'a str,
-        _name: &'a str,
-    ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn wait_for_readiness<'a>(
         &'a self,
         _objects: &'a [RenderedObjectRef],
@@ -2397,15 +2397,22 @@ async fn reconcile_proxy_work(
     client: FakeKubernetesClient,
     broker: RouteSubscriptionBroker,
 ) {
-    control_plane::MaterializationReconciler::new(
-        store,
-        KubernetesMaterializer::new(client),
-        proxy_target(),
-        Default::default(),
-        sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+    store.retry_failed_attempts();
+    let observed = store.clone();
+    support::reconcile_until(
+        control_plane::MaterializationReconciler::new(
+            store,
+            KubernetesMaterializer::new(client),
+            proxy_target(),
+            support::reconciler_config(),
+            sleepypods_observability::recorder::ObservabilityRecorder::noop(),
+        )
+        .with_route_events(broker),
+        || {
+            let settled = observed.lifecycle_settled(&proxy_target());
+            async move { settled }
+        },
     )
-    .with_route_events(broker)
-    .run_once()
     .await;
 }
 
@@ -2540,6 +2547,7 @@ fn materialization_with_state_and_target(
     target: MaterializationTarget,
 ) -> MaterializationRecord {
     MaterializationRecord {
+        pod_backend: None,
         id: MaterializationId::new(format!(
             "{}:{}:{}",
             instance_id,

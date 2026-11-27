@@ -9,15 +9,14 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
         CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
-        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationRequest, LoadReadyMaterializationRequest,
-        MaterializationOperationalMetrics, MaterializationRecord, RecordMaterializationRequest,
-        ReleaseMaterializationReconciliationLeaseRequest,
+        LoadActiveMaterializationRequest, LoadMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
+        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
@@ -271,15 +270,6 @@ impl ControlPlaneStore for PostgresStore {
         Box::pin(async move { materialization_ops::finalize_sleep(self, request).await })
     }
 
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        request: ListMaterializationReconciliationCandidatesRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
-        Box::pin(async move {
-            materialization_ops::list_materialization_reconciliation_candidates(self, request).await
-        })
-    }
-
     fn load_materialization_operational_metrics(
         &self,
     ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
@@ -288,30 +278,12 @@ impl ControlPlaneStore for PostgresStore {
         })
     }
 
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         Box::pin(async move {
-            materialization_ops::claim_materialization_reconciliation(self, request).await
-        })
-    }
-
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::MaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(
-            async move { materialization_ops::begin_materialization_effect(self, request).await },
-        )
-    }
-
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            materialization_ops::acknowledge_materialization_effect(self, request).await
+            materialization_ops::claim_next_materialization_reconciliation(self, request).await
         })
     }
 

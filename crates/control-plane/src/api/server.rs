@@ -676,29 +676,9 @@ where
             response.next_attempt_at_unix_millis = status.next_attempt_at_unix_millis;
             response.operation_deadline_unix_millis = status.operation_deadline_unix_millis;
             response.failure_count = status.failure_count;
-            response.failure_kind = if status.uncertain_effect.is_some() {
-                "uncertain".into()
-            } else {
-                status.failure_kind.unwrap_or_default()
-            };
+            response.failure_kind = status.failure_kind.unwrap_or_default();
             response.failure_message = status.failure_message;
             response.wake_failure_message = status.wake_failure_message;
-            response.uncertain_effect =
-                status
-                    .uncertain_effect
-                    .map(|effect| pb::UncertainMaterializationEffect {
-                        instance_generation: effect.generation.get(),
-                        owner: effect.owner,
-                        lease_attempt: effect.attempt,
-                        effect_id: effect.effect_id,
-                        operation: effect.operation,
-                        object: Some(rendered_object_ref_to_proto(&effect.object)),
-                        expected_uid: effect.expected_uid.unwrap_or_default(),
-                        expected_resource_version: effect
-                            .expected_resource_version
-                            .unwrap_or_default(),
-                        started_at_unix_millis: effect.started_at_unix_millis,
-                    });
         }
         Ok(Response::new(response))
     }

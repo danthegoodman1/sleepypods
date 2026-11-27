@@ -120,8 +120,8 @@ pub async fn delete_with_original_deadline(
                 }
             }
         }
-        // A live cleanup lease/effect is normal. Persistent terminal or stuck
-        // work fails at this original deadline, not an arbitrary earlier sample.
+        // A live cleanup lease is normal. Stuck work fails at this original
+        // deadline, not an arbitrary earlier sample.
         tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(100))).await;
     }
 }

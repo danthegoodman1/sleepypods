@@ -202,8 +202,7 @@ async fn one_delete_and_one_status_allow_active_cleanup_until_authoritative_not_
     {
         let mut status = scenario.status.lock().unwrap();
         status.lease_owner = "live-worker".into();
-        status.uncertain_effect = Some(Default::default());
-        status.failure_kind = "uncertain".into();
+        status.failure_kind = "transient".into();
     }
     let (mut client, tasks) = server(scenario.clone()).await;
     let result = deletion_observation::delete_with_original_deadline(

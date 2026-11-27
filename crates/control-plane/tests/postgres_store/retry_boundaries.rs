@@ -58,9 +58,7 @@ impl ControlPlaneStore for LostResponseStore {
         complete_wake,
         begin_sleep,
         finalize_sleep,
-        list_materialization_reconciliation_candidates,
         load_materialization_operational_metrics,
-        begin_materialization_effect,
         renew_materialization_reconciliation_lease,
         release_materialization_reconciliation_lease,
         complete_wake_reconciliation,
@@ -133,26 +131,14 @@ impl ControlPlaneStore for LostResponseStore {
             self.lost(result).await
         })
     }
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
         Box::pin(async move {
             let result = self
                 .inner
-                .claim_materialization_reconciliation(request)
-                .await?;
-            self.lost(result).await
-        })
-    }
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: control_plane::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        Box::pin(async move {
-            let result = self
-                .inner
-                .acknowledge_materialization_effect(request)
+                .claim_next_materialization_reconciliation(request)
                 .await?;
             self.lost(result).await
         })
@@ -299,20 +285,26 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         }];
         let next = pg.clone();
         let replacement_id = initial.id.clone();
+        let replacement_target = target.clone();
         let (store, fault) = lossy(pg, move || {
             let db = next.clone();
             let request = replacement.clone();
             let id = replacement_id.clone();
+            let target = replacement_target.clone();
             Box::pin(async move {
                 db.record_materialization(request).await?;
-                db.claim_materialization_reconciliation(
-                    ClaimMaterializationReconciliationRequest::new(
-                        id,
-                        "replacement-owner",
-                        Duration::from_secs(60),
-                    ),
-                )
-                .await?;
+                // Every earlier Pending row in this target is already leased.
+                let claimed = db
+                    .claim_next_materialization_reconciliation(
+                        ClaimNextMaterializationRequest::new(
+                            MaterializationState::Pending,
+                            target,
+                            "replacement-owner",
+                            Duration::from_secs(60),
+                        ),
+                    )
+                    .await?;
+                assert_eq!(claimed.map(|claimed| claimed.id), Some(id));
                 Ok(())
             })
         });
@@ -603,75 +595,16 @@ async fn exact_fence_retries(
         ))
         .await?;
     let claimed = pg
-        .claim_materialization_reconciliation(ClaimMaterializationReconciliationRequest::new(
-            pending.id.clone(),
+        .claim_next_materialization_reconciliation(ClaimNextMaterializationRequest::new(
+            MaterializationState::Pending,
+            target.clone(),
             "fenced-owner",
             Duration::from_secs(60),
         ))
         .await?
         .unwrap();
+    assert_eq!(claimed.id, pending.id);
     let attempt = claimed.reconciliation_lease.as_ref().unwrap().attempt;
-    let effect = MaterializationEffectRequest {
-        effect_id: 1,
-        materialization_id: pending.id.clone(),
-        owner: "fenced-owner".into(),
-        attempt,
-        instance_generation: pending.instance_generation,
-        expected_state: MaterializationState::Pending,
-        operation: "apply",
-        object: RenderedObjectRef {
-            api_version: "v1".into(),
-            kind: "Service".into(),
-            namespace: "apps".into(),
-            name: "retry-fenced".into(),
-        },
-        precondition: None,
-    };
-    assert!(pg.begin_materialization_effect(effect.clone()).await?);
-    let ack = AcknowledgeMaterializationEffectRequest {
-        instance_generation: pending.instance_generation,
-        effect_id: 1,
-        materialization_id: pending.id.clone(),
-        owner: "fenced-owner".into(),
-        attempt,
-    };
-    let next = pg.clone();
-    let newer_effect = MaterializationEffectRequest {
-        effect_id: 2,
-        ..effect
-    };
-    let (store, fault) = lossy(pg, move || {
-        let db = next.clone();
-        let effect = newer_effect.clone();
-        Box::pin(async move {
-            assert!(db.begin_materialization_effect(effect).await?);
-            Ok(())
-        })
-    });
-    assert!(
-        !store.acknowledge_materialization_effect(ack).await?,
-        "exact old ACK retry is a no-op"
-    );
-    assert_eq!(fault.calls.load(Ordering::SeqCst), 2);
-    let status = pg
-        .load_materialization_work_status(pending.id.clone())
-        .await?
-        .unwrap();
-    assert_eq!(
-        status.uncertain_effect.unwrap().effect_id,
-        2,
-        "old retry cannot erase later effect"
-    );
-    assert!(
-        pg.acknowledge_materialization_effect(AcknowledgeMaterializationEffectRequest {
-            instance_generation: pending.instance_generation,
-            effect_id: 2,
-            materialization_id: pending.id.clone(),
-            owner: "fenced-owner".into(),
-            attempt
-        })
-        .await?
-    );
     let (store, fault) = lossy(pg, || Box::pin(async { Ok(()) }));
     assert!(
         !store

@@ -455,7 +455,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pod_uid,
             &materialization_id,
             FINALIZER,
-            0,
+            "",
         )
         .await?;
 
@@ -480,18 +480,8 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             return Err("restart changed accepted deletion generation".into());
         }
         let mut recovered_operator = connect_operator(&config.operator_endpoint).await?;
-        // A pass can finish while old replicas drain. Take a fresh restored
-        // baseline so the following increment proves a new controller pass.
-        let restored = recovered_operator
-            .reconcile_materialization(ReconcileMaterializationRequest {
-                materialization_id: materialization_id.clone(),
-                status_only: true,
-            })
-            .await?
-            .into_inner();
-        if !restored.found || restored.failure_count < before.failure_count {
-            return Err("restored deletion lost durable failure progress".into());
-        }
+        // A lease owner names one process, so a new owner proves the restarted
+        // controller took up the cleanup.
         let retained = wait_for_blocked_delete(
             &mut recovered_operator,
             &pods,
@@ -499,7 +489,7 @@ async fn accepted_delete_survives_restart_without_another_mutation(
             &pod_uid,
             &materialization_id,
             FINALIZER,
-            restored.failure_count,
+            &before.lease_owner,
         )
         .await?;
         if retained.observed_refs != before.observed_refs {
@@ -545,9 +535,11 @@ async fn wait_for_blocked_delete(
     uid: &str,
     materialization_id: &str,
     finalizer: &str,
-    previous_failures: u32,
+    previous_owner: &str,
 ) -> TestResult<ReconcileMaterializationResponse> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Cleanup waits inside its attempt while the Pod is held, so the attempt's
+    // lease is the sign that a controller is working on it.
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let pod = pods.get(name).await?;
         let status = operator
@@ -560,9 +552,8 @@ async fn wait_for_blocked_delete(
         if status.found
             && status.state == "Deleting"
             && !status.observed_refs.is_empty()
-            && status.failure_count > previous_failures
-            && status.lease_owner.is_empty()
-            && status.uncertain_effect.is_none()
+            && !status.lease_owner.is_empty()
+            && status.lease_owner != previous_owner
             && pod.metadata.deletion_timestamp.is_some()
         {
             if status.attempted {
@@ -573,7 +564,7 @@ async fn wait_for_blocked_delete(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "no definite blocked cleanup pass before restart deadline: {status:?}"
+                "no controller held the blocked cleanup before the deadline: {status:?}"
             )
             .into());
         }

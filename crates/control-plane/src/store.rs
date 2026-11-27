@@ -11,15 +11,14 @@ use crate::{
         DeleteInstanceRequest, GetInstanceRequest, InstanceRecord,
     },
     materialization::{
-        BeginSleepRequest, BeginSleepResult, ClaimMaterializationReconciliationRequest,
+        BeginSleepRequest, BeginSleepResult, ClaimNextMaterializationRequest,
         CompleteWakeReconciliationRequest, CompleteWakeRequest, CompleteWakeResult,
         DeleteMaterializationReconciliationRequest, FinalizeSleepReconciliationRequest,
         FinalizeSleepRequest, FinalizeSleepResult, ForceDeleteMaterializationRequest,
         ForceReleaseExclusivityKeyRequest, ForceReleaseExclusivityKeyResult,
-        ListMaterializationReconciliationCandidatesRequest, LoadActiveMaterializationRequest,
-        LoadMaterializationRequest, LoadReadyMaterializationRequest,
-        MaterializationOperationalMetrics, MaterializationRecord, RecordMaterializationRequest,
-        ReleaseMaterializationReconciliationLeaseRequest,
+        LoadActiveMaterializationRequest, LoadMaterializationRequest,
+        LoadReadyMaterializationRequest, MaterializationOperationalMetrics, MaterializationRecord,
+        RecordMaterializationRequest, ReleaseMaterializationReconciliationLeaseRequest,
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
@@ -210,29 +209,14 @@ pub trait ControlPlaneStore: Send + Sync {
         request: FinalizeSleepRequest,
     ) -> StoreFuture<'a, StoreResult<FinalizeSleepResult>>;
 
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        request: ListMaterializationReconciliationCandidatesRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>>;
-
     fn load_materialization_operational_metrics(
         &self,
     ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>>;
 
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>>;
-
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::MaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
-
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>>;
 
     fn renew_materialization_reconciliation_lease<'a>(
         &'a self,
@@ -674,15 +658,6 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn list_materialization_reconciliation_candidates<'a>(
-        &'a self,
-        request: ListMaterializationReconciliationCandidatesRequest,
-    ) -> StoreFuture<'a, StoreResult<Vec<MaterializationRecord>>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.list_materialization_reconciliation_candidates(request.clone())
-        })
-    }
-
     fn load_materialization_operational_metrics(
         &self,
     ) -> StoreFuture<'_, StoreResult<MaterializationOperationalMetrics>> {
@@ -691,30 +666,14 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn claim_materialization_reconciliation<'a>(
+    fn claim_next_materialization_reconciliation<'a>(
         &'a self,
-        request: ClaimMaterializationReconciliationRequest,
+        request: ClaimNextMaterializationRequest,
     ) -> StoreFuture<'a, StoreResult<Option<MaterializationRecord>>> {
-        // A claim has no expected incarnation/attempt fence; uncertain acquisition is not replayed.
-        self.inner.claim_materialization_reconciliation(request)
-    }
-
-    fn begin_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::MaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        // Dispatch is not replayed after an uncertain begin commit. The fenced
-        // client can acknowledge a known-not-dispatched operation explicitly.
-        self.inner.begin_materialization_effect(request)
-    }
-
-    fn acknowledge_materialization_effect<'a>(
-        &'a self,
-        request: crate::materialization::AcknowledgeMaterializationEffectRequest,
-    ) -> StoreFuture<'a, StoreResult<bool>> {
-        retry_store_operation(&self.inner, self.policy, move |store| {
-            store.acknowledge_materialization_effect(request.clone())
-        })
+        // A claim whose response is lost leaves a lease nobody renews; a replay
+        // would take a second row. The lost lease expires on its own.
+        self.inner
+            .claim_next_materialization_reconciliation(request)
     }
 
     fn renew_materialization_reconciliation_lease<'a>(
@@ -1031,11 +990,8 @@ mod tests {
             finalize_instance_deletions,
             list_route_bindings_for_instance,
             load_materialization,
-            list_materialization_reconciliation_candidates,
             load_materialization_operational_metrics,
-            claim_materialization_reconciliation,
-            begin_materialization_effect,
-            acknowledge_materialization_effect,
+            claim_next_materialization_reconciliation,
             renew_materialization_reconciliation_lease,
             release_materialization_reconciliation_lease,
             complete_wake_reconciliation,

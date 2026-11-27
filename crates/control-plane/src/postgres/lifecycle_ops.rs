@@ -130,6 +130,10 @@ pub(crate) async fn accept_wake(
         );
     }
     if current.state == InstanceState::Draining {
+        if let Some(revived) = revive_draining(&tx, &current, &request).await? {
+            tx.commit().await.map_err(map_postgres_error)?;
+            return Ok(revived);
+        }
         let generation = generation_to_i64(request.pending.instance_generation)?;
         let projection = generation_to_i64(request.pending.projection_generation)?;
         let backend =
@@ -164,7 +168,67 @@ pub(crate) async fn accept_wake(
             ", &[&id,&generation]).await.map_err(map_postgres_error)?;
     upsert_materialization(&tx, &request.pending).await?;
     tx.commit().await.map_err(map_postgres_error)?;
+    crate::runtime_work::signal_lifecycle_work();
     instance_from_row(&row)
+}
+
+/// Returns a draining instance to Running on its existing projection. Teardown
+/// starts only once the drain deadline has passed, and a claim needs that same
+/// deadline under this row lock, so a revived projection is one no driver has
+/// touched. The projection generation the sidecar holds stays as it is; the
+/// Ready transition restarts the activation floor.
+async fn revive_draining(
+    tx: &impl GenericClient,
+    current: &InstanceRecord,
+    request: &AcceptWakeRequest,
+) -> StoreResult<Option<InstanceRecord>> {
+    let id = current.id.as_str();
+    let running = current.generation.next();
+    let running_db = generation_to_i64(running)?;
+    let drained_db = generation_to_i64(current.generation)? - 1;
+    let revived = tx
+        .execute(
+            "
+            UPDATE materializations
+            SET state = 'ready',
+                instance_generation = $5,
+                backend_generation = backend_generation + 1,
+                updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+                AND cluster_id = $2
+                AND namespace = $3
+                AND state = 'deleting'
+                AND instance_generation = $4
+                AND backend_uri IS NOT NULL
+                AND reconcile_owner IS NULL
+                AND drain_not_before_unix_millis > (extract(epoch from clock_timestamp()) * 1000)::bigint
+            ",
+            &[
+                &id,
+                &request.pending.target.cluster_id(),
+                &request.pending.target.namespace(),
+                &drained_db,
+                &running_db,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    if revived == 0 {
+        return Ok(None);
+    }
+    let row = tx
+        .query_one(
+            "
+            UPDATE instances
+            SET state = 'running', generation = $2, updated_at_unix_millis = (extract(epoch from clock_timestamp()) * 1000)::bigint
+            WHERE instance_id = $1
+            RETURNING instance_id, workload_class_id, workload_class_version, values, state, generation
+            ",
+            &[&id, &running_db],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+    instance_from_row(&row).map(Some)
 }
 
 /// Called inside the sleep-finalization transaction, after old reservations are
@@ -269,6 +333,7 @@ pub(crate) async fn request_instance_deletion(
     .await
     .map_err(map_postgres_error)?;
     tx.commit().await.map_err(map_postgres_error)?;
+    crate::runtime_work::signal_lifecycle_work();
     Ok(true)
 }
 
