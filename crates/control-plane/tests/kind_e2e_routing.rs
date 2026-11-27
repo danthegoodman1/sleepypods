@@ -19,6 +19,7 @@ use control_plane::api::pb::{
     WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
     WorkloadValueSchema,
 };
+use control_plane::{render_instance_scoped_name, InstanceId};
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
@@ -897,16 +898,12 @@ fn challenge_path(token: &str) -> String {
     format!("/.well-known/acme-challenge/{token}")
 }
 
+/// The Deployment and Service name the class renders for a fixture target. The
+/// target's instance ID and base name are both `e2e-routing-{target}`.
 fn workload_name(target: &str) -> String {
-    // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
-    let suffix = match target {
-        "exact" => "b735c72f",
-        "wildcard" => "989d17dd",
-        "path-api" => "23d08b63",
-        "path-root" => "8556a630",
-        _ => panic!("unknown fixture target {target}"),
-    };
-    format!("e2e-routing-{target}-{suffix}")
+    let base = format!("e2e-routing-{target}");
+    let instance_id = InstanceId::new(base.clone()).expect("valid fixture instance ID");
+    render_instance_scoped_name(&base, &instance_id)
 }
 
 fn unix_millis(time: SystemTime) -> TestResult<i64> {
