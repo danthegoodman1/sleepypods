@@ -9,6 +9,8 @@ mod serialize;
 mod template;
 
 #[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
 mod tests;
 
 pub use objects::{

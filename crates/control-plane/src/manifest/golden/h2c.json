@@ -1,0 +1,207 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "41633b5642e0931d"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "web-acme-80a707af7dc77ee1"
+      },
+      "name": "web-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 80,
+          "targetPort": 15000
+        }
+      ],
+      "selector": {
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-name": "web-acme-80a707af7dc77ee1"
+      }
+    }
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {
+      "annotations": {
+        "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+        "sleepypods.io/rendered-hash": "22951a00eb140dc9"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "sleepypods",
+        "sleepypods.io/instance-generation": "7",
+        "sleepypods.io/instance-id": "tenant-a",
+        "sleepypods.io/workload-class-id": "web",
+        "sleepypods.io/workload-class-version": "3",
+        "sleepypods.io/workload-name": "web-acme-80a707af7dc77ee1"
+      },
+      "name": "web-acme-80a707af7dc77ee1",
+      "namespace": "apps"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "sleepypods.io/instance-id": "tenant-a",
+          "sleepypods.io/workload-name": "web-acme-80a707af7dc77ee1"
+        }
+      },
+      "strategy": {
+        "type": "Recreate"
+      },
+      "template": {
+        "metadata": {
+          "annotations": {
+            "sleepypods.io/materialization-id": "tenant-a:cluster-a:apps",
+            "sleepypods.io/rendered-hash": "22951a00eb140dc9"
+          },
+          "labels": {
+            "app.kubernetes.io/managed-by": "sleepypods",
+            "sleepypods.io/instance-generation": "7",
+            "sleepypods.io/instance-id": "tenant-a",
+            "sleepypods.io/workload-class-id": "web",
+            "sleepypods.io/workload-class-version": "3",
+            "sleepypods.io/workload-name": "web-acme-80a707af7dc77ee1"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "TENANT",
+                  "value": "acme"
+                },
+                {
+                  "name": "EMPTY",
+                  "value": ""
+                }
+              ],
+              "image": "example/web:2.1",
+              "name": "app",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http"
+                },
+                {
+                  "containerPort": 9090
+                }
+              ],
+              "securityContext": {
+                "allowPrivilegeEscalation": false
+              },
+              "volumeMounts": []
+            },
+            {
+              "env": [
+                {
+                  "name": "SLEEPYPODS_POD_UID",
+                  "valueFrom": {
+                    "fieldRef": {
+                      "apiVersion": "v1",
+                      "fieldPath": "metadata.uid"
+                    }
+                  }
+                },
+                {
+                  "name": "SLEEPYPODS_LISTEN_PORT",
+                  "value": "15000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_LISTEN_ADDR",
+                  "value": "0.0.0.0:15000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR",
+                  "value": "0.0.0.0:15001"
+                },
+                {
+                  "name": "SLEEPYPODS_APP_PORT",
+                  "value": "8080"
+                },
+                {
+                  "name": "SLEEPYPODS_INSTANCE_ID",
+                  "value": "tenant-a"
+                },
+                {
+                  "name": "SLEEPYPODS_INSTANCE_GENERATION",
+                  "value": "7"
+                },
+                {
+                  "name": "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
+                  "value": "http://sleepypods-control-plane.apps.svc.cluster.local:50051"
+                },
+                {
+                  "name": "SLEEPYPODS_IDLE_TIMEOUT_MS",
+                  "value": "120000"
+                },
+                {
+                  "name": "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS",
+                  "value": "5000"
+                },
+                {
+                  "name": "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS",
+                  "value": "30000"
+                },
+                {
+                  "name": "SLEEPYPODS_SIDECAR_MODE",
+                  "value": "http"
+                },
+                {
+                  "name": "SLEEPYPODS_APP_PROTOCOL",
+                  "value": "h2c"
+                }
+              ],
+              "image": "sleepypods/sidecar:test",
+              "name": "sleepypods-sidecar",
+              "ports": [
+                {
+                  "containerPort": 15000,
+                  "name": "sleepypods"
+                },
+                {
+                  "containerPort": 15001
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 1,
+                "httpGet": {
+                  "path": "/ready",
+                  "port": 15001
+                },
+                "periodSeconds": 1,
+                "timeoutSeconds": 1
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false
+              },
+              "volumeMounts": []
+            }
+          ],
+          "securityContext": {
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "terminationGracePeriodSeconds": 30,
+          "volumes": []
+        }
+      }
+    }
+  }
+]
