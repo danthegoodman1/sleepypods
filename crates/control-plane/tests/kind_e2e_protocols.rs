@@ -1087,9 +1087,10 @@ fn http_route_identity(host: &str, path_prefix: Option<&str>) -> RouteIdentity {
 fn workload_name(target: &str) -> String {
     // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
     let suffix = match target {
-        "http2" => "ecdc9151",
-        "grpc" => "1e039054",
-        "websocket" => "64dd4c6b",
+        "http2" => "ecdc91511c9b986e",
+        "grpc" => "1e03905468da9734",
+        "websocket" => "64dd4c6b5648b019",
+        "grpcio" => "cd373d1d93902be7",
         _ => panic!("unknown fixture target {target}"),
     };
     format!("e2e-protocol-{target}-{suffix}")

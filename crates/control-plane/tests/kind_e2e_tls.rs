@@ -920,9 +920,9 @@ fn sni_route_identity(host_kind: i32, host: &str) -> RouteIdentity {
 fn workload_name(target: &str) -> String {
     // Independently calculated SHA-256 suffixes for each complete fixture instance ID.
     let suffix = match target {
-        "termination" => "f589b132",
-        "sni-exact" => "24c750bd",
-        "sni-wildcard" => "df3d5390",
+        "termination" => "f589b1325e571750",
+        "sni-exact" => "24c750bdaa8b61ab",
+        "sni-wildcard" => "df3d5390ba6fcf39",
         _ => panic!("unknown fixture target {target}"),
     };
     format!("e2e-tls-{target}-{suffix}")
