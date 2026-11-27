@@ -55,8 +55,12 @@ const UNBOUND_INSTANCE_ID: &str = "failure-unbound";
 const UNBOUND_ROUTE_ID: &str = "failure-unbound-route";
 const UNBOUND_ROUTE_HOST: &str = "unbound.failure.sleepypods.test";
 const UNBOUND_WORKLOAD_NAME: &str = "failure-unbound-app";
+const UNBOUND_PV_BASE: &str = "failure-unbound-pv";
+const UNBOUND_FIRST_PVC_BASE: &str = "failure-unbound-a-pvc";
 const UNBOUND_PV_NAME: &str = "failure-unbound-pv-69ac89bca4a0a94a";
 const UNBOUND_FIRST_PVC_NAME: &str = "failure-unbound-a-pvc-69ac89bca4a0a94a";
+/// Where a raw manifest reads the instance suffix the platform supplies.
+const SUFFIX: &str = "{suffix}";
 const UNBOUND_SECOND_PVC_NAME: &str = "failure-unbound-b-pvc";
 // Explicit test-owned stale reservation, never the UID of a live claim.
 const UNBOUND_PREVIOUS_CLAIM_UID: &str = "00000000-0000-4000-8000-000000000001";
@@ -1128,32 +1132,66 @@ fn unbound_static_inventory(namespace: &str) -> Vec<RawKubernetesManifestTemplat
     // prebindings without that check. Reserve this task-owned Retain PV to an
     // explicit prior claim incarnation, keeping exact recorded names and equal
     // capacities. The current claim must stay Pending until the wake deadline.
+    let pv_name = format!("{UNBOUND_PV_BASE}-{SUFFIX}");
+    let pvc_name = format!("{UNBOUND_FIRST_PVC_BASE}-{SUFFIX}");
     [
         json!({
             "apiVersion": "v1", "kind": "PersistentVolume",
-            "metadata": { "name": UNBOUND_PV_NAME },
+            "metadata": { "name": pv_name },
             "spec": {
                 "capacity": { "storage": "1Mi" },
                 "accessModes": ["ReadWriteOnce"],
                 "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
                 "persistentVolumeReclaimPolicy": "Retain",
-                "claimRef": { "namespace": namespace, "name": UNBOUND_FIRST_PVC_NAME, "uid": UNBOUND_PREVIOUS_CLAIM_UID },
+                "claimRef": { "namespace": namespace, "name": pvc_name, "uid": UNBOUND_PREVIOUS_CLAIM_UID },
                 "hostPath": { "path": "/tmp/sleepypods-kind-e2e-failures/unbound", "type": "DirectoryOrCreate" }
             }
         }),
         json!({
             "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": { "name": UNBOUND_FIRST_PVC_NAME, "namespace": namespace },
+            "metadata": { "name": pvc_name, "namespace": namespace },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
                 "volumeMode": "Filesystem", "storageClassName": "sleepypods-kind-static",
-                "volumeName": UNBOUND_PV_NAME,
+                "volumeName": pv_name,
                 "resources": { "requests": { "storage": "1Mi" } }
             }
         }),
     ].into_iter().map(|value| RawKubernetesManifestTemplate {
-        manifest: Some(literal_text(&value.to_string())),
+        manifest: Some(suffixed_text(&value.to_string())),
     }).collect()
+}
+
+/// Template text that reads the instance suffix wherever `value` has `SUFFIX`.
+fn suffixed_text(value: &str) -> TemplateText {
+    let mut pieces = value.split(SUFFIX);
+    let literal = |text: &str| TemplateTextPart {
+        kind: Some(template_text_part::Kind::Literal(text.to_owned())),
+    };
+    let mut parts = vec![literal(pieces.next().unwrap_or_default())];
+    for piece in pieces {
+        parts.push(TemplateTextPart {
+            kind: Some(template_text_part::Kind::InstanceValue(
+                control_plane::manifest::INSTANCE_SUFFIX_VALUE.to_owned(),
+            )),
+        });
+        parts.push(literal(piece));
+    }
+    TemplateText { parts }
+}
+
+#[test]
+fn unbound_names_are_the_instance_scoped_names() {
+    let instance_id = control_plane::InstanceId::new(UNBOUND_INSTANCE_ID).unwrap();
+    for (constant, base) in [
+        (UNBOUND_PV_NAME, UNBOUND_PV_BASE),
+        (UNBOUND_FIRST_PVC_NAME, UNBOUND_FIRST_PVC_BASE),
+    ] {
+        assert_eq!(
+            constant,
+            control_plane::render_instance_scoped_name(base, &instance_id)
+        );
+    }
 }
 
 // Run the same raw inventory through the real renderer without requiring a cluster.
@@ -1165,15 +1203,23 @@ fn unbound_inventory_passes_real_render_validation() -> TestResult<()> {
     let raw_objects = unbound_static_inventory(namespace)
         .into_iter()
         .map(|raw| {
-            let text = raw.manifest.expect("fixture raw manifest exists");
-            let [TemplateTextPart {
-                kind: Some(template_text_part::Kind::Literal(text)),
-            }] = text.parts.as_slice()
-            else {
-                panic!("fixture raw manifest is literal");
-            };
+            let parts: Vec<domain::TemplateTextPart> = raw
+                .manifest
+                .expect("fixture raw manifest exists")
+                .parts
+                .into_iter()
+                .map(|part| match part.kind {
+                    Some(template_text_part::Kind::Literal(text)) => {
+                        domain::TemplateTextPart::literal(text)
+                    }
+                    Some(template_text_part::Kind::InstanceValue(name)) => {
+                        domain::TemplateTextPart::instance_value(name)
+                    }
+                    other => panic!("unexpected fixture text part {other:?}"),
+                })
+                .collect();
             domain::manifest::RawKubernetesManifestTemplate {
-                manifest: domain::TemplateText::literal(text),
+                manifest: domain::TemplateText::from_parts(parts),
             }
         })
         .collect();
