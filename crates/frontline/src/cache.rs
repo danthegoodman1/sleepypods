@@ -1,479 +1,374 @@
-use crate::subscription::SubscriptionId;
-use sleepypods_api::{BackendGeneration, CachePolicy, Generation, RouteEntry, RouteIdentity};
+//! The route cache: one complete rule set per exact host.
+//!
+//! The coordinator's actor owns a [`RouteTable`] and is its only writer.
+//! Request tasks read a [`RouteSnapshot`] the table publishes, so a lookup
+//! takes no lock and writes no shared memory.
+
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PositiveCacheEntry {
-    /// `None` once the stream that issued this answer ended. The answer stays
-    /// usable until its TTL, but nothing can invalidate it, and it has no ID the
-    /// control plane would recognise.
-    pub subscription_id: Option<SubscriptionId>,
-    pub matched_identity: RouteIdentity,
-    pub request_identity: RouteIdentity,
-    pub entry: RouteEntry,
-    expires_at: Instant,
-    sequence: u64,
+use sleepypods_api::{HostRules, RouteKind};
+
+use crate::subscription::SubscriptionId;
+
+/// The cached answer for one host. An empty rule set records that no binding
+/// applies to the host.
+#[derive(Debug)]
+pub struct HostEntry {
+    pub rules: HostRules,
+    pub expires_at: Instant,
+    /// Changes whenever the answer for this host is installed or replaced.
+    pub version: u64,
+    /// The live subscription that keeps this answer current. `None` for an
+    /// empty rule set, and for an answer carried over from an ended stream
+    /// until it is registered again.
+    subscription: Option<SubscriptionId>,
+    /// First-in, first-out position within the positive or negative budget.
+    order: u64,
+    used: AtomicBool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NegativeCacheEntry {
-    pub request_identity: RouteIdentity,
-    expires_at: Instant,
-    sequence: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CacheLookup {
-    Hit(CacheLookupHit),
-    Expired,
-    Absent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CacheLookupHit {
-    Positive(Arc<PositiveCacheEntry>),
-    Negative(Arc<NegativeCacheEntry>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CacheLookupStatus {
-    PositiveHit,
-    NegativeHit,
-    Expired,
-    Absent,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CacheInsertResult {
-    pub subscriptions_to_unsubscribe: Vec<SubscriptionId>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StaleRouteEntry {
-    InstanceGeneration {
-        current: Generation,
-        incoming: Generation,
-    },
-    BackendGeneration {
-        current: BackendGeneration,
-        incoming: BackendGeneration,
-    },
-}
-
-/// One stored copy of an identity, shared by every index that points at it, so
-/// indexing an answer costs a refcount rather than another string.
-type CacheKey = Arc<RouteIdentity>;
-
-/// Exact-identity cache. Both halves are keyed by the identity the caller asked
-/// for, so a lookup is one hash probe however many routes are cached. Reads
-/// never alter eviction order: each budget uses FIFO insertion order, with
-/// O(log n) removal/expiry and O(1) idle maintenance. `by_subscription` holds
-/// only answers a live stream still backs, so a control-plane ID reaches the
-/// right entry and a dead one reaches nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RouteCache {
-    capacity: usize,
-    positives: HashMap<CacheKey, Arc<PositiveCacheEntry>>,
-    by_subscription: HashMap<SubscriptionId, CacheKey>,
-    positive_order: BTreeMap<u64, CacheKey>,
-    positive_expiry: BTreeMap<(Instant, u64), CacheKey>,
-    negatives: HashMap<CacheKey, Arc<NegativeCacheEntry>>,
-    negative_order: BTreeMap<u64, CacheKey>,
-    negative_expiry: BTreeMap<(Instant, u64), CacheKey>,
-    sequence: u64,
-}
-
-impl PositiveCacheEntry {
-    pub fn new(
-        subscription_id: SubscriptionId,
-        matched_identity: RouteIdentity,
-        entry: RouteEntry,
-        cache_policy: CachePolicy,
-        now: Instant,
-    ) -> Self {
-        Self {
-            subscription_id: Some(subscription_id),
-            request_identity: matched_identity.clone(),
-            matched_identity,
-            entry,
-            expires_at: now + cache_policy.ttl(),
-            sequence: 0,
-        }
-    }
-
-    pub fn expires_at(&self) -> Instant {
-        self.expires_at
-    }
-
+impl HostEntry {
     pub fn is_expired(&self, now: Instant) -> bool {
         now >= self.expires_at
     }
 
-    /// Whether this answer is still backed by a live control-plane subscription.
-    pub fn is_registered(&self) -> bool {
-        self.subscription_id.is_some()
+    /// Records a hit. After the first hit this only reads.
+    pub fn mark_used(&self) {
+        if !self.used.load(Ordering::Relaxed) {
+            self.used.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn was_used(&self) -> bool {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    pub fn subscription(&self) -> Option<SubscriptionId> {
+        self.subscription
     }
 }
 
-impl NegativeCacheEntry {
-    pub fn new(request_identity: RouteIdentity, cache_policy: CachePolicy, now: Instant) -> Self {
+/// An exact host of one listener family.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostKey {
+    pub kind: RouteKind,
+    pub host: Arc<str>,
+}
+
+impl HostKey {
+    pub fn new(kind: RouteKind, host: &str) -> Self {
         Self {
-            request_identity,
-            expires_at: now + cache_policy.ttl(),
-            sequence: 0,
-        }
-    }
-
-    pub fn expires_at(&self) -> Instant {
-        self.expires_at
-    }
-
-    pub fn is_expired(&self, now: Instant) -> bool {
-        now >= self.expires_at
-    }
-}
-
-impl CacheLookup {
-    pub fn status(&self) -> CacheLookupStatus {
-        match self {
-            Self::Hit(CacheLookupHit::Positive(_)) => CacheLookupStatus::PositiveHit,
-            Self::Hit(CacheLookupHit::Negative(_)) => CacheLookupStatus::NegativeHit,
-            Self::Expired => CacheLookupStatus::Expired,
-            Self::Absent => CacheLookupStatus::Absent,
+            kind,
+            host: Arc::from(host),
         }
     }
 }
 
-impl RouteCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            positives: HashMap::new(),
-            by_subscription: HashMap::new(),
-            positive_order: BTreeMap::new(),
-            positive_expiry: BTreeMap::new(),
-            negatives: HashMap::new(),
-            negative_order: BTreeMap::new(),
-            negative_expiry: BTreeMap::new(),
-            sequence: 0,
+/// What request tasks read. Immutable once published.
+#[derive(Clone, Debug, Default)]
+pub struct RouteSnapshot {
+    http: HashMap<Arc<str>, Arc<HostEntry>>,
+    sni: HashMap<Arc<str>, Arc<HostEntry>>,
+}
+
+impl RouteSnapshot {
+    pub fn get(&self, kind: RouteKind, host: &str) -> Option<&Arc<HostEntry>> {
+        match kind {
+            RouteKind::Http => self.http.get(host),
+            RouteKind::Sni => self.sni.get(host),
         }
     }
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
+
     pub fn len(&self) -> usize {
-        self.positives.len() + self.negatives.len()
+        self.http.len() + self.sni.len()
     }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    pub fn lookup(&self, identity: &RouteIdentity, now: Instant) -> CacheLookup {
-        if let Some(entry) = self.positives.get(identity) {
-            return if entry.is_expired(now) {
-                CacheLookup::Expired
-            } else {
-                CacheLookup::Hit(CacheLookupHit::Positive(entry.clone()))
-            };
-        }
-        match self.negatives.get(identity) {
-            Some(entry) if entry.is_expired(now) => CacheLookup::Expired,
-            Some(entry) => CacheLookup::Hit(CacheLookupHit::Negative(entry.clone())),
-            None => CacheLookup::Absent,
-        }
-    }
-    /// Install an exact identity, for callers that already have a complete answer.
-    pub fn insert_positive(
-        &mut self,
-        subscription_id: SubscriptionId,
-        identity: RouteIdentity,
-        entry: RouteEntry,
-        policy: CachePolicy,
-        now: Instant,
-    ) -> CacheInsertResult {
-        self.insert_resolved(
-            identity.clone(),
-            PositiveCacheEntry::new(subscription_id, identity, entry, policy, now),
-            now,
-        )
-    }
-    /// Only the queried identity is authoritative; the matching rule is metadata.
-    pub fn insert_resolved(
-        &mut self,
-        request: RouteIdentity,
-        mut positive: PositiveCacheEntry,
-        now: Instant,
-    ) -> CacheInsertResult {
-        let mut result = self.expire_limited(now, 64);
-        if let Some(existing) = self.positives.get(&request).cloned() {
-            if stale_route_entry(&existing.entry, &positive.entry).is_some() {
-                result
-                    .subscriptions_to_unsubscribe
-                    .extend(positive.subscription_id);
-                // A rotated answer gets one attempt to register again, so
-                // rejecting it here leaves an answer no invalidation can reach.
-                // Drop it and let the next request resolve from scratch.
-                if existing.subscription_id.is_none() {
-                    self.remove_positive(&request);
-                }
-                return result;
+}
+
+/// What a table change displaced: the answers that left the cache and the
+/// subscriptions the control plane still holds for them.
+#[derive(Debug, Default)]
+pub struct Displaced {
+    pub entries: Vec<Arc<HostEntry>>,
+    pub unsubscribe: Vec<SubscriptionId>,
+}
+
+impl Displaced {
+    fn take(&mut self, entry: Arc<HostEntry>, keep: Option<SubscriptionId>) {
+        if let Some(id) = entry.subscription {
+            if Some(id) != keep {
+                self.unsubscribe.push(id);
             }
         }
-        // Release what this identity held, unless the replacement arrived on the
-        // same subscription.
-        if let Some(released) = self.remove_positive(&request).and_then(released_id) {
-            if Some(&released) != positive.subscription_id.as_ref() {
-                result.subscriptions_to_unsubscribe.push(released);
-            }
-        }
-        if let Some(id) = positive.subscription_id.clone() {
-            self.remove_positive_by_subscription(&id);
-        }
-        self.remove_negative(&request);
-        positive.request_identity = request.clone();
-        self.index_positive(request, positive);
-        while self.positives.len() > self.capacity {
-            let identity = self.oldest_positive().expect("a positive over capacity");
-            result
-                .subscriptions_to_unsubscribe
-                .extend(self.remove_positive(&identity).and_then(released_id));
-        }
-        result
+        self.entries.push(entry);
     }
 
-    fn index_positive(&mut self, request: RouteIdentity, mut positive: PositiveCacheEntry) {
+    pub fn absorb(&mut self, other: Displaced) {
+        self.entries.extend(other.entries);
+        self.unsubscribe.extend(other.unsubscribe);
+    }
+}
+
+/// The actor's working copy of the cache. Rule sets and empty answers have
+/// separate first-in, first-out budgets of `capacity` hosts each, so hosts
+/// with no route cannot push routed hosts out.
+#[derive(Debug)]
+pub struct RouteTable {
+    capacity: usize,
+    snapshot: RouteSnapshot,
+    by_subscription: HashMap<SubscriptionId, HostKey>,
+    positive_order: BTreeMap<u64, HostKey>,
+    negative_order: BTreeMap<u64, HostKey>,
+    expiry: BTreeMap<(Instant, u64), HostKey>,
+    sequence: u64,
+    changed: bool,
+}
+
+impl RouteTable {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            snapshot: RouteSnapshot::default(),
+            by_subscription: HashMap::new(),
+            positive_order: BTreeMap::new(),
+            negative_order: BTreeMap::new(),
+            expiry: BTreeMap::new(),
+            sequence: 0,
+            changed: false,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Lowers the positive budget to what the control plane accepted.
+    pub fn limit_capacity(&mut self, capacity: usize) {
+        self.capacity = self.capacity.min(capacity.max(1));
+    }
+
+    pub fn positive_len(&self) -> usize {
+        self.positive_order.len()
+    }
+
+    pub fn negative_len(&self) -> usize {
+        self.negative_order.len()
+    }
+
+    pub fn get(&self, key: &HostKey) -> Option<&Arc<HostEntry>> {
+        self.snapshot.get(key.kind, &key.host)
+    }
+
+    pub fn host_of(&self, subscription: SubscriptionId) -> Option<&HostKey> {
+        self.by_subscription.get(&subscription)
+    }
+
+    /// A copy for request tasks, when the table changed since the last one.
+    pub fn publish(&mut self) -> Option<Arc<RouteSnapshot>> {
+        if !self.changed {
+            return None;
+        }
+        self.changed = false;
+        Some(Arc::new(self.snapshot.clone()))
+    }
+
+    /// Installs the answer for `key`, replacing what was cached. A replaced
+    /// rule set keeps its place in the eviction order.
+    pub fn install(
+        &mut self,
+        key: HostKey,
+        rules: HostRules,
+        expires_at: Instant,
+        subscription: Option<SubscriptionId>,
+    ) -> Displaced {
+        let mut displaced = Displaced::default();
         self.sequence += 1;
-        positive.sequence = self.sequence;
-        let key: CacheKey = Arc::new(request);
-        if let Some(id) = &positive.subscription_id {
-            self.by_subscription.insert(id.clone(), key.clone());
-        }
-        self.positive_order.insert(positive.sequence, key.clone());
-        self.positive_expiry
-            .insert((positive.expires_at, positive.sequence), key.clone());
-        self.positives.insert(key, Arc::new(positive));
-    }
-
-    /// The stream backing every current subscription has ended. Cached answers
-    /// stay valid until their own TTL, but their IDs are dead: the next stream
-    /// restarts its numbering, so a retained ID would alias a stranger's live
-    /// subscription. Drop the IDs and report what has to be registered again.
-    pub fn rotate_session(&mut self) -> Vec<RouteIdentity> {
-        self.by_subscription.clear();
-        let mut identities = Vec::with_capacity(self.positives.len());
-        for (key, entry) in &mut self.positives {
-            Arc::make_mut(entry).subscription_id = None;
-            identities.push((**key).clone());
-        }
-        identities
-    }
-    pub fn insert_negative(
-        &mut self,
-        request: RouteIdentity,
-        policy: CachePolicy,
-        now: Instant,
-    ) -> CacheInsertResult {
-        let mut result = self.expire_limited(now, 64);
-        result
-            .subscriptions_to_unsubscribe
-            .extend(self.remove_positive(&request).and_then(released_id));
-        self.remove_negative(&request);
-        self.sequence += 1;
-        let mut entry = NegativeCacheEntry::new(request, policy, now);
-        entry.sequence = self.sequence;
-        let key: CacheKey = Arc::new(entry.request_identity.clone());
-        self.negative_order.insert(entry.sequence, key.clone());
-        self.negative_expiry
-            .insert((entry.expires_at, entry.sequence), key.clone());
-        self.negatives.insert(key, Arc::new(entry));
-        while self.negatives.len() > self.capacity {
-            let key = self.negative_order.first_key_value().unwrap().1.clone();
-            self.remove_negative(&key);
-        }
-        result
-    }
-    /// Whether a rotated answer for this identity is still worth registering
-    /// again: re-registration is pointless once it has been replaced, expired,
-    /// or already re-registered by a live request.
-    pub fn needs_reregistration(&self, identity: &RouteIdentity, now: Instant) -> bool {
-        self.positives
-            .get(identity)
-            .is_some_and(|entry| entry.subscription_id.is_none() && !entry.is_expired(now))
-    }
-    /// True when `expire_limited` would evict something. Lets a caller skip
-    /// taking the write lock on an idle maintenance pass.
-    pub fn has_expired(&self, now: Instant) -> bool {
-        self.positive_expiry
-            .first_key_value()
-            .is_some_and(|((expires, _), _)| *expires <= now)
-            || self
-                .negative_expiry
-                .first_key_value()
-                .is_some_and(|((expires, _), _)| *expires <= now)
-    }
-    pub fn expire(&mut self, now: Instant) -> CacheInsertResult {
-        self.expire_limited(now, usize::MAX)
-    }
-
-    pub fn expire_limited(&mut self, now: Instant, limit: usize) -> CacheInsertResult {
-        let mut remaining = limit;
-        let mut result = CacheInsertResult::default();
-        while let Some(((expires, _), identity)) = self.positive_expiry.first_key_value() {
-            if *expires > now || remaining == 0 {
-                break;
-            }
-            remaining -= 1;
-            let identity = identity.clone();
-            result
-                .subscriptions_to_unsubscribe
-                .extend(self.remove_positive(&identity).and_then(released_id));
-        }
-        while let Some(((expires, _), request)) = self.negative_expiry.first_key_value() {
-            if *expires > now || remaining == 0 {
-                break;
-            }
-            remaining -= 1;
-            let request = request.clone();
-            self.remove_negative(&request);
-        }
-        result
-    }
-    pub fn invalidate_subscription(&mut self, id: &SubscriptionId) -> bool {
-        self.remove_positive_by_subscription(id).is_some()
-    }
-    /// Drop the answer cached for this identity and report the subscription it
-    /// held, for callers that address an answer without knowing whether a live
-    /// stream still backs it.
-    pub fn invalidate_request(&mut self, identity: &RouteIdentity) -> Option<SubscriptionId> {
-        self.remove_positive(identity).and_then(released_id)
-    }
-    pub fn active_subscription_ids(&self) -> Vec<SubscriptionId> {
-        self.by_subscription.keys().cloned().collect()
-    }
-    pub fn replace_subscription(
-        &mut self,
-        id: &SubscriptionId,
-        matched_identity: RouteIdentity,
-        entry: RouteEntry,
-        policy: CachePolicy,
-        now: Instant,
-    ) -> CacheInsertResult {
-        if let Some(identity) = self.by_subscription.get(id).cloned() {
-            self.refresh_positive(&identity, matched_identity, entry, policy, now);
-        }
-        CacheInsertResult::default()
-    }
-    /// Update the answer cached for this identity in place, keeping its FIFO
-    /// position and whatever subscription it holds.
-    pub fn refresh_positive(
-        &mut self,
-        identity: &RouteIdentity,
-        matched_identity: RouteIdentity,
-        entry: RouteEntry,
-        policy: CachePolicy,
-        now: Instant,
-    ) {
-        let Some((key, cached)) = self.positives.get_key_value(identity) else {
-            return;
+        let version = self.sequence;
+        let positive = !rules.is_empty();
+        let previous = self.detach(&key);
+        let order = match &previous {
+            Some(previous) if positive && !previous.rules.is_empty() => previous.order,
+            _ => version,
         };
-        let (key, previous, seq) = (key.clone(), cached.expires_at, cached.sequence);
-        let updated = Arc::make_mut(self.positives.get_mut(identity).expect("just observed"));
-        updated.matched_identity = matched_identity;
-        updated.entry = entry;
-        updated.expires_at = now + policy.ttl();
-        let expires_at = updated.expires_at;
-        self.positive_expiry.remove(&(previous, seq));
-        self.positive_expiry.insert((expires_at, seq), key);
-    }
-    /// The answer cached for an identity, whether or not a live stream backs it.
-    pub fn positive(&self, identity: &RouteIdentity) -> Option<&Arc<PositiveCacheEntry>> {
-        self.positives.get(identity)
-    }
-    pub fn positive_by_subscription(
-        &self,
-        id: &SubscriptionId,
-    ) -> Option<&Arc<PositiveCacheEntry>> {
-        self.by_subscription
-            .get(id)
-            .and_then(|identity| self.positives.get(identity))
-    }
-    pub fn positives(&self) -> impl Iterator<Item = &Arc<PositiveCacheEntry>> {
-        self.positives.values()
-    }
-    pub fn negatives(&self) -> Vec<Arc<NegativeCacheEntry>> {
-        self.negatives.values().cloned().collect()
-    }
-    pub fn clear(&mut self) {
-        *self = Self::new(self.capacity);
-    }
-    fn oldest_positive(&self) -> Option<CacheKey> {
-        self.positive_order
-            .first_key_value()
-            .map(|(_, key)| key.clone())
-    }
-    fn remove_positive(&mut self, identity: &RouteIdentity) -> Option<Arc<PositiveCacheEntry>> {
-        let removed = self.positives.remove(identity)?;
-        if let Some(id) = &removed.subscription_id {
-            self.by_subscription.remove(id);
+        if let Some(previous) = previous {
+            displaced.take(previous, subscription);
         }
-        self.positive_order.remove(&removed.sequence);
-        self.positive_expiry
-            .remove(&(removed.expires_at, removed.sequence));
-        Some(removed)
-    }
-    fn remove_positive_by_subscription(
-        &mut self,
-        id: &SubscriptionId,
-    ) -> Option<Arc<PositiveCacheEntry>> {
-        let identity = self.by_subscription.get(id)?.clone();
-        self.remove_positive(&identity)
-    }
-    fn remove_negative(&mut self, request: &RouteIdentity) -> Option<Arc<NegativeCacheEntry>> {
-        let removed = self.negatives.remove(request)?;
-        self.negative_order.remove(&removed.sequence);
-        self.negative_expiry
-            .remove(&(removed.expires_at, removed.sequence));
-        Some(removed)
-    }
-}
-
-/// The ID a removed answer held, which is what its owner has to release. A
-/// rotated answer holds none, and unsubscribing a dead ID would reach whatever
-/// the next stream gave that number to.
-fn released_id(removed: Arc<PositiveCacheEntry>) -> Option<SubscriptionId> {
-    removed.subscription_id.clone()
-}
-
-pub(crate) fn stale_route_entry(
-    current: &RouteEntry,
-    incoming: &RouteEntry,
-) -> Option<StaleRouteEntry> {
-    if current.instance_id != incoming.instance_id {
-        return None;
-    }
-
-    // Instance and backend generations are only ordered within one instance
-    // lineage. A route reassignment to a different instance can legitimately
-    // restart generation numbers at a lower value.
-    if incoming.instance_generation < current.instance_generation {
-        return Some(StaleRouteEntry::InstanceGeneration {
-            current: current.instance_generation,
-            incoming: incoming.instance_generation,
+        let subscription = subscription.filter(|_| positive);
+        let entry = Arc::new(HostEntry {
+            rules,
+            expires_at,
+            version,
+            subscription,
+            order,
+            used: AtomicBool::new(false),
         });
+        if let Some(id) = subscription {
+            self.by_subscription.insert(id, key.clone());
+        }
+        if positive {
+            self.positive_order.insert(order, key.clone());
+        } else {
+            self.negative_order.insert(order, key.clone());
+        }
+        self.expiry.insert((expires_at, version), key.clone());
+        self.hosts_mut(key.kind).insert(key.host, entry);
+        self.changed = true;
+        while self.positive_order.len() > self.capacity {
+            let oldest = self.oldest(true).expect("a rule set over capacity");
+            displaced.take(self.detach(&oldest).expect("indexed host"), None);
+        }
+        while self.negative_order.len() > self.capacity {
+            let oldest = self.oldest(false).expect("an empty answer over capacity");
+            displaced.take(self.detach(&oldest).expect("indexed host"), None);
+        }
+        displaced
     }
 
-    if let (Some(current), Some(incoming)) =
-        (current.backend_generation, incoming.backend_generation)
-    {
-        if incoming < current {
-            return Some(StaleRouteEntry::BackendGeneration { current, incoming });
+    /// Removes the oldest `count` rule sets to make room.
+    pub fn evict_oldest(&mut self, count: usize) -> Displaced {
+        let mut displaced = Displaced::default();
+        for _ in 0..count {
+            let Some(oldest) = self.oldest(true) else {
+                break;
+            };
+            displaced.take(self.detach(&oldest).expect("indexed host"), None);
+        }
+        displaced
+    }
+
+    pub fn remove(&mut self, key: &HostKey) -> Displaced {
+        let mut displaced = Displaced::default();
+        if let Some(entry) = self.detach(key) {
+            displaced.take(entry, None);
+        }
+        displaced
+    }
+
+    /// Removes the answer a subscription keeps current. The control plane has
+    /// already dropped the subscription, so nothing is left to release.
+    pub fn remove_subscription(&mut self, subscription: SubscriptionId) -> Displaced {
+        let mut displaced = Displaced::default();
+        if let Some(key) = self.by_subscription.get(&subscription).cloned() {
+            if let Some(entry) = self.detach(&key) {
+                displaced.entries.push(entry);
+            }
+        }
+        displaced
+    }
+
+    pub fn next_expiry(&self) -> Option<Instant> {
+        self.expiry.keys().next().map(|(expires_at, _)| *expires_at)
+    }
+
+    /// Removes up to `limit` answers whose lifetime has passed.
+    pub fn expire(&mut self, now: Instant, limit: usize) -> Displaced {
+        let mut displaced = Displaced::default();
+        for _ in 0..limit {
+            let Some(((expires_at, _), key)) = self.expiry.first_key_value() else {
+                break;
+            };
+            if *expires_at > now {
+                break;
+            }
+            let key = key.clone();
+            displaced.take(self.detach(&key).expect("indexed host"), None);
+        }
+        displaced
+    }
+
+    /// The stream that kept every subscription current ended in order. Rule
+    /// sets a request used stay cached until their own lifetime and are
+    /// returned for registration on the next stream; the rest leave now.
+    pub fn end_session(&mut self) -> (Vec<HostKey>, Displaced) {
+        self.by_subscription.clear();
+        let mut kept = Vec::new();
+        let mut displaced = Displaced::default();
+        let hosts: Vec<HostKey> = self.positive_order.values().cloned().collect();
+        for key in hosts {
+            let entry = self.get(&key).expect("indexed host").clone();
+            if !entry.was_used() {
+                displaced.entries.extend(self.detach(&key));
+                continue;
+            }
+            let carried = Arc::new(HostEntry {
+                rules: entry.rules.clone(),
+                expires_at: entry.expires_at,
+                version: entry.version,
+                subscription: None,
+                order: entry.order,
+                used: AtomicBool::new(false),
+            });
+            self.hosts_mut(key.kind).insert(key.host.clone(), carried);
+            kept.push(key);
+        }
+        self.changed = true;
+        (kept, displaced)
+    }
+
+    /// Whether the host still holds a rule set that no live subscription
+    /// keeps current.
+    pub fn awaits_registration(&self, key: &HostKey, now: Instant) -> bool {
+        self.get(key).is_some_and(|entry| {
+            !entry.rules.is_empty() && entry.subscription.is_none() && !entry.is_expired(now)
+        })
+    }
+
+    pub fn clear(&mut self) -> Displaced {
+        let mut displaced = Displaced::default();
+        displaced
+            .entries
+            .extend(self.snapshot.http.drain().map(|(_, entry)| entry));
+        displaced
+            .entries
+            .extend(self.snapshot.sni.drain().map(|(_, entry)| entry));
+        self.by_subscription.clear();
+        self.positive_order.clear();
+        self.negative_order.clear();
+        self.expiry.clear();
+        self.changed = true;
+        displaced
+    }
+
+    fn oldest(&self, positive: bool) -> Option<HostKey> {
+        let order = if positive {
+            &self.positive_order
+        } else {
+            &self.negative_order
+        };
+        order.first_key_value().map(|(_, key)| key.clone())
+    }
+
+    fn detach(&mut self, key: &HostKey) -> Option<Arc<HostEntry>> {
+        let entry = self.hosts_mut(key.kind).remove(&*key.host)?;
+        if let Some(id) = entry.subscription {
+            self.by_subscription.remove(&id);
+        }
+        if entry.rules.is_empty() {
+            self.negative_order.remove(&entry.order);
+        } else {
+            self.positive_order.remove(&entry.order);
+        }
+        self.expiry.remove(&(entry.expires_at, entry.version));
+        self.changed = true;
+        Some(entry)
+    }
+
+    fn hosts_mut(&mut self, kind: RouteKind) -> &mut HashMap<Arc<str>, Arc<HostEntry>> {
+        match kind {
+            RouteKind::Http => &mut self.snapshot.http,
+            RouteKind::Sni => &mut self.snapshot.sni,
         }
     }
-
-    None
 }
 
 #[cfg(test)]

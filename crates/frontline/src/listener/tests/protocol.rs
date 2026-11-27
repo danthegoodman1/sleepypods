@@ -174,30 +174,20 @@ async fn chain(app_protocol: proxy_core::AppProtocol) -> Chain {
         NoIdle,
         shutdown.clone(),
     ));
-    let mut state = SubscriptionState::new(8);
-    for (index, path) in ["/plain", "/socket", "/reject", "/forbidden"]
-        .into_iter()
-        .enumerate()
-    {
-        state.apply_control_plane_message(
-            resolved_response(
-                request_id(&format!("initial-{index}")),
-                subscription_id(&format!("sub-{index}")),
-                http_identity("ws.example.com", path),
-                route_entry(
-                    InstanceState::Running,
-                    7,
-                    Some((format!("http://{sidecar_addr}"), 3)),
-                ),
-            ),
-            now(),
-        );
-    }
+    let route_client = FakeControlPlane::default();
+    seed(
+        &route_client,
+        http_identity("ws.example.com", "/"),
+        route_entry(
+            InstanceState::Running,
+            7,
+            Some((format!("http://{sidecar_addr}"), 3)),
+        ),
+    );
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let edge = listener.local_addr().unwrap();
     let runtime = runtime_with_state(
-        state,
-        FakeRouteClient::default(),
+        route_client.clone(),
         DrainTracker::new(Duration::from_secs(2)),
     );
     let edge_task = tokio::spawn(serve_http_listener(listener, runtime, shutdown.clone()));

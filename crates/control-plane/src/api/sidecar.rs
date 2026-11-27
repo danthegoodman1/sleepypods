@@ -5,7 +5,6 @@ use tonic::{Request, Response, Status};
 use crate::{
     api::{
         pb::{self, sidecar_control_plane_server::SidecarControlPlaneServer},
-        route_events::RouteSubscriptionBroker,
         store_error_to_status,
     },
     idle::{self, ReportIdleError, ReportIdleResult, ReportIdleUnavailableReason},
@@ -22,7 +21,6 @@ pub struct StoreBackedSidecarApi<C> {
     store: Arc<dyn ControlPlaneStore>,
     materializer: KubernetesMaterializer<C>,
     target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
 }
 
 impl<C> StoreBackedSidecarApi<C> {
@@ -31,20 +29,10 @@ impl<C> StoreBackedSidecarApi<C> {
         materializer: KubernetesMaterializer<C>,
         target: MaterializationTarget,
     ) -> Self {
-        Self::with_route_events(store, materializer, target, RouteSubscriptionBroker::new())
-    }
-
-    pub fn with_route_events(
-        store: Arc<dyn ControlPlaneStore>,
-        materializer: KubernetesMaterializer<C>,
-        target: MaterializationTarget,
-        route_events: RouteSubscriptionBroker,
-    ) -> Self {
         Self {
             store,
             materializer,
             target,
-            route_events,
         }
     }
 }
@@ -60,25 +48,8 @@ where
     C: KubernetesMaterializerClient + Clone + 'static,
 {
     SidecarControlPlaneServer::new(StoreBackedSidecarApi::new(store, materializer, target))
-}
-
-pub fn sidecar_grpc_service_with_store_and_route_events<C>(
-    store: Arc<dyn ControlPlaneStore>,
-    materializer: KubernetesMaterializer<C>,
-    target: MaterializationTarget,
-    route_events: RouteSubscriptionBroker,
-) -> StoreBackedSidecarGrpcService<C>
-where
-    C: KubernetesMaterializerClient + Clone + 'static,
-{
-    SidecarControlPlaneServer::new(StoreBackedSidecarApi::with_route_events(
-        store,
-        materializer,
-        target,
-        route_events,
-    ))
-    .max_decoding_message_size(256 * 1024)
-    .max_encoding_message_size(1024 * 1024)
+        .max_decoding_message_size(256 * 1024)
+        .max_encoding_message_size(1024 * 1024)
 }
 
 #[tonic::async_trait]
@@ -101,29 +72,10 @@ where
         )
         .await
         {
-            Ok(result) => {
-                if let ReportIdleResult::Accepted { instance } = &result {
-                    notify_instance_routes_changed(
-                        self.store.as_ref(),
-                        &self.route_events,
-                        instance.id.clone(),
-                    )
-                    .await?;
-                }
-                Ok(Response::new(report_idle_result_to_proto(result)))
-            }
+            Ok(result) => Ok(Response::new(report_idle_result_to_proto(result))),
             Err(error) => report_idle_error_response(request_instance_id, error).map(Response::new),
         }
     }
-}
-
-async fn notify_instance_routes_changed(
-    _store: &dyn ControlPlaneStore,
-    route_events: &RouteSubscriptionBroker,
-    instance_id: InstanceId,
-) -> Result<(), Status> {
-    route_events.notify_instance_changed(instance_id);
-    Ok(())
 }
 
 fn report_idle_request_from_proto(

@@ -15,6 +15,7 @@ pub struct PostgresStore {
     pub(crate) pool: Pool,
     pub(crate) certificate_work: crate::certificate::work::CertificateWorkLimits,
     pub(crate) certificate_sealer: Option<std::sync::Arc<crate::certificate::CertificateSealer>>,
+    pub(crate) route_changes: super::runtime_work::RouteChangeListener,
 }
 
 impl PostgresStore {
@@ -34,6 +35,7 @@ impl PostgresStore {
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
+        let route_changes = super::runtime_work::RouteChangeListener::new(pg_config.clone());
         let manager = Manager::from_config(pg_config, NoTls, manager_config);
         let pool = Pool::builder(manager)
             .max_size(config.max_connections)
@@ -51,6 +53,7 @@ impl PostgresStore {
                 config.max_connections,
             ),
             certificate_sealer: None,
+            route_changes,
         };
 
         store.run_migrations().await?;

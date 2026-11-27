@@ -18,10 +18,7 @@ use crate::{
         BackendEndpoint, MaterializationReconciliationLease, MaterializationRecord,
         MaterializationState, MaterializationTarget, RenderedObjectRef,
     },
-    route::{
-        CachePolicy, PathPrefix, ProtocolRoute, RouteBindingRecord, RouteBindingSpec, RouteHost,
-        RouteHostKind, RouteIdentity,
-    },
+    route::{PathPrefix, RouteBindingRecord, RouteHost, RouteHostKind, RouteIdentity},
     sleep_policy::{IdleTimeoutOverridePolicy, WorkloadSleepPolicy},
     store::{StoreError, StoreResult},
     workload::{
@@ -35,7 +32,6 @@ pub(crate) struct RouteBindingRow {
     pub id: RouteBindingId,
     pub instance_id: InstanceId,
     pub identity: RouteIdentity,
-    pub protocol: ProtocolRoute,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +90,6 @@ pub(crate) fn route_binding_from_row(row: &Row) -> StoreResult<RouteBindingRecor
         id: binding.id,
         instance_id: binding.instance_id,
         identity: binding.identity,
-        protocol: binding.protocol,
     })
 }
 
@@ -105,13 +100,11 @@ pub(crate) fn route_binding_row_from_row(row: &Row) -> StoreResult<RouteBindingR
     let host_kind: String = row.get("host_kind");
     let host: String = row.get("host");
     let path_prefix: Option<String> = row.get("path_prefix");
-    let protocol: String = row.get("protocol");
 
     Ok(RouteBindingRow {
         id: RouteBindingId::new(route_binding_id).map_err(invalid_stored_data)?,
         instance_id: InstanceId::new(instance_id).map_err(invalid_stored_data)?,
         identity: route_identity_from_parts(&identity_kind, &host_kind, &host, path_prefix)?,
-        protocol: protocol_from_db(&protocol)?,
     })
 }
 
@@ -456,19 +449,6 @@ pub(crate) fn route_identity_key(identity: &RouteIdentity) -> String {
     }
 }
 
-pub(crate) fn validate_route_protocol(spec: &RouteBindingSpec) -> StoreResult<()> {
-    match (&spec.identity, spec.protocol) {
-        (RouteIdentity::Http { .. }, ProtocolRoute::Http)
-        | (RouteIdentity::Sni { .. }, ProtocolRoute::TlsSni) => Ok(()),
-        (RouteIdentity::Http { .. }, ProtocolRoute::TlsSni) => Err(StoreError::invalid_argument(
-            "HTTP route identities must use the HTTP protocol route",
-        )),
-        (RouteIdentity::Sni { .. }, ProtocolRoute::Http) => Err(StoreError::invalid_argument(
-            "SNI route identities must use the TLS SNI protocol route",
-        )),
-    }
-}
-
 pub(crate) fn materialization_id(
     instance_id: &InstanceId,
     target: &MaterializationTarget,
@@ -498,13 +478,6 @@ pub(crate) fn materialization_state_to_db(state: MaterializationState) -> &'stat
     }
 }
 
-pub(crate) fn protocol_to_db(protocol: ProtocolRoute) -> &'static str {
-    match protocol {
-        ProtocolRoute::Http => "http",
-        ProtocolRoute::TlsSni => "tls_sni",
-    }
-}
-
 pub(crate) fn generation_to_i64(value: Generation) -> StoreResult<i64> {
     i64::try_from(value.get())
         .map_err(|_| StoreError::invalid_argument("generation does not fit in Postgres bigint"))
@@ -527,10 +500,6 @@ pub(crate) fn unix_millis_from_system_time(value: SystemTime) -> StoreResult<i64
             Ok(-millis)
         }
     }
-}
-
-pub(crate) fn default_negative_cache_policy() -> CachePolicy {
-    CachePolicy::new(Duration::from_secs(1))
 }
 
 fn route_identity_from_parts(
@@ -596,16 +565,6 @@ pub(crate) fn materialization_state_from_db(value: &str) -> StoreResult<Material
         "deleted" => Ok(MaterializationState::Deleted),
         other => Err(StoreError::internal(format!(
             "stored materialization state {other:?} is invalid"
-        ))),
-    }
-}
-
-fn protocol_from_db(value: &str) -> StoreResult<ProtocolRoute> {
-    match value {
-        "http" => Ok(ProtocolRoute::Http),
-        "tls_sni" => Ok(ProtocolRoute::TlsSni),
-        other => Err(StoreError::internal(format!(
-            "stored route protocol {other:?} is invalid"
         ))),
     }
 }
@@ -686,9 +645,7 @@ fn invalid_stored_data(error: impl std::fmt::Display) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::route_identity_key;
-    use crate::route::{
-        route_match_score, PathPrefix, ProtocolRoute, RouteBindingSpec, RouteHost, RouteIdentity,
-    };
+    use crate::route::{PathPrefix, RouteHost, RouteIdentity};
 
     #[test]
     fn route_identity_key_uses_normalized_domain_parts() {
@@ -701,132 +658,5 @@ mod tests {
             route_identity_key(&identity),
             "http:wildcard_suffix:example.com:/api"
         );
-    }
-
-    #[test]
-    fn route_match_prefers_specific_hosts_and_paths() {
-        let exact = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api").expect("valid prefix")),
-        };
-        let wildcard = RouteIdentity::Http {
-            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
-            path: None,
-        };
-        let lookup = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        };
-
-        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
-    }
-
-    #[test]
-    fn exact_host_beats_wildcard_even_when_wildcard_has_longer_path() {
-        let exact = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: None,
-        };
-        let wildcard = RouteIdentity::Http {
-            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        };
-        let lookup = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
-        };
-
-        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
-    }
-
-    #[test]
-    fn more_specific_wildcard_suffix_beats_broader_wildcard() {
-        let broad = RouteIdentity::Http {
-            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
-            path: None,
-        };
-        let specific = RouteIdentity::Http {
-            host: RouteHost::wildcard_suffix("customer.example.com").expect("valid host"),
-            path: None,
-        };
-        let lookup = RouteIdentity::Http {
-            host: RouteHost::exact("app.customer.example.com").expect("valid host"),
-            path: None,
-        };
-
-        assert!(route_match_score(&specific, &lookup) > route_match_score(&broad, &lookup));
-    }
-
-    #[test]
-    fn longest_path_prefix_wins_within_selected_host_rule() {
-        let short = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api").expect("valid prefix")),
-        };
-        let long = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1").expect("valid prefix")),
-        };
-        let lookup = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/v1/users").expect("valid prefix")),
-        };
-
-        assert!(route_match_score(&long, &lookup) > route_match_score(&short, &lookup));
-    }
-
-    #[test]
-    fn path_prefix_matching_respects_segment_boundaries() {
-        let api = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api").expect("valid prefix")),
-        };
-        let exact = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api").expect("valid prefix")),
-        };
-        let child = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/api/child").expect("valid prefix")),
-        };
-        let near_miss = RouteIdentity::Http {
-            host: RouteHost::exact("app.example.com").expect("valid host"),
-            path: Some(PathPrefix::new("/apix").expect("valid prefix")),
-        };
-
-        assert!(route_match_score(&api, &exact).is_some());
-        assert!(route_match_score(&api, &child).is_some());
-        assert!(route_match_score(&api, &near_miss).is_none());
-    }
-
-    #[test]
-    fn sni_routes_support_exact_and_wildcard_matching() {
-        let exact = RouteIdentity::Sni {
-            host: RouteHost::exact("db.example.com").expect("valid host"),
-        };
-        let wildcard = RouteIdentity::Sni {
-            host: RouteHost::wildcard_suffix("example.com").expect("valid host"),
-        };
-        let lookup = RouteIdentity::Sni {
-            host: RouteHost::exact("db.example.com").expect("valid host"),
-        };
-        let miss = RouteIdentity::Sni {
-            host: RouteHost::exact("example.com").expect("valid host"),
-        };
-
-        assert!(route_match_score(&exact, &lookup) > route_match_score(&wildcard, &lookup));
-        assert!(route_match_score(&wildcard, &miss).is_none());
-    }
-
-    #[test]
-    fn route_protocol_validation_rejects_mismatched_identity() {
-        let spec = RouteBindingSpec::new(
-            RouteIdentity::Sni {
-                host: RouteHost::exact("db.example.com").expect("valid host"),
-            },
-            ProtocolRoute::Http,
-        );
-
-        assert!(super::validate_route_protocol(&spec).is_err());
     }
 }

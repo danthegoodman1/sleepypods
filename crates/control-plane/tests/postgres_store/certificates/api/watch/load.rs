@@ -21,18 +21,11 @@ async fn ordinary_progress(
     let instance_ms = started.elapsed().as_secs_f64() * 1000.0;
     let (send, input) = mpsc::channel(1);
     send.send(pb::ProxySubscribeRequest {
-        input: Some(pb::proxy_subscribe_request::Input::SubscribeRoute(
-            pb::ProxySubscribeRouteRequest {
-                request_id: "ordinary".into(),
-                identity: Some(pb::RouteIdentity {
-                    kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                        host: Some(pb::RouteHost {
-                            kind: pb::RouteHostKind::Exact as i32,
-                            host: "ordinary.example".into(),
-                        }),
-                        path_prefix: Some("/".into()),
-                    })),
-                }),
+        input: Some(pb::proxy_subscribe_request::Input::Subscribe(
+            pb::ProxySubscribeHostRequest {
+                subscription_id: 1,
+                kind: pb::RouteKind::Http as i32,
+                host: "ordinary.example".into(),
             },
         )),
     })
@@ -46,7 +39,7 @@ async fn ordinary_progress(
         let response = route.message().await?.ok_or("route closed")?;
         assert!(matches!(
             response.output,
-            Some(pb::proxy_subscribe_response::Output::RouteMiss(_))
+            Some(pb::proxy_subscribe_response::Output::Rules(rules)) if rules.rules.is_empty()
         ));
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })

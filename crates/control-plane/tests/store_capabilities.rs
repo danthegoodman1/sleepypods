@@ -189,11 +189,11 @@ impl ControlPlaneStore for CapabilityProbe {
     ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>> {
         self.fail("list_route_bindings_for_instance", format!("{request:?}"))
     }
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
-        self.fail("resolve_route", format!("{request:?}"))
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>> {
+        self.fail("resolve_host_rules", format!("{request:?}"))
     }
     fn compare_and_swap_instance_state<'a>(
         &'a self,
@@ -524,12 +524,7 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     check!(
         1,
         create_route_binding,
-        CreateRouteBindingRequest::new(
-            route.clone(),
-            instance.clone(),
-            identity.clone(),
-            ProtocolRoute::Http
-        )
+        CreateRouteBindingRequest::new(route.clone(), instance.clone(), identity.clone(),)
     );
     check!(
         2,
@@ -548,8 +543,12 @@ async fn every_required_capability_forwards_arguments_and_has_an_explicit_replay
     );
     check!(
         2,
-        resolve_route,
-        ResolveRouteRequest::new(identity, target.clone())
+        resolve_host_rules,
+        ResolveHostRulesRequest::new(
+            control_plane::RouteKind::Http,
+            identity.host().clone(),
+            target.clone()
+        )
     );
     check!(
         2,

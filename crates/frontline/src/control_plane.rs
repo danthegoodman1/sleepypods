@@ -7,12 +7,12 @@ use std::{
 use sleepypods_api::{
     pb, BackendEndpoint, BackendGeneration, CachePolicy, Generation, Http01ChallengeKey,
     Http01ChallengeRecord, InstanceId, InstanceState, PathPrefix, RouteBindingId, RouteEntry,
-    RouteHost, RouteHostKind, RouteIdentity,
+    RouteHost, RouteIdentity, RouteKind, RouteRule,
 };
 
 use crate::{
-    InvalidationReason, ProxySubscribeInput, RouteRequestId, SubscribeControlPlaneOutput,
-    SubscriptionId, WakeInstanceRequest, WakeInstanceResponse,
+    RouteStreamReply, RouteStreamRequest, SubscribeErrorCode, WakeInstanceRequest,
+    WakeInstanceResponse,
 };
 
 const INVALID_CACHE_TTL_MILLIS: u64 = u64::MAX;
@@ -36,18 +36,21 @@ pub enum ProxyProtocolAdapterError {
     },
 }
 
-pub fn proxy_subscribe_input_to_proto(input: ProxySubscribeInput) -> pb::ProxySubscribeRequest {
-    let input = match input {
-        ProxySubscribeInput::SubscribeRoute {
-            request_id,
-            identity,
-        } => pb::proxy_subscribe_request::Input::SubscribeRoute(pb::ProxySubscribeRouteRequest {
-            request_id: request_id.as_str().to_owned(),
-            identity: Some(route_identity_to_proto(identity)),
-        }),
-        ProxySubscribeInput::Unsubscribe { subscription_id } => {
+pub fn route_stream_request_to_proto(request: RouteStreamRequest) -> pb::ProxySubscribeRequest {
+    let input = match request {
+        RouteStreamRequest::Subscribe { id, kind, host } => {
+            pb::proxy_subscribe_request::Input::Subscribe(pb::ProxySubscribeHostRequest {
+                subscription_id: id,
+                kind: match kind {
+                    RouteKind::Http => pb::RouteKind::Http,
+                    RouteKind::Sni => pb::RouteKind::Sni,
+                } as i32,
+                host: host.as_str().to_owned(),
+            })
+        }
+        RouteStreamRequest::Unsubscribe { id } => {
             pb::proxy_subscribe_request::Input::Unsubscribe(pb::ProxyUnsubscribeRequest {
-                subscription_id: subscription_id.as_str().to_owned(),
+                subscription_id: id,
             })
         }
     };
@@ -86,61 +89,27 @@ pub fn http01_challenge_record_from_proto(
     )
 }
 
-pub fn proxy_subscribe_response_from_proto(
+pub fn route_stream_reply_from_proto(
     response: pb::ProxySubscribeResponse,
-) -> Result<SubscribeControlPlaneOutput, ProxyProtocolAdapterError> {
+) -> Result<RouteStreamReply, ProxyProtocolAdapterError> {
     match response
         .output
         .ok_or(ProxyProtocolAdapterError::MissingField { field: "output" })?
     {
-        pb::proxy_subscribe_response::Output::RouteResolved(response) => {
-            Ok(SubscribeControlPlaneOutput::RouteResolved {
-                request_id: route_request_id(response.request_id)?,
-                subscription_id: subscription_id(response.subscription_id)?,
-                matched_identity: route_identity_from_required_proto(
-                    response.matched_identity,
-                    "matched_identity",
-                )?,
-                entry: route_entry_from_required_proto(response.route, "route")?,
-                cache_policy: cache_policy_from_required_proto(
-                    response.cache_policy,
-                    "cache_policy",
-                )?,
-            })
-        }
-        pb::proxy_subscribe_response::Output::RouteMiss(response) => {
-            Ok(SubscribeControlPlaneOutput::RouteMiss {
-                request_id: route_request_id(response.request_id)?,
-                request_identity: route_identity_from_required_proto(
-                    response.request_identity,
-                    "request_identity",
-                )?,
-                negative_cache_policy: cache_policy_from_required_proto(
-                    response.negative_cache_policy,
-                    "negative_cache_policy",
-                )?,
-            })
-        }
-        pb::proxy_subscribe_response::Output::RouteUpdated(response) => {
-            Ok(SubscribeControlPlaneOutput::RouteUpdated {
-                subscription_id: subscription_id(response.subscription_id)?,
-                matched_identity: route_identity_from_required_proto(
-                    response.matched_identity,
-                    "matched_identity",
-                )?,
-                entry: route_entry_from_required_proto(response.route, "route")?,
-                cache_policy: cache_policy_from_required_proto(
-                    response.cache_policy,
-                    "cache_policy",
-                )?,
-            })
-        }
-        pb::proxy_subscribe_response::Output::RouteInvalidated(response) => {
-            Ok(SubscribeControlPlaneOutput::RouteInvalidated {
-                subscription_id: subscription_id(response.subscription_id)?,
-                reason: invalidation_reason_from_proto(response.reason)?,
-            })
-        }
+        pb::proxy_subscribe_response::Output::Rules(response) => Ok(RouteStreamReply::Rules {
+            id: response.subscription_id,
+            rules: response
+                .rules
+                .into_iter()
+                .map(route_rule_from_proto)
+                .collect::<Result<_, _>>()?,
+            cache_policy: cache_policy_from_required_proto(response.cache_policy, "cache_policy")?,
+        }),
+        pb::proxy_subscribe_response::Output::Error(response) => Ok(RouteStreamReply::Error {
+            id: response.subscription_id,
+            code: subscribe_error_code_from_proto(response.code)?,
+            message: response.message,
+        }),
     }
 }
 
@@ -199,20 +168,6 @@ impl fmt::Display for ProxyProtocolAdapterError {
 
 impl Error for ProxyProtocolAdapterError {}
 
-fn route_request_id(value: String) -> Result<RouteRequestId, ProxyProtocolAdapterError> {
-    RouteRequestId::new(value).map_err(|error| ProxyProtocolAdapterError::InvalidField {
-        field: error.field(),
-        message: error.to_string(),
-    })
-}
-
-fn subscription_id(value: String) -> Result<SubscriptionId, ProxyProtocolAdapterError> {
-    SubscriptionId::new(value).map_err(|error| ProxyProtocolAdapterError::InvalidField {
-        field: error.field(),
-        message: error.to_string(),
-    })
-}
-
 fn instance_id(value: String) -> Result<InstanceId, ProxyProtocolAdapterError> {
     InstanceId::new(value).map_err(|error| ProxyProtocolAdapterError::InvalidField {
         field: error.field(),
@@ -234,18 +189,19 @@ fn backend_endpoint(value: String) -> Result<BackendEndpoint, ProxyProtocolAdapt
     })
 }
 
-fn route_identity_from_required_proto(
-    identity: Option<pb::RouteIdentity>,
-    field: &'static str,
-) -> Result<RouteIdentity, ProxyProtocolAdapterError> {
-    route_identity_from_proto(identity.ok_or(ProxyProtocolAdapterError::MissingField { field })?)
-}
-
-fn route_entry_from_required_proto(
-    route: Option<pb::ProxyRouteEntry>,
-    field: &'static str,
-) -> Result<RouteEntry, ProxyProtocolAdapterError> {
-    route_entry_from_proto(route.ok_or(ProxyProtocolAdapterError::MissingField { field })?)
+fn route_rule_from_proto(rule: pb::ProxyRouteRule) -> Result<RouteRule, ProxyProtocolAdapterError> {
+    Ok(RouteRule {
+        identity: route_identity_from_proto(rule.identity.ok_or(
+            ProxyProtocolAdapterError::MissingField {
+                field: "rule.identity",
+            },
+        )?)?,
+        entry: route_entry_from_proto(rule.route.ok_or(
+            ProxyProtocolAdapterError::MissingField {
+                field: "rule.route",
+            },
+        )?)?,
+    })
 }
 
 fn cache_policy_from_required_proto(
@@ -402,25 +358,18 @@ fn cache_policy_from_proto(
     Ok(CachePolicy::new(ttl))
 }
 
-fn invalidation_reason_from_proto(
+fn subscribe_error_code_from_proto(
     value: i32,
-) -> Result<InvalidationReason, ProxyProtocolAdapterError> {
-    match pb::ProxyRouteInvalidationReason::try_from(value).map_err(|_| {
-        ProxyProtocolAdapterError::InvalidEnum {
-            field: "route_invalidation.reason",
-            value,
+) -> Result<SubscribeErrorCode, ProxyProtocolAdapterError> {
+    match pb::ProxySubscribeErrorCode::try_from(value) {
+        Ok(pb::ProxySubscribeErrorCode::InvalidArgument) => Ok(SubscribeErrorCode::InvalidArgument),
+        Ok(pb::ProxySubscribeErrorCode::ResourceExhausted) => {
+            Ok(SubscribeErrorCode::ResourceExhausted)
         }
-    })? {
-        pb::ProxyRouteInvalidationReason::RouteRemoved => Ok(InvalidationReason::RouteRemoved),
-        pb::ProxyRouteInvalidationReason::RouteChanged => Ok(InvalidationReason::RouteChanged),
-        pb::ProxyRouteInvalidationReason::InstanceChanged => {
-            Ok(InvalidationReason::InstanceChanged)
-        }
-        pb::ProxyRouteInvalidationReason::BackendChanged => Ok(InvalidationReason::BackendChanged),
-        pb::ProxyRouteInvalidationReason::StreamClosed => Ok(InvalidationReason::StreamClosed),
-        pb::ProxyRouteInvalidationReason::Unspecified => {
+        Ok(pb::ProxySubscribeErrorCode::Unavailable) => Ok(SubscribeErrorCode::Unavailable),
+        Ok(pb::ProxySubscribeErrorCode::Unspecified) | Err(_) => {
             Err(ProxyProtocolAdapterError::InvalidEnum {
-                field: "route_invalidation.reason",
+                field: "subscribe_error.code",
                 value,
             })
         }
@@ -444,36 +393,6 @@ fn wake_unavailable_reason_from_proto(
                 value,
             })
         }
-    }
-}
-
-fn route_identity_to_proto(identity: RouteIdentity) -> pb::RouteIdentity {
-    let kind = match identity {
-        RouteIdentity::Http { host, path } => {
-            pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                host: Some(route_host_to_proto(host)),
-                path_prefix: path.map(|path| path.as_str().to_owned()),
-            })
-        }
-        RouteIdentity::Sni { host } => pb::route_identity::Kind::Sni(pb::SniRouteIdentity {
-            host: Some(route_host_to_proto(host)),
-        }),
-    };
-
-    pb::RouteIdentity { kind: Some(kind) }
-}
-
-fn route_host_to_proto(host: RouteHost) -> pb::RouteHost {
-    pb::RouteHost {
-        kind: route_host_kind_to_proto(host.kind()) as i32,
-        host: host.as_str().to_owned(),
-    }
-}
-
-fn route_host_kind_to_proto(kind: RouteHostKind) -> pb::RouteHostKind {
-    match kind {
-        RouteHostKind::Exact => pb::RouteHostKind::Exact,
-        RouteHostKind::WildcardSuffix => pb::RouteHostKind::WildcardSuffix,
     }
 }
 

@@ -510,28 +510,8 @@ where
                 });
                 response.map(|body| body.map_err(|error| match error {}).boxed_unsync())
             }
-            Ok(outcome) => route_outcome_response(outcome),
+            Ok(outcome) => crate::runtime::route_outcome_response(outcome),
             Err(error) => crate::runtime::route_resolution_error_response(error),
-        }
-    }
-}
-
-fn route_outcome_response(
-    outcome: FrontlineRouteOutcome,
-) -> http::Response<crate::FrontlineRuntimeBody> {
-    match outcome {
-        FrontlineRouteOutcome::Ready(_) => {
-            unreachable!("ready route outcomes are upgraded before response mapping")
-        }
-        FrontlineRouteOutcome::Miss(_) => status_response(StatusCode::NOT_FOUND),
-        FrontlineRouteOutcome::Waiting(_)
-        | FrontlineRouteOutcome::Waking { .. }
-        | FrontlineRouteOutcome::Unavailable(_)
-        | FrontlineRouteOutcome::WakeFailed { .. }
-        | FrontlineRouteOutcome::WakeUnavailable { .. }
-        | FrontlineRouteOutcome::GenerationConflict { .. }
-        | FrontlineRouteOutcome::RejectedWakeObservation(_) => {
-            status_response(StatusCode::SERVICE_UNAVAILABLE)
         }
     }
 }

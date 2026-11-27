@@ -46,12 +46,7 @@ where
 }
 
 fn route(route_binding_id: &str, instance_id: &str, host: &str) -> CreateRouteBindingRequest {
-    create_route_binding_request(
-        route_binding_id,
-        instance_id,
-        http_identity(host, None),
-        ProtocolRoute::Http,
-    )
+    create_route_binding_request(route_binding_id, instance_id, http_identity(host, None))
 }
 
 fn spawn_create(store: &PostgresStore, request: &CreateInstanceRequest) -> CreateTask {

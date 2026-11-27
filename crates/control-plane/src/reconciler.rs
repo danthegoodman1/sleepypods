@@ -22,7 +22,6 @@ use sleepypods_observability::{
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    api::RouteSubscriptionBroker,
     ids::InstanceId,
     instance::{GetInstanceRequest, InstanceRecord, InstanceState},
     manifest::{render_manifests_with_options, RenderManifestRequest},
@@ -58,7 +57,6 @@ pub struct MaterializationReconciler<C> {
     target: crate::materialization::MaterializationTarget,
     config: MaterializationReconcilerConfig,
     observability: ObservabilityRecorder,
-    route_events: RouteSubscriptionBroker,
     cancellation: crate::runtime_work::Cancellation,
 }
 
@@ -103,14 +101,8 @@ where
             target,
             config,
             observability,
-            route_events: RouteSubscriptionBroker::new(),
             cancellation: crate::runtime_work::Cancellation::new(),
         }
-    }
-
-    pub fn with_route_events(mut self, route_events: RouteSubscriptionBroker) -> Self {
-        self.route_events = route_events;
-        self
     }
 
     pub async fn run_until_shutdown(
@@ -489,8 +481,7 @@ where
         );
         complete.rendered_objects = materialization.rendered_objects.clone();
         complete.exclusivity_keys = materialization.exclusivity_keys.clone();
-        let result = self
-            .store
+        self.store
             .complete_wake_reconciliation(CompleteWakeReconciliationRequest::new(
                 materialization.id.clone(),
                 self.config.owner.clone(),
@@ -503,8 +494,6 @@ where
             ))
             .await
             .map_err(MaterializationReconcileError::Store)?;
-        self.notify_instance_routes_changed(result.instance.id)
-            .await?;
         Ok(())
     }
 
@@ -535,8 +524,7 @@ where
             return self.mark_deleted(materialization).await;
         }
 
-        let result = self
-            .store
+        self.store
             .finalize_sleep_reconciliation(FinalizeSleepReconciliationRequest::new(
                 materialization.id.clone(),
                 self.config.owner.clone(),
@@ -549,16 +537,6 @@ where
             ))
             .await
             .map_err(MaterializationReconcileError::Store)?;
-        self.notify_instance_routes_changed(result.instance.id)
-            .await?;
-        Ok(())
-    }
-
-    async fn notify_instance_routes_changed(
-        &self,
-        instance_id: InstanceId,
-    ) -> Result<(), MaterializationReconcileError> {
-        self.route_events.notify_instance_changed(instance_id);
         Ok(())
     }
 
@@ -859,7 +837,6 @@ where
             target: self.target.clone(),
             config: self.config.clone(),
             observability: self.observability.clone(),
-            route_events: self.route_events.clone(),
             cancellation: self.cancellation.clone(),
         }
     }
@@ -2452,7 +2429,7 @@ mod tests {
             create_route_binding,
             get_route_binding,
             delete_route_binding,
-            resolve_route,
+            resolve_host_rules,
             compare_and_swap_instance_state,
             record_materialization,
             load_ready_materialization,

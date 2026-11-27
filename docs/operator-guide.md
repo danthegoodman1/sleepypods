@@ -328,16 +328,15 @@ Sidecars use their configured TCP setup timeout and the same two-second TLS
 handshake timeout. Canceling an async caller does not stop an operating-system
 DNS lookup already running on a blocking worker.
 
-`SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS` sets the positive route
-cache lifetime the control plane hands to proxies, sixty seconds by default and
-at most ten minutes. Subscription invalidations, not this TTL, keep proxy caches
-fresh; the TTL bounds how long a dropped invalidation can go unnoticed. A proxy
-keeps its cached answers across an orderly stream rotation and registers them
-again on the replacement stream, so the TTL outlives
-`SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS`; a session that dropped
-events discards its cache instead. Lowering the TTL increases control-plane
-load: an expiring entry costs one unsubscribe and one subscribe per route per
-proxy.
+`SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS` sets how long a proxy
+may serve a host's rule set with no word from the control plane: ninety seconds
+by default and at most fifteen minutes. Pushed rule sets keep proxy caches
+fresh; the TTL bounds a proxy whose stream is gone. A proxy keeps the rule sets
+in use across an orderly stream rotation and registers them again on the
+replacement stream, which renews each TTL. The control plane therefore refuses
+to start unless the TTL exceeds
+`SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS` by at least ten seconds. A
+stream that ends with an error makes the proxy discard its cache instead.
 
 The control plane applies `SLEEPYPODS_CONTROL_PLANE_SETUP_TIMEOUT_MS` (five
 seconds by default) to the complete server-side TLS handshake as well as initial
@@ -588,21 +587,30 @@ Add a route or custom domain:
 CreateRouteBinding({
   route_binding_id: "route-tenant-a-app",
   instance_id: "tenant-a",
-  protocol: PROTOCOL_ROUTE_HTTP,
   identity: {http: {host: {kind: ROUTE_HOST_KIND_EXACT, host: "app.example.com"},
     path_prefix: "/"}}
 })
 ```
 
 Use `ROUTE_HOST_KIND_WILDCARD_SUFFIX` for wildcard suffix routing, for example
-`host: "*.apps.example.com"`. Use `PROTOCOL_ROUTE_TLS_SNI` with `identity.sni`
-for TLS/SNI passthrough routes.
+`host: "*.apps.example.com"`. Use `identity.sni` for TLS/SNI passthrough
+routes; the identity kind selects the protocol.
 
 A route host is an ASCII DNS name or IPv4 address without a port or path, at
 most 253 characters long. Each dot-separated label has 1 to 63 letters, digits,
 hyphens or underscores and starts and ends without a hyphen. The control plane
 lowercases the host and rejects any other form with `InvalidArgument`, so every
-stored route names a host a request can carry.
+stored route names a host a request can carry. A path prefix starts with `/`
+and is at most 4,096 bytes, the longest path frontline routes.
+
+A host's rule set holds its exact bindings and the wildcard bindings on its
+suffixes, and one Subscribe answer carries it. `CreateRouteBinding` and
+`CreateInstance` therefore return `InvalidArgument` for a route that would give
+any name more than 256 rules, or rules counting over 1 MiB: each rule counts
+its route binding ID, instance ID, host and path prefix plus 512 bytes. A
+wildcard counts toward every name under its suffix, so one wildcard can fill
+many hosts at once. Route creates take turns across the store, so concurrent
+creates cannot overfill a name.
 
 Add an HTTP-01 challenge token:
 
@@ -759,22 +767,51 @@ errors and expired wake deadlines publish Failed and queue safe cleanup. The
 original wake reason survives cleanup retries; a new wake can start after cleanup
 finishes. Failed cleanup and uncertain effects retain refs and exclusivity.
 
-Every semantic route/lifecycle write records change intent in its transaction.
-Each control-plane process independently polls targeted history every 250ms in
-batches of 1024. Unrelated instance changes leave existing hot subscriptions
-intact. Transactional revision reservation orders commits; it adds a short shared
-row-lock section to semantic writes. History retains at most 100000 records and
-maintenance removes an expired ten-minute prefix. Lag beyond retained history or
-a dispatcher read failure resets subscriptions. Five consecutive dispatcher or
-maintenance failures stop the runtime. Under healthy storage, an unbacklogged
-change is dispatched within one polling interval plus database/scheduling time;
-a backlog requires additional batches. This is not a hard wall-clock guarantee
-during storage failure. Positive cache TTL is sixty seconds by default and
-negative TTL is one second, providing a bounded fallback even when transport
-notification fails. Reaching `SUBSCRIPTION_LIFETIME_MS` ends a stream in order,
-and the proxy keeps serving its cached answers while it registers them on the
-replacement stream. A session that dropped events discards its cache, because a
-lost invalidation can name any cached route.
+Every semantic route/lifecycle write records change intent in its transaction,
+and the same trigger sends a PostgreSQL notification that is delivered at
+commit. Each control-plane process holds one dedicated listening connection and
+reads the change history when notified, in batches of 1024; a 250ms poll covers
+a missed notification or a listening connection that is reconnecting. The
+dispatcher loads its cursor before any listener serves, so a subscription can
+never predate it. Transactional revision reservation orders commits; it adds a
+short shared row-lock section to semantic writes. History retains at most 100000
+records and maintenance removes an expired ten-minute prefix.
+
+A proxy subscribes to one exact host at a time and receives that host's complete
+rule set. The control plane sends the set again when a binding for the host or
+a covering wildcard suffix is added or removed, and when an instance or
+materialization behind one of its rules changes. Changes to other hosts and
+instances leave a subscription untouched. Under healthy storage a change reaches
+subscribed proxies within the notification, one history read and one rule-set
+lookup; a backlog requires additional batches. This is not a hard wall-clock
+guarantee during storage failure.
+
+Failures stay as narrow as their cause:
+
+- A lookup that fails ends that subscription with an error code and leaves the
+  stream and its other subscriptions in place: an invalid host
+  (`INVALID_ARGUMENT`), a store error or lookup timeout (`UNAVAILABLE`), or the
+  per-stream subscription limit (`RESOURCE_EXHAUSTED`). A proxy at the limit
+  releases its oldest hosts and asks again.
+- Route creation keeps every rule set within 256 bindings and one 1MiB
+  answer. A lookup that still finds a larger set refuses the host with
+  `INVALID_ARGUMENT`; requests for that host fail until bindings are removed,
+  and other hosts are unaffected.
+- A failed read of the change history leaves streams open and the cursor in
+  place. The dispatcher reads again on the next notification or poll.
+- Lag beyond retained history, a change record the dispatcher cannot read, or a
+  stream that falls 4096 events behind ends the affected streams with
+  `DATA_LOSS`. A proxy that leaves its response queue full for
+  `RESPONSE_TIMEOUT_MS` ends its stream with `DEADLINE_EXCEEDED`. A proxy
+  discards its whole cache after either, because a lost change can name any
+  cached host, and reconnects after 250ms.
+- Reaching `SUBSCRIPTION_LIFETIME_MS` ends a stream in order. The proxy
+  reconnects at once, keeps serving the rule sets in use and registers them on
+  the replacement stream.
+- Five consecutive maintenance failures stop the runtime.
+
+Positive cache TTL is ninety seconds by default and negative TTL is one second.
+They bound what a proxy serves when its stream is gone.
 
 Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 
@@ -782,20 +819,21 @@ Native gRPC and optional gRPC-web share finite admission. Defaults and controls:
 | --- | --- |
 | `MAX_CONNECTIONS` | 256 accepted sockets, shared across listeners |
 | `MAX_RPCS` | 128 unary handlers/responses including final queued DATA |
-| `MAX_SUBSCRIPTION_STREAMS` | 64 owned streams including queued DATA |
-| `MAX_SUBSCRIPTIONS_PER_STREAM` | 256 dependency entries |
+| `MAX_SUBSCRIPTION_STREAMS` | 64 owned streams including queued DATA; each frontline replica holds one |
+| `MAX_SUBSCRIPTIONS_PER_STREAM` | 2048 host subscriptions, at most 4096 |
 | `SETUP_TIMEOUT_MS` / `WRITE_TIMEOUT_MS` | 5000 / 5000 |
 | `UNARY_DELIVERY_TIMEOUT_MS` | 5000 from response headers to complete delivery |
-| `SUBSCRIPTION_LIFETIME_MS` | 60000, at most 600000; then reconnect/refresh |
+| `SUBSCRIPTION_LIFETIME_MS` | 60000, at most 600000; then the proxy reconnects and registers its hosts again |
 | `LOOKUP_TIMEOUT_MS` / `RESPONSE_TIMEOUT_MS` | 3000 / 1000 |
-| `POSITIVE_ROUTE_CACHE_TTL_MS` | 60000, at most 600000; bounds a missed invalidation |
+| `POSITIVE_ROUTE_CACHE_TTL_MS` | 90000, at most 900000, and at least `SUBSCRIPTION_LIFETIME_MS` plus 10000 |
 
 Admission occurs before connection tasks or protobuf decoding. Each connection
 allows 32 H2 streams; protobuf requests/responses are capped at 256KiB/1MiB.
-Subscription IDs/request IDs, hosts and paths have byte-length bounds. Producers
-have a 16-response queue and stop when enqueue blocks for the response timeout.
-Transport capacity may remain held until the separate subscription lifetime;
-it does not necessarily return within the producer timeout. Unary delivery uses
+A subscribed host is at most 253 bytes. Each stream runs 16 rule-set lookups at
+once and queues 64 responses; it ends when a response waits for the response
+timeout to be queued. Transport capacity may remain held until the subscription
+lifetime plus the response timeout; it does not necessarily return within the
+producer timeout. Unary delivery uses
 a total delivery deadline, not an inactivity timeout. An H2 peer that answers
 PING while withholding credit is closed on its delivery/subscription deadline;
 public tonic/Hyper cannot reset an already queued final DATA frame individually,
@@ -819,18 +857,20 @@ event retention. Instance generation watermarks are preserved.
   instance remains `Draining`. Cleanup waits for the complete persisted grace;
   finishing cleanup and promoting the queued wake are one transaction. Delete
   cancels the queued wake in its acceptance transaction.
-- Hot route: the frontline uses its local route cache and must not call the
-  control plane on measured hot-cache hits.
+- Hot route: the frontline answers from its local route cache. After one lookup
+  for a host, every path on that host resolves locally, and measured hot-cache
+  hits must not call the control plane.
 - Idle sleep and drain: a report from the exact current projection and live Pod
   UID starts a persisted drain deadline. Ordinary and manual reconciliation both
   honor that deadline before deleting recorded objects. A report from an older
   projection cannot authorize sleep of a replacement.
-- Delete: operator delete durably accepts generation-checked intent and
-  invalidates route dependencies. The reconciler removes active materialization
+- Delete: operator delete durably accepts generation-checked intent, and
+  subscribed proxies receive the changed rule sets. The reconciler removes active materialization
   objects and finalizes deletion; acceptance does not mean cleanup has finished.
-- Route/domain change: create/delete route bindings through the API. Active
-  proxy subscriptions are invalidated so the next request resolves the new
-  route instead of relying only on TTL expiry.
+- Route/domain change: create/delete route bindings through the API. Proxies
+  subscribed to an affected host receive its new rule set, so the change takes
+  effect without waiting for a TTL. Moving a route by deleting one binding and
+  creating another leaves the host without a route between the two commits.
 - Restart recovery: durable state is in Postgres. Control-plane restart resumes
   discoverable work and route notifications without a new client RPC. Ambiguous
   mutating effects retain inventory and reservations until audited recovery; see
@@ -914,7 +954,7 @@ Important environment variables:
 | frontline | `SLEEPYPODS_CONTROL_PLANE_ENDPOINT` |
 | frontline | `SLEEPYPODS_CONTROL_PLANE_PROXY_TOKEN` when control-plane static auth is enabled |
 | control plane / frontline / sidecar | `SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM` optional public trust for a private platform CA; control plane injects it into rendered sidecars |
-| frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` |
+| frontline | `SLEEPYPODS_ROUTE_CACHE_CAPACITY` optional, default `1024` hosts with routes and as many hosts without; keep it under the control plane's `MAX_SUBSCRIPTIONS_PER_STREAM` |
 | frontline | `SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS` optional, default `30000` |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_TERMINATION_LISTEN_ADDR` optional |
 | frontline | `SLEEPYPODS_FRONTLINE_TLS_PASSTHROUGH_LISTEN_ADDR` optional |

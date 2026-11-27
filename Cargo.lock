@@ -63,6 +63,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -339,6 +348,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "deadpool-postgres",
+ "frontline",
  "futures-util",
  "http",
  "http-body",
@@ -708,6 +718,7 @@ dependencies = [
 name = "frontline"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "criterion",
  "futures-util",

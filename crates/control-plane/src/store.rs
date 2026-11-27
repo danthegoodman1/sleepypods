@@ -23,9 +23,9 @@ use crate::{
         RenewMaterializationReconciliationLeaseRequest,
     },
     route::{
-        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-        ListRouteBindingsForInstanceRequest, ResolveRouteRequest, RouteBindingRecord,
-        RouteDependencyLookup, RouteDependencySet, RouteResolution,
+        CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest, HostRules,
+        ListRouteBindingsForInstanceRequest, ResolveHostRulesRequest, RouteBindingRecord,
+        RouteDependencyLookup, RouteDependencySet,
     },
     workload::{
         CreateWorkloadClassVersionRequest, LoadWorkloadClassVersionRequest, WorkloadClassVersion,
@@ -93,6 +93,13 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> StoreFuture<'_, StoreResult<crate::runtime_work::DurableRouteChanges>>;
 
     fn load_route_change_revision(&self) -> StoreFuture<'_, StoreResult<u64>>;
+
+    /// Wakes its waiter when route-change history may have advanced. A store
+    /// that cannot push returns a signal that stays quiet, and the caller's
+    /// poll finds the change.
+    fn route_change_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::new(tokio::sync::Notify::new())
+    }
 
     fn load_materialization_work_status(
         &self,
@@ -171,10 +178,10 @@ pub trait ControlPlaneStore: Send + Sync {
         request: ListRouteBindingsForInstanceRequest,
     ) -> StoreFuture<'a, StoreResult<Vec<RouteBindingRecord>>>;
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>>;
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>>;
 
     fn compare_and_swap_instance_state<'a>(
         &'a self,
@@ -466,6 +473,9 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
             store.load_route_change_revision()
         })
     }
+    fn route_change_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.route_change_signal()
+    }
     fn load_materialization_work_status(
         &self,
         id: crate::ids::MaterializationId,
@@ -597,12 +607,12 @@ impl ControlPlaneStore for RetryingControlPlaneStore {
         })
     }
 
-    fn resolve_route<'a>(
+    fn resolve_host_rules<'a>(
         &'a self,
-        request: ResolveRouteRequest,
-    ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+        request: ResolveHostRulesRequest,
+    ) -> StoreFuture<'a, StoreResult<HostRules>> {
         retry_store_operation(&self.inner, self.policy, move |store| {
-            store.resolve_route(request.clone())
+            store.resolve_host_rules(request.clone())
         })
     }
 
@@ -1098,10 +1108,10 @@ mod tests {
             not_implemented()
         }
 
-        fn resolve_route<'a>(
+        fn resolve_host_rules<'a>(
             &'a self,
-            _request: ResolveRouteRequest,
-        ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+            _request: ResolveHostRulesRequest,
+        ) -> StoreFuture<'a, StoreResult<HostRules>> {
             not_implemented()
         }
 

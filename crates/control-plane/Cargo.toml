@@ -10,6 +10,7 @@ deadpool-postgres = "0.14.1"
 http-body.workspace = true
 k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 kube = { version = "4.0.0", default-features = false, features = ["client", "rustls-tls"] }
+prost = "0.14.4"
 ring = "0.17"
 rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -30,12 +31,12 @@ zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 bytes = { workspace = true, default-features = true }
+frontline = { path = "../frontline" }
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 http = { workspace = true, default-features = false, features = ["std"] }
 http-body-util = { workspace = true, default-features = true }
 hyper = { workspace = true, default-features = false, features = ["client", "http2"] }
 hyper-util = { workspace = true, default-features = false, features = ["tokio"] }
-prost = "0.14.4"
 rcgen = "0.14"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util", "time"], default-features = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }

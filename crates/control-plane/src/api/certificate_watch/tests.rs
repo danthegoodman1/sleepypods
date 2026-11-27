@@ -34,7 +34,7 @@ impl ControlPlaneStore for TestStore {
         get_route_binding,
         delete_route_binding,
         list_route_bindings_for_instance,
-        resolve_route,
+        resolve_host_rules,
         compare_and_swap_instance_state,
         record_materialization,
         load_ready_materialization,

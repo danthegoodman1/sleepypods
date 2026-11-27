@@ -24,9 +24,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     api::{
-        operator_grpc_service_with_store_and_route_events,
-        proxy_grpc_service_with_store_and_route_events,
-        sidecar_grpc_service_with_store_and_route_events, RouteSubscriptionBroker,
+        operator_grpc_service_with_store, proxy_grpc_service_with_store_and_route_events,
+        sidecar_grpc_service_with_store, RouteSubscriptionBroker,
     },
     auth::{AuthConfig, ControlPlaneAuth, InvalidStaticBearerTokens, StaticBearerTokens},
     config::{ControlPlaneConfig, PostgresStoreConfig},
@@ -276,19 +275,24 @@ impl RuntimeConfig {
             }
             api_limits.subscription_lifetime = std::time::Duration::from_millis(value);
         }
-        // The positive route cache TTL bounds how long a dropped invalidation
-        // can go unnoticed, so it is allowed past the 60s request-timeout cap
-        // the shared duration loop applies to request-scoped settings.
+        // The positive route cache TTL bounds how long a proxy serves a rule
+        // set after its stream is gone. It must outlast a stream rotation, so
+        // its cap sits above the lifetime's.
         if let Some(value) = postgres_positive_integer(
             &values,
             "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
         )? {
-            if value > 600_000 {
+            if value > 900_000 {
                 return Err(RuntimeConfigError::InvalidPostgresSetting {
                     name: "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
                 });
             }
             api_limits.positive_route_cache_ttl = std::time::Duration::from_millis(value);
+        }
+        if api_limits.validate().is_err() {
+            return Err(RuntimeConfigError::InvalidPostgresSetting {
+                name: "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
+            });
         }
         Ok(Self {
             security,
@@ -333,12 +337,7 @@ where
             ),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            sidecar_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            sidecar_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::SIDECAR_SERVICE_NAME,
                 crate::auth::CallerRole::Sidecar,
@@ -361,12 +360,7 @@ where
     let auth = ControlPlaneAuth::from_config(auth_config, ObservabilityRecorder::global());
     Ok(grpc_server(route_events.clone(), tls)?.add_service(
         tonic::service::interceptor::InterceptedService::new(
-            operator_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            operator_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
@@ -421,12 +415,7 @@ where
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            operator_grpc_service_with_store_and_route_events(
-                store,
-                materializer,
-                target,
-                route_events,
-            ),
+            operator_grpc_service_with_store(store, materializer, target),
             auth.interceptor(
                 crate::api::OPERATOR_SERVICE_NAME,
                 crate::auth::CallerRole::Operator,
@@ -533,8 +522,10 @@ where
         config.target.clone(),
         MaterializationReconcilerConfig::default(),
         ObservabilityRecorder::global(),
-    )
-    .with_route_events(route_events.clone());
+    );
+    // The cursor is fixed before any listener serves: a subscriber resolves
+    // only after this point, so every later change is dispatched to it.
+    let route_change_cursor = store.load_route_change_revision().await?;
     let mut listeners = JoinSet::new();
     listeners.spawn(async move {
         reconciler
@@ -546,7 +537,13 @@ where
     let dispatcher_events = route_events.clone();
     let dispatcher_shutdown = shutdown_tx.subscribe();
     listeners.spawn(async move {
-        dispatch_route_changes(dispatcher_store, dispatcher_events, dispatcher_shutdown).await
+        dispatch_route_changes(
+            dispatcher_store,
+            dispatcher_events,
+            route_change_cursor,
+            dispatcher_shutdown,
+        )
+        .await
     });
     let maintenance_store = store.clone();
     let maintenance_shutdown = shutdown_tx.subscribe();
@@ -682,46 +679,48 @@ async fn shutdown_signal() {
     }
 }
 
+/// The fallback poll for route changes; a store notification normally wakes
+/// the dispatcher first.
+const ROUTE_CHANGE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+const ROUTE_CHANGE_BATCH: u32 = 1024;
+
+/// Publishes committed route changes after `cursor` to this replica's
+/// subscribers. A failed read keeps the cursor, so the next wake retries and
+/// subscribers lose nothing; history that was pruned past the cursor resets
+/// them.
 pub async fn dispatch_route_changes(
     store: Arc<dyn ControlPlaneStore>,
     events: RouteSubscriptionBroker,
+    mut cursor: u64,
     mut shutdown: watch::Receiver<bool>,
 ) -> RuntimeResult<()> {
-    // Subscribers attach after this process starts and resolve against current
-    // state, so retained history predating it carries no information they lack.
-    // Replaying it also bursts the broadcast channel at the moment the control
-    // plane is coldest, and a subscriber that lags is dropped and made to reset.
-    let mut cursor: Option<u64> = None;
-    let mut failures = 0;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let changed = store.route_change_signal();
+    let mut poll = tokio::time::interval(ROUTE_CHANGE_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => { events.shutdown(); return Ok(()); },
-            _ = interval.tick() => {
-                let Some(start) = cursor else {
-                    match store.load_route_change_revision().await {
-                        Ok(revision) => { failures = 0; cursor = Some(revision); },
-                        Err(error) => {
-                            failures += 1;
-                            if failures >= 5 { return Err(Box::new(error)); }
-                        }
-                    }
-                    continue;
-                };
-                let batch = match store.load_route_changes(start, 1024).await {
-                    Ok(batch) => { failures = 0; batch },
-                    Err(error) => {
-                        events.reset(); failures += 1;
-                        if failures >= 5 { return Err(Box::new(error)); }
-                        continue;
-                    }
-                };
-                if batch.reset { events.reset(); }
-                for event in batch.events { events.publish_durable(&event)?; }
-                cursor = Some(batch.cursor);
+            _ = changed.notified() => {},
+            _ = poll.tick() => {},
+        }
+        while let Ok(batch) = store.load_route_changes(cursor, ROUTE_CHANGE_BATCH).await {
+            if batch.reset {
+                events.reset();
             }
+            let full = batch.events.len() == ROUTE_CHANGE_BATCH as usize;
+            for event in &batch.events {
+                if events.publish_durable(event).is_err() {
+                    // An unreadable record may name any subscription.
+                    events.reset();
+                }
+            }
+            cursor = batch.cursor;
+            if !full {
+                break;
+            }
+            // Subscribers drain the broadcast between batches.
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -1018,8 +1017,8 @@ pub(crate) mod tests {
         materializer::{KubernetesClientFuture, KubernetesClientResult, KubernetesMaterializer},
         route::{
             CreateRouteBindingRequest, DeleteRouteBindingRequest, GetRouteBindingRequest,
-            ResolveRouteRequest, RouteBindingRecord, RouteDependencyLookup, RouteDependencySet,
-            RouteResolution,
+            HostRules, ResolveHostRulesRequest, RouteBindingRecord, RouteDependencyLookup,
+            RouteDependencySet,
         },
         store::{StoreError, StoreFuture, StoreResult},
         workload::{
@@ -1177,6 +1176,10 @@ pub(crate) mod tests {
         for value in ["1", "60000", "300000", "600000"] {
             let mut env = valid_env();
             env.push((name, value));
+            env.push((
+                "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS",
+                "900000",
+            ));
             assert!(
                 RuntimeConfig::from_key_values(env).is_ok(),
                 "{name}={value}"
@@ -1191,6 +1194,38 @@ pub(crate) mod tests {
                 Err(RuntimeConfigError::InvalidPostgresSetting { name: actual }) if actual == name),
                 "{name}={value}"
             );
+        }
+    }
+
+    #[test]
+    fn route_cache_ttl_outlasts_a_stream_rotation() {
+        let lifetime = "SLEEPYPODS_CONTROL_PLANE_SUBSCRIPTION_LIFETIME_MS";
+        let ttl = "SLEEPYPODS_CONTROL_PLANE_POSITIVE_ROUTE_CACHE_TTL_MS";
+        let defaults = crate::api::admission::ApiLimits::default();
+        assert!(defaults.validate().is_ok());
+        assert!(
+            defaults.positive_route_cache_ttl
+                >= defaults.subscription_lifetime + crate::api::admission::ROUTE_TTL_MARGIN
+        );
+
+        for (lifetime_ms, ttl_ms, valid) in [
+            ("60000", "70000", true),
+            ("60000", "69999", false),
+            ("60000", "60000", false),
+            ("600000", "610000", true),
+            ("600000", "900001", false),
+        ] {
+            let mut env = valid_env();
+            env.push((lifetime, lifetime_ms));
+            env.push((ttl, ttl_ms));
+            let parsed = RuntimeConfig::from_key_values(env);
+            assert_eq!(parsed.is_ok(), valid, "{lifetime_ms} / {ttl_ms}");
+            if !valid {
+                assert!(matches!(
+                    parsed,
+                    Err(RuntimeConfigError::InvalidPostgresSetting { name }) if name == ttl
+                ));
+            }
         }
     }
 
@@ -1769,11 +1804,10 @@ pub(crate) mod tests {
     /// transport tests that need a real service behind the listener.
     pub(crate) fn noop_operator_service(
     ) -> crate::api::StoreBackedOperatorGrpcService<NoopKubernetesClient> {
-        operator_grpc_service_with_store_and_route_events(
+        operator_grpc_service_with_store(
             Arc::new(NoopStore),
             KubernetesMaterializer::new(NoopKubernetesClient),
             MaterializationTarget::new("cluster-a", "apps").expect("valid target"),
-            RouteSubscriptionBroker::new(),
         )
     }
 
@@ -1809,7 +1843,7 @@ pub(crate) mod tests {
             get_route_binding,
             delete_route_binding,
             list_route_bindings_for_instance,
-            resolve_route,
+            resolve_host_rules,
             compare_and_swap_instance_state,
             record_materialization,
             load_ready_materialization,
@@ -1959,10 +1993,10 @@ pub(crate) mod tests {
             not_implemented()
         }
 
-        fn resolve_route<'a>(
+        fn resolve_host_rules<'a>(
             &'a self,
-            _request: ResolveRouteRequest,
-        ) -> StoreFuture<'a, StoreResult<RouteResolution>> {
+            _request: ResolveHostRulesRequest,
+        ) -> StoreFuture<'a, StoreResult<HostRules>> {
             not_implemented()
         }
 
@@ -2171,6 +2205,67 @@ mod supervision_tests {
             .unwrap_err();
         assert!(error.to_string().contains("dispatcher exited"));
         assert!(broker.cancellation.is_cancelled());
+    }
+
+    /// A proxy keeps its route cache across a stream that ends in order, so
+    /// the lifetime must end the stream and leave the connection up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscribe_stream_ends_in_order_at_its_lifetime_over_the_production_transport() {
+        use crate::api::pb::proxy_control_plane_client::ProxyControlPlaneClient;
+        use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+        for _ in 0..16 {
+            let broker = RouteSubscriptionBroker::with_limits(crate::api::admission::ApiLimits {
+                subscription_lifetime: std::time::Duration::from_millis(50),
+                ..Default::default()
+            });
+            let incoming = crate::runtime_io::BoundedIncoming::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::new(tokio::sync::Semaphore::new(8)),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let address = incoming.local_addr().unwrap();
+            let (shutdown, receiver) = watch::channel(false);
+            let service = crate::api::proxy_grpc_service_with_store_and_route_events(
+                Arc::new(tests::NoopStore),
+                KubernetesMaterializer::new(tests::NoopKubernetesClient),
+                MaterializationTarget::new("cluster-a", "apps").unwrap(),
+                broker.clone(),
+            );
+            let mut server = grpc_server(broker.clone(), None).unwrap();
+            let serving = tokio::spawn(async move {
+                let _ = server
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(incoming, wait_for_shutdown(receiver))
+                    .await;
+            });
+            let mut client = ProxyControlPlaneClient::connect(format!("http://{address}"))
+                .await
+                .unwrap();
+            let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+            let mut responses = client
+                .subscribe(ReceiverStream::new(incoming))
+                .await
+                .unwrap()
+                .into_inner();
+
+            let end = tokio::time::timeout(std::time::Duration::from_secs(5), responses.message())
+                .await
+                .expect("the stream ends at its lifetime");
+            assert!(matches!(end, Ok(None)), "the stream ends in order: {end:?}");
+            // The connection that carried the stream opens the next one.
+            let (_requests, incoming) = tokio::sync::mpsc::channel(1);
+            client
+                .subscribe(ReceiverStream::new(incoming))
+                .await
+                .expect("the connection outlives the stream");
+
+            let _ = shutdown.send(true);
+            broker.shutdown();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
+        }
     }
 
     #[cfg(unix)]

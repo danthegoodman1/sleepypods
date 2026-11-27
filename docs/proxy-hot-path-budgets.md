@@ -230,7 +230,7 @@ Host header.
 
 Before measuring the HTTP/1.1 frontline path, the script waits for one
 successful frontline request. That request validates lazy route resolution
-through `SubscribeRoute` and warms the route cache; the measured frontline phase
+through a `Subscribe` host lookup and warms the route cache; the measured frontline phase
 then uses the cached ready route. The helper exposes a small stats endpoint for
 the fake control plane, and the script fails if the measured hot-cache
 frontline phase increments `subscribe_route_calls`.
@@ -244,8 +244,8 @@ requests over that long-lived channel, matching how generated gRPC clients
 such as tonic and grpc-go hold long-lived multiplexed channels. The helper
 backend accepts both HTTP/1.1 and h2c, so the h2c phase uses the same
 direct-backend baseline and the same production frontline image. The h2c phase
-also fails if measured hot-cache requests make additional `SubscribeRoute`
-calls.
+also fails if measured hot-cache requests make additional `Subscribe` host
+lookups.
 
 The script generates a temporary self-signed certificate for the route host and
 serves it from the helper's authenticated native TLS certificate API. Frontline
@@ -273,7 +273,7 @@ generated `ProxyControlPlane` service and measures generated
 `ProxyControlPlaneClient/WakeInstance` calls directly to that backend and
 through the production frontline HTTP listener. The fake control plane routes
 only the generated method path to this backend, and the measured hot-cache phase
-fails if it makes additional `SubscribeRoute` calls after warmup.
+fails if it makes additional `Subscribe` host lookups after warmup.
 
 The script then warms and measures WebSocket forwarding through the same cached
 ready route. The helper client performs a real HTTP upgrade, sends text and
@@ -282,14 +282,15 @@ sends a deterministic binary byte stream in configurable frames. The helper
 backend validates the exact incoming stream bytes and echoes them; the client
 validates the exact echoed bytes. The measured WebSocket phase has a
 direct-backend baseline, emits `mib_per_s`, gates frontend/direct streaming
-throughput ratio, and fails if it makes additional `SubscribeRoute` calls after
+throughput ratio, and fails if it makes additional `Subscribe` host lookups after
 warmup.
 
-Finally, the script sends one request through the distinct cold route. The fake
-control plane returns `InstanceState::Cold` without a backend URI, the
-production frontline calls `WakeInstance`, the fake control plane returns a
-ready backend, and the client request must succeed through the backend. The
-helper stats endpoint exposes separate `subscribe_route_calls`,
+Finally, the script sends one request through the distinct cold route. The
+host's cached rule set reports that route's instance `Cold` without a backend
+URI, the production frontline calls `WakeInstance`, and the fake control plane
+answers ready. The frontline then asks for the host's rule set once more, which
+now reports the instance running, and the client request must succeed through
+the backend. The helper stats endpoint exposes separate `subscribe_route_calls`,
 `wake_instance_calls`, and `backend_http_requests` counters; the cold-wake smoke
 fails unless that phase increments each expected counter exactly once. The same
 client result emits latency fields and the script gates the single-request p99
@@ -305,7 +306,7 @@ request/session latency percentiles as stable `key=value` fields: `stream_bytes`
 `mib_per_s`, `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms`. The smoke fails on
 correctness errors, startup or process failures, missing tools or images,
 malformed or missing load metrics, non-positive direct baselines, additional
-hot-cache `SubscribeRoute` calls, frontend/direct RPS or WebSocket throughput
+hot-cache `Subscribe` host lookups, frontend/direct RPS or WebSocket throughput
 ratios below their configured thresholds, p99 added latency above configured
 thresholds, or fake-control-plane cold-wake latency above its configured
 threshold.
@@ -416,7 +417,9 @@ defaults to `5000` ms, and TCP stream p99 added latency defaults to `10000` ms.
 | HTTP helper work | `http/prepare_reverse_proxy_request`, `http/strip_hop_by_hop_headers` | Keep request URI rewrite and hop-by-hop header cleanup bounded and simple. |
 | WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | Two WebSocket peers exchange a binary message and close through the byte relay, without an external service. The peers frame; the relay copies bytes. |
 | TLS ClientHello/SNI parsing | `tls/parse_client_hello_sni_*` | Keep complete and fragmented ClientHello parsing bounded before TLS routing decisions are added. |
-| Frontline route lookup | `route_lookup/http_exact_host_many_unrelated`, `route_lookup/http_wildcard_suffix_many_unrelated`, `route_lookup/http_same_host_many_paths`, `route_lookup/sni_exact_host_many_unrelated` | Keep hot positive route-cache lookup indexed with many unrelated cached routes present. |
+| Frontline route lookup | `route_lookup/http_host_many_unrelated`, `route_lookup/http_host_256_path_rules_last_match`, `route_lookup/sni_host_many_unrelated`, `route_lookup/full_resolve_*` | Keep a hot host lookup indexed with 4096 unrelated hosts cached, and bound the scan of the largest rule set a host may have. |
+| Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/{1,8,32}` | Each value times one hit by every task, so it stays near the single-task time while throughput rises with cores. |
+| Frontline route cache writes | `route_cache_scale/*` | Track expiry, eviction and the snapshot copy a cache change publishes, at 1000, 10000 and 100000 hosts. |
 | Admission/accounting | `admission/try_acquire_release`, `accounting/track_release` | Keep permit/guard operations allocation-free after setup. A permit is a semaphore operation, and a guard is a few atomic operations that wake a task only while one waits for the count. |
 | Observability helpers | `observability/label_as_str_and_outcome_mapping` | Keep label and outcome mapping low-cardinality and allocation-free. |
 
@@ -436,7 +439,8 @@ expected.
 | WebSocket relay | `websocket/proxy_streams_duplex_binary_round_trip` | <= 50 us per 1 KiB in-memory binary round trip |
 | TLS ClientHello/SNI parse, single record | `tls/parse_client_hello_sni_single_record` | <= 1 us per complete ClientHello |
 | TLS ClientHello/SNI parse, fragmented records | `tls/parse_client_hello_sni_fragmented_records` | <= 2 us per fragmented ClientHello |
-| Frontline route lookup | `route_lookup/*` | <= 1 us per hot-cache lookup with 4096 unrelated cached routes or same-host path routes |
+| Frontline route lookup | `route_lookup/*` | <= 1 us per hot-cache lookup with 4096 unrelated cached hosts, or with 256 path rules on the host |
+| Frontline route lookup scaling | `route_lookup_scaling/hot_hit_tasks/1` | <= 157 ns per hit; the 8- and 32-task values stay within a small multiple of it |
 | Admission acquire/release | `admission/try_acquire_release` | <= 100 ns per steady-state permit |
 | Active connection track/release | `accounting/track_release` | <= 100 ns per steady-state guard |
 | Observability label/outcome helpers | `observability/label_as_str_and_outcome_mapping` | <= 50 ns per mapping batch |
@@ -456,7 +460,10 @@ budgets describe steady-state helper behavior.
 | HTTP static hop-by-hop cleanup | `strip static hop-by-hop headers` | 0 allocations |
 | TLS ClientHello/SNI parse | `TLS ClientHello SNI parse` | <= 16 allocations for a complete SNI ClientHello |
 
-Local route-key lookup benchmarks are covered by
-`cargo bench -p frontline --bench route_lookup`. The current harness focuses on
-frontline hot-cache positive lookup; broader route throughput and tail-latency
-gates remain separate load-test work.
+Local route lookup benchmarks are covered by
+`cargo bench -p frontline --bench route_lookup`. The harness covers the
+hot-cache hit through the production coordinator, its scaling across tasks, and
+the cost of cache writes; broader route throughput and tail-latency gates remain
+separate load-test work. Publishing a cache change copies the host index, about
+17 us at 1000 hosts and 3 ms at 100000, and the coordinator applies up to 64
+waiting stream messages per copy.

@@ -146,62 +146,64 @@ message ProxyWakeGenerationConflictResult {
 
 message ProxySubscribeRequest {
   oneof input {
-    ProxySubscribeRouteRequest subscribe_route = 1;
+    ProxySubscribeHostRequest subscribe = 1;
     ProxyUnsubscribeRequest unsubscribe = 2;
   }
 }
 
-message ProxySubscribeRouteRequest {
-  string request_id = 1;
-  RouteIdentity identity = 2;
+// Subscribes to the complete rule set for one exact host. The proxy chooses
+// subscription_id, which names this subscription in every later message and is
+// unique among the stream's live subscriptions.
+message ProxySubscribeHostRequest {
+  uint64 subscription_id = 1;
+  RouteKind kind = 2;
+  string host = 3;
 }
 
 message ProxyUnsubscribeRequest {
-  string subscription_id = 1;
+  uint64 subscription_id = 1;
 }
 
 message ProxySubscribeResponse {
   oneof output {
-    ProxyRouteResolvedResponse route_resolved = 1;
-    ProxyRouteMissResponse route_miss = 2;
-    ProxyRouteUpdatedResponse route_updated = 3;
-    ProxyRouteInvalidatedResponse route_invalidated = 4;
+    ProxyHostRulesResponse rules = 1;
+    ProxySubscribeErrorResponse error = 2;
   }
 }
 
-message ProxyRouteResolvedResponse {
-  string request_id = 1;
-  string subscription_id = 2;
-  RouteIdentity matched_identity = 3;
-  ProxyRouteEntry route = 4;
-  ProxyCachePolicy cache_policy = 5;
+// The complete rule set for a subscribed host, most specific rule first. It
+// answers the subscribe and follows every change to a binding or instance the
+// set depends on. An empty set means no binding applies to the host; the
+// control plane holds no subscription for it.
+message ProxyHostRulesResponse {
+  uint64 subscription_id = 1;
+  repeated ProxyRouteRule rules = 2;
+  ProxyCachePolicy cache_policy = 3;
 }
 
-message ProxyRouteMissResponse {
-  string request_id = 1;
-  RouteIdentity request_identity = 2;
-  ProxyCachePolicy negative_cache_policy = 3;
+message ProxyRouteRule {
+  RouteIdentity identity = 1;
+  ProxyRouteEntry route = 2;
 }
 
-message ProxyRouteUpdatedResponse {
-  string subscription_id = 1;
-  RouteIdentity matched_identity = 2;
-  ProxyRouteEntry route = 3;
-  ProxyCachePolicy cache_policy = 4;
+// Ends one subscription. The stream and its other subscriptions continue.
+message ProxySubscribeErrorResponse {
+  uint64 subscription_id = 1;
+  ProxySubscribeErrorCode code = 2;
+  string message = 3;
 }
 
-message ProxyRouteInvalidatedResponse {
-  string subscription_id = 1;
-  ProxyRouteInvalidationReason reason = 2;
+enum ProxySubscribeErrorCode {
+  PROXY_SUBSCRIBE_ERROR_CODE_UNSPECIFIED = 0;
+  PROXY_SUBSCRIBE_ERROR_CODE_INVALID_ARGUMENT = 1;
+  PROXY_SUBSCRIBE_ERROR_CODE_RESOURCE_EXHAUSTED = 2;
+  PROXY_SUBSCRIBE_ERROR_CODE_UNAVAILABLE = 3;
 }
 
-enum ProxyRouteInvalidationReason {
-  PROXY_ROUTE_INVALIDATION_REASON_UNSPECIFIED = 0;
-  PROXY_ROUTE_INVALIDATION_REASON_ROUTE_REMOVED = 1;
-  PROXY_ROUTE_INVALIDATION_REASON_ROUTE_CHANGED = 2;
-  PROXY_ROUTE_INVALIDATION_REASON_INSTANCE_CHANGED = 3;
-  PROXY_ROUTE_INVALIDATION_REASON_BACKEND_CHANGED = 4;
-  PROXY_ROUTE_INVALIDATION_REASON_STREAM_CLOSED = 5;
+enum RouteKind {
+  ROUTE_KIND_UNSPECIFIED = 0;
+  ROUTE_KIND_HTTP = 1;
+  ROUTE_KIND_SNI = 2;
 }
 
 message ProxyRouteEntry {
@@ -465,12 +467,12 @@ message DeleteInstanceResponse {
 
 // A repeat that names the same instance and identity returns the stored
 // binding; any other request for an existing route_binding_id returns
-// ALREADY_EXISTS.
+// ALREADY_EXISTS. A binding that would give any host more than 256 rules, or
+// rules counting over 1 MiB, returns INVALID_ARGUMENT.
 message CreateRouteBindingRequest {
-  string route_binding_id = 2;
-  string instance_id = 3;
-  RouteIdentity identity = 4;
-  ProtocolRoute protocol = 5;
+  string route_binding_id = 1;
+  string instance_id = 2;
+  RouteIdentity identity = 3;
 }
 
 message GetRouteBindingRequest {
@@ -489,7 +491,6 @@ message RouteBinding {
   string route_binding_id = 1;
   string instance_id = 2;
   RouteIdentity identity = 3;
-  ProtocolRoute protocol = 4;
 }
 
 message RouteIdentity {
@@ -501,6 +502,7 @@ message RouteIdentity {
 
 message HttpRouteIdentity {
   RouteHost host = 1;
+  // Starts with "/" and is at most 4,096 bytes.
   optional string path_prefix = 2;
 }
 
@@ -517,12 +519,6 @@ enum RouteHostKind {
   ROUTE_HOST_KIND_UNSPECIFIED = 0;
   ROUTE_HOST_KIND_EXACT = 1;
   ROUTE_HOST_KIND_WILDCARD_SUFFIX = 2;
-}
-
-enum ProtocolRoute {
-  PROTOCOL_ROUTE_UNSPECIFIED = 0;
-  PROTOCOL_ROUTE_HTTP = 1;
-  PROTOCOL_ROUTE_TLS_SNI = 2;
 }
 
 message Http01ChallengeKey {

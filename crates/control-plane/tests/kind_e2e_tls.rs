@@ -17,10 +17,10 @@ use control_plane::api::pb::{
     route_identity, template_text_part, ContainerPortTemplate, ContainerTemplate,
     CreateInstanceRequest, CreateRouteBindingRequest, CreateWorkloadClassVersionRequest,
     EnvVarTemplate, GetInstanceRequest, HttpRouteIdentity, Instance,
-    InstanceState as PbInstanceState, ManifestTemplate, ProtocolRoute, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity,
-    TemplateText, TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy,
-    WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    InstanceState as PbInstanceState, ManifestTemplate, RouteHost, RouteHostKind, RouteIdentity,
+    ServicePortTemplate, ServiceTemplate, SidecarTemplate, SniRouteIdentity, TemplateText,
+    TemplateTextPart, WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use k8s_openapi::{
     api::{
@@ -335,7 +335,6 @@ async fn create_tls_termination_resources(
                 RouteHostKind::Exact as i32,
                 TERMINATION_HOST,
             )),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 
@@ -366,7 +365,6 @@ async fn create_sni_passthrough_resources(
                 route_binding_id: spec.route_id.to_owned(),
                 instance_id: spec.instance_id.to_owned(),
                 identity: Some(sni_route_identity(spec.host_kind, spec.host)),
-                protocol: ProtocolRoute::TlsSni as i32,
             })
             .await?;
     }

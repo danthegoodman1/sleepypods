@@ -143,7 +143,6 @@ async fn create(operator: &mut Operator, config: &E2eConfig) -> TestResult<()> {
                 route_binding_id: format!("route-{id}"),
                 instance_id: (*id).into(),
                 identity: Some(identity),
-                protocol: ProtocolRoute::Http as i32,
             })
             .await?;
     }

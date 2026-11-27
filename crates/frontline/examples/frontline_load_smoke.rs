@@ -670,128 +670,58 @@ impl FakeProxyControlPlane {
             .input
             .ok_or_else(|| Status::invalid_argument("subscribe request input is required"))?
         {
-            pb::proxy_subscribe_request::Input::SubscribeRoute(request) => {
+            pb::proxy_subscribe_request::Input::Subscribe(request) => {
                 self.stats.record_subscribe_route();
-                Ok(Some(self.subscribe_route_response(request)?))
+                Ok(Some(self.host_rules_response(request)))
             }
             pb::proxy_subscribe_request::Input::Unsubscribe(_) => Ok(None),
         }
     }
 
-    fn subscribe_route_response(
+    /// The complete rule set for the subscribed host. Every HTTP host routes
+    /// the generated gRPC method, because that client names the frontline's
+    /// own address as its host.
+    fn host_rules_response(
         &self,
-        request: pb::ProxySubscribeRouteRequest,
-    ) -> Result<pb::ProxySubscribeResponse, Status> {
-        let request_id = non_empty(request.request_id, "request_id")?;
-        let request_identity = request
-            .identity
-            .ok_or_else(|| Status::invalid_argument("identity is required"))?;
-
-        if self.cold_route_matches(&request_identity) {
-            Ok(self.resolved_response(
-                request_id,
-                self.cold_matched_identity(),
-                self.cold_route_entry(),
-            ))
-        } else if self.real_grpc_route_matches(&request_identity) {
-            Ok(self.resolved_response(request_id, request_identity, self.real_grpc_route_entry()))
-        } else if self.route_matches(&request_identity) {
-            Ok(pb::ProxySubscribeResponse {
-                output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
-                    pb::ProxyRouteResolvedResponse {
-                        subscription_id: format!("frontline-load-smoke:{request_id}"),
-                        request_id,
-                        matched_identity: Some(self.matched_identity()),
-                        route: Some(self.route_entry()),
-                        cache_policy: Some(pb::ProxyCachePolicy {
-                            ttl_millis: ROUTE_CACHE_TTL_MILLIS,
-                        }),
-                    },
-                )),
-            })
-        } else {
-            Ok(pb::ProxySubscribeResponse {
-                output: Some(pb::proxy_subscribe_response::Output::RouteMiss(
-                    pb::ProxyRouteMissResponse {
-                        request_id,
-                        request_identity: Some(request_identity),
-                        negative_cache_policy: Some(pb::ProxyCachePolicy { ttl_millis: 1_000 }),
-                    },
-                )),
-            })
-        }
-    }
-
-    fn route_matches(&self, identity: &pb::RouteIdentity) -> bool {
-        self.http_identity_matches(identity, self.route_path.as_ref())
-    }
-
-    fn real_grpc_route_matches(&self, identity: &pb::RouteIdentity) -> bool {
-        let Some(pb::route_identity::Kind::Http(identity)) = identity.kind.as_ref() else {
-            return false;
-        };
-
-        path_prefix_matches(
-            identity.path_prefix.as_deref().unwrap_or("/"),
-            REAL_GRPC_PATH,
-        )
-    }
-
-    fn cold_route_matches(&self, identity: &pb::RouteIdentity) -> bool {
-        self.http_identity_matches(identity, self.cold_route_path.as_ref())
-    }
-
-    fn http_identity_matches(&self, identity: &pb::RouteIdentity, route_path: &str) -> bool {
-        let Some(pb::route_identity::Kind::Http(identity)) = identity.kind.as_ref() else {
-            return false;
-        };
-        let Some(host) = identity.host.as_ref() else {
-            return false;
-        };
-
-        host.kind == pb::RouteHostKind::Exact as i32
-            && host.host == self.route_host.as_ref()
-            && path_prefix_matches(identity.path_prefix.as_deref().unwrap_or("/"), route_path)
-    }
-
-    fn matched_identity(&self) -> pb::RouteIdentity {
-        self.http_matched_identity(self.route_path.as_ref())
-    }
-
-    fn cold_matched_identity(&self) -> pb::RouteIdentity {
-        self.http_matched_identity(self.cold_route_path.as_ref())
-    }
-
-    fn http_matched_identity(&self, route_path: &str) -> pb::RouteIdentity {
-        pb::RouteIdentity {
-            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                host: Some(pb::RouteHost {
-                    kind: pb::RouteHostKind::Exact as i32,
-                    host: self.route_host.to_string(),
-                }),
-                path_prefix: Some(route_path.to_owned()),
-            })),
-        }
-    }
-
-    fn resolved_response(
-        &self,
-        request_id: String,
-        matched_identity: pb::RouteIdentity,
-        route: pb::ProxyRouteEntry,
+        request: pb::ProxySubscribeHostRequest,
     ) -> pb::ProxySubscribeResponse {
+        let mut rules = Vec::new();
+        if request.kind == pb::RouteKind::Http as i32 {
+            if request.host == self.route_host.as_ref() {
+                rules.push(self.rule(
+                    &request.host,
+                    &self.cold_route_path,
+                    self.cold_route_entry(),
+                ));
+                rules.push(self.rule(&request.host, &self.route_path, self.route_entry()));
+            }
+            rules.push(self.rule(&request.host, REAL_GRPC_PATH, self.real_grpc_route_entry()));
+        }
         pb::ProxySubscribeResponse {
-            output: Some(pb::proxy_subscribe_response::Output::RouteResolved(
-                pb::ProxyRouteResolvedResponse {
-                    subscription_id: format!("frontline-load-smoke:{request_id}"),
-                    request_id,
-                    matched_identity: Some(matched_identity),
-                    route: Some(route),
+            output: Some(pb::proxy_subscribe_response::Output::Rules(
+                pb::ProxyHostRulesResponse {
+                    subscription_id: request.subscription_id,
+                    rules,
                     cache_policy: Some(pb::ProxyCachePolicy {
                         ttl_millis: ROUTE_CACHE_TTL_MILLIS,
                     }),
                 },
             )),
+        }
+    }
+
+    fn rule(&self, host: &str, path: &str, route: pb::ProxyRouteEntry) -> pb::ProxyRouteRule {
+        pb::ProxyRouteRule {
+            identity: Some(pb::RouteIdentity {
+                kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
+                    host: Some(pb::RouteHost {
+                        kind: pb::RouteHostKind::Exact as i32,
+                        host: host.to_owned(),
+                    }),
+                    path_prefix: Some(path.to_owned()),
+                })),
+            }),
+            route: Some(route),
         }
     }
 
@@ -827,7 +757,15 @@ impl FakeProxyControlPlane {
         }
     }
 
+    /// The cold instance runs once a proxy has asked to wake it.
     fn cold_route_entry(&self) -> pb::ProxyRouteEntry {
+        if self.stats.snapshot().wake_instance_calls > 0 {
+            return self.route_entry_for(
+                "frontline-load-smoke-cold-route",
+                "frontline-load-smoke-cold-instance",
+                &self.backend_uri,
+            );
+        }
         pb::ProxyRouteEntry {
             route_binding_id: "frontline-load-smoke-cold-route".to_owned(),
             instance_id: "frontline-load-smoke-cold-instance".to_owned(),
@@ -1011,30 +949,6 @@ impl ProxyControlPlane for GeneratedGrpcBackend {
             "load-smoke generated gRPC backend only implements WakeInstance",
         ))
     }
-}
-
-fn non_empty(value: String, field: &'static str) -> Result<String, Status> {
-    if value.trim().is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "{field} must not be empty"
-        )));
-    }
-
-    Ok(value)
-}
-
-fn path_prefix_matches(request_path: &str, route_path: &str) -> bool {
-    if route_path == "/" || request_path == route_path {
-        return true;
-    }
-
-    if route_path.ends_with('/') {
-        return request_path.starts_with(route_path);
-    }
-
-    request_path
-        .strip_prefix(route_path)
-        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2085,10 +1999,10 @@ impl Error for ResponseValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_response, make_stream_chunk, path_prefix_matches, validate_response,
-        validate_stream_chunk, ClientConfig, ClientProtocol, FakeProxyControlPlane, HttpTarget,
-        LatencyStats, SmokeStats, BACKEND_BODY, DEFAULT_WEBSOCKET_STREAM_BYTES,
-        DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE, GRPC_BODY, STATS_PATH,
+        backend_response, make_stream_chunk, validate_response, validate_stream_chunk,
+        ClientConfig, ClientProtocol, FakeProxyControlPlane, HttpTarget, LatencyStats, SmokeStats,
+        BACKEND_BODY, DEFAULT_WEBSOCKET_STREAM_BYTES, DEFAULT_WEBSOCKET_STREAM_CHUNK_SIZE,
+        GRPC_BODY, STATS_PATH,
     };
     use crate::REAL_GRPC_PATH;
     use bytes::Bytes;
@@ -2298,148 +2212,104 @@ mod tests {
         );
     }
 
-    #[test]
-    fn path_prefix_matching_uses_route_boundaries() {
-        assert!(path_prefix_matches("/smoke", "/smoke"));
-        assert!(path_prefix_matches("/smoke/request", "/smoke"));
-        assert!(!path_prefix_matches("/smoke-test", "/smoke"));
-    }
-
-    #[test]
-    fn fake_control_plane_matches_known_http_route() {
-        let service = FakeProxyControlPlane::new(
+    fn smoke_control_plane(stats: SmokeStats) -> FakeProxyControlPlane {
+        FakeProxyControlPlane::new(
             "app.example.test".to_owned(),
             "/smoke".to_owned(),
             "/cold-smoke".to_owned(),
             "http://127.0.0.1:18080".to_owned(),
             "http://127.0.0.1:18082".to_owned(),
-            SmokeStats::default(),
-        );
-
-        assert!(service.route_matches(&pb::RouteIdentity {
-            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                host: Some(pb::RouteHost {
-                    kind: pb::RouteHostKind::Exact as i32,
-                    host: "app.example.test".to_owned(),
-                }),
-                path_prefix: Some("/smoke".to_owned()),
-            })),
-        }));
+            stats,
+        )
     }
 
-    #[test]
-    fn fake_control_plane_counts_subscribe_route_requests() {
-        let stats = SmokeStats::default();
-        let service = FakeProxyControlPlane::new(
-            "app.example.test".to_owned(),
-            "/smoke".to_owned(),
-            "/cold-smoke".to_owned(),
-            "http://127.0.0.1:18080".to_owned(),
-            "http://127.0.0.1:18082".to_owned(),
-            stats.clone(),
-        );
-
-        let request = pb::ProxySubscribeRequest {
-            input: Some(pb::proxy_subscribe_request::Input::SubscribeRoute(
-                pb::ProxySubscribeRouteRequest {
-                    request_id: "request-1".to_owned(),
-                    identity: Some(pb::RouteIdentity {
-                        kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                            host: Some(pb::RouteHost {
-                                kind: pb::RouteHostKind::Exact as i32,
-                                host: "app.example.test".to_owned(),
-                            }),
-                            path_prefix: Some("/smoke".to_owned()),
-                        })),
-                    }),
-                },
-            )),
-        };
-
+    fn subscribe(
+        service: &FakeProxyControlPlane,
+        kind: pb::RouteKind,
+        host: &str,
+    ) -> pb::ProxyHostRulesResponse {
         let response = service
-            .handle_subscribe_request(request)
-            .expect("subscribe route succeeds");
+            .handle_subscribe_request(pb::ProxySubscribeRequest {
+                input: Some(pb::proxy_subscribe_request::Input::Subscribe(
+                    pb::ProxySubscribeHostRequest {
+                        subscription_id: 7,
+                        kind: kind as i32,
+                        host: host.to_owned(),
+                    },
+                )),
+            })
+            .expect("subscribe succeeds")
+            .expect("a subscribe is answered");
+        let Some(pb::proxy_subscribe_response::Output::Rules(rules)) = response.output else {
+            panic!("expected a rule set");
+        };
+        assert_eq!(rules.subscription_id, 7);
+        rules
+    }
 
-        assert!(response.is_some());
+    fn rule_paths(rules: &pb::ProxyHostRulesResponse) -> Vec<(String, i32)> {
+        rules
+            .rules
+            .iter()
+            .map(|rule| {
+                let Some(pb::route_identity::Kind::Http(identity)) = rule
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.kind.as_ref())
+                else {
+                    panic!("expected an HTTP rule");
+                };
+                (
+                    identity.path_prefix.clone().expect("path prefix"),
+                    rule.route.as_ref().expect("route").instance_state,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fake_control_plane_answers_the_route_host_with_its_rule_set_and_counts_it() {
+        let stats = SmokeStats::default();
+        let service = smoke_control_plane(stats.clone());
+
+        let rules = subscribe(&service, pb::RouteKind::Http, "app.example.test");
+
+        assert_eq!(
+            rule_paths(&rules),
+            vec![
+                ("/cold-smoke".to_owned(), pb::InstanceState::Cold as i32),
+                ("/smoke".to_owned(), pb::InstanceState::Running as i32),
+                (REAL_GRPC_PATH.to_owned(), pb::InstanceState::Running as i32),
+            ]
+        );
         assert_eq!(stats.snapshot().subscribe_route_calls, 1);
     }
 
     #[test]
-    fn fake_control_plane_matches_generated_grpc_route_path() {
-        let service = FakeProxyControlPlane::new(
-            "app.example.test".to_owned(),
-            "/smoke".to_owned(),
-            "/cold-smoke".to_owned(),
-            "http://127.0.0.1:18080".to_owned(),
-            "http://127.0.0.1:18082".to_owned(),
-            SmokeStats::default(),
+    fn fake_control_plane_routes_the_generated_grpc_method_on_any_http_host() {
+        let service = smoke_control_plane(SmokeStats::default());
+
+        let rules = subscribe(&service, pb::RouteKind::Http, "127.0.0.1");
+        assert_eq!(
+            rule_paths(&rules),
+            vec![(REAL_GRPC_PATH.to_owned(), pb::InstanceState::Running as i32)]
         );
 
-        assert!(service.real_grpc_route_matches(&pb::RouteIdentity {
-            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                host: Some(pb::RouteHost {
-                    kind: pb::RouteHostKind::Exact as i32,
-                    host: "127.0.0.1".to_owned(),
-                }),
-                path_prefix: Some(REAL_GRPC_PATH.to_owned()),
-            })),
-        }));
-
-        let request_identity = pb::RouteIdentity {
-            kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                host: Some(pb::RouteHost {
-                    kind: pb::RouteHostKind::Exact as i32,
-                    host: "127.0.0.1".to_owned(),
-                }),
-                path_prefix: Some(REAL_GRPC_PATH.to_owned()),
-            })),
-        };
-        let response = service
-            .subscribe_route_response(pb::ProxySubscribeRouteRequest {
-                request_id: "generated-grpc-request".to_owned(),
-                identity: Some(request_identity.clone()),
-            })
-            .expect("generated gRPC route resolves");
-        let Some(pb::proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output
-        else {
-            panic!("expected resolved route");
-        };
-        assert_eq!(resolved.matched_identity, Some(request_identity));
+        let sni = subscribe(&service, pb::RouteKind::Sni, "app.example.test");
+        assert!(sni.rules.is_empty());
     }
 
     #[test]
-    fn fake_control_plane_returns_cold_route_for_cold_path() {
-        let service = FakeProxyControlPlane::new(
-            "app.example.test".to_owned(),
-            "/smoke".to_owned(),
-            "/cold-smoke".to_owned(),
-            "http://127.0.0.1:18080".to_owned(),
-            "http://127.0.0.1:18082".to_owned(),
-            SmokeStats::default(),
-        );
+    fn fake_control_plane_runs_the_cold_instance_once_it_is_woken() {
+        let stats = SmokeStats::default();
+        let service = smoke_control_plane(stats.clone());
 
-        let response = service
-            .subscribe_route_response(pb::ProxySubscribeRouteRequest {
-                request_id: "cold-request".to_owned(),
-                identity: Some(pb::RouteIdentity {
-                    kind: Some(pb::route_identity::Kind::Http(pb::HttpRouteIdentity {
-                        host: Some(pb::RouteHost {
-                            kind: pb::RouteHostKind::Exact as i32,
-                            host: "app.example.test".to_owned(),
-                        }),
-                        path_prefix: Some("/cold-smoke".to_owned()),
-                    })),
-                }),
-            })
-            .expect("cold route resolves");
+        stats.record_wake_instance();
 
-        let Some(pb::proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output
-        else {
-            panic!("expected resolved route");
-        };
-        let route = resolved.route.expect("route is present");
-        assert_eq!(route.instance_state, pb::InstanceState::Cold as i32);
-        assert!(route.backend_uri.is_none());
+        let rules = subscribe(&service, pb::RouteKind::Http, "app.example.test");
+        let cold = rules.rules[0].route.as_ref().expect("route");
+        assert_eq!(cold.instance_state, pb::InstanceState::Running as i32);
+        assert_eq!(cold.backend_uri.as_deref(), Some("http://127.0.0.1:18080"));
     }
 
     #[tokio::test]
@@ -2467,7 +2337,7 @@ mod tests {
 
         assert_eq!(
             body.as_ref(),
-            b"subscribe_route_calls=2 wake_instance_calls=0 backend_http_requests=0 backend_websocket_sessions=0\n"
+            b"subscribe_route_calls=2 wake_instance_calls=0 backend_http_requests=0 backend_websocket_sessions=0 resolve_certificate_calls=0\n"
         );
     }
 

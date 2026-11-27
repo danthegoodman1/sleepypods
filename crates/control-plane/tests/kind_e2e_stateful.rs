@@ -17,11 +17,11 @@ use control_plane::api::pb::{
     DeleteInstanceRequest, GetInstanceRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity,
     Instance, InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
     PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProjectionObservation,
-    ProtocolRoute, ReconcileMaterializationRequest, ReconcileMaterializationResponse, RouteHost,
-    RouteHostKind, RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef,
-    WorkloadExclusivityKey, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
-    WorkloadValueFieldRule, WorkloadValueSchema,
+    ReconcileMaterializationRequest, ReconcileMaterializationResponse, RouteHost, RouteHostKind,
+    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText,
+    TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadExclusivityKey,
+    WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule,
+    WorkloadValueSchema,
 };
 use control_plane::projection::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE};
 use control_plane::{render_instance_scoped_name, InstanceId};
@@ -982,7 +982,6 @@ async fn create_stateful_operator_resources(
                     path_prefix: None,
                 })),
             }),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 
@@ -1079,7 +1078,6 @@ async fn create_exclusive_instance_and_route(
                     path_prefix: None,
                 })),
             }),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
 

@@ -51,7 +51,7 @@ impl ControlPlaneStore for LostResponseStore {
         load_workload_class_version,
         get_route_binding,
         list_route_bindings_for_instance,
-        resolve_route,
+        resolve_host_rules,
         compare_and_swap_instance_state,
         load_ready_materialization,
         load_active_materialization,
@@ -369,14 +369,12 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         "delete-route",
         owner.id.as_str(),
         http_identity("old.retry.example", None),
-        ProtocolRoute::Http,
     );
     pg.create_route_binding(original_route.clone()).await?;
     let replacement_route = create_route_binding_request(
         "delete-route",
         owner.id.as_str(),
         http_identity("new.retry.example", None),
-        ProtocolRoute::Http,
     );
     let next = pg.clone();
     let replacement = replacement_route.clone();
@@ -532,7 +530,6 @@ async fn replacement_checks(pg: &PostgresStore) -> TestResult {
         "create-route-lost",
         owner.id.as_str(),
         http_identity("create.retry.example", None),
-        ProtocolRoute::Http,
     );
     let next = pg.clone();
     let id = create.route_binding_id.clone();

@@ -17,12 +17,12 @@ use control_plane::api::pb::{
     CreateRouteBindingRequest, CreateWorkloadClassVersionRequest, DeleteInstanceRequest,
     DeleteRouteBindingRequest, HostPathVolumeSourceTemplate, HttpRouteIdentity, Instance,
     InstanceState as PbInstanceState, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProtocolRoute,
-    ProxyRouteInvalidationReason, ProxySubscribeRequest, ProxySubscribeRouteRequest,
-    ProxyWakeInstanceRequest, ReconcileMaterializationRequest, RouteHost, RouteHostKind,
-    RouteIdentity, ServicePortTemplate, ServiceTemplate, SidecarReportIdleRequest, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadClassVersionRef, WorkloadKind,
-    WorkloadSleepPolicy, WorkloadTemplate, WorkloadValueFieldRule, WorkloadValueSchema,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, ProxySubscribeHostRequest,
+    ProxySubscribeRequest, ProxyWakeInstanceRequest, ReconcileMaterializationRequest, RouteHost,
+    RouteHostKind, RouteIdentity, RouteKind, ServicePortTemplate, ServiceTemplate,
+    SidecarReportIdleRequest, SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate,
+    WorkloadClassVersionRef, WorkloadKind, WorkloadSleepPolicy, WorkloadTemplate,
+    WorkloadValueFieldRule, WorkloadValueSchema,
 };
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
@@ -1137,19 +1137,15 @@ async fn route_reassignment_invalidates_active_subscription(
         .subscribe(ReceiverStream::new(request_stream))
         .await?
         .into_inner();
+    let mut subscription_id = 1;
     requests
-        .send(subscribe_route_request(
-            "lifecycle-reassign-old-subscribe",
+        .send(subscribe_host_request(
+            subscription_id,
             "reassign.lifecycle.sleepypods.test",
         ))
         .await?;
-    let resolved = expect_route_resolved(next_subscribe_response(&mut responses).await?);
-    if resolved
-        .route
-        .as_ref()
-        .map(|route| route.instance_id.as_str())
-        != Some("lifecycle-reassign-old")
-    {
+    let resolved = expect_rules(next_subscribe_response(&mut responses).await?);
+    if routed_instance(&resolved) != Some("lifecycle-reassign-old") {
         return Err(format!("active subscription did not resolve old route: {resolved:?}").into());
     }
 
@@ -1188,31 +1184,32 @@ async fn route_reassignment_invalidates_active_subscription(
     .await
     .map_err(|_| "healthy route cutover commits exceeded1s fixture budget")??;
 
-    // Direct subscription delivery and the independently delivered frontend
-    // invalidation share a bounded window; one does not imply the other arrived.
+    // The direct subscription and the frontend's own subscription are told
+    // independently within one bounded window; one does not imply the other.
     timeout(Duration::from_secs(3), async {
-        let invalidated = expect_route_invalidated(next_subscribe_response(&mut responses).await?);
-        if invalidated.subscription_id != resolved.subscription_id
-            || invalidated.reason != ProxyRouteInvalidationReason::RouteRemoved as i32
-        {
-            return Err(format!("unexpected route invalidation: {invalidated:?}").into());
-        }
-        requests
-            .send(subscribe_route_request(
-                "lifecycle-reassign-new-subscribe",
-                "reassign.lifecycle.sleepypods.test",
-            ))
-            .await?;
-        let new_resolved = expect_route_resolved(next_subscribe_response(&mut responses).await?);
-        if new_resolved
-            .route
-            .as_ref()
-            .map(|route| route.instance_id.as_str())
-            != Some("lifecycle-reassign-new")
-        {
-            return Err(
-                format!("new subscription did not resolve new route: {new_resolved:?}").into(),
-            );
+        loop {
+            let rules = expect_rules(next_subscribe_response(&mut responses).await?);
+            if rules.subscription_id != subscription_id {
+                continue;
+            }
+            match routed_instance(&rules) {
+                Some("lifecycle-reassign-new") => break,
+                Some("lifecycle-reassign-old") => {}
+                None => {
+                    // The removal arrived before the new binding was committed
+                    // and ended the subscription. Ask again.
+                    subscription_id += 1;
+                    requests
+                        .send(subscribe_host_request(
+                            subscription_id,
+                            "reassign.lifecycle.sleepypods.test",
+                        ))
+                        .await?;
+                }
+                Some(other) => {
+                    return Err(format!("cutover resolved an unknown instance: {other}").into())
+                }
+            }
         }
         loop {
             let response = http_get_with_timeout(
@@ -1348,7 +1345,6 @@ async fn create_route(
             route_binding_id: route_id.to_owned(),
             instance_id: instance_id.to_owned(),
             identity: Some(http_route_identity(host)),
-            protocol: ProtocolRoute::Http as i32,
         })
         .await?;
     Ok(())
@@ -1647,34 +1643,34 @@ async fn next_subscribe_response(
         .map_err(|error| error.into())
 }
 
-fn subscribe_route_request(request_id: &str, host: &str) -> ProxySubscribeRequest {
+fn subscribe_host_request(subscription_id: u64, host: &str) -> ProxySubscribeRequest {
     ProxySubscribeRequest {
-        input: Some(proxy_subscribe_request::Input::SubscribeRoute(
-            ProxySubscribeRouteRequest {
-                request_id: request_id.to_owned(),
-                identity: Some(http_route_identity(host)),
+        input: Some(proxy_subscribe_request::Input::Subscribe(
+            ProxySubscribeHostRequest {
+                subscription_id,
+                kind: RouteKind::Http as i32,
+                host: host.to_owned(),
             },
         )),
     }
 }
 
-fn expect_route_resolved(
+fn expect_rules(
     response: control_plane::api::pb::ProxySubscribeResponse,
-) -> control_plane::api::pb::ProxyRouteResolvedResponse {
-    let Some(proxy_subscribe_response::Output::RouteResolved(resolved)) = response.output else {
-        panic!("expected route resolved response");
-    };
-    resolved
+) -> control_plane::api::pb::ProxyHostRulesResponse {
+    match response.output {
+        Some(proxy_subscribe_response::Output::Rules(rules)) => rules,
+        other => panic!("expected a rule set, got {other:?}"),
+    }
 }
 
-fn expect_route_invalidated(
-    response: control_plane::api::pb::ProxySubscribeResponse,
-) -> control_plane::api::pb::ProxyRouteInvalidatedResponse {
-    let Some(proxy_subscribe_response::Output::RouteInvalidated(invalidated)) = response.output
-    else {
-        panic!("expected route invalidated response");
-    };
-    invalidated
+/// The instance the host's most specific rule routes to.
+fn routed_instance(rules: &control_plane::api::pb::ProxyHostRulesResponse) -> Option<&str> {
+    rules
+        .rules
+        .first()
+        .and_then(|rule| rule.route.as_ref())
+        .map(|route| route.instance_id.as_str())
 }
 
 fn load_image_into_kind(config: &E2eConfig, image: &str) -> TestResult<()> {
