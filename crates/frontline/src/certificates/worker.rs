@@ -8,19 +8,13 @@ use tokio_rustls::rustls;
 pub struct TlsCertificateWorker {
     cache: TlsCertificateStore,
     resolver: Arc<dyn CertificateResolver>,
-    receiver: mpsc::Receiver<Fetch>,
     watcher: Option<Arc<dyn CertificateWatcher>>,
 }
 impl TlsCertificateWorker {
-    pub(super) fn new(
-        cache: TlsCertificateStore,
-        resolver: Arc<dyn CertificateResolver>,
-        receiver: mpsc::Receiver<Fetch>,
-    ) -> Self {
+    pub(super) fn new(cache: TlsCertificateStore, resolver: Arc<dyn CertificateResolver>) -> Self {
         Self {
             cache,
             resolver,
-            receiver,
             watcher: None,
         }
     }
@@ -41,44 +35,119 @@ impl TlsCertificateWorker {
             self.run_fetches(shutdown).await;
         }
     }
-    /// On shutdown, cancel network work, then join every validation already
-    /// dispatched. Bounded blocking input and its fetch slot survive caller
-    /// cancellation; there is no independent refresh task per hostname.
-    async fn run_fetches(mut self, shutdown: Shutdown) {
+    /// Starts queued fetches as slots free up. On shutdown, cancel network
+    /// work, then join every validation already dispatched. Bounded blocking
+    /// input and its fetch slot survive caller cancellation; there is no
+    /// independent refresh task per hostname.
+    async fn run_fetches(self, shutdown: Shutdown) {
         let mut tasks = JoinSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut refresh_turn = false;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => { self.cache.tasks(tasks.len()); },
-                Some(fetch) = self.receiver.recv(), if tasks.len() < CERTIFICATE_FETCHES => {
-                    let cache = self.cache.clone();
-                    let resolver = self.resolver.clone();
-                    let shutdown = shutdown.clone();
-                    tasks.spawn(async move {
-                        fetch_one(cache, resolver, fetch, shutdown).await;
-                    });
-                    self.cache.tasks(tasks.len());
-                },
-                _ = ticker.tick() => {
-                    let mut state = self.cache.shared.state.lock().unwrap();
-                    let due: Vec<_> = state.entries.iter()
-                        .filter(|(_, entry)| !entry.pending && (entry.refresh_requested || entry.value.as_ref()
-                            .is_some_and(|view| view.config.is_some() && Instant::now() >= view.refresh)))
-                        .map(|(hostname, _)| hostname.clone())
-                        .collect();
-                    for hostname in due {
-                        let _ = self.cache.queue_locked(&mut state, &hostname);
-                    }
-                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                _ = self.cache.shared.queued.notified() => {},
+                _ = ticker.tick() => self.cache.queue_due_refreshes(),
             }
+            while tasks.len() < CERTIFICATE_FETCHES {
+                let Some(fetch) = self.cache.next_fetch(&mut refresh_turn) else {
+                    break;
+                };
+                tasks.spawn(fetch_one(
+                    self.cache.clone(),
+                    self.resolver.clone(),
+                    fetch,
+                    shutdown.clone(),
+                ));
+            }
+            self.cache.tasks(tasks.len());
         }
         self.cache.stop();
-        self.receiver.close();
-        while self.receiver.try_recv().is_ok() {}
         while tasks.join_next().await.is_some() {
             self.cache.tasks(tasks.len());
+        }
+    }
+}
+impl TlsCertificateStore {
+    /// Queues a refresh for every certificate whose lease is due.
+    fn queue_due_refreshes(&self) {
+        let now = Instant::now();
+        let mut state = self.shared.state.lock().unwrap();
+        let State {
+            entries,
+            refreshes,
+            serial,
+            ..
+        } = &mut *state;
+        for (hostname, entry) in entries {
+            let due = entry
+                .value
+                .as_ref()
+                .is_some_and(|view| view.config.is_some() && now >= view.refresh);
+            if due && !entry.pending && entry.refresh.is_none() {
+                let Some(position) = serial.checked_add(1) else {
+                    return;
+                };
+                *serial = position;
+                entry.refresh = Some(position);
+                refreshes.insert(position, hostname.clone());
+            }
+        }
+    }
+    /// Takes a fetch slot and the next queued hostname. When both queues hold
+    /// work, `refresh_turn` says which goes first, and it flips with each
+    /// fetch.
+    fn next_fetch(&self, refresh_turn: &mut bool) -> Option<Fetch> {
+        let slot = self.shared.fetches.clone().try_acquire_owned().ok()?;
+        let mut state = self.shared.state.lock().unwrap();
+        let State {
+            entries,
+            lookups,
+            refreshes,
+            ..
+        } = &mut *state;
+        loop {
+            let refresh = if lookups.is_empty() || refreshes.is_empty() {
+                lookups.is_empty()
+            } else {
+                *refresh_turn
+            };
+            let queue = if refresh {
+                &mut *refreshes
+            } else {
+                &mut *lookups
+            };
+            let (_, hostname) = queue.pop_first()?;
+            let Some(entry) = entries.get_mut(&hostname) else {
+                continue;
+            };
+            if refresh {
+                entry.refresh = None;
+            } else {
+                entry.lookup = None;
+                // Every handshake waiting on this lookup has left.
+                if entry.refresh.is_none() && entry.changed.receiver_count() == 0 {
+                    continue;
+                }
+            }
+            if let Some(position) = entry.lookup.take() {
+                lookups.remove(&position);
+            }
+            if let Some(position) = entry.refresh.take() {
+                refreshes.remove(&position);
+            }
+            entry.pending = true;
+            entry.last_error = None;
+            *refresh_turn = !refresh;
+            return Some(Fetch {
+                hostname,
+                generation: entry.generation,
+                prior: entry.value.clone(),
+                floor: entry.floor,
+                _slot: slot,
+            });
         }
     }
 }

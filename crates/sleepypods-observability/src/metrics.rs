@@ -318,14 +318,14 @@ pub const RUNTIME_CERTIFICATE_FETCHES: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_runtime_certificate_fetches",
     MetricKind::Gauge,
     Some("operations"),
-    "Certificate fetch permits held by queued, running or validating work.",
+    "Certificate fetches running or validating.",
     NO_LABELS,
 );
 pub const RUNTIME_CERTIFICATE_QUEUE: MetricDescriptor = MetricDescriptor::new(
     "sleepypods_runtime_certificate_queue",
     MetricKind::Gauge,
     Some("operations"),
-    "Queued certificate fetch messages owned by the supervisor channel.",
+    "Certificate lookups and refreshes awaiting a fetch slot.",
     NO_LABELS,
 );
 pub const RUNTIME_CERTIFICATE_TASKS: MetricDescriptor = MetricDescriptor::new(

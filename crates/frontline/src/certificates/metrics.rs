@@ -32,10 +32,7 @@ impl TlsCertificateStore {
             (RUNTIME_CERTIFICATE_NEGATIVE_ENTRIES, usage.negative_entries),
             (RUNTIME_CERTIFICATE_ACCOUNTED_BYTES, usage.certificate_bytes),
             (RUNTIME_CERTIFICATE_FETCHES, usage.fetches),
-            (
-                RUNTIME_CERTIFICATE_QUEUE,
-                self.sender.max_capacity() - self.sender.capacity(),
-            ),
+            (RUNTIME_CERTIFICATE_QUEUE, usage.queued),
             (
                 RUNTIME_CERTIFICATE_TASKS,
                 self.shared.retained_tasks.load(Ordering::Relaxed),

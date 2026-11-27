@@ -3,6 +3,11 @@
 //!
 //! Entry counts bound the cache. Hostnames holding a certificate and hostnames
 //! without one have separate budgets, so unknown names evict only each other.
+//!
+//! A fetch waits in one of two queues until the worker has a slot for it. A
+//! lookup has a handshake waiting on it; a refresh comes from a notification
+//! or a due lease. Slots alternate between the queues when both hold work, so
+//! neither a flood of lookups nor a wave of refreshes starves the other.
 mod client;
 mod metrics;
 mod notifications;
@@ -21,7 +26,7 @@ mod tests;
 use proxy_core::observability::{recorder::ObservabilityRecorder, Operation, Outcome};
 use sleepypods_api::{pb, TlsHostname};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     future::Future,
     pin::Pin,
@@ -29,7 +34,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
 use tokio_rustls::rustls::ServerConfig;
@@ -47,7 +52,7 @@ pub const CERTIFICATE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 // - Validation admits a bundle of at most 128 KiB with 100 SANs, so a cached
 //   certificate retains at most about 160 KiB: 160 MiB for a full cache, and
 //   about 10 MiB when chains are a few KiB.
-// - A negative entry holds a hostname and bookkeeping, under 1 KiB.
+// - A negative entry holds a hostname and bookkeeping, about 1 KiB at most.
 // - A resolve response is at most 256 KiB on the wire. Decoding a malformed
 //   one of minimal repeated fields expands it to at most 8 MiB before
 //   validation rejects it, so three fetches hold at most 24 MiB.
@@ -89,7 +94,6 @@ impl std::error::Error for CertificateLookupError {}
 #[derive(Clone)]
 pub struct TlsCertificateStore {
     shared: Arc<Shared>,
-    sender: mpsc::Sender<Fetch>,
 }
 impl fmt::Debug for TlsCertificateStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -113,21 +117,57 @@ struct Shared {
     wall: Arc<dyn Fn() -> i64 + Send + Sync>,
     state: Mutex<State>,
     fetches: Arc<Semaphore>,
+    /// Wakes the worker when a fetch joins a queue.
+    queued: Notify,
 }
 struct State {
     interests_changed: watch::Sender<()>,
     entries: HashMap<String, Entry>,
+    /// Hostnames awaiting a fetch slot, in request order. Each hostname
+    /// appears at most once in each queue.
+    lookups: BTreeMap<u64, String>,
+    refreshes: BTreeMap<u64, String>,
     serial: u64,
     stopped: bool,
+}
+impl State {
+    fn next_serial(&mut self) -> Result<u64, CertificateLookupError> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .ok_or(CertificateLookupError::Capacity)?;
+        Ok(self.serial)
+    }
+    /// Queues a fetch for a waiting handshake unless one is running or queued.
+    fn queue_lookup(&mut self, hostname: &str, position: u64) {
+        if let Some(entry) = self.entries.get_mut(hostname) {
+            if !entry.pending && entry.lookup.is_none() {
+                entry.lookup = Some(position);
+                self.lookups.insert(position, hostname.to_owned());
+            }
+        }
+    }
+    /// Queues a fetch that no handshake waits on unless one is running or
+    /// queued.
+    fn queue_refresh(&mut self, hostname: &str, position: u64) {
+        if let Some(entry) = self.entries.get_mut(hostname) {
+            if !entry.pending && entry.refresh.is_none() {
+                entry.refresh = Some(position);
+                self.refreshes.insert(position, hostname.to_owned());
+            }
+        }
+    }
 }
 struct Entry {
     incarnation: u64,
     floor: u64,
-    refresh_requested: bool,
     generation: u64,
     touched: u64,
     value: Option<View>,
     pending: bool,
+    /// Positions in `State::lookups` and `State::refreshes`.
+    lookup: Option<u64>,
+    refresh: Option<u64>,
     changed: watch::Sender<u64>,
     last_error: Option<CertificateLookupError>,
 }
@@ -165,7 +205,10 @@ pub struct CertificateCacheUsage {
     pub negative_entries: usize,
     /// Chain and key bytes held by cached certificates.
     pub certificate_bytes: usize,
+    /// Fetches running or validating.
     pub fetches: usize,
+    /// Lookups and refreshes awaiting a fetch slot.
+    pub queued: usize,
 }
 
 impl TlsCertificateStore {
@@ -201,14 +244,16 @@ impl TlsCertificateStore {
             state: Mutex::new(State {
                 interests_changed: watch::channel(()).0,
                 entries: HashMap::new(),
+                lookups: BTreeMap::new(),
+                refreshes: BTreeMap::new(),
                 serial: 0,
                 stopped: false,
             }),
             fetches: Arc::new(Semaphore::new(CERTIFICATE_FETCHES)),
+            queued: Notify::new(),
         });
-        let (sender, receiver) = mpsc::channel(CERTIFICATE_FETCHES);
-        let cache = Self { shared, sender };
-        let worker = TlsCertificateWorker::new(cache.clone(), resolver, receiver);
+        let cache = Self { shared };
+        let worker = TlsCertificateWorker::new(cache.clone(), resolver);
         (cache, worker)
     }
     /// A passthrough-only adapter has no certificate delivery worker.
@@ -235,10 +280,13 @@ impl TlsCertificateStore {
                 .map(|view| view.bytes)
                 .sum(),
             fetches: CERTIFICATE_FETCHES - self.shared.fetches.available_permits(),
+            queued: state.lookups.len() + state.refreshes.len(),
         }
     }
-    /// Each waiter remains owned by its admitted handshake. Canceling a waiter
-    /// does not cancel a shared bounded fetch needed by another waiter.
+    /// Each waiter remains owned by its admitted handshake. A lookup waits for
+    /// a fetch slot and then for its fetch, all within one deadline. Canceling
+    /// a waiter does not cancel a running fetch; a lookup whose waiters all
+    /// left before it reached a slot starts no fetch.
     pub async fn resolve(
         &self,
         sni: &str,
@@ -252,11 +300,7 @@ impl TlsCertificateStore {
             if state.stopped {
                 return Err(CertificateLookupError::Stopped);
             }
-            state.serial = state
-                .serial
-                .checked_add(1)
-                .ok_or(CertificateLookupError::Capacity)?;
-            let serial = state.serial;
+            let serial = state.next_serial()?;
             if let Some(entry) = state.entries.get_mut(&hostname) {
                 entry.touched = serial;
                 if let Some(view) = &entry.value {
@@ -271,18 +315,20 @@ impl TlsCertificateStore {
                     Entry {
                         incarnation: serial,
                         floor: 0,
-                        refresh_requested: false,
                         generation: serial,
                         touched: serial,
                         value: None,
                         pending: false,
+                        lookup: None,
+                        refresh: None,
                         changed,
                         last_error: None,
                     },
                 );
                 enforce_budgets(&mut state, &hostname);
             }
-            self.queue_locked(&mut state, &hostname)?;
+            state.queue_lookup(&hostname, serial);
+            self.shared.queued.notify_one();
             state.entries[&hostname].changed.subscribe()
         };
         loop {
@@ -297,7 +343,7 @@ impl TlsCertificateStore {
                         return Ok(view.config.clone());
                     }
                 }
-                if !entry.pending {
+                if !entry.pending && entry.lookup.is_none() {
                     return Err(entry
                         .last_error
                         .unwrap_or(CertificateLookupError::Unavailable));
@@ -309,43 +355,12 @@ impl TlsCertificateStore {
                 .map_err(|_| CertificateLookupError::Unavailable)?;
         }
     }
-    fn queue_locked(
-        &self,
-        state: &mut State,
-        hostname: &str,
-    ) -> Result<(), CertificateLookupError> {
-        let Some(entry) = state.entries.get(hostname) else {
-            return Err(CertificateLookupError::Unavailable);
-        };
-        if entry.pending {
-            return Ok(());
-        }
-        let slot = self
-            .shared
-            .fetches
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CertificateLookupError::Capacity)?;
-        let entry = state.entries.get_mut(hostname).unwrap();
-        let fetch = Fetch {
-            hostname: hostname.to_owned(),
-            generation: entry.generation,
-            prior: entry.value.clone(),
-            floor: entry.floor,
-            _slot: slot,
-        };
-        self.sender
-            .try_send(fetch)
-            .map_err(|_| CertificateLookupError::Capacity)?;
-        entry.pending = true;
-        entry.refresh_requested = false;
-        entry.last_error = None;
-        Ok(())
-    }
     fn stop(&self) {
         let mut state = self.shared.state.lock().unwrap();
         state.stopped = true;
         state.entries.clear();
+        state.lookups.clear();
+        state.refreshes.clear();
         state.interests_changed.send_replace(());
     }
 }
@@ -378,13 +393,19 @@ fn enforce_budgets(state: &mut State, keep: &str) {
         }
     }
 }
-/// Removing a certificate changes what the watch should follow.
+/// Removes an entry and its queued fetches. Removing a certificate changes
+/// what the watch follows.
 fn evict(state: &mut State, hostname: &str) {
-    if state
-        .entries
-        .remove(hostname)
-        .is_some_and(|entry| entry.certified())
-    {
+    let Some(entry) = state.entries.remove(hostname) else {
+        return;
+    };
+    if let Some(position) = entry.lookup {
+        state.lookups.remove(&position);
+    }
+    if let Some(position) = entry.refresh {
+        state.refreshes.remove(&position);
+    }
+    if entry.certified() {
         state.interests_changed.send_replace(());
     }
 }

@@ -192,26 +192,6 @@ async fn late_result_after_eviction_and_reinsertion_cannot_replace_new_view() {
     rig.finish().await;
 }
 #[tokio::test]
-async fn fetch_slots_stay_bounded_when_more_hostnames_arrive() {
-    let mut rig = Rig::new();
-    let mut callers = JoinSet::new();
-    let mut held = Vec::new();
-    for i in 0..CERTIFICATE_FETCHES {
-        let c = rig.cache.clone();
-        callers.spawn(async move { c.resolve(&format!("f{i}.example")).await });
-        held.push(rig.next().await.1);
-    }
-    assert_eq!(rig.cache.usage().fetches, CERTIFICATE_FETCHES);
-    assert_eq!(
-        rig.cache.resolve("overflow.example").await.unwrap_err(),
-        CertificateLookupError::Capacity
-    );
-    callers.abort_all();
-    while callers.join_next().await.is_some() {}
-    rig.finish().await;
-    drop(held);
-}
-#[tokio::test]
 async fn current_wall_validity_and_fixed_monotonic_lease_both_gate_warm_selection() {
     use std::sync::atomic::{AtomicI64, Ordering};
     let api = Arc::new(FakeResolver::default());

@@ -194,27 +194,28 @@ fn apply(
             .filter(|v| v.revision >= last_invalidating_revision)
             .and_then(|v| v.metadata.as_ref())
             .is_some_and(|m| Some(m.certificate_id.as_str()) == id);
-    state.serial = state
-        .serial
-        .checked_add(1)
-        .ok_or(CertificateLookupError::Capacity)?;
-    let serial = state.serial;
+    let serial = state.next_serial()?;
     let entry = state.entries.get_mut(hostname).unwrap();
     let certified = entry.certified();
+    let superseded = entry.pending;
     entry.floor = revision;
     entry.generation = serial;
     entry.pending = false;
-    entry.refresh_requested = true;
     if !retain {
         entry.value = None;
     }
     entry.changed.send_modify(|v| *v = v.wrapping_add(1));
+    // The invalidation applies now; its fetch waits for a slot.
+    state.queue_refresh(hostname, serial);
+    if superseded {
+        // Handshakes waiting on the superseded fetch keep their turn.
+        state.queue_lookup(hostname, serial);
+    }
     if certified && !retain {
         state.interests_changed.send_replace(());
         enforce_budgets(&mut state, hostname);
     }
-    // Capacity pressure may postpone fetch, never postpone the invalidation.
-    let _ = cache.queue_locked(&mut state, hostname);
+    cache.shared.queued.notify_one();
     Ok(())
 }
 #[cfg(test)]

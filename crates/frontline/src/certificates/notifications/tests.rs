@@ -170,6 +170,13 @@ async fn until(mut condition: impl FnMut() -> bool) {
         tokio::task::yield_now().await;
     }
 }
+/// Queues a background refresh as a due lease does.
+fn refresh(rig: &Rig, host: &str) {
+    let mut state = rig.cache.shared.state.lock().unwrap();
+    let position = state.next_serial().unwrap();
+    state.queue_refresh(host, position);
+    rig.cache.shared.queued.notify_one();
+}
 fn revision(rig: &Rig, host: &str) -> Option<u64> {
     rig.cache
         .shared
@@ -278,10 +285,7 @@ async fn rotation_fences_held_unchanged_and_preserves_only_original_view_until_r
     let mut watch = rig.open().await;
     sync(&mut watch, vec![("app.example", 1, Some("A"))]).await;
     let release = rig.hold();
-    {
-        let mut state = rig.cache.shared.state.lock().unwrap();
-        rig.cache.queue_locked(&mut state, "app.example").unwrap();
-    }
+    refresh(&rig, "app.example");
     until(|| rig.api.api.requests.lock().unwrap().len() == 2).await;
     peer(&rig.cache, "app.example", &old).await;
     let original_expiry = rig.cache.shared.state.lock().unwrap().entries["app.example"]
@@ -360,6 +364,47 @@ async fn received_removal_fences_late_found_and_rebind_accepts_lower_certificate
     peer(&rig.cache, "app.example", &cert).await;
     let mut watch = rig.open().await;
     sync(&mut watch, vec![("app.example", 12, Some("B"))]).await;
+    rig.finish().await;
+}
+#[tokio::test]
+async fn handshake_waiting_on_a_superseded_fetch_receives_the_replacement() {
+    let mut rig = Rig::new();
+    rig.publish("app.example", 1, "A", 1);
+    rig.cache.resolve("app.example").await.unwrap();
+    let mut watch = rig.open().await;
+    sync(&mut watch, vec![("app.example", 1, Some("A"))]).await;
+    rig.cache
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut("app.example")
+        .unwrap()
+        .value
+        .as_mut()
+        .unwrap()
+        .expires = Instant::now();
+    let superseded = rig.hold();
+    let mut callers = JoinSet::new();
+    let cache = rig.cache.clone();
+    callers.spawn(async move { cache.resolve("app.example").await });
+    until(|| rig.api.api.requests.lock().unwrap().len() == 2).await;
+    let rebound = rig.publish("app.example", 2, "B", 1);
+    push(&mut watch, "app.example", 2, Some("B"), true).await;
+    assert!(callers
+        .join_next()
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .is_some());
+    assert_eq!(revision(&rig, "app.example"), Some(2));
+    superseded.send(()).unwrap();
+    until(|| rig.cache.usage().fetches == 0).await;
+    assert_eq!(revision(&rig, "app.example"), Some(2));
+    assert_eq!(rig.cache.usage().queued, 0);
+    peer(&rig.cache, "app.example", &rebound).await;
     rig.finish().await;
 }
 #[tokio::test]
@@ -563,7 +608,7 @@ async fn invalid_replacement_and_watch_outage_cannot_extend_original_hard_lease(
 }
 
 #[tokio::test]
-async fn the_watch_and_three_fetch_owners_survive_until_joined_shutdown() {
+async fn the_watch_three_fetch_owners_and_a_queued_lookup_survive_until_joined_shutdown() {
     let mut rig = Rig::new();
     rig.publish("app.example", 1, "A", 1);
     rig.cache.resolve("app.example").await.unwrap();
@@ -577,13 +622,16 @@ async fn the_watch_and_three_fetch_owners_survive_until_joined_shutdown() {
         until(|| rig.api.api.requests.lock().unwrap().len() == i + 2).await;
     }
     assert_eq!(rig.cache.usage().fetches, CERTIFICATE_FETCHES);
-    assert!(matches!(
-        rig.cache.resolve("excess.example").await,
-        Err(CertificateLookupError::Capacity)
-    ));
+    let cache = rig.cache.clone();
+    callers.spawn(async move { cache.resolve("queued.example").await });
+    until(|| rig.cache.usage().queued == 1).await;
     assert!(!open.events.is_closed());
+    let cache = rig.cache.clone();
     rig.finish().await;
-    while callers.join_next().await.is_some() {}
+    while let Some(result) = callers.join_next().await {
+        assert!(result.unwrap().is_err());
+    }
+    assert_eq!(cache.usage().queued, 0);
     assert!(open.events.is_closed());
     assert!(releases.into_iter().all(|r| r.send(()).is_err()));
 }
@@ -596,10 +644,7 @@ async fn coalesced_destructive_watermark_invalidates_retained_view_and_both_late
     let mut open = rig.open().await;
     sync(&mut open, vec![("app.example", 1, Some("A"))]).await;
     let unchanged = rig.hold();
-    {
-        let mut state = rig.cache.shared.state.lock().unwrap();
-        rig.cache.queue_locked(&mut state, "app.example").unwrap();
-    }
+    refresh(&rig, "app.example");
     until(|| rig.api.api.requests.lock().unwrap().len() == 2).await;
     rig.publish("app.example", 4, "A", 2);
     let stale_found = rig.hold();

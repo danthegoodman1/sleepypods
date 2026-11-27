@@ -201,22 +201,27 @@ certificate arrives. At most three fetches run at once.
 Entry counts bound cache memory. Validation limits a bundle to 128 KiB and 100
 SANs, so a cached certificate retains at most about 160 KiB: 160 MiB for 1,024
 maximum-size certificates, and about 10 MiB when chains are a few KiB. A hostname
-without a certificate costs under 1 KiB. A resolve response is at most 256 KiB
-on the wire and a watch snapshot 512 KiB; a malformed one expands to at most
-8 MiB per fetch and 32 MiB for the watch while it is decoded and rejected. The
-worst case is about 220 MiB. A configuration that is rotated or evicted while
+without a certificate costs about 1 KiB at most. A resolve response is at most
+256 KiB on the wire and a watch snapshot 512 KiB; a malformed one expands to at
+most 8 MiB per fetch and 32 MiB for the watch while it is decoded and rejected.
+The worst case is about 220 MiB. A configuration that is rotated or evicted while
 connections still use it stays in memory until those connections close, so
 `SLEEPYPODS_PROXY_MAX_CONNECTIONS` bounds how many remain. Connection buffers
 and the runtime have separate costs.
 
 Identical misses share one fetch. Lookup has a three-second deadline within the
-overall five-second TLS setup bound; a lookup that finds all three fetch slots
-busy fails the handshake.
+overall five-second TLS setup bound. A lookup that finds all three fetch slots
+busy waits its turn in arrival order, and the handshake fails only if that
+deadline passes first; a lookup whose handshakes have all left starts no fetch.
+Background refreshes wait for the same slots in their own queue. When both
+queues hold work the slots alternate between them, so a burst of unknown names
+leaves refreshes running and a wave of refreshes leaves new hostnames resolving.
 
 Positive views refresh after approximately 60 seconds with hostname jitter, or
-half the granted lease when that is sooner. The worker polls once per second;
-leases shorter than a poll or lookup cannot promise a completed refresh before
-expiry, and selection still fails closed at the original deadline.
+half the granted lease when that is sooner. The worker queues due refreshes once
+per second and starts them as fetch slots free up; leases shorter than a poll or
+lookup cannot promise a completed refresh before expiry, and selection still
+fails closed at the original deadline.
 Each successful authoritative resolution grants at most five minutes of service,
 capped by the effective validity of the entire chain and measured conservatively
 from the start of the RPC. Failed refreshes never extend that deadline. An
