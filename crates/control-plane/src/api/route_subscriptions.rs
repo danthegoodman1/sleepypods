@@ -650,7 +650,8 @@ mod tests {
 
     /// Route creation admits a host's rule set while its rules count at most
     /// `MAX_HOST_RULES` and `MAX_HOST_RULES_BYTES`. The largest such set, with
-    /// the longest backend URI the materializer renders, fits one answer.
+    /// the longest Service and Pod backend URIs the materializer renders, fits
+    /// one answer.
     #[test]
     fn the_largest_rule_set_route_creation_admits_fits_one_answer() {
         let host = format!(
@@ -666,6 +667,7 @@ mod tests {
             "s".repeat(63),
             "n".repeat(63)
         );
+        let pod_backend = "http://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535";
         let instance_id = "i".repeat(InstanceId::MAX_LEN);
         for path_bytes in [1, 1024, 3000, MAX_ROUTE_PATH_BYTES] {
             let mut rules = Vec::new();
@@ -693,6 +695,7 @@ mod tests {
                         instance_state: InstanceState::Running,
                         instance_generation: Generation::new(u64::MAX),
                         backend: Some(BackendEndpoint::new(backend.clone()).unwrap()),
+                        pod_backend: Some(BackendEndpoint::new(pod_backend).unwrap()),
                         backend_generation: Some(BackendGeneration::new(u64::MAX)),
                     },
                 });

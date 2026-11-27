@@ -421,6 +421,7 @@ pub(crate) fn entry(instance: &str, state: InstanceState, generation: u64) -> Ro
         instance_state: state,
         instance_generation: Generation::new(generation),
         backend: running.then(|| BackendEndpoint::new(format!("http://{instance}:8080")).unwrap()),
+        pod_backend: None,
         backend_generation: running.then(|| BackendGeneration::new(generation)),
     }
 }

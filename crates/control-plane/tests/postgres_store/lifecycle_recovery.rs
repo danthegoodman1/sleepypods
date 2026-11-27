@@ -679,6 +679,56 @@ async fn postgres_pod_address_is_recorded_and_cleared_with_the_backend() -> Test
 }
 
 #[tokio::test]
+async fn postgres_route_rules_carry_the_pod_address_of_the_ready_backend() -> TestResult {
+    with_store(|store, _raw| async move {
+        let class = class(&store, "pod-route-class").await?;
+        let target = target("pod-route");
+        let identity = http_identity("pod-route.example.test", None);
+        let cold = store
+            .create_instance(create_instance_request(
+                "pod-route",
+                class.reference.clone(),
+                vec![identity.clone()],
+            ))
+            .await?
+            .instance;
+        let addresses = || async {
+            let entry = resolve_route(&store, identity.clone(), target.clone())
+                .await?
+                .ok_or("the binding no longer resolves")?;
+            let uri = |backend: Option<BackendEndpoint>| backend.map(|b| b.uri().to_owned());
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                uri(entry.backend),
+                uri(entry.pod_backend),
+            ))
+        };
+        assert_eq!(addresses().await?, (None, None));
+
+        wake(&store, &target, &cold).await?;
+        let awake = complete(&store, &target).await?;
+        assert_eq!(
+            addresses().await?,
+            (
+                Some("http://10.0.0.9:8080".to_owned()),
+                Some(POD_BACKEND.to_owned())
+            )
+        );
+
+        // A draining instance has no ready backend to route to.
+        store
+            .begin_sleep(BeginSleepRequest::new(
+                awake.instance.id.clone(),
+                awake.instance.generation,
+                target.clone(),
+            ))
+            .await?;
+        assert_eq!(addresses().await?, (None, None));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn postgres_wake_during_drain_grace_revives_the_projection() -> TestResult {
     use pb::{
         proxy_wake_instance_response::Outcome as Wake,

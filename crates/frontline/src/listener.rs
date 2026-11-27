@@ -263,7 +263,7 @@ where
     let http = serve_listener(listeners.http, &shutdown, |stream, peer| {
         let (stream, handshake) = shared.admit(stream)?;
         let context = FrontlineForwardContext::http(peer.ip());
-        Some(serve_http_connection(
+        Ok(serve_http_connection(
             stream,
             shared.clone(),
             shutdown.clone(),
@@ -275,7 +275,7 @@ where
         let (stream, handshake) = shared.admit(stream)?;
         let (shared, shutdown) = (shared.clone(), shutdown.clone());
         let context = FrontlineForwardContext::https(peer.ip());
-        Some(async move {
+        Ok(async move {
             let setup = shared.admission.config().setup_timeout();
             let terminated = tokio::select! {
                 _ = shutdown.cancelled() => return,
@@ -290,7 +290,7 @@ where
     let tls_passthrough = serve_optional(listeners.tls_passthrough, &shutdown, |stream, _| {
         let (stream, handshake) = shared.admit(stream)?;
         let shared = shared.clone();
-        Some(async move {
+        Ok(async move {
             shared
                 .handle_tls_passthrough_connection(stream, handshake)
                 .await;
@@ -317,7 +317,7 @@ async fn serve_optional<L, F, Fut>(
 ) -> JoinSet<()>
 where
     L: Accept,
-    F: FnMut(TcpStream, SocketAddr) -> Option<Fut>,
+    F: FnMut(TcpStream, SocketAddr) -> Result<Fut, TcpStream>,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     match listener {
@@ -383,17 +383,21 @@ where
         }
     }
 
-    /// Takes a connection slot and a setup slot, or closes the socket.
+    /// Takes a setup slot and a connection slot, or hands the socket back.
     fn admit(
         &self,
         stream: TcpStream,
-    ) -> Option<(
-        proxy_core::AdmittedIo<TcpStream>,
-        proxy_core::AdmissionPermit,
-    )> {
-        let stream = self.admission.admit_io(stream).ok()?;
-        let handshake = self.admission.handshakes.try_acquire().ok()?;
-        Some((stream, handshake))
+    ) -> Result<
+        (
+            proxy_core::AdmittedIo<TcpStream>,
+            proxy_core::AdmissionPermit,
+        ),
+        TcpStream,
+    > {
+        let Ok(handshake) = self.admission.handshakes.try_acquire() else {
+            return Err(stream);
+        };
+        Ok((self.admission.admit_io(stream)?, handshake))
     }
 
     async fn handle(

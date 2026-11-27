@@ -1,5 +1,5 @@
 //! Process-local data-plane bounds. Limits are acquired without wait queues.
-use crate::{AdmissionError, AdmissionLimiter, AdmissionPermit};
+use crate::{AdmissionLimiter, AdmissionPermit};
 use std::{
     error::Error,
     fmt,
@@ -284,12 +284,13 @@ impl ProxyAdmission {
     pub fn config(&self) -> ProxyResourceConfig {
         self.config
     }
-    pub fn admit_io<IO>(&self, io: IO) -> Result<AdmittedIo<IO>, AdmissionError> {
-        Ok(AdmittedIo::new(
-            io,
-            self.connections.try_acquire()?,
-            self.config.write_idle_timeout,
-        ))
+    /// Takes a connection slot for `io`, or hands `io` back when every slot is
+    /// taken.
+    pub fn admit_io<IO>(&self, io: IO) -> Result<AdmittedIo<IO>, IO> {
+        match self.connections.try_acquire() {
+            Ok(permit) => Ok(AdmittedIo::new(io, permit, self.config.write_idle_timeout)),
+            Err(_) => Err(io),
+        }
     }
 }
 
@@ -314,6 +315,10 @@ impl<IO> AdmittedIo<IO> {
             shutdown: None,
             cancellation: None,
         }
+    }
+    /// Releases the connection slot and returns the I/O.
+    pub fn into_inner(self) -> IO {
+        self.inner
     }
     pub(crate) fn cancellable(mut self) -> Self {
         let shutdown = crate::Shutdown::new();

@@ -104,7 +104,7 @@ It records:
 - Instance ID and generation.
 - Target cluster and namespace.
 - Rendered object names.
-- Backend address exposed to proxies.
+- Backend addresses exposed to proxies: the Service and the ready Pod.
 - Readiness and failure state.
 
 Materializations are transient. They can be deleted on sleep and recreated on
@@ -187,17 +187,18 @@ Wildcard host:            *.customer.com
 
 The cache authority is the **exact queried host with its complete rule set**.
 One lookup returns every binding for that host and every wildcard-suffix binding
-that covers it, each with its instance state, generation and backend. The set is
-ranked most specific first: an exact host before a wildcard suffix, a longer
-suffix before a shorter one, then a longer path prefix before a shorter one. The
-proxy routes a request to the first rule whose path prefix covers the request
-path. The store and the proxy share this ranking through `HostRules` in
+that covers it, each with its instance state, generation and backend addresses.
+The set is ranked most specific first: an exact host before a wildcard suffix, a
+longer suffix before a shorter one, then a longer path prefix before a shorter
+one. The proxy routes a request to the first rule whose path prefix covers the
+request path. The store and the proxy share this ranking through `HostRules` in
 `sleepypods-api`.
 
 ```text
 (http | sni, exact host)
   -> subscription ID chosen by the proxy
-  -> ranked rules: matched identity, route ID, instance ID, state, generation, backend
+  -> ranked rules: matched identity, route ID, instance ID, state, generation,
+     Service and Pod backend addresses
 ```
 
 Because the set is complete, every path on a cached host resolves locally, and a
@@ -222,6 +223,15 @@ client request
   -> wait for a rule set that reports Running with a backend
   -> route request or connection
 ```
+
+An HTTP or WebSocket request connects to the ready Pod address first and to the
+Service when the Pod address fails. Kube-proxy programs a new Service up to a
+second after its endpoint turns ready, so the first request after a wake would
+otherwise wait for it. A Pod address can be reused by another instance's Pod,
+so the connection opens with a claim naming the instance, and a sidecar serves
+only a claim for its own. TLS passthrough uses the Service. The
+[proxy protocol contract](proxy-protocol-contract.md#pod-address-first)
+describes the claim and the fallback.
 
 The control plane keeps every subscription current. It sends the host's rule set
 again when a binding for the host or a covering suffix is added or removed, and

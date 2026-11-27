@@ -309,6 +309,28 @@ async fn class_creation_rejects_raw_objects_that_cannot_render() {
             "valid YAML or JSON",
         ),
         (named("ConfigMap", &suffixed), "not in the V1 allow-list"),
+        (
+            raw_object(text(&[
+                (
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: aux-",
+                    false,
+                ),
+                (SUFFIX_VALUE, true),
+                ("\n", false),
+            ])),
+            "declared in template.workload",
+        ),
+        (
+            raw_object(text(&[
+                (
+                    "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: aux-",
+                    false,
+                ),
+                (SUFFIX_VALUE, true),
+                ("\n", false),
+            ])),
+            "declared in template.workload",
+        ),
         (named("Secret", &[("settings", false)]), "instance suffix"),
         (
             named("Secret", &[("settings-", false), ("tenant", true)]),

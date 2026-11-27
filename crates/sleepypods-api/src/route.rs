@@ -17,7 +17,7 @@ pub const MAX_HOST_RULES: usize = 256;
 /// [`HOST_RULE_OVERHEAD_BYTES`].
 pub const MAX_HOST_RULES_BYTES: usize = 1024 * 1024;
 /// What a rule counts beyond its IDs, host and path prefix: room for its
-/// backend URI and its framing in a Subscribe answer.
+/// Service and Pod backend URIs and its framing in a Subscribe answer.
 pub const HOST_RULE_OVERHEAD_BYTES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -153,7 +153,11 @@ pub struct RouteEntry {
     pub instance_id: InstanceId,
     pub instance_state: InstanceState,
     pub instance_generation: Generation,
+    /// The ready backend's Service address.
     pub backend: Option<BackendEndpoint>,
+    /// The ready backend's Pod address, when the control plane recorded one:
+    /// the ready endpoint's IP on the sidecar's listen port.
+    pub pod_backend: Option<BackendEndpoint>,
     pub backend_generation: Option<BackendGeneration>,
 }
 
@@ -398,6 +402,7 @@ mod tests {
             instance_state: InstanceState::Running,
             instance_generation: Generation::new(7),
             backend: None,
+            pod_backend: None,
             backend_generation: None,
         }
     }

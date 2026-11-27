@@ -37,7 +37,48 @@ Frontline replaces spoofable `Forwarded` and `X-Forwarded-*` fields using the
 peer address, the listener scheme and the client's authority: the `Host` field,
 or the request target for an HTTP/2 client. The sidecar preserves that trusted
 edge output and takes the client's authority from `Host`, then
-`X-Forwarded-Host`, then the request target.
+`X-Forwarded-Host`, then the request target without its userinfo.
+
+## Pod address first
+
+A ready route carries two addresses for its sidecar: the Service address and
+the Pod address, which is the ready endpoint's IP on the sidecar's listen port.
+HTTP and WebSocket forwarding connect to the Pod address first. The Service
+accepts connections only once kube-proxy has programmed it, up to a second
+after the endpoint turns ready; the Pod address answers at once. TLS
+passthrough connects to the Service address only.
+
+Pod addresses are reused, and every sidecar of a class listens on the same
+port, so a connection to a Pod address opens with an instance claim:
+
+```text
+frontline -> sidecar   \0sleepypods-instance <instance-id>\n
+sidecar -> frontline   the same line
+```
+
+- The sidecar echoes a claim that names its own `SLEEPYPODS_INSTANCE_ID` and
+  then serves the connection as HTTP/1.1 or HTTP/2. It closes a connection
+  whose claim names another instance, is malformed, is followed by other bytes
+  before the echo, or misses the setup deadline, so its app never sees a
+  request meant for another instance. The close is the one an excess socket
+  gets: FIN, then the unread input discarded. A connection whose first byte is
+  not `\0` is plain HTTP; Service connections are plain HTTP. The first
+  request's headers have their own setup deadline after the claim.
+- Frontline sends no request byte until it has read the exact echo. The TCP
+  connect and the echo share a 250 ms deadline, or the remaining setup budget
+  when that is shorter. A refused connection, a missing or different echo, or
+  the deadline sends the connection to the Service under the rest of the setup
+  deadline, with the connect recovery described below. The choice is made
+  before a request is written, so no request is replayed.
+- Frontline remembers a failed Pod address with its instance and backend
+  generation, and connects through the Service until the control plane
+  certifies a new backend generation. A stale Pod address therefore costs a
+  frontline one HTTP attempt and one WebSocket attempt. Each remembers up to
+  4,096 failed addresses and starts over when full.
+- Pooled upstream connections are keyed by Service address, instance, Pod
+  address and backend generation, so a pool never mixes instances. A
+  connection that fell back to the Service stays in its pool and serves later
+  requests for the same route.
 
 ## WebSocket handshakes
 
@@ -93,7 +134,8 @@ closing is found after about 90 seconds on any protocol.
   headers are complete. The upstream pool idle timeout must be shorter, so a
   proxy retires a pooled connection before the next hop closes it; startup
   rejects configuration where it is not.
-- Ordinary HTTP upstream connection establishment has a 10-second deadline.
+- Ordinary HTTP upstream connection establishment has a 10-second deadline,
+  which includes the Pod attempt of at most 250 ms.
   HTTP/1, HTTP/2, WebSocket, TCP and SNI share pre-dispatch connection recovery.
   Completed connect-stage errors containing `ConnectionRefused` or `TimedOut`
   may retry, at most once per 50 ms; other errors return immediately. The
@@ -255,12 +297,14 @@ termination and SNI passthrough listeners.
 | `SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS` | 60000 | Response-header wait without upload-byte progress |
 | `SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS` | 60000 | Pending socket/stream delivery writes, including TCP/SNI |
 
-Admission has no wait queue: excess accepted sockets are closed before spawning
-connection work; excess HTTP requests return 503 with Retry-After: 1. Hyper also
-limits h2 streams before service dispatch. Pooled HTTP upstream saturation returns
-503 until an active socket closes or idle eviction frees a slot. WS/TCP/SNI
-upstream sockets follow their admitted active sessions and are separate from the
-HTTP pool cap.
+Admission has no wait queue. An excess accepted socket closes before any
+connection work starts: it sends FIN, then discards up to 64 KiB the client has
+already sent, such as a ClientHello, so the client and any relay in front of the
+proxy, such as `kubectl port-forward`, read end of stream. Excess HTTP requests
+return 503 with Retry-After: 1. Hyper also limits h2 streams before service
+dispatch. Pooled HTTP upstream saturation returns 503 until an active socket
+closes or idle eviction frees a slot. WS/TCP/SNI upstream sockets follow their
+admitted active sessions and are separate from the HTTP pool cap.
 
 Both the upload body and produced response buffers retain request admission and
 drain activity until their queued bytes are delivered or canceled, even for a

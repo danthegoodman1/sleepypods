@@ -86,10 +86,11 @@ pub(crate) async fn delete_route_binding(
 pub(crate) const HOST_RULES_SQL: &str = "
     SELECT bindings.route_binding_id, bindings.instance_id, bindings.identity_kind,
         bindings.host_kind, bindings.host, bindings.path_prefix,
-        instances.state, instances.generation, ready.backend_uri, ready.backend_generation
+        instances.state, instances.generation, ready.backend_uri, ready.pod_backend_uri,
+        ready.backend_generation
     FROM route_bindings bindings JOIN instances USING (instance_id)
     LEFT JOIN LATERAL (
-        SELECT backend_uri, backend_generation FROM materializations
+        SELECT backend_uri, pod_backend_uri, backend_generation FROM materializations
         WHERE instance_id = bindings.instance_id
             AND instance_generation = instances.generation
             AND cluster_id = $4 AND namespace = $5 AND state = 'ready'
@@ -134,7 +135,13 @@ pub(crate) async fn resolve_host_rules(
             let route = route_binding_row_from_row(row)?;
             let state: String = row.get("state");
             let backend_uri: Option<String> = row.get("backend_uri");
+            let pod_backend_uri: Option<String> = row.get("pod_backend_uri");
             let backend_generation: Option<i64> = row.get("backend_generation");
+            let endpoint = |uri: Option<String>| {
+                uri.map(crate::materialization::BackendEndpoint::new)
+                    .transpose()
+                    .map_err(|error| StoreError::internal(error.to_string()))
+            };
             Ok(RouteRule {
                 identity: route.identity,
                 entry: RouteEntry {
@@ -144,10 +151,8 @@ pub(crate) async fn resolve_host_rules(
                     instance_generation: super::mapping::generation_from_i64(
                         row.get("generation"),
                     )?,
-                    backend: backend_uri
-                        .map(crate::materialization::BackendEndpoint::new)
-                        .transpose()
-                        .map_err(|error| StoreError::internal(error.to_string()))?,
+                    backend: endpoint(backend_uri)?,
+                    pod_backend: endpoint(pod_backend_uri)?,
                     backend_generation: backend_generation
                         .map(super::mapping::backend_generation_from_i64)
                         .transpose()?,

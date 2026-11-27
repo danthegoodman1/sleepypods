@@ -1,20 +1,25 @@
 use std::collections::BTreeMap;
 
-use serde_json::json;
+use k8s_openapi::{
+    api::core::v1::{
+        CSIPersistentVolumeSource, HostPathVolumeSource, PersistentVolume, SecretReference,
+    },
+    Resource,
+};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
 
 use super::{
     render_manifests, render_manifests_with_options, AppProtocol, ApplyOrder,
-    ContainerPortTemplate, ContainerTemplate, CsiPersistentVolumeSource, CsiSecretRefTemplate,
-    CsiSecretReference, EnvVar, EnvVarTemplate, HostPathPersistentVolumeSource, KubernetesObject,
-    ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
-    PersistentVolumeReclaimPolicy, PersistentVolumeSource, PersistentVolumeSourceTemplate,
-    RawKubernetesManifestTemplate, RawKubernetesObject, RenderManifestOptions,
-    RenderManifestRequest, RenderedManifest, ServicePortTemplate, ServiceTemplate, SidecarTemplate,
-    TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind, WorkloadTemplate,
-    INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID, LABEL_WORKLOAD_CLASS_ID,
-    LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
+    ContainerPortTemplate, ContainerTemplate, CsiSecretRefTemplate, EnvVarTemplate,
+    KubernetesObject, ManifestRenderError, ManifestTemplate, PersistentVolumeAccessMode,
+    PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate,
+    RenderManifestOptions, RenderManifestRequest, RenderedManifest, ServicePortTemplate,
+    ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
+    WorkloadTemplate, INSTANCE_SUFFIX_VALUE, LABEL_INSTANCE_GENERATION, LABEL_INSTANCE_ID,
+    LABEL_WORKLOAD_CLASS_ID, LABEL_WORKLOAD_CLASS_VERSION, LABEL_WORKLOAD_NAME,
 };
-use crate::materializer::{rendered_object_ref, rendered_object_refs};
+use crate::materializer::rendered_object_refs;
 use crate::{
     auth::BearerToken,
     ids::{Generation, InstanceId, WorkloadClassId},
@@ -94,113 +99,56 @@ fn renders_deployment_and_service_without_volumes() {
     assert_eq!(rendered.objects[0].apply_order, ApplyOrder::Service);
     assert_eq!(rendered.objects[1].apply_order, ApplyOrder::Workload);
 
-    let service = match &rendered.objects[0].object {
-        KubernetesObject::Service(service) => service,
-        other => panic!("expected Service, got {}", other.kind()),
-    };
-    assert_eq!(service.metadata.name, "svc-acme-69856ec0faae6daf");
-    assert_eq!(service.spec.selector[LABEL_INSTANCE_ID], "instance-a");
-    assert_eq!(service.spec.ports[0].port, 80);
-    assert_eq!(service.spec.ports[0].target_port, 15000);
+    let service = rendered.objects[0].object.to_kubernetes_json();
+    assert_eq!(service["kind"], "Service");
+    assert_eq!(service["metadata"]["name"], "svc-acme-69856ec0faae6daf");
+    assert_eq!(service["spec"]["selector"][LABEL_INSTANCE_ID], "instance-a");
+    assert_eq!(service["spec"]["ports"][0]["port"], 80);
+    assert_eq!(service["spec"]["ports"][0]["targetPort"], 15000);
 
-    let deployment = match &rendered.objects[1].object {
-        KubernetesObject::Deployment(deployment) => deployment,
-        other => panic!("expected Deployment, got {}", other.kind()),
-    };
-    assert_eq!(deployment.metadata.name, "app-acme-69856ec0faae6daf");
-    assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_ID], "instance-a");
-    assert_eq!(deployment.metadata.labels[LABEL_INSTANCE_GENERATION], "7");
-    assert_eq!(deployment.metadata.labels[LABEL_WORKLOAD_CLASS_ID], "web");
+    let deployment = rendered.objects[1].object.to_kubernetes_json();
+    assert_eq!(deployment["kind"], "Deployment");
+    let labels = &deployment["metadata"]["labels"];
+    assert_eq!(deployment["metadata"]["name"], "app-acme-69856ec0faae6daf");
+    assert_eq!(labels[LABEL_INSTANCE_ID], "instance-a");
+    assert_eq!(labels[LABEL_INSTANCE_GENERATION], "7");
+    assert_eq!(labels[LABEL_WORKLOAD_CLASS_ID], "web");
+    assert_eq!(labels[LABEL_WORKLOAD_CLASS_VERSION], "1");
+    assert_eq!(deployment["spec"]["replicas"], 1);
     assert_eq!(
-        deployment.metadata.labels[LABEL_WORKLOAD_CLASS_VERSION],
-        "1"
-    );
-    assert_eq!(deployment.spec.replicas, 1);
-    assert_eq!(
-        deployment.spec.selector.match_labels, service.spec.selector,
+        deployment["spec"]["selector"]["matchLabels"], service["spec"]["selector"],
         "service and workload selectors should target the same pods"
     );
-    assert_eq!(
-        deployment.spec.template.metadata.labels[LABEL_INSTANCE_ID],
-        "instance-a"
-    );
-    assert_eq!(deployment.spec.template.spec.containers.len(), 2);
-    assert_eq!(
-        deployment.spec.template.spec.containers[0].image,
-        "example/app:1"
-    );
-    assert_eq!(
-        deployment.spec.template.spec.containers[0].ports[0].container_port,
-        8080
-    );
-    assert_eq!(
-        deployment.spec.template.spec.containers[1].name,
-        "sleepypods-sidecar"
-    );
-    assert_eq!(
-        deployment.spec.template.spec.containers[1].image,
-        "sleepypods/sidecar:test"
-    );
-    assert_eq!(
-        deployment.spec.template.spec.containers[1].ports[0].container_port,
-        15000
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_LISTEN_PORT",
-        "15000",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_SIDECAR_LISTEN_ADDR",
-        "0.0.0.0:15000",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_APP_PORT",
-        "8080",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_INSTANCE_ID",
-        "instance-a",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_INSTANCE_GENERATION",
-        "7",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
-        "http://sleepypods-control-plane.apps.svc.cluster.local:50051",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_IDLE_TIMEOUT_MS",
-        "120000",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_IDLE_RETRY_BACKOFF_MS",
-        "5000",
-    );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS",
-        "30000",
-    );
-    assert_env_absent(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN",
-    );
-    assert!(deployment.spec.template.spec.volumes.is_empty());
-    assert!(deployment.spec.template.spec.containers[0]
-        .volume_mounts
-        .is_empty());
-    assert!(deployment.spec.template.spec.containers[1]
-        .volume_mounts
-        .is_empty());
+    let pod = &deployment["spec"]["template"];
+    assert_eq!(pod["metadata"]["labels"][LABEL_INSTANCE_ID], "instance-a");
+    let containers = &pod["spec"]["containers"];
+    assert_eq!(containers.as_array().map(Vec::len), Some(2));
+    assert_eq!(containers[0]["image"], "example/app:1");
+    assert_eq!(containers[0]["ports"][0]["containerPort"], 8080);
+    assert_eq!(containers[1]["name"], "sleepypods-sidecar");
+    assert_eq!(containers[1]["image"], "sleepypods/sidecar:test");
+    assert_eq!(containers[1]["ports"][0]["containerPort"], 15000);
+    let env = &containers[1]["env"];
+    for (name, expected) in [
+        ("SLEEPYPODS_LISTEN_PORT", "15000"),
+        ("SLEEPYPODS_SIDECAR_LISTEN_ADDR", "0.0.0.0:15000"),
+        ("SLEEPYPODS_APP_PORT", "8080"),
+        ("SLEEPYPODS_INSTANCE_ID", "instance-a"),
+        ("SLEEPYPODS_INSTANCE_GENERATION", "7"),
+        (
+            "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
+            "http://sleepypods-control-plane.apps.svc.cluster.local:50051",
+        ),
+        ("SLEEPYPODS_IDLE_TIMEOUT_MS", "120000"),
+        ("SLEEPYPODS_IDLE_RETRY_BACKOFF_MS", "5000"),
+        ("SLEEPYPODS_DRAIN_GRACE_TIMEOUT_MS", "30000"),
+    ] {
+        assert_env(env, name, expected);
+    }
+    assert_env_absent(env, "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN");
+    assert_eq!(pod["spec"]["volumes"], json!([]));
+    assert_eq!(containers[0]["volumeMounts"], json!([]));
+    assert_eq!(containers[1]["volumeMounts"], json!([]));
 }
 
 #[test]
@@ -221,63 +169,41 @@ fn private_render_options_inject_sidecar_control_plane_token() {
     )
     .expect("deployment renders");
 
-    let secret = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Secret(secret) => Some(secret),
-            _ => None,
-        })
-        .expect("sidecar token Secret renders");
+    let secret = json_of(&rendered, "Secret");
     assert_eq!(
-        secret.metadata.name,
+        secret["metadata"]["name"],
         "sleepypods-sidecar-token-69856ec0faae6daf"
     );
-    assert_eq!(secret.metadata.namespace.as_deref(), Some("apps"));
-    assert_eq!(secret.string_data["token"], "sidecar-secret");
+    assert_eq!(secret["metadata"]["namespace"], "apps");
+    assert_eq!(secret["stringData"]["token"], "sidecar-secret");
 
-    let deployment = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Deployment(deployment) => Some(deployment),
-            _ => None,
+    let deployment = json_of(&rendered, "Deployment");
+    let env = sidecar_env(&deployment);
+    assert_env(
+        env,
+        "SLEEPYPODS_CONTROL_PLANE_ENDPOINT",
+        "https://cp.platform.example:50051",
+    );
+    assert_env(
+        env,
+        sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV,
+        "PUBLIC-CA-ONLY",
+    );
+    assert!(!env.as_array().expect("env is a list").iter().any(|var| {
+        let name = var["name"].as_str().expect("env name");
+        name.contains("SEALING") || name.contains("TLS_KEY")
+    }));
+    let token_env = env_var(env, "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN");
+    assert_eq!(
+        token_env["valueFrom"],
+        json!({
+            "secretKeyRef": {
+                "name": "sleepypods-sidecar-token-69856ec0faae6daf",
+                "key": "token",
+            },
         })
-        .expect("Deployment renders");
-
-    let env = &deployment.spec.template.spec.containers[1].env;
-    assert_eq!(
-        env.iter()
-            .find(|e| e.name == "SLEEPYPODS_CONTROL_PLANE_ENDPOINT")
-            .unwrap()
-            .value,
-        "https://cp.platform.example:50051"
     );
-    assert_eq!(
-        env.iter()
-            .find(|e| e.name == sleepypods_api::transport::CONTROL_PLANE_TLS_CA_PEM_ENV)
-            .unwrap()
-            .value,
-        "PUBLIC-CA-ONLY"
-    );
-    assert!(!env
-        .iter()
-        .any(|e| e.name.contains("SEALING") || e.name.contains("TLS_KEY")));
-    let token_env = deployment.spec.template.spec.containers[1]
-        .env
-        .iter()
-        .find(|env| env.name == "SLEEPYPODS_CONTROL_PLANE_SIDECAR_TOKEN")
-        .expect("sidecar token env renders");
-    let source = token_env
-        .value_from
-        .as_ref()
-        .expect("sidecar token env uses valueFrom");
-    let super::EnvVarSource::SecretKeyRef(source) = source else {
-        panic!("expected secret reference")
-    };
-    assert_eq!(source.name, "sleepypods-sidecar-token-69856ec0faae6daf");
-    assert_eq!(source.key, "token");
-    assert_eq!(token_env.value, "");
+    assert!(token_env.get("value").is_none());
 }
 
 #[test]
@@ -291,11 +217,11 @@ fn rendered_names_use_hash_suffix_for_short_instance_id() {
     .expect("deployment renders");
 
     assert_eq!(
-        object_name(&rendered.objects[0].object),
+        rendered.objects[0].object.name(),
         "svc-acme-ba7816bf8f01cfea"
     );
     assert_eq!(
-        object_name(&rendered.objects[1].object),
+        rendered.objects[1].object.name(),
         "app-acme-ba7816bf8f01cfea"
     );
 }
@@ -311,11 +237,11 @@ fn rendered_names_hash_full_long_instance_id() {
     .expect("deployment renders");
 
     assert_eq!(
-        object_name(&rendered.objects[0].object),
+        rendered.objects[0].object.name(),
         "svc-acme-ca2f2069ea0c6e46"
     );
     assert_eq!(
-        object_name(&rendered.objects[1].object),
+        rendered.objects[1].object.name(),
         "app-acme-ca2f2069ea0c6e46"
     );
 }
@@ -334,8 +260,8 @@ fn rendered_names_truncate_operator_base_before_instance_suffix() {
     })
     .expect("deployment renders");
 
-    let service_name = object_name(&rendered.objects[0].object);
-    let workload_name = object_name(&rendered.objects[1].object);
+    let service_name = rendered.objects[0].object.name();
+    let workload_name = rendered.objects[1].object.name();
     assert_eq!(service_name.len(), 63);
     assert_eq!(workload_name.len(), 63);
     assert!(service_name.ends_with("-69856ec0faae6daf"));
@@ -358,14 +284,8 @@ fn rendered_names_do_not_add_kubernetes_kind_tokens() {
     })
     .expect("deployment renders");
 
-    assert_eq!(
-        object_name(&rendered.objects[0].object),
-        "shared-69856ec0faae6daf"
-    );
-    assert_eq!(
-        object_name(&rendered.objects[1].object),
-        "shared-69856ec0faae6daf"
-    );
+    assert_eq!(rendered.objects[0].object.name(), "shared-69856ec0faae6daf");
+    assert_eq!(rendered.objects[1].object.name(), "shared-69856ec0faae6daf");
 }
 
 #[test]
@@ -402,24 +322,14 @@ fn renders_optional_sidecar_mode_env() {
         namespace: "apps",
     })
     .expect("deployment renders");
-    let service = match &rendered.objects[0].object {
-        KubernetesObject::Service(service) => service,
-        other => panic!("expected Service, got {}", other.kind()),
-    };
-    let deployment = match &rendered.objects[1].object {
-        KubernetesObject::Deployment(deployment) => deployment,
-        other => panic!("expected Deployment, got {}", other.kind()),
-    };
+    let service = json_of(&rendered, "Service");
+    let deployment = json_of(&rendered, "Deployment");
 
     assert_eq!(
-        service.metadata.annotations["sleepypods.io/backend-scheme"],
+        service["metadata"]["annotations"]["sleepypods.io/backend-scheme"],
         "tcp"
     );
-    assert_env(
-        &deployment.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_SIDECAR_MODE",
-        "tcp",
-    );
+    assert_env(sidecar_env(&deployment), "SLEEPYPODS_SIDECAR_MODE", "tcp");
 }
 
 #[test]
@@ -434,12 +344,7 @@ fn sidecar_carries_the_declared_app_protocol() {
             sleep_policy: sleep_policy(),
             namespace: "apps",
         })
-        .map(|rendered| match &rendered.objects[1].object {
-            KubernetesObject::Deployment(deployment) => {
-                deployment.spec.template.spec.containers[1].env.clone()
-            }
-            other => panic!("expected Deployment, got {}", other.kind()),
-        })
+        .map(|rendered| sidecar_env(&json_of(&rendered, "Deployment")).clone())
     };
 
     for (mode, app_protocol, expected) in [
@@ -474,8 +379,7 @@ fn pod_carries_an_explicit_termination_grace_period() {
             namespace: "apps",
         })
         .map(|rendered| {
-            rendered.to_kubernetes_json_values()[1]["spec"]["template"]["spec"]
-                ["terminationGracePeriodSeconds"]
+            json_values(&rendered)[1]["spec"]["template"]["spec"]["terminationGracePeriodSeconds"]
                 .clone()
         })
     };
@@ -500,7 +404,7 @@ fn serializes_deployment_and_service_as_kubernetes_json() {
     })
     .expect("deployment renders");
 
-    let objects = rendered.to_kubernetes_json_values();
+    let objects = json_values(&rendered);
     let service = &objects[0];
     assert_eq!(service["apiVersion"], json!("v1"));
     assert_eq!(service["kind"], json!("Service"));
@@ -616,95 +520,64 @@ fn renders_stateful_set_service_pv_and_pvc_with_bound_volume() {
         ]
     );
 
-    let pv = match &rendered.objects[0].object {
-        KubernetesObject::PersistentVolume(pv) => pv,
-        other => panic!("expected PersistentVolume, got {}", other.kind()),
-    };
-    assert_eq!(pv.metadata.name, "pv-acme-2e1ac556311afdd5");
-    assert_eq!(pv.metadata.labels[LABEL_INSTANCE_ID], "postgres-a");
+    let pv = rendered.objects[0].object.to_kubernetes_json();
+    assert_eq!(pv["metadata"]["name"], "pv-acme-2e1ac556311afdd5");
+    assert_eq!(pv["metadata"]["labels"][LABEL_INSTANCE_ID], "postgres-a");
+    assert_eq!(pv["spec"]["accessModes"], json!(["ReadWriteOnce"]));
+    assert_eq!(pv["spec"]["capacity"]["storage"], "10Gi");
+    assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Retain");
+    assert_eq!(pv["spec"]["storageClassName"], "manual");
     assert_eq!(
-        pv.spec.access_modes,
-        vec![PersistentVolumeAccessMode::ReadWriteOnce]
+        pv["spec"]["claimRef"],
+        json!({"namespace": "data", "name": "pvc-acme-2e1ac556311afdd5"})
     );
-    assert_eq!(pv.spec.capacity, "10Gi");
     assert_eq!(
-        pv.spec.persistent_volume_reclaim_policy,
-        PersistentVolumeReclaimPolicy::Retain
-    );
-    assert_eq!(pv.spec.storage_class_name.as_deref(), Some("manual"));
-    assert_eq!(pv.spec.claim_ref.namespace, "data");
-    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556311afdd5");
-    assert_eq!(
-        pv.spec.source,
-        PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
+        persistent_volume(&rendered).csi,
+        Some(CSIPersistentVolumeSource {
             driver: "csi.example.com".to_owned(),
             volume_handle: "provider-vol-123".to_owned(),
             fs_type: Some("ext4".to_owned()),
-            read_only: false,
-            volume_attributes: BTreeMap::from([("tenant".to_owned(), "acme".to_owned())]),
-            controller_publish_secret_ref: None,
-            node_stage_secret_ref: None,
-            node_publish_secret_ref: None,
-            controller_expand_secret_ref: None,
-            node_expand_secret_ref: None,
-        }))
+            read_only: Some(false),
+            volume_attributes: Some(BTreeMap::from([("tenant".to_owned(), "acme".to_owned())])),
+            ..CSIPersistentVolumeSource::default()
+        })
     );
 
-    let pvc = match &rendered.objects[1].object {
-        KubernetesObject::PersistentVolumeClaim(pvc) => pvc,
-        other => panic!("expected PersistentVolumeClaim, got {}", other.kind()),
-    };
-    assert_eq!(pvc.metadata.name, "pvc-acme-2e1ac556311afdd5");
-    assert_eq!(pvc.metadata.namespace.as_deref(), Some("data"));
-    assert_eq!(pvc.spec.volume_name, "pv-acme-2e1ac556311afdd5");
-    assert_eq!(pvc.spec.resources.requests_storage, "10Gi");
+    let pvc = rendered.objects[1].object.to_kubernetes_json();
+    assert_eq!(pvc["kind"], "PersistentVolumeClaim");
+    assert_eq!(pvc["metadata"]["name"], "pvc-acme-2e1ac556311afdd5");
+    assert_eq!(pvc["metadata"]["namespace"], "data");
+    assert_eq!(pvc["spec"]["volumeName"], "pv-acme-2e1ac556311afdd5");
+    assert_eq!(pvc["spec"]["resources"]["requests"]["storage"], "10Gi");
 
-    let stateful_set = match &rendered.objects[3].object {
-        KubernetesObject::StatefulSet(stateful_set) => stateful_set,
-        other => panic!("expected StatefulSet, got {}", other.kind()),
-    };
-    assert_eq!(stateful_set.metadata.name, "db-acme-2e1ac556311afdd5");
-    assert_eq!(stateful_set.spec.service_name, "db-acme-2e1ac556311afdd5");
-    assert_eq!(stateful_set.spec.replicas, 1);
-    assert_eq!(stateful_set.spec.template.spec.containers.len(), 2);
+    let stateful_set = rendered.objects[3].object.to_kubernetes_json();
+    assert_eq!(stateful_set["kind"], "StatefulSet");
+    assert_eq!(stateful_set["metadata"]["name"], "db-acme-2e1ac556311afdd5");
     assert_eq!(
-        stateful_set.spec.template.spec.containers[0].ports[0].container_port,
-        5432
+        stateful_set["spec"]["serviceName"],
+        "db-acme-2e1ac556311afdd5"
     );
+    assert_eq!(stateful_set["spec"]["replicas"], 1);
+    let pod = &stateful_set["spec"]["template"]["spec"];
+    let containers = &pod["containers"];
+    assert_eq!(containers.as_array().map(Vec::len), Some(2));
+    assert_eq!(containers[0]["ports"][0]["containerPort"], 5432);
+    assert_eq!(containers[1]["name"], "sleepypods-sidecar");
+    assert_eq!(containers[1]["ports"][0]["containerPort"], 15000);
+    assert_env(sidecar_env(&stateful_set), "SLEEPYPODS_APP_PORT", "5432");
     assert_eq!(
-        stateful_set.spec.template.spec.containers[1].name,
-        "sleepypods-sidecar"
-    );
-    assert_eq!(
-        stateful_set.spec.template.spec.containers[1].ports[0].container_port,
-        15000
-    );
-    assert_env(
-        &stateful_set.spec.template.spec.containers[1].env,
-        "SLEEPYPODS_APP_PORT",
-        "5432",
-    );
-    assert_eq!(
-        stateful_set.spec.template.spec.volumes[0]
-            .persistent_volume_claim
-            .claim_name,
+        pod["volumes"][0]["persistentVolumeClaim"]["claimName"],
         "pvc-acme-2e1ac556311afdd5"
     );
     assert_eq!(
-        stateful_set.spec.template.spec.containers[0].volume_mounts[0].name,
-        "data"
+        containers[0]["volumeMounts"],
+        json!([{"name": "data", "mountPath": "/var/lib/postgresql/data"}])
     );
-    assert_eq!(
-        stateful_set.spec.template.spec.containers[0].volume_mounts[0].mount_path,
-        "/var/lib/postgresql/data"
-    );
-    assert!(stateful_set.spec.template.spec.containers[1]
-        .volume_mounts
-        .is_empty());
+    assert_eq!(containers[1]["volumeMounts"], json!([]));
 }
 
 #[test]
-fn renders_valid_raw_pv_pvc_service_and_stateful_set() {
+fn renders_valid_raw_pv_pvc_and_service() {
     let mut template = deployment_template();
     template.raw_objects = vec![
         raw_manifest(
@@ -763,29 +636,6 @@ spec:
 "#,
             ),
         ]),
-        raw_manifest(
-            r#"
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: raw-db-acme-{suffix}
-spec:
-  podManagementPolicy: Parallel
-  serviceName: raw-svc-acme-{suffix}
-  selector:
-    matchLabels:
-      app: raw
-  template:
-    metadata:
-      name: raw-pod-template
-      labels:
-        app: raw
-    spec:
-      containers:
-        - name: postgres
-          image: postgres:17
-"#,
-        ),
     ];
 
     let rendered = render_manifests(RenderManifestRequest {
@@ -800,7 +650,7 @@ spec:
         rendered
             .objects
             .iter()
-            .map(|object| (object.apply_order, rendered_object_ref(&object.object)))
+            .map(|object| (object.apply_order, object.object.object_ref()))
             .collect::<Vec<_>>(),
         vec![
             (
@@ -828,23 +678,15 @@ spec:
                 ApplyOrder::Workload,
                 object_ref("apps/v1", "Deployment", "apps", "app-acme-69856ec0faae6daf")
             ),
-            (
-                ApplyOrder::Workload,
-                object_ref(
-                    "apps/v1",
-                    "StatefulSet",
-                    "apps",
-                    "raw-db-acme-69856ec0faae6daf"
-                )
-            ),
         ]
     );
 
     let raw_service = rendered
         .objects
         .iter()
-        .find(|object| object_name(&object.object) == "raw-svc-acme-69856ec0faae6daf")
+        .find(|object| object.object.name() == "raw-svc-acme-69856ec0faae6daf")
         .expect("raw service rendered")
+        .object
         .to_kubernetes_json();
     let materialization = crate::materialization::MaterializationRecord {
         pod_backend: None,
@@ -881,29 +723,78 @@ spec:
         raw_service["metadata"]["finalizers"],
         json!(["raw.example.com/protect"])
     );
+}
 
-    let raw_stateful_set = rendered
+#[test]
+fn rejects_raw_workload_controllers() {
+    for kind in ["Deployment", "StatefulSet"] {
+        let mut template = deployment_template();
+        template.raw_objects = vec![raw_manifest(&format!(
+            r#"
+apiVersion: apps/v1
+kind: {kind}
+metadata:
+  name: aux-{{suffix}}
+spec:
+  serviceName: aux
+  selector:
+    matchLabels:
+      app: aux
+  template:
+    metadata:
+      labels:
+        app: aux
+    spec:
+      containers:
+        - name: aux
+          image: example/aux:1
+"#
+        ))];
+
+        let error = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+        })
+        .expect_err("a raw workload controller is rejected");
+
+        assert_invalid_field(error, "raw_objects.manifest.kind", "template.workload");
+    }
+}
+
+/// Each raw object is read as its Kubernetes kind, so a field of the wrong type
+/// fails at render and the API server receives only fields the kind defines.
+#[test]
+fn raw_objects_follow_their_kubernetes_schema() {
+    let render = |spec: &str| {
+        let mut template = deployment_template();
+        template.raw_objects = vec![raw_manifest(&format!(
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: aux-{{suffix}}\nspec:\n{spec}"
+        ))];
+        render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("instance-a", 7, values([("tenant", "acme")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
+        })
+    };
+
+    assert_invalid_field(
+        render("  ports:\n    - port: eighty\n").expect_err("a port is a number"),
+        "raw_objects.manifest",
+        "does not match its Kubernetes schema",
+    );
+    let rendered =
+        render("  ports:\n    - port: 80\n  clusterIp: None\n").expect("an unknown field renders");
+    let service = rendered
         .objects
         .iter()
-        .find(|object| object_name(&object.object) == "raw-db-acme-69856ec0faae6daf")
-        .expect("raw stateful set rendered")
+        .find(|object| object.object.name() == "aux-69856ec0faae6daf")
+        .expect("raw Service renders")
+        .object
         .to_kubernetes_json();
-    assert_eq!(
-        raw_stateful_set["metadata"]["labels"][LABEL_INSTANCE_GENERATION],
-        json!("7")
-    );
-    assert_eq!(
-        raw_stateful_set["spec"]["template"]["metadata"]["labels"][LABEL_INSTANCE_ID],
-        json!("instance-a")
-    );
-    assert_eq!(
-        raw_stateful_set["spec"]["template"]["metadata"]["name"],
-        json!("raw-pod-template")
-    );
-    assert_eq!(
-        raw_stateful_set["spec"]["podManagementPolicy"],
-        json!("Parallel")
-    );
+    assert_eq!(service["spec"], json!({"ports": [{"port": 80}]}));
 }
 
 #[test]
@@ -1261,7 +1152,7 @@ spec:
     .expect("a templated raw PV declaring Retain renders");
 
     assert_eq!(
-        raw_object(&rendered).metadata.name,
+        rendered_kind(&rendered, "PersistentVolume").name(),
         "raw-pv-acme-69856ec0faae6daf"
     );
 }
@@ -1314,7 +1205,8 @@ spec:
     })
     .expect("raw object renders");
 
-    let annotations = &raw_object(&rendered).value["metadata"]["annotations"];
+    let raw = json_named(&rendered, "raw-svc-69856ec0faae6daf");
+    let annotations = &raw["metadata"]["annotations"];
     assert_eq!(
         annotations["example.com/first"],
         "sleepypodsInstanceValue1-"
@@ -1356,7 +1248,8 @@ spec:
     })
     .expect("raw object renders");
 
-    let annotations = &raw_object(&rendered).value["metadata"]["annotations"];
+    let raw = json_named(&rendered, "raw-svc-69856ec0faae6daf");
+    let annotations = &raw["metadata"]["annotations"];
     assert_eq!(
         annotations["example.com/author"],
         "sleepypodsInstanceValue0-"
@@ -1398,7 +1291,8 @@ spec:
     .expect("raw object renders");
 
     assert_eq!(
-        raw_object(&rendered).value["metadata"]["annotations"]["example.com/acme"],
+        json_named(&rendered, "raw-svc-69856ec0faae6daf")["metadata"]["annotations"]
+            ["example.com/acme"],
         "owned"
     );
 }
@@ -1490,7 +1384,7 @@ fn raw_object_names_end_with_the_instance_suffix() {
 
     let rendered = render("settings-{suffix}").expect("a suffixed raw name renders");
     assert_eq!(
-        raw_object(&rendered).metadata.name,
+        rendered_kind(&rendered, "Secret").name(),
         "settings-69856ec0faae6daf"
     );
     for name in ["settings", "settings-acme", "settings{suffix}", "{suffix}"] {
@@ -1577,18 +1471,9 @@ fn renders_host_path_subdirectory_whose_name_begins_with_dots() {
     })
     .expect("a subdirectory whose name begins with dots still renders");
 
-    let volume = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::PersistentVolume(volume) => Some(volume),
-            _ => None,
-        })
-        .expect("PersistentVolume was rendered");
-
     assert_eq!(
-        volume.spec.source,
-        PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
+        persistent_volume(&rendered).host_path,
+        Some(HostPathVolumeSource {
             path: "/var/local/sleepypods/..data".to_owned(),
             type_: Some("DirectoryOrCreate".to_owned()),
         })
@@ -1647,36 +1532,33 @@ fn renders_static_archil_csi_volume_with_node_publish_secret_ref() {
     })
     .expect("Archil-style CSI workload renders");
 
-    let pv = match &rendered.objects[0].object {
-        KubernetesObject::PersistentVolume(pv) => pv,
-        other => panic!("expected PersistentVolume, got {}", other.kind()),
-    };
+    let pv = persistent_volume(&rendered);
     assert_eq!(
-        pv.spec.persistent_volume_reclaim_policy,
-        PersistentVolumeReclaimPolicy::Retain
+        pv.persistent_volume_reclaim_policy.as_deref(),
+        Some("Retain")
     );
-    assert_eq!(pv.spec.claim_ref.namespace, "data");
-    assert_eq!(pv.spec.claim_ref.name, "pvc-acme-2e1ac556311afdd5");
+    let claim = pv.claim_ref.as_ref().expect("the PV names its claim");
+    assert_eq!(claim.namespace.as_deref(), Some("data"));
+    assert_eq!(claim.name.as_deref(), Some("pvc-acme-2e1ac556311afdd5"));
     assert_eq!(
-        pv.spec.source,
-        PersistentVolumeSource::Csi(Box::new(CsiPersistentVolumeSource {
+        pv.csi,
+        Some(CSIPersistentVolumeSource {
             driver: "csi.archil.com".to_owned(),
             volume_handle: "archil-volume-123".to_owned(),
-            fs_type: None,
-            read_only: false,
-            volume_attributes: BTreeMap::from([("region".to_owned(), "us-west-2".to_owned())]),
-            controller_publish_secret_ref: None,
-            node_stage_secret_ref: None,
-            node_publish_secret_ref: Some(CsiSecretReference {
-                name: "archil-node-secret".to_owned(),
-                namespace: "storage-secrets".to_owned(),
+            read_only: Some(false),
+            volume_attributes: Some(BTreeMap::from([(
+                "region".to_owned(),
+                "us-west-2".to_owned()
+            )])),
+            node_publish_secret_ref: Some(SecretReference {
+                name: Some("archil-node-secret".to_owned()),
+                namespace: Some("storage-secrets".to_owned()),
             }),
-            controller_expand_secret_ref: None,
-            node_expand_secret_ref: None,
-        }))
+            ..CSIPersistentVolumeSource::default()
+        })
     );
 
-    let objects = rendered.to_kubernetes_json_values();
+    let objects = json_values(&rendered);
     assert_eq!(
         objects[0]["spec"]["csi"]["nodePublishSecretRef"],
         json!({
@@ -1730,13 +1612,9 @@ fn renders_all_csi_secret_refs_to_kubernetes_keys() {
     })
     .expect("CSI workload with all secret refs renders");
 
-    let pv = match &rendered.objects[0].object {
-        KubernetesObject::PersistentVolume(pv) => pv,
-        other => panic!("expected PersistentVolume, got {}", other.kind()),
-    };
-    let PersistentVolumeSource::Csi(csi) = &pv.spec.source else {
-        panic!("expected CSI source");
-    };
+    let csi = persistent_volume(&rendered)
+        .csi
+        .expect("expected CSI source");
 
     let expected = [
         (
@@ -1765,13 +1643,13 @@ fn renders_all_csi_secret_refs_to_kubernetes_keys() {
             csi.node_expand_secret_ref.as_ref(),
         ),
     ];
-    let objects = rendered.to_kubernetes_json_values();
+    let objects = json_values(&rendered);
     let csi_json = &objects[0]["spec"]["csi"];
 
     for (key, name, rendered_ref) in expected {
         assert_eq!(
-            rendered_ref.map(|ref_| (ref_.name.as_str(), ref_.namespace.as_str())),
-            Some((name, "storage-secrets")),
+            rendered_ref.map(|ref_| (ref_.name.as_deref(), ref_.namespace.as_deref())),
+            Some((Some(name), Some("storage-secrets"))),
             "{key}"
         );
         assert_eq!(
@@ -1799,7 +1677,7 @@ fn serializes_stateful_set_pv_and_pvc_as_kubernetes_json() {
     })
     .expect("stateful workload renders");
 
-    let objects = rendered.to_kubernetes_json_values();
+    let objects = json_values(&rendered);
     let pv = &objects[0];
     assert_eq!(pv["apiVersion"], json!("v1"));
     assert_eq!(pv["kind"], json!("PersistentVolume"));
@@ -1900,14 +1778,9 @@ fn renders_host_path_persistent_volume_source() {
     })
     .expect("hostPath stateful workload renders");
 
-    let pv = match &rendered.objects[0].object {
-        KubernetesObject::PersistentVolume(pv) => pv,
-        other => panic!("expected PersistentVolume, got {}", other.kind()),
-    };
-
     assert_eq!(
-        pv.spec.source,
-        PersistentVolumeSource::HostPath(HostPathPersistentVolumeSource {
+        persistent_volume(&rendered).host_path,
+        Some(HostPathVolumeSource {
             path: "/var/local/sleepypods/acme".to_owned(),
             type_: Some("DirectoryOrCreate".to_owned()),
         })
@@ -1924,7 +1797,7 @@ fn serializes_host_path_persistent_volume_source_as_kubernetes_json() {
     })
     .expect("hostPath stateful workload renders");
 
-    let pv = &rendered.to_kubernetes_json_values()[0];
+    let pv = &json_values(&rendered)[0];
 
     assert_eq!(
         pv["spec"]["hostPath"],
@@ -2705,32 +2578,76 @@ fn sleep_policy() -> ResolvedSleepPolicy {
     }
 }
 
-fn assert_env(env: &[EnvVar], name: &str, expected: &str) {
-    let value = env
+fn json_values(rendered: &RenderedManifest) -> Vec<Value> {
+    rendered
+        .objects
         .iter()
-        .find(|var| var.name == name)
-        .unwrap_or_else(|| panic!("missing env var {name}"));
-
-    assert_eq!(value.value, expected);
+        .map(|rendered| rendered.object.to_kubernetes_json())
+        .collect()
 }
 
-fn assert_env_absent(env: &[EnvVar], name: &str) {
+/// The first rendered object of `kind`.
+fn rendered_kind<'a>(rendered: &'a RenderedManifest, kind: &str) -> &'a KubernetesObject {
+    &rendered
+        .objects
+        .iter()
+        .find(|rendered| rendered.object.kind() == kind)
+        .unwrap_or_else(|| panic!("a {kind} renders"))
+        .object
+}
+
+fn json_of(rendered: &RenderedManifest, kind: &str) -> Value {
+    rendered_kind(rendered, kind).to_kubernetes_json()
+}
+
+fn json_named(rendered: &RenderedManifest, name: &str) -> Value {
+    rendered
+        .objects
+        .iter()
+        .find(|rendered| rendered.object.name() == name)
+        .unwrap_or_else(|| panic!("{name} renders"))
+        .object
+        .to_kubernetes_json()
+}
+
+/// The first rendered object of kind `K`, read back as its `k8s-openapi` type.
+fn typed<K: Resource + DeserializeOwned>(rendered: &RenderedManifest) -> K {
+    serde_json::from_value(json_of(rendered, K::KIND)).expect("rendered JSON fits its kind")
+}
+
+fn persistent_volume(
+    rendered: &RenderedManifest,
+) -> k8s_openapi::api::core::v1::PersistentVolumeSpec {
+    typed::<PersistentVolume>(rendered)
+        .spec
+        .expect("a PersistentVolume has a spec")
+}
+
+/// The environment of the sidecar, the second container of a workload's Pod.
+fn sidecar_env(workload: &Value) -> &Value {
+    &workload["spec"]["template"]["spec"]["containers"][1]["env"]
+}
+
+fn env_var<'a>(env: &'a Value, name: &str) -> &'a Value {
+    env.as_array()
+        .expect("env is a list")
+        .iter()
+        .find(|var| var["name"] == name)
+        .unwrap_or_else(|| panic!("missing env var {name}"))
+}
+
+fn assert_env(env: &Value, name: &str, expected: &str) {
+    assert_eq!(env_var(env, name)["value"], expected);
+}
+
+fn assert_env_absent(env: &Value, name: &str) {
     assert!(
-        env.iter().all(|var| var.name != name),
+        env.as_array()
+            .expect("env is a list")
+            .iter()
+            .all(|var| var["name"] != name),
         "env var {name} should be absent"
     );
-}
-
-fn object_name(object: &KubernetesObject) -> &str {
-    match object {
-        KubernetesObject::Deployment(object) => &object.metadata.name,
-        KubernetesObject::StatefulSet(object) => &object.metadata.name,
-        KubernetesObject::Service(object) => &object.metadata.name,
-        KubernetesObject::Secret(object) => &object.metadata.name,
-        KubernetesObject::PersistentVolume(object) => &object.metadata.name,
-        KubernetesObject::PersistentVolumeClaim(object) => &object.metadata.name,
-        KubernetesObject::Raw(object) => &object.metadata.name,
-    }
 }
 
 fn composed(prefix: &str, field: &str) -> TemplateText {
@@ -2762,17 +2679,6 @@ fn raw_manifest_parts(parts: impl Into<Vec<TemplateTextPart>>) -> RawKubernetesM
     RawKubernetesManifestTemplate {
         manifest: TemplateText::from_parts(expanded),
     }
-}
-
-fn raw_object(rendered: &RenderedManifest) -> &RawKubernetesObject {
-    rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Raw(raw) => Some(raw),
-            _ => None,
-        })
-        .expect("raw object was rendered")
 }
 
 fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> RenderedObjectRef {
@@ -2841,12 +2747,7 @@ fn primary_http_and_tcp_workloads_have_private_transport_readiness() {
             namespace: "apps",
         })
         .unwrap();
-        let workload = rendered
-            .objects
-            .iter()
-            .find(|object| object.object.kind() == "Deployment")
-            .unwrap()
-            .to_kubernetes_json();
+        let workload = json_of(&rendered, "Deployment");
         let containers = &workload["spec"]["template"]["spec"]["containers"];
         assert!(containers[0]["readinessProbe"].is_null());
         assert_eq!(
@@ -2859,12 +2760,7 @@ fn primary_http_and_tcp_workloads_have_private_transport_readiness() {
         assert!(containers[1]["env"].as_array().unwrap().contains(&json!({
             "name":"SLEEPYPODS_SIDECAR_READINESS_LISTEN_ADDR", "value":"0.0.0.0:15001"
         })));
-        let service = rendered
-            .objects
-            .iter()
-            .find(|object| object.object.kind() == "Service")
-            .unwrap()
-            .to_kubernetes_json();
+        let service = json_of(&rendered, "Service");
         assert_eq!(service["spec"]["ports"].as_array().unwrap().len(), 1);
         assert_eq!(service["spec"]["ports"][0]["targetPort"], 15000);
     }
@@ -2896,12 +2792,7 @@ fn readiness_port_skips_declared_app_proxy_and_metrics_ports() {
         })
     };
     let rendered = render(&template).unwrap();
-    let workload = rendered
-        .objects
-        .iter()
-        .find(|object| object.object.kind() == "Deployment")
-        .unwrap()
-        .to_kubernetes_json();
+    let workload = json_of(&rendered, "Deployment");
     let containers = &workload["spec"]["template"]["spec"]["containers"];
     assert_eq!(containers[0]["ports"][0]["name"], "sleepypods");
     assert!(
@@ -2926,12 +2817,7 @@ fn readiness_port_skips_declared_app_proxy_and_metrics_ports() {
         .value = TemplateText::literal("");
     let empty_metrics =
         render(&template).expect("empty optional metrics listener remains disabled");
-    let workload = empty_metrics
-        .objects
-        .iter()
-        .find(|object| object.object.kind() == "Deployment")
-        .unwrap()
-        .to_kubernetes_json();
+    let workload = json_of(&empty_metrics, "Deployment");
     assert_eq!(
         workload["spec"]["template"]["spec"]["containers"][1]["readinessProbe"]["httpGet"]["port"],
         15003
@@ -2952,77 +2838,15 @@ fn readiness_port_skips_declared_app_proxy_and_metrics_ports() {
 }
 
 #[test]
-fn raw_auxiliary_workloads_never_match_primary_service_selector() {
-    let mut template = deployment_template();
-    template.raw_objects = ["Deployment", "StatefulSet"]
-        .map(|kind| {
-            raw_manifest(&format!(
-                r#"
-apiVersion: apps/v1
-kind: {kind}
-metadata:
-  name: auxiliary-{{suffix}}
-spec:
-  selector:
-    matchLabels:
-      app: auxiliary
-  template:
-    metadata:
-      labels:
-        app: auxiliary
-    spec:
-      containers:
-      - name: auxiliary
-        image: example/auxiliary:test
-"#
-            ))
-        })
-        .to_vec();
-    let rendered = render_manifests(RenderManifestRequest {
-        template: &template,
-        instance: &instance("instance-a", 7, values([("tenant", "acme")])),
-        sleep_policy: sleep_policy(),
-        namespace: "apps",
-    })
-    .unwrap();
-    let service = rendered
-        .objects
-        .iter()
-        .find(|object| object.object.kind() == "Service")
-        .unwrap()
-        .to_kubernetes_json();
-    let selector = service["spec"]["selector"].as_object().unwrap();
-    for object in rendered
-        .objects
-        .iter()
-        .filter(|object| matches!(object.object, KubernetesObject::Raw(_)))
-    {
-        let value = object.to_kubernetes_json();
-        let labels = value["spec"]["template"]["metadata"]["labels"]
-            .as_object()
-            .unwrap();
-        assert_eq!(labels[LABEL_INSTANCE_ID], "instance-a");
-        assert_eq!(labels[LABEL_INSTANCE_GENERATION], "7");
-        assert!(!labels.contains_key(LABEL_WORKLOAD_NAME));
-        assert!(!selector
-            .iter()
-            .all(|(key, value)| labels.get(key) == Some(value)));
-        assert_eq!(
-            value["spec"]["selector"],
-            json!({"matchLabels":{"app":"auxiliary"}})
-        );
-    }
-}
-
-#[test]
 fn raw_auxiliaries_cannot_supply_reserved_primary_selector_labels_or_expressions() {
-    for pointer in [
-        "/metadata/labels",
-        "/spec/template/metadata/labels",
-        "/spec/selector/matchLabels",
-        "/spec/selector/matchExpressions",
+    let service = json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"auxiliary","labels":{}},"spec":{"selector":{}}});
+    let claim = json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"auxiliary"},"spec":{"volumeName":"auxiliary","selector":{"matchLabels":{},"matchExpressions":[]}}});
+    for (mut raw, pointer) in [
+        (service.clone(), "/metadata/labels"),
+        (service, "/spec/selector"),
+        (claim.clone(), "/spec/selector/matchLabels"),
+        (claim, "/spec/selector/matchExpressions"),
     ] {
-        let mut raw = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"auxiliary","labels":{}},"spec":{"selector":{"matchLabels":{},"matchExpressions":[]},"template":{"metadata":{"labels":{}},"spec":{"containers":[]}}}});
         if pointer.ends_with("matchExpressions") {
             *raw.pointer_mut(pointer).unwrap() =
                 json!([{"key":LABEL_WORKLOAD_NAME,"operator":"Exists"}]);
@@ -3087,21 +2911,11 @@ spec:
         namespace: "apps",
     })
     .unwrap();
-    let workload = rendered
-        .objects
-        .iter()
-        .find(|object| object.object.kind() == "Deployment")
-        .unwrap()
-        .to_kubernetes_json();
+    let workload = json_of(&rendered, "Deployment");
     assert_eq!(
         workload["spec"]["template"]["spec"]["containers"][1]["ports"][0]["name"],
         "sleepypods"
     );
-    let alias = rendered
-        .objects
-        .iter()
-        .find(|object| matches!(object.object, KubernetesObject::Raw(_)))
-        .unwrap()
-        .to_kubernetes_json();
+    let alias = json_named(&rendered, "primary-alias-69856ec0faae6daf");
     assert_eq!(alias["spec"]["ports"][0]["targetPort"], "sleepypods");
 }

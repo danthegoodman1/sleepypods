@@ -24,8 +24,8 @@ use crate::{
         MaterializationTarget, RenderedObjectRef,
     },
     materializer::{
-        is_workload_ref, rendered_object_ref, rendered_object_refs, KubernetesClientError,
-        KubernetesClientFuture, KubernetesClientResult,
+        is_workload_ref, rendered_object_refs, KubernetesClientError, KubernetesClientFuture,
+        KubernetesClientResult,
     },
     projection::{LiveObjectIdentity, LiveObjectMetadata, ProjectionObjectInspection},
     runtime_work::{MaterializationWorkStatus, RecordMaterializationFailure},
@@ -647,7 +647,7 @@ impl ClusterState {
 
     fn insert(&mut self, object: &KubernetesObject, active: bool) {
         self.next_uid += 1;
-        let object_ref = rendered_object_ref(object);
+        let object_ref = object.object_ref();
         let mut metadata = LiveObjectMetadata::from_rendered_object(object);
         metadata.identity = LiveObjectIdentity {
             uid: format!("uid-{}", self.next_uid),
@@ -765,7 +765,7 @@ impl KubernetesMaterializerClient for FakeCluster {
         precondition: Option<&'a LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            let object_ref = rendered_object_ref(object);
+            let object_ref = object.object_ref();
             match precondition {
                 None => {
                     self.mutate(Op::Create, &object_ref, |state| {
@@ -1590,7 +1590,7 @@ async fn a_create_that_lands_after_cleanup_starts_no_pod_and_the_next_wake_adopt
     let late = stamped_manifest(&sleep)
         .objects
         .into_iter()
-        .find(|rendered| is_workload_ref(&rendered_object_ref(&rendered.object)))
+        .find(|rendered| is_workload_ref(&rendered.object.object_ref()))
         .expect("a workload is rendered");
     cluster.state().insert(&late.object, false);
     tokio::time::sleep(Duration::from_secs(300)).await;
@@ -1622,11 +1622,9 @@ async fn a_wake_refuses_an_object_it_does_not_own_and_the_instance_fails() {
     let mut service = stamped_manifest(&foreign)
         .objects
         .into_iter()
-        .find(|rendered| rendered_object_ref(&rendered.object).kind == "Service")
+        .find(|rendered| rendered.object.object_ref().kind == "Service")
         .expect("a Service is rendered");
-    if let KubernetesObject::Service(service) = &mut service.object {
-        service.metadata.name = service_ref(&wake).name;
-    }
+    service.object.metadata_mut().name = Some(service_ref(&wake).name);
     cluster.state().insert(&service.object, false);
     let harness = start(&store, &cluster);
 

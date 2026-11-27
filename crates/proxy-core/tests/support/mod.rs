@@ -39,7 +39,9 @@ where
         .handshakes
         .try_acquire()
         .expect("new admission has capacity");
-    let io = admission.admit_io(io).expect("new admission has capacity");
+    let Ok(io) = admission.admit_io(io) else {
+        panic!("new admission has capacity");
+    };
     proxy_core::serve_http_connection_admitted(io, shutdown, admission, handshake, None, handler)
         .await;
 }

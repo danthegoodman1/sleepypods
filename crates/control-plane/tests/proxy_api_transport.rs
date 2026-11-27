@@ -26,8 +26,8 @@ use control_plane::api::{
 };
 use control_plane::projection::{LiveObjectMetadata, ProjectionObjectInspection};
 use control_plane::{
-    rendered_object_ref, AuthConfig, BackendEndpoint, BackendGeneration, CallerRole,
-    ControlPlaneAuth, ControlPlaneStore, Generation, InstanceId, InstanceRecord,
+    AuthConfig, BackendEndpoint, BackendGeneration, CallerRole, ControlPlaneAuth,
+    ControlPlaneStore, Generation, InstanceId, InstanceRecord,
     InstanceState as DomainInstanceState, KubernetesClientError, KubernetesClientFuture,
     KubernetesClientResult, KubernetesMaterializer, KubernetesMaterializerClient,
     MaterializationId, MaterializationRecord, MaterializationState, MaterializationTarget,
@@ -492,6 +492,7 @@ async fn proxy_subscribe_returns_the_complete_rule_set_for_the_host_most_specifi
             instance_state: InstanceState::Cold as i32,
             instance_generation: 7,
             backend_uri: Some("http://svc-acme.apps.svc.cluster.local:80".to_owned()),
+            pod_backend_uri: None,
             backend_generation: Some(7),
         })
     );
@@ -521,7 +522,9 @@ async fn proxy_subscribe_publishes_the_backend_its_one_store_read_resolved() {
             DomainInstanceState::Running,
         ),
     );
-    store.seed_ready_materialization(ready_materialization("instance-snapshot", 7));
+    let mut ready = ready_materialization("instance-snapshot", 7);
+    ready.pod_backend = Some(BackendEndpoint::new("http://10.244.0.7:15000").unwrap());
+    store.seed_ready_materialization(ready);
 
     let rules = subscribe_once(store, "snapshot.example.com").await;
 
@@ -529,6 +532,10 @@ async fn proxy_subscribe_publishes_the_backend_its_one_store_read_resolved() {
     assert_eq!(
         route.backend_uri.as_deref(),
         Some("http://svc-acme.apps.svc.cluster.local:80")
+    );
+    assert_eq!(
+        route.pod_backend_uri.as_deref(),
+        Some("http://10.244.0.7:15000")
     );
     assert_eq!(route.backend_generation, Some(7));
 }
@@ -1842,7 +1849,7 @@ impl KubernetesMaterializerClient for FakeKubernetesClient {
         _precondition: Option<&'a control_plane::projection::LiveObjectIdentity>,
     ) -> KubernetesClientFuture<'a, KubernetesClientResult<()>> {
         Box::pin(async move {
-            let object_ref = rendered_object_ref(object);
+            let object_ref = object.object_ref();
             self.live_objects
                 .lock()
                 .expect("fake kubernetes lock is available")
@@ -2144,6 +2151,7 @@ fn domain_route_entry(
         backend: Some(
             BackendEndpoint::new("http://backend.example.local:8080").expect("backend is valid"),
         ),
+        pod_backend: None,
         backend_generation: Some(BackendGeneration::new(9)),
     }
 }

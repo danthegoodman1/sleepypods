@@ -7,15 +7,16 @@
 use control_plane::ids::WorkloadClassId;
 use control_plane::{
     manifest::{
-        render_manifests, ContainerPortTemplate, ContainerTemplate, KubernetesObject,
-        ManifestTemplate, PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy,
-        PersistentVolumeSourceTemplate, RawKubernetesManifestTemplate, RenderManifestRequest,
-        ServicePortTemplate, ServiceTemplate, SidecarTemplate, TemplateText, TemplateTextPart,
-        VolumeTemplate, WorkloadKind, WorkloadTemplate,
+        render_manifests, ContainerPortTemplate, ContainerTemplate, ManifestTemplate,
+        PersistentVolumeAccessMode, PersistentVolumeReclaimPolicy, PersistentVolumeSourceTemplate,
+        RawKubernetesManifestTemplate, RenderManifestRequest, ServicePortTemplate, ServiceTemplate,
+        SidecarTemplate, TemplateText, TemplateTextPart, VolumeTemplate, WorkloadKind,
+        WorkloadTemplate,
     },
-    Generation, InstanceId, InstanceRecord, InstanceState, InstanceValues, ResolvedSleepPolicy,
-    WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
+    Generation, InstanceId, InstanceRecord, InstanceState, InstanceValues, RenderedManifest,
+    ResolvedSleepPolicy, WorkloadClassVersionRef, WorkloadValueFieldRule, WorkloadValueSchema,
 };
+use serde_json::Value;
 
 // --------------------------------------------------------------------------
 // F2b (fixed): instance values bind into the parsed document, so a value
@@ -23,85 +24,61 @@ use control_plane::{
 // --------------------------------------------------------------------------
 
 #[test]
-fn instance_value_cannot_inject_pod_spec_structure_into_a_raw_manifest() {
+fn instance_value_cannot_inject_structure_into_a_raw_manifest() {
     // A WorkloadClass author writes what looks like a safe template: the tenant
-    // only gets to pick the container image tag.
+    // only gets to pick the owning team.
     let template = template_with_raw_object(TemplateText::from_parts([
         TemplateTextPart::literal(
             r#"
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Service
 metadata:
-  name: raw-app-{suffix}
-spec:
-  selector:
-    matchLabels:
-      app: raw
-  template:
-    metadata:
-      labels:
-        app: raw
-    spec:
-      containers:
-        - name: app
-          image: "example/app:"#,
+  name: raw-svc-{suffix}
+  annotations:
+    example.com/owner: "team-"#,
         ),
-        TemplateTextPart::instance_value("tag"),
+        TemplateTextPart::instance_value("team"),
         TemplateTextPart::literal(
             r#""
+spec:
+  selector:
+    app: raw
+  ports:
+    - port: 8080
 "#,
         ),
     ]));
 
-    // The tenant supplies a tag that closes the string and opens new keys.
-    let malicious_tag = r#"1"
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: host
-              mountPath: /host
-      hostPID: true
-      hostNetwork: true
-      serviceAccountName: sleepypods-control-plane
-      volumes:
-        - name: host
-          hostPath:
-            path: /
+    // The tenant supplies a team that closes the string and opens new keys.
+    let malicious_team = r#"a"
+    example.com/injected: "yes"
+spec:
+  type: LoadBalancer
+  externalIPs:
+    - 203.0.113.1
 #"#;
 
     let rendered = render_manifests(RenderManifestRequest {
         template: &template,
-        instance: &instance("tenant-evil", 1, values([("tag", malicious_tag)])),
+        instance: &instance("tenant-evil", 1, values([("team", malicious_team)])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
     })
     .expect("render still accepts the manifest");
 
-    let raw = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Raw(raw) => Some(raw),
-            _ => None,
-        })
-        .expect("raw object was rendered");
-
-    let json = raw.value.clone();
-    let pod_spec = &json["spec"]["template"]["spec"];
+    let json = rendered_named(&rendered, "raw-svc-");
 
     // None of the injected keys exist: the structure is the class author's.
-    assert!(pod_spec["containers"][0]["securityContext"].is_null());
-    assert!(pod_spec["hostPID"].is_null());
-    assert!(pod_spec["hostNetwork"].is_null());
-    assert!(pod_spec["serviceAccountName"].is_null());
-    assert!(pod_spec["volumes"].is_null());
+    assert!(json["spec"]["type"].is_null());
+    assert!(json["spec"]["externalIPs"].is_null());
+    assert!(json["metadata"]["annotations"]["example.com/injected"].is_null());
 
     // The payload is inert: it landed in the scalar the author templated.
-    let image = pod_spec["containers"][0]["image"]
+    let owner = json["metadata"]["annotations"]["example.com/owner"]
         .as_str()
-        .expect("image is a string scalar");
-    assert!(image.starts_with("example/app:1"));
-    assert!(image.contains("privileged: true"));
+        .expect("owner is a string scalar");
+    assert!(owner.starts_with("team-a"));
+    assert!(owner.contains("LoadBalancer"));
 }
 
 /// The escape hatch still works for what it is for: a class author's structure,
@@ -145,36 +122,30 @@ spec:
     })
     .expect("raw object with instance values renders");
 
-    let raw = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Raw(raw) => Some(raw),
-            _ => None,
-        })
-        .expect("raw object was rendered");
+    let raw = rendered_named(&rendered, "raw-svc-");
 
-    assert_eq!(raw.metadata.name, "raw-svc-acme-80a707af7dc77ee1");
+    assert_eq!(raw["metadata"]["name"], "raw-svc-acme-80a707af7dc77ee1");
     assert_eq!(
-        raw.value["metadata"]["annotations"]["example.com/owner"],
+        raw["metadata"]["annotations"]["example.com/owner"],
         "team-acme"
     );
-    assert_eq!(raw.value["spec"]["ports"][0]["port"], 8080);
+    assert_eq!(raw["spec"]["ports"][0]["port"], 8080);
 }
 
 // --------------------------------------------------------------------------
-// F2b: even with no injection, the renderer performs no pod-security
-// validation on raw Deployment/StatefulSet objects.
+// F2b (fixed): a raw object cannot be a Deployment or StatefulSet, so every Pod
+// the platform starts comes from the structured, hardened workload.
 // --------------------------------------------------------------------------
 
 #[test]
-fn raw_workload_manifest_is_applied_with_no_pod_security_validation() {
-    let template = template_with_raw_object(TemplateText::literal(
-        r#"
+fn raw_workload_manifest_is_rejected() {
+    for kind in ["Deployment", "StatefulSet"] {
+        let template = template_with_raw_object(TemplateText::literal(format!(
+            r#"
 apiVersion: apps/v1
-kind: StatefulSet
+kind: {kind}
 metadata:
-  name: raw-db-{suffix}
+  name: raw-db-{{suffix}}
 spec:
   serviceName: raw-db
   selector:
@@ -186,7 +157,6 @@ spec:
         app: raw
     spec:
       hostPID: true
-      hostIPC: true
       hostNetwork: true
       serviceAccountName: sleepypods-control-plane
       automountServiceAccountToken: true
@@ -195,48 +165,22 @@ spec:
           image: example/escape:1
           securityContext:
             privileged: true
-            allowPrivilegeEscalation: true
-            runAsUser: 0
-            capabilities:
-              add: ["SYS_ADMIN"]
-          volumeMounts:
-            - name: host
-              mountPath: /host
-      volumes:
-        - name: host
-          hostPath:
-            path: /
-            type: Directory
-"#,
-    ));
+"#
+        )));
 
-    let rendered = render_manifests(RenderManifestRequest {
-        template: &template,
-        instance: &instance("tenant-evil", 1, values([("tag", "1")])),
-        sleep_policy: sleep_policy(),
-        namespace: "apps",
-    })
-    .expect("render accepts a fully privileged raw workload");
-
-    let raw = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Raw(raw) => Some(raw),
-            _ => None,
+        let error = render_manifests(RenderManifestRequest {
+            template: &template,
+            instance: &instance("tenant-evil", 1, values([("tag", "1")])),
+            sleep_policy: sleep_policy(),
+            namespace: "apps",
         })
-        .expect("raw object was rendered");
+        .expect_err("a raw workload controller is rejected");
 
-    // to_kubernetes_json is exactly what is sent to the API server.
-    let applied = raw.value.clone();
-    let pod_spec = &applied["spec"]["template"]["spec"];
-    assert_eq!(pod_spec["hostPID"], true);
-    assert_eq!(pod_spec["serviceAccountName"], "sleepypods-control-plane");
-    assert_eq!(
-        pod_spec["containers"][0]["securityContext"]["privileged"],
-        true
-    );
-    assert_eq!(pod_spec["volumes"][0]["hostPath"]["path"], "/");
+        assert!(
+            format!("{error}").contains("template.workload"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -254,16 +198,13 @@ fn rendered_pod_spec_drops_its_service_account_token_and_sandboxes_the_workload(
     })
     .expect("deployment renders");
 
-    let deployment = rendered
+    let json = rendered
         .objects
         .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Deployment(deployment) => Some(deployment),
-            _ => None,
-        })
-        .expect("deployment was rendered");
-
-    let json = KubernetesObject::Deployment(deployment.clone()).to_kubernetes_json();
+        .find(|object| object.object.kind() == "Deployment")
+        .expect("deployment was rendered")
+        .object
+        .to_kubernetes_json();
     let pod_spec = &json["spec"]["template"]["spec"];
 
     assert_eq!(pod_spec["automountServiceAccountToken"], false);
@@ -329,58 +270,38 @@ fn value_schema_accepts_printable_text() {
 }
 
 /// Binding after the parse means an instance value is always a string scalar.
-/// A class that substitutes into a numeric or boolean field now renders a string
-/// there and Kubernetes rejects it, which is the intended trade: a value that can
-/// change a field's type can also change what the field means.
+/// A class that substitutes into a numeric or boolean field renders a string
+/// there, and the object's Kubernetes schema rejects it at render: a value that
+/// can change a field's type can also change what the field means.
 #[test]
 fn instance_values_bind_as_strings_even_in_numeric_positions() {
     let template = template_with_raw_object(TemplateText::from_parts([
         TemplateTextPart::literal(
             r#"
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Service
 metadata:
-  name: raw-app-{suffix}
+  name: raw-svc-{suffix}
 spec:
-  replicas: "#,
+  ports:
+    - port: "#,
         ),
-        TemplateTextPart::instance_value("replicas"),
-        TemplateTextPart::literal(
-            r#"
-  selector:
-    matchLabels:
-      app: raw
-  template:
-    metadata:
-      labels:
-        app: raw
-    spec:
-      containers:
-        - name: app
-          image: example/app:1
-"#,
-        ),
+        TemplateTextPart::instance_value("port"),
+        TemplateTextPart::literal("\n"),
     ]));
 
-    let rendered = render_manifests(RenderManifestRequest {
+    let error = render_manifests(RenderManifestRequest {
         template: &template,
-        instance: &instance("tenant-a", 1, values([("replicas", "3")])),
+        instance: &instance("tenant-a", 1, values([("port", "8080")])),
         sleep_policy: sleep_policy(),
         namespace: "apps",
     })
-    .expect("render succeeds");
+    .expect_err("a string port does not fit the Service schema");
 
-    let raw = rendered
-        .objects
-        .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::Raw(raw) => Some(raw),
-            _ => None,
-        })
-        .expect("raw object was rendered");
-
-    assert_eq!(raw.value["spec"]["replicas"], "3");
-    assert!(raw.value["spec"]["replicas"].as_u64().is_none());
+    assert!(
+        format!("{error}").contains("does not match its Kubernetes schema"),
+        "unexpected error: {error}"
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -444,15 +365,13 @@ fn host_path_rooted_in_an_author_literal_still_renders_per_instance() {
     })
     .expect("a rooted per-instance hostPath still renders");
 
-    let pv = rendered
+    let pv_json = rendered
         .objects
         .iter()
-        .find_map(|object| match &object.object {
-            KubernetesObject::PersistentVolume(pv) => Some(pv.clone()),
-            _ => None,
-        })
-        .expect("PersistentVolume was rendered");
-    let pv_json = KubernetesObject::PersistentVolume(pv).to_kubernetes_json();
+        .find(|object| object.object.kind() == "PersistentVolume")
+        .expect("PersistentVolume was rendered")
+        .object
+        .to_kubernetes_json();
     assert_eq!(pv_json["spec"]["hostPath"]["path"], "/srv/sleepypods/acme");
 }
 
@@ -537,6 +456,17 @@ fn template_with_raw_object(manifest: TemplateText) -> ManifestTemplate {
         }],
         ..base_template()
     }
+}
+
+/// The JSON of the rendered object whose name starts with `prefix`.
+fn rendered_named(rendered: &RenderedManifest, prefix: &str) -> Value {
+    rendered
+        .objects
+        .iter()
+        .find(|object| object.object.name().starts_with(prefix))
+        .unwrap_or_else(|| panic!("an object named {prefix}... renders"))
+        .object
+        .to_kubernetes_json()
 }
 
 fn instance(id: &str, generation: u64, values: InstanceValues) -> InstanceRecord {
