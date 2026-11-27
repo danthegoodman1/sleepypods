@@ -128,8 +128,9 @@ changing the projection stamp. Renewal checks the state the attempt claimed,
 so the wake's driver stops at its next renewal or mutation, releases its exact
 claim, and cleanup starts without waiting for the lease to expire.
 
-Every lifecycle transaction locks the instance row before its materialization
-row.
+A wake or sleep transition locks the instance row before its materialization
+row, and a cleanup completion locks its materialization alone, so no two
+lifecycle writes wait on each other in opposite orders.
 
 ## Recovery
 
