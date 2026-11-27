@@ -1,2 +1,0 @@
-error: error parsing jsonpath {range .items[*]}{.metadata.name}{"	"}{.metadata.uid}{"	"}{.status.phase}{"	"}{.status.conditions}{"
-"}{end}, unterminated quoted string

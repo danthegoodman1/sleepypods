@@ -1,8 +1,0 @@
-{
-  "namespace": "sp-6m-draining-1788840433",
-  "production_before": "799aa84679078f48050f9f44d8a3eb2f0facd3e442479a8319878d81c04e0989",
-  "started_utc": "2026-09-08T04:07:13.842142+00:00",
-  "exit_code": 101,
-  "elapsed_seconds": 177.85975545807742,
-  "production_after": "799aa84679078f48050f9f44d8a3eb2f0facd3e442479a8319878d81c04e0989"
-}

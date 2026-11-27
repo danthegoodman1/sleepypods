@@ -1,6 +1,0 @@
-observability.type=event event.name=runtime.drain.started active.count=0
-observability.type=metric metric.name=sleepypods_runtime_drain_duration_seconds metric.value=0.000066334 metric.labels=outcome=success
-observability.type=event event.name=runtime.drain.completed active.count=0 duration.ms=0
-observability.type=event event.name=runtime.drain.started active.count=0
-observability.type=metric metric.name=sleepypods_runtime_drain_duration_seconds metric.value=0.000021916 metric.labels=outcome=success
-observability.type=event event.name=runtime.drain.completed active.count=0 duration.ms=0

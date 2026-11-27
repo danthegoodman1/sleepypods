@@ -1,5 +1,0 @@
-   Compiling sleepypods-observability v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sleepypods-observability)
-   Compiling sleepypods-api v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sleepypods-api)
-   Compiling proxy-core v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/proxy-core)
-   Compiling sidecar v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/sidecar)
-    Finished `release` profile [optimized] target(s) in 18.50s

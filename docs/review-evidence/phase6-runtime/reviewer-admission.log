@@ -1,9 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
-     Running unittests src/lib.rs (target/debug/deps/control_plane-f987a49657eb41e0)
-
-running 2 tests
-test api::admission::tests::rpc_capacity_precedes_handler_and_recovers_after_cancel ... ok
-test api::admission::tests::completed_response_capacity_includes_owned_watchdog_teardown ... ok
-
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 232 filtered out; finished in 0.00s
-

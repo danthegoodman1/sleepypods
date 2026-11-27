@@ -1,9 +1,0 @@
-# Exclusivity deletion-timeout investigation
-
-The [initial gate](kind-before.log) failed with the generic `accepted instance deletion did not complete` after 135.07s of driver execution ([metadata](kind-before.json)). The last progress line concerns deleting the original owner, but the same helper is called again during final cleanup without progress labels. The log therefore does not identify which instance exceeded its 60s deletion wait.
-
-A [frozen-image repeat](frozen-repeat.log) of the exact same Rust driver passes unchanged, including all instance deletion checks, in 150.93s of whole-script time ([record](frozen-repeat.json)). The retained [diagnostic script](frozen-diagnostic.sh) skips image builds/loads and preserves its isolated namespace for read-only inspection. This is a diagnostic pass, not the final original-script gate.
-
-At 03:15:01 UTC, the [valid database snapshot](capture/first-valid-db.log) shows the original owner and blocked contender already deleted. Only the unrelated instance `m12otherc` remains Deleting, with no lease owner, attempt 3, two transient failures and `projection cleanup blocked across 3 object(s)`. Its next attempt is scheduled for 03:15:03.894. Later inspection finds [no instances or effect barriers](capture/effects-instances-schema.log) and [no owned workload objects](capture/remaining-objects.json). The test exits successfully without manual lifecycle mutation.
-
-The initial timed snapshot query referenced a nonexistent `observed_object_refs` column. Those failed query logs are retained, not treated as database evidence; control-plane logs were captured independently. No exact cause or affected instance was recovered for the first failure, no production correction or timeout increase is attributed to this repeat, and the confirmed Pending-to-Deleting supersession defect is investigated separately. The final original-script exclusivity gate remains required.

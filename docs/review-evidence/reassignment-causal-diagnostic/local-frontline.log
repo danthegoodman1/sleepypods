@@ -1,2 +1,0 @@
-observability.type=event event.name=runtime.drain.started active.count=0
-observability.type=event event.name=runtime.drain.completed active.count=0 duration.ms=0

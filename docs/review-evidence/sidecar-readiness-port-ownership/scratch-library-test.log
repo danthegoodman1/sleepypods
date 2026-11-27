@@ -1,9 +1,0 @@
-   Compiling sidecar v0.1.0 (/private/tmp/sleepypods-cleanup-boundary-ro13u8e8/crates/sidecar)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.87s
-     Running unittests src/lib.rs (/Users/dangoodman/code/sleepy-pods/target/debug/deps/sidecar-59fd6f5b2d211a11)
-
-running 1 test
-test readiness::tests::readiness_waits_for_loopback_app_and_stops_on_shutdown ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 70 filtered out; finished in 0.01s
-

@@ -1,7 +1,0 @@
-connect_ms=0.307
-write_ms=0.332
-first_byte_ms=1.747
-headers_ms=1.765 head="HTTP/1.0 200 OK\r\nserver: SleepypodsRoutingE2E/1.0 Python/3.13.3\r\ndate: Tue, 08 Sep 2026 04:32:17 GMT\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 78\r\nconnection: close"
-framed_complete_ms=1.783
-eof_ms=1.789
-read_to_end_result=Ok(262) elapsed_ms=1.791 bytes=262

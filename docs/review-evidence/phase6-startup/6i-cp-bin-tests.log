@@ -1,9 +1,0 @@
-   Compiling control-plane v0.1.0 (/Users/dangoodman/code/sleepy-pods/crates/control-plane)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
-     Running unittests src/bin/control-plane.rs (target/debug/deps/control_plane-1d87c6630a1d6de0)
-
-running 1 test
-test runtime_shutdown_tests::blocking_worker_cannot_pin_final_process_teardown ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.32s
-

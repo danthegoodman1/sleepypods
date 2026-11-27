@@ -1,6 +1,0 @@
-protocol=h1 path=direct requests=500000 concurrency=16 rps=143699.389 p50_ms=0.1100 p99_ms=0.1727 elapsed_s=3.4795
-protocol=h1 path=sidecar requests=500000 concurrency=16 rps=71079.396 p50_ms=0.2216 p99_ms=0.3205 elapsed_s=7.0344
-protocol=h1 sidecar_direct_ratio=0.4946 added_p99_ms=0.1479
-protocol=h2 path=direct requests=500000 concurrency=16 rps=69373.047 p50_ms=0.2265 p99_ms=0.3896 elapsed_s=7.2074
-protocol=h2 path=sidecar requests=500000 concurrency=16 rps=38930.276 p50_ms=0.4040 p99_ms=0.6550 elapsed_s=12.8435
-protocol=h2 sidecar_direct_ratio=0.5612 added_p99_ms=0.2654

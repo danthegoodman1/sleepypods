@@ -1,7 +1,0 @@
-2026-09-08T00:00:21.685452380Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:1
-2026-09-08T00:00:24.606923715Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:29
-2026-09-08T00:00:24.685768882Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:30
-2026-09-08T00:00:24.932513715Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:33
-2026-09-08T00:00:26.985154716Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:53
-2026-09-08T00:00:27.035535800Z temporary cold-protocol diagnostic: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 10.96.75.133:8080, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }))
-2026-09-08T00:00:27.195340508Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:54

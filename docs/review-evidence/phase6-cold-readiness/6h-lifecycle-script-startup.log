@@ -1,1 +1,0 @@
-PASS: /bin/bash startup only; three default image tags differ across invocations; all explicit overrides preserved. No kind commands executed.

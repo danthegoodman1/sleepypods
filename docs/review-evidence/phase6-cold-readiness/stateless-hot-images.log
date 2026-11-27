@@ -1,4 +1,0 @@
-NAME                                        UID                                    IMAGE                                                   IMAGE_ID
-sleepypods-control-plane-7fd6cb6fd5-fjshr   9850be17-a0c6-415f-9ee7-d6f35c43b4aa   docker.io/sleepypods/control-plane:review-remediation   sha256:ef1f6d80575906dd85aff08d8c0e800c75835f30a8f04e17a631048053a344cf
-sleepypods-frontline-77b6f8c65b-czmjt       0c38723e-43d1-40e1-a13e-3503156f1ece   docker.io/sleepypods/frontline:review-remediation       sha256:af67717ec9e460dece325ef0e4ff65d68325cde8d73dc951531a3ce9995ad576
-sleepypods-postgres-69d7b7c9fc-sbpr5        8fcd954a-b9e0-4e4d-9160-e307854191a1   docker.io/library/postgres:17-alpine                    sha256:ff80089083d7365046af7f03d949a2defa14e0b09e14bd5b8f08a242291be8b2

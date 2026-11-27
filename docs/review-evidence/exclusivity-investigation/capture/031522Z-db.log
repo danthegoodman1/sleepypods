@@ -1,4 +1,0 @@
-ERROR:  column "observed_object_refs" does not exist
-LINE 1: ..._kind, failure_message, failure_requires_cleanup, observed_o...
-                                                             ^
-command terminated with exit code 1

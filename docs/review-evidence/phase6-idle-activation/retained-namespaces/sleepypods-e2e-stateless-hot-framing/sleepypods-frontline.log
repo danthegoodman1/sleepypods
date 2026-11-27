@@ -1,7 +1,0 @@
-2026-09-08T01:16:06.391468554Z frontline waiting for control-plane endpoint http://sleepypods-control-plane.sleepypods-e2e-stateless-hot-framing.svc.cluster.local:50051: transport error
-2026-09-08T01:16:07.396273054Z frontline waiting for control-plane endpoint http://sleepypods-control-plane.sleepypods-e2e-stateless-hot-framing.svc.cluster.local:50051: transport error
-2026-09-08T01:16:10.859253916Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:1
-2026-09-08T01:16:11.117443416Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:3
-2026-09-08T01:16:13.087180792Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:22
-2026-09-08T01:16:16.207197544Z observability.type=event event.name=runtime.subscribe_stream.event subscription.id=sub:23
-2026-09-08T01:17:10.856999166Z observability.type=event event.name=runtime.subscribe_stream.event error.reason=response_stream_closed
