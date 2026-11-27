@@ -22,6 +22,7 @@ kubeconfig="$(mktemp)"
 control_plane_pf_log="$(mktemp)"
 frontline_pf_log="$(mktemp)"
 created_cluster=0
+operator_pf=""
 control_plane_pf=""
 frontline_pf=""
 port_forward_loop_pid=""
@@ -71,14 +72,12 @@ start_port_forward_loop() {
 cleanup() {
   local status=$?
 
-  if [[ -n "${control_plane_pf}" ]]; then
-    kill "${control_plane_pf}" >/dev/null 2>&1 || true
-    wait "${control_plane_pf}" 2>/dev/null || true
-  fi
-  if [[ -n "${frontline_pf}" ]]; then
-    kill "${frontline_pf}" >/dev/null 2>&1 || true
-    wait "${frontline_pf}" 2>/dev/null || true
-  fi
+  for loop_pid in "${operator_pf}" "${control_plane_pf}" "${frontline_pf}"; do
+    if [[ -n "${loop_pid}" ]]; then
+      kill "${loop_pid}" >/dev/null 2>&1 || true
+      wait "${loop_pid}" 2>/dev/null || true
+    fi
+  done
 
   if [[ "${created_cluster}" == "1" && "${keep_cluster}" != "1" ]]; then
     KUBECONFIG="${kubeconfig}" kind delete cluster --name "${cluster_name}" || true
@@ -385,6 +384,7 @@ KUBECONFIG="${kubeconfig}" kubectl -n "${namespace}" rollout status deployment/s
 
 echo "==> Starting local port-forward loops"
 start_port_forward_loop sleepypods-control-plane "${operator_port}" 50053 "${control_plane_pf_log}"
+operator_pf="${port_forward_loop_pid}"
 start_port_forward_loop sleepypods-control-plane "${workload_port}" 50051 "${control_plane_pf_log}"
 control_plane_pf="${port_forward_loop_pid}"
 start_port_forward_loop sleepypods-frontline "${frontline_port}" 8080 "${frontline_pf_log}"
