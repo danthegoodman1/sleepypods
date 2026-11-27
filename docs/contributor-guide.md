@@ -149,7 +149,11 @@ Targeted gates live in `scripts/`:
 - `test-kind-e2e-failures.sh`: bad route, readiness failure, an auxiliary
   claim that never binds while the wake completes on readiness, bad volume
   template, and stale generation.
-- `test-kind-e2e-restart.sh`: control-plane restart recovery.
+- `test-kind-e2e-restart.sh`: control-plane restart recovery, then dependency
+  interruption: Postgres stops for 30 seconds during a wake and during a
+  drain, and the kind node's API server stops for 20 seconds during a wake.
+  Each instance must reach `Running` or `Cold` with no operator RPC, and no
+  control-plane container may restart.
 - `test-kind-e2e-lifecycle-races.sh`: concurrent wake/sleep/delete/stale
   lifecycle races.
 

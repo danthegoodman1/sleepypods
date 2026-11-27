@@ -206,7 +206,7 @@ A repeat that arrives while the first create is uncommitted waits for it and
 then compares with what it stored. A refused or failed create leaves no row and
 leaves the generation watermark where it was.
 
-Validation and measurements: [Phase 5 evidence](review-evidence/phase5/README.md).
+Validation and measurements: [Phase 5 evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase5/README.md).
 
 ## Durable lifecycle transitions
 
@@ -245,7 +245,7 @@ key expiry nor resource deletion removes them. The optional wake
 `backend_generation` is a floor: the transaction allocates at least that value
 and strictly above the prior stored value.
 
-Validation: [Phase 6A evidence](review-evidence/phase6a/README.md).
+Validation: [Phase 6A evidence](https://github.com/danthegoodman1/sleepypods/blob/1a472fd/docs/review-evidence/phase6a/README.md).
 
 ## Lease fencing
 
