@@ -769,3 +769,56 @@ async fn sixty_four_hosts_on_waking_instances_leave_an_unrelated_miss_served_and
     }
     assert_eq!(instance(request.await.unwrap()), "instance-3");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_request_outlasts_a_store_outage_during_its_wake_and_is_served() {
+    let edge = Edge::new(ApiLimits::default());
+    edge.store.seed_workload_class(domain_workload_class());
+    edge.store.seed_instance(domain_instance(
+        "instance-cold",
+        DomainInstanceState::Cold,
+        1,
+    ));
+    let identity = exact_http("cold.example.com", None);
+    edge.store.seed_route_resolved(
+        identity.clone(),
+        domain_route_entry("route-cold", "instance-cold", DomainInstanceState::Cold),
+    );
+    edge.store
+        .record_route_change(support::route_change_payload(
+            &binding_record("route-cold", identity, "instance-cold"),
+            false,
+        ));
+    settle().await;
+    // The store fails every wake, and then every lookup, for 30 seconds.
+    edge.store
+        .fail_get_with(support::FakeStoreError::Unavailable("database is down"));
+
+    let request = {
+        let routes = edge.routes.clone();
+        tokio::spawn(async move {
+            routes
+                .route_http("cold.example.com", Some("/"), now())
+                .await
+        })
+    };
+    settle().await;
+    edge.store.seed_route_error_unavailable("database is down");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!request.is_finished(), "the cold request still waits");
+    assert!(edge.store.transition_requests().is_empty());
+
+    // The store returns. The next wake call is accepted and the instance runs.
+    edge.store.clear_get_error();
+    edge.store.clear_route_error();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(edge.store.transition_requests().len(), 1);
+    for _ in 0..64 {
+        reconcile_proxy_work(edge.store.clone(), edge.kubernetes.clone()).await;
+        settle().await;
+        if request.is_finished() {
+            break;
+        }
+    }
+    assert_eq!(instance(request.await.unwrap()), "instance-cold");
+}

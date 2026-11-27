@@ -209,13 +209,21 @@ path segments below it.
 | The rule's instance is being deleted | 503 |
 | The lookup failed, timed out or found 64 other hosts already resolving | 503 |
 | 256 requests are already waiting for a lookup or a wake | 503 |
+| The control plane refused the wake, or the wake left the instance Failed | 503 |
 | The instance did not run within the route timeout | 503 |
 
 A lookup failure affects only requests for its own host; hosts already cached
 keep serving. A request for an instance that is not running waits for it under
 the route timeout, and the proxy asks the control plane to wake each instance
-generation once. Requests waiting on a wake hold no lookup slot, so lookups for
-other hosts proceed. A passthrough or terminated TLS connection whose SNI name
+generation once. A wake call that times out, fails in transport, or meets a
+control plane that answers `UNAVAILABLE` or `DEADLINE_EXCEEDED` is repeated
+after 250 ms, doubling to 2 seconds, while any request still waits; the
+requests keep waiting, so a control-plane or store outage shorter than the
+route timeout only delays a cold request. Any other failed call
+answers the waiting requests at once. Requests waiting on a wake that leaves
+the instance Failed get 503 and start no further wake; a later request wakes it
+again. Requests waiting on a wake hold no lookup slot, so lookups for other
+hosts proceed. A passthrough or terminated TLS connection whose SNI name
 has no route, or cannot be routed, is closed.
 
 The control plane sends a host's rule set again whenever a binding or instance

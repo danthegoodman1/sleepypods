@@ -748,6 +748,12 @@ Sleep and wake:
 
 - Wake is runtime-driven: a cold route request causes the frontline to call
   `ProxyControlPlane/WakeInstance`.
+- A cold request rides out a brief control-plane or Postgres outage. Frontline
+  repeats a wake call that times out, fails in transport, or meets an
+  unavailable control plane, 250 ms after the failure and doubling to 2 s, and
+  holds the request until the instance runs or
+  `SLEEPYPODS_FRONTLINE_ROUTE_TIMEOUT_MS` passes. Requests waiting on a wake
+  that fails get 503; the next request starts a new wake.
 - Sleep is sidecar-driven: when active work reaches zero for the idle timeout,
   the sidecar drains and reports idle to the control plane.
 - A wake that arrives while an instance drains, before its drain deadline,
