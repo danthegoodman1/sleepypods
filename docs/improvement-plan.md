@@ -605,13 +605,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 7A: Prepared statements and class cache | Missing: `prepare_cached` helper, class cache, removed duplicate pre-check. |
-| Incomplete | Work | 7B: Narrow revision lock | Missing: baseline measurement, chosen allocation scheme, ordering tests. |
+| Complete | Work | 7A: Prepared statements and class cache | Commits `9bd4f2b`, `fc2d3ae`, `217e5e0`, `78be351`, `f0b9481`: every statement goes through `postgres/sql.rs` with `prepare_cached`; class versions are cached in process; lifecycle transitions are conditional single statements. |
+| Complete | Work | 7B: Narrow revision lock | Commit `9babcef`: revisions are numbered by a deferred constraint trigger at commit; an open lifecycle transaction no longer stalls other writers. Transitions per second with 8 writers: 170 → 354 at 0.5 ms per statement, 83 → 333 at 2 ms (`tests/store_throughput.rs`). |
 | Complete | Work | 7C: Effect barrier on the materialization row | Superseded by 5C: the effect journal is deleted. |
-| Incomplete | Decision | 7D: One lifecycle row | Needs: owner decision after Phases 4 and 5. |
-| Incomplete | Work | 7E: Store surface and baseline migration | Missing: deleted methods, role traits, in-operation retry, single migration. |
-| Incomplete | Gate | Round-trip budgets and caller coverage | Missing: counter assertions and a grep-clean trait. |
-| Incomplete | Test | Real-Postgres conformance | Missing: complete `postgres_store` run with the execution checker. |
+| Complete | Decision | 7D: One lifecycle row | Declined: the round-trip budgets are met with headroom while instance and materialization stay separate tables. |
+| Complete | Work | 7E: Store surface and baseline migration | Commits `6f77292`, `e4d483f`, `2cef484`: the seven test-only methods are deleted; the trait is split into nine consumer roles; `unexpected_store.rs` and `RetryingControlPlaneStore` are gone, and `replay_policy::postgres_operations_repeat_only_when_a_repeat_is_safe` pins each operation's retry policy; migrations collapse into `0001_baseline.sql`. |
+| Complete | Gate | Round-trip budgets and caller coverage | `postgres_lifecycle_operations_fit_their_round_trip_budgets`: wake acceptance 16 → 5, idle report 20 → 6, fencing one mutation 14 → 1. Every store method has a production caller. |
+| Complete | Test | Real-Postgres conformance | `./scripts/test-postgres-store.sh`: 46 passed, complete inventory, on the store stream's final tree. The scalability test's 2 s timeout, which failed under 70 ms of injected latency, now allows 20 s (`022880f`). |
 
 ## Phase 8: Smaller Surface
 
