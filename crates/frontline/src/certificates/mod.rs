@@ -2,7 +2,8 @@
 //! work; the handle only accesses bounded memory and queues bounded fetches.
 //!
 //! Entry counts bound the cache. Hostnames holding a certificate and hostnames
-//! without one have separate budgets, so unknown names evict only each other.
+//! without one have separate budgets, so a hostname without a certificate
+//! displaces only another hostname without one.
 //!
 //! A fetch waits in one of two queues until the worker has a slot for it. A
 //! lookup has a handshake waiting on it; a refresh comes from a notification
@@ -364,9 +365,10 @@ impl TlsCertificateStore {
         state.interests_changed.send_replace(());
     }
 }
-/// Holds each kind of entry to its budget by evicting the least recently
-/// handshaken entry of that kind. Call it after inserting `keep` or after
-/// `keep` gains or loses its certificate; `keep` itself stays.
+/// Holds each kind of entry to its budget by evicting one entry of that kind:
+/// the least recently handshaken, taken first from those with no handshake
+/// waiting. Call it after inserting `keep` or after `keep` gains or loses its
+/// certificate; `keep` itself stays.
 fn enforce_budgets(state: &mut State, keep: &str) {
     if state.entries.len() <= CERTIFICATE_CACHE_ENTRIES.min(CERTIFICATE_NEGATIVE_ENTRIES) {
         return;
@@ -386,7 +388,7 @@ fn enforce_budgets(state: &mut State, keep: &str) {
         }
         let victim = kind()
             .filter(|(hostname, _)| hostname.as_str() != keep)
-            .min_by_key(|(_, entry)| entry.touched)
+            .min_by_key(|(_, entry)| (entry.changed.receiver_count() > 0, entry.touched))
             .map(|(hostname, _)| hostname.clone());
         if let Some(hostname) = victim {
             evict(state, &hostname);

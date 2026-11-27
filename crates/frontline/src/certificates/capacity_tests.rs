@@ -247,7 +247,7 @@ async fn full_cache_stays_warm_through_a_refresh_cycle_with_three_fetches_in_fli
     rig.finish().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unknown_hostnames_leave_every_certificate_cached() {
     let rig = Rig::new();
     let installed = rig.install(64).await;
@@ -278,6 +278,66 @@ async fn unknown_hostnames_leave_every_certificate_cached() {
             .load(std::sync::atomic::Ordering::SeqCst)
             <= CERTIFICATE_FETCHES
     );
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lookup_with_a_handshake_waiting_outlives_newer_unknown_hostnames() {
+    let rig = Rig::new();
+    // Fill the budget with answered misses, three fetches in flight and one
+    // queued lookup. Only the last four have a handshake waiting.
+    let answered = CERTIFICATE_NEGATIVE_ENTRIES - CERTIFICATE_FETCHES - 1;
+    let unknown = |i: usize| format!("unknown{i}.example");
+    for i in 0..answered {
+        assert!(rig.cache.resolve(&unknown(i)).await.unwrap().is_none());
+    }
+    let mut held = rig.gate();
+    let mut callers = JoinSet::new();
+    let releases = rig.occupy(&mut held, &mut callers).await;
+    let cache = rig.cache.clone();
+    callers.spawn(async move { cache.resolve("queued.example").await });
+    until(|| rig.cache.usage().queued == 1).await;
+    assert_eq!(
+        rig.cache.usage().negative_entries,
+        CERTIFICATE_NEGATIVE_ENTRIES
+    );
+    // Handshaking the cached misses again leaves the waited-on hostnames as
+    // the least recently handshaken.
+    for i in 0..answered {
+        assert!(rig.cache.resolve(&unknown(i)).await.unwrap().is_none());
+    }
+    assert_eq!(rig.requests(), answered + CERTIFICATE_FETCHES);
+
+    let cache = rig.cache.clone();
+    callers.spawn(async move { cache.resolve("newcomer.example").await });
+    until(|| rig.cache.usage().queued == 2).await;
+    assert_eq!(
+        rig.cache.usage().negative_entries,
+        CERTIFICATE_NEGATIVE_ENTRIES
+    );
+    for host in [
+        "busy0.example",
+        "busy1.example",
+        "busy2.example",
+        "queued.example",
+        "newcomer.example",
+    ] {
+        assert!(
+            rig.cached(host),
+            "{host} was evicted with a handshake waiting"
+        );
+    }
+    assert!(!rig.cached(&unknown(0)));
+
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for _ in 0..2 {
+        started(&mut held).await.1.send(()).unwrap();
+    }
+    while let Some(result) = callers.join_next().await {
+        assert!(result.unwrap().unwrap().is_none());
+    }
     rig.finish().await;
 }
 

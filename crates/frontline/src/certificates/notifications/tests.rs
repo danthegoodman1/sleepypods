@@ -170,6 +170,17 @@ async fn until(mut condition: impl FnMut() -> bool) {
         tokio::task::yield_now().await;
     }
 }
+/// Every started fetch has finished, including its installation step.
+async fn settled(rig: &Rig) {
+    until(|| {
+        rig.cache
+            .shared
+            .retained_tasks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+    })
+    .await;
+}
 /// Queues a background refresh as a due lease does.
 fn refresh(rig: &Rig, host: &str) {
     let mut state = rig.cache.shared.state.lock().unwrap();
@@ -257,14 +268,13 @@ async fn peer(cache: &TlsCertificateStore, host: &str, cert: &CertificateDer<'st
     assert_eq!(client.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
     assert_eq!(server.stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cached_miss_expires_into_a_lookup_and_only_a_certificate_opens_the_watch() {
     let mut rig = Rig::new();
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     let cert = rig.publish("app.example", 2, "A", 1);
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     assert_eq!(rig.api.api.requests.lock().unwrap().len(), 1);
-    tokio::time::pause();
     tokio::time::advance(Duration::from_millis(600)).await;
     assert!(
         rig.opened.try_recv().is_err(),
@@ -353,7 +363,7 @@ async fn received_removal_fences_late_found_and_rebind_accepts_lower_certificate
     assert_eq!(rig.cache.usage().certificates, 0);
     assert_eq!(rig.cache.usage().negative_entries, 1);
     release.send(()).unwrap();
-    until(|| rig.cache.usage().fetches == 0).await;
+    settled(&rig).await;
     assert!(rig.cache.resolve("app.example").await.unwrap().is_none());
     // The hostname left the watch with its certificate. A handshake after the
     // cached miss expires finds the new binding and watches it again.
@@ -401,7 +411,7 @@ async fn handshake_waiting_on_a_superseded_fetch_receives_the_replacement() {
         .is_some());
     assert_eq!(revision(&rig, "app.example"), Some(2));
     superseded.send(()).unwrap();
-    until(|| rig.cache.usage().fetches == 0).await;
+    settled(&rig).await;
     assert_eq!(revision(&rig, "app.example"), Some(2));
     assert_eq!(rig.cache.usage().queued, 0);
     peer(&rig.cache, "app.example", &rebound).await;

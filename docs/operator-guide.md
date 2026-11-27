@@ -193,10 +193,10 @@ applies at startup. An empty cache alone does not prevent listener readiness.
 
 The cache holds at most 1,024 hostnames with a certificate. A separate budget
 holds at most 1,024 hostnames without one: authoritative misses, pending lookups
-and failed lookups. Each budget evicts its own least recently handshaken
-hostname when it is full. Unknown SNI names therefore displace only each other,
-and a cached certificate leaves before its lease expires only when a 1,025th
-certificate arrives. At most three fetches run at once.
+and failed lookups. A full budget evicts its least recently handshaken hostname,
+choosing first among those with no handshake waiting. A hostname without a
+certificate therefore displaces only another hostname without one, and only a
+1,025th certificate evicts a cached one. At most three fetches run at once.
 
 Entry counts bound cache memory. Validation limits a bundle to 128 KiB and 100
 SANs, so a cached certificate retains at most about 160 KiB: 160 MiB for 1,024
@@ -211,8 +211,9 @@ and the runtime have separate costs.
 
 Identical misses share one fetch. Lookup has a three-second deadline within the
 overall five-second TLS setup bound. A lookup that finds all three fetch slots
-busy waits its turn in arrival order, and the handshake fails only if that
-deadline passes first; a lookup whose handshakes have all left starts no fetch.
+busy waits its turn in arrival order until that deadline. Eviction ends a wait
+early only when all 1,024 hostnames without a certificate have handshakes
+waiting at once. A lookup whose handshakes have all left starts no fetch.
 Background refreshes wait for the same slots in their own queue. When both
 queues hold work the slots alternate between them, so a burst of unknown names
 leaves refreshes running and a wave of refreshes leaves new hostnames resolving.
