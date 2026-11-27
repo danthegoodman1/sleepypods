@@ -2,8 +2,9 @@ use std::{
     error::Error,
     fmt,
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -14,9 +15,9 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use http::{
-    header::{CONNECTION, HOST},
-    uri::InvalidUriParts,
-    HeaderMap, HeaderName, HeaderValue, Request, Response, Uri,
+    header::{CONNECTION, CONTENT_TYPE, HOST, TE},
+    uri::{Authority, InvalidUriParts},
+    HeaderMap, HeaderName, HeaderValue, Request, Response, Uri, Version,
 };
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
@@ -29,6 +30,7 @@ use hyper_util::{
 use pin_project_lite::pin_project;
 
 use crate::{
+    delivery::{DeliveryFailure, DeliveryState, Watchdog},
     drain::{DrainError, DrainPermit, DrainTracker},
     AdmissionPermit, ProxyAdmission, ProxyResourceConfig, Shutdown,
 };
@@ -38,6 +40,12 @@ type BoxError = Box<dyn Error + Send + Sync>;
 type UpstreamBody = UnsyncBoxBody<UploadBuf, BoxError>;
 type UpstreamClient = Client<LimitedConnector, UpstreamBody>;
 
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+
+/// Forwards requests to the origin each request names, in the HTTP version
+/// its client used. The upstream is a sidecar, which serves both versions.
 #[derive(Clone, Debug)]
 pub struct HttpProxy {
     drain: DrainTracker,
@@ -46,6 +54,28 @@ pub struct HttpProxy {
     config: ProxyResourceConfig,
     upstream_connections: crate::AdmissionLimiter,
 }
+
+/// Forwards requests to one app address in the protocol declared for its port,
+/// whatever version the client used.
+#[derive(Clone, Debug)]
+pub struct AppHttpProxy {
+    http: HttpProxy,
+    origin: Uri,
+    protocol: AppProtocol,
+}
+
+/// The protocol an app port serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppProtocol {
+    /// HTTP/1.1.
+    #[default]
+    Http1,
+    /// HTTP/2 over cleartext with prior knowledge, as gRPC servers expect.
+    H2c,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidAppProtocol(pub String);
 
 #[derive(Debug)]
 pub enum HttpProxyError {
@@ -57,10 +87,25 @@ pub enum HttpProxyError {
 }
 
 #[derive(Debug)]
+pub enum AppHttpProxyError {
+    Proxy(HttpProxyError),
+    /// gRPC needs HTTP/2 to the app, and the app port is declared `http1`.
+    GrpcRequiresH2c,
+}
+
+#[derive(Debug)]
 pub enum ReverseProxyRequestError {
     MissingUpstreamScheme,
     MissingUpstreamAuthority,
     InvalidUri(InvalidUriParts),
+}
+
+/// What this proxy's upstream connections reach.
+enum Hop {
+    /// A sidecar at the address in each request URI.
+    Sidecar,
+    /// The app at one fixed origin, whatever authority a request URI carries.
+    App(Uri),
 }
 
 impl HttpProxy {
@@ -69,9 +114,18 @@ impl HttpProxy {
     }
 
     pub fn with_config(drain: DrainTracker, config: ProxyResourceConfig) -> Self {
+        Self::build(drain, config, Hop::Sidecar)
+    }
+
+    fn build(drain: DrainTracker, config: ProxyResourceConfig, hop: Hop) -> Self {
         let upstream_connections = crate::AdmissionLimiter::new(config.max_upstream_connections());
+        let to_sidecar = matches!(hop, Hop::Sidecar);
         let connector = LimitedConnector {
             inner: http_connector(config),
+            dial: match hop {
+                Hop::Sidecar => None,
+                Hop::App(origin) => Some(origin),
+            },
             capacity: upstream_connections.clone(),
             write_timeout: config.write_idle_timeout(),
             connect_timeout: config.setup_timeout(),
@@ -80,10 +134,20 @@ impl HttpProxy {
         configure_pool(&mut http1_builder, config);
         let http1_client = http1_builder.build(connector.clone());
         let mut http2_builder = Client::builder(TokioExecutor::new());
-        // h2c has no ALPN signal, so HTTP/2 inbound requests use prior knowledge
-        // when dialing a cleartext upstream.
+        // Cleartext HTTP/2 has no ALPN signal, so the client uses prior knowledge.
         http2_builder.http2_only(true);
         configure_pool(&mut http2_builder, config);
+        if to_sidecar {
+            // An idle or silent connection to a lost sidecar fails within the
+            // interval plus the timeout. An app's HTTP/2 server may count pings
+            // against its client (gRPC servers close after too many), and the
+            // app shares the pod, so the app hop sends none.
+            http2_builder
+                .timer(TokioTimer::new())
+                .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+                .http2_keep_alive_timeout(config.setup_timeout())
+                .http2_keep_alive_while_idle(true);
+        }
         let http2_client = http2_builder.build(connector);
 
         Self {
@@ -112,26 +176,54 @@ impl HttpProxy {
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<BoxError>,
     {
+        let http2 = request.version() == Version::HTTP_2;
+        let request = prepare_reverse_proxy_request(request, upstream_origin)?;
+        self.forward(request, http2).await
+    }
+
+    /// Sends a prepared request over the HTTP/2 or HTTP/1.1 client and holds
+    /// drain activity for the upload and the response body.
+    async fn forward<B>(
+        &self,
+        mut request: Request<B>,
+        http2: bool,
+    ) -> Result<Response<TrackedBody<Incoming>>, HttpProxyError>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+    {
         let permit = Arc::new(self.drain.try_acquire()?);
         let admitted = request
             .extensions()
             .get::<RequestAdmission>()
             .map(|guard| guard.0.clone());
         let track_delivery = admitted.is_some();
-        let use_http2_upstream = request.version() == http::Version::HTTP_2;
-        let mut request = prepare_reverse_proxy_request(request, upstream_origin)?;
-        let capture = (!request.body().is_end_stream())
-            .then(|| hyper_util::client::legacy::connect::capture_connection(&mut request));
+        if http2 {
+            *request.version_mut() = Version::HTTP_2;
+        } else {
+            if request.version() == Version::HTTP_2 {
+                *request.version_mut() = Version::HTTP_11;
+            }
+            request.headers_mut().remove(TE);
+        }
+        let has_body = !request.body().is_end_stream();
+        let capture = hyper_util::client::legacy::connect::capture_connection(&mut request);
+        // Abandoning an upload leaves its bytes queued on the connection, so
+        // only a request with a body closes its connection on an early exit.
         let mut cancel_on_error = CancelUpstream {
-            capture: capture.clone(),
+            capture: has_body.then(|| capture.clone()),
             armed: true,
         };
-        let upload_delivery = crate::delivery::DeliveryState::new(
+        let upload_delivery = DeliveryState::new(
             admitted,
             None,
             Some(permit.clone()),
-            self.config.write_idle_timeout(),
-            crate::delivery::DeliveryFailure::Upstream(capture),
+            http2.then(|| {
+                Watchdog::new(
+                    self.config.write_idle_timeout(),
+                    DeliveryFailure::Upstream(Some(capture.clone())),
+                )
+            }),
         );
         let progress = Arc::new(UploadProgress {
             started: tokio::time::Instant::now(),
@@ -144,7 +236,7 @@ impl HttpProxy {
                 delivery: upload_delivery,
             })
         });
-        let client = if use_http2_upstream {
+        let client = if http2 {
             &self.http2_client
         } else {
             &self.http1_client
@@ -157,7 +249,14 @@ impl HttpProxy {
                 response = &mut response => break response.map_err(classify_client_error)?,
                 _ = tokio::time::sleep_until(deadline) => {
                     deadline = progress.started + Duration::from_nanos(progress.latest_nanos.load(Ordering::Relaxed)) + self.config.upstream_header_idle_timeout();
-                    if deadline <= tokio::time::Instant::now() { return Err(HttpProxyError::UpstreamHeaderTimeout); }
+                    if deadline <= tokio::time::Instant::now() {
+                        // The connection may have lost its peer. Later requests
+                        // open a new one; streams already on it continue.
+                        if let Some(connected) = capture.connection_metadata().as_ref() {
+                            connected.poison();
+                        }
+                        return Err(HttpProxyError::UpstreamHeaderTimeout);
+                    }
                 }
             }
         };
@@ -177,29 +276,111 @@ impl HttpProxy {
     }
 }
 
-/// Shared HTTP server with default process-local bounds. Production listeners
-/// call the admitted variant with one admission state shared by all connections.
-pub async fn serve_http_connection<IO, F, Fut, B, E>(io: IO, shutdown: Shutdown, handler: F)
-where
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: Fn(Request<Incoming>) -> Fut,
-    Fut: Future<Output = Result<Response<B>, E>> + Send + 'static,
-    B: Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<BoxError>,
-    E: Into<BoxError>,
-{
-    let admission = ProxyAdmission::new(ProxyResourceConfig::default());
-    let handshake = admission
-        .handshakes
-        .try_acquire()
-        .expect("new admission has capacity");
-    let io = admission.admit_io(io).expect("new admission has capacity");
-    serve_http_connection_admitted(io, shutdown, admission, handshake, None, handler).await;
+impl AppHttpProxy {
+    pub fn new(
+        drain: DrainTracker,
+        config: ProxyResourceConfig,
+        app_addr: SocketAddr,
+        protocol: AppProtocol,
+    ) -> Self {
+        let origin: Uri = format!("http://{app_addr}")
+            .parse()
+            .expect("a socket address forms a valid HTTP origin");
+        Self {
+            http: HttpProxy::build(drain, config, Hop::App(origin.clone())),
+            origin,
+            protocol,
+        }
+    }
+
+    /// Forwards `request` to the app. The app receives the client's authority:
+    /// as `Host` on an `http1` port and as `:authority` on an `h2c` port.
+    pub async fn proxy<B>(
+        &self,
+        mut request: Request<B>,
+    ) -> Result<Response<TrackedBody<Incoming>>, AppHttpProxyError>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+    {
+        let authority = client_authority(&request);
+        let http2 = self.protocol == AppProtocol::H2c;
+        if http2 {
+            // Connections reach the app whatever authority the URI carries, so
+            // the URI keeps the client's authority and the Host field retires.
+            let authority = authority
+                .and_then(|value| Authority::try_from(value.as_bytes()).ok())
+                .or_else(|| self.origin.authority().cloned());
+            let mut parts = self.origin.clone().into_parts();
+            parts.authority = authority;
+            let origin = Uri::from_parts(parts).map_err(ReverseProxyRequestError::InvalidUri)?;
+            request = prepare_reverse_proxy_request(request, &origin)?;
+            request.headers_mut().remove(HOST);
+        } else {
+            if is_grpc(&request) {
+                return Err(AppHttpProxyError::GrpcRequiresH2c);
+            }
+            request = prepare_reverse_proxy_request(request, &self.origin)?;
+            if let Some(authority) = authority {
+                request.headers_mut().entry(HOST).or_insert(authority);
+            }
+        }
+        Ok(self.http.forward(request, http2).await?)
+    }
 }
 
+impl AppProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::H2c => "h2c",
+        }
+    }
+}
+
+impl FromStr for AppProtocol {
+    type Err = InvalidAppProtocol;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "http1" => Ok(Self::Http1),
+            "h2c" => Ok(Self::H2c),
+            other => Err(InvalidAppProtocol(other.to_owned())),
+        }
+    }
+}
+
+/// The authority the client addressed: its `Host` field, else the edge's
+/// `X-Forwarded-Host`, else the request target.
+fn client_authority<B>(request: &Request<B>) -> Option<HeaderValue> {
+    request
+        .headers()
+        .get(HOST)
+        .or_else(|| request.headers().get(X_FORWARDED_HOST))
+        .cloned()
+        .or_else(|| uri_authority(request.uri()))
+}
+
+fn uri_authority(uri: &Uri) -> Option<HeaderValue> {
+    HeaderValue::from_str(uri.authority()?.as_str()).ok()
+}
+
+/// `application/grpc` and its `+codec` forms. gRPC-Web uses its own type and
+/// travels over HTTP/1.1.
+fn is_grpc<B>(request: &Request<B>) -> bool {
+    request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.as_bytes().strip_prefix(b"application/grpc"))
+        .is_some_and(|rest| matches!(rest.first(), None | Some(b'+' | b';')))
+}
+
+/// Serves one HTTP/1.1 or HTTP/2 connection with shared process-wide bounds.
+///
 /// Admission runs synchronously before creating handler futures. HTTP/2 also
-/// rejects streams above its finite transport cap before service dispatch.
+/// rejects streams above its finite transport cap before service dispatch. The
+/// first request has the setup deadline; an HTTP/1.1 connection then waits up
+/// to the keep-alive idle timeout for each later request.
 pub async fn serve_http_connection_admitted<IO, F, Fut, B, E>(
     io: IO,
     shutdown: Shutdown,
@@ -221,12 +402,12 @@ pub async fn serve_http_connection_admitted<IO, F, Fut, B, E>(
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(config.setup_timeout())
+        .header_read_timeout(config.keepalive_idle_timeout())
         .max_buf_size(64 * 1024);
     builder
         .http2()
         .timer(TokioTimer::new())
-        .keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
         .keep_alive_timeout(config.setup_timeout())
         .max_concurrent_streams(config.max_http2_streams())
         .max_header_list_size(64 * 1024);
@@ -242,6 +423,7 @@ pub async fn serve_http_connection_admitted<IO, F, Fut, B, E>(
             None
         };
         let admitted = admission.requests.try_acquire().ok().map(Arc::new);
+        let http2 = request.version() == Version::HTTP_2;
         let upgrade = crate::is_websocket_upgrade(&request);
         let handshake = if upgrade {
             admission.handshakes.try_acquire().ok()
@@ -293,12 +475,11 @@ pub async fn serve_http_connection_admitted<IO, F, Fut, B, E>(
                 .map(|guard| guard.0);
             Ok(response.map(|body| AdmittedBody {
                 inner: Some(body),
-                delivery: Some(crate::delivery::DeliveryState::new(
+                delivery: Some(DeliveryState::new(
                     permit,
                     upgrade_permit.map(|guard| guard.request),
                     drain,
-                    config.write_idle_timeout(),
-                    delivery_failed,
+                    http2.then(|| Watchdog::new(config.write_idle_timeout(), delivery_failed)),
                 )),
             }))
         }
@@ -336,7 +517,7 @@ pin_project! {
     struct AdmittedBody<B> {
         #[pin]
         inner: Option<B>,
-        delivery: Option<Arc<crate::delivery::DeliveryState>>,
+        delivery: Option<Arc<DeliveryState>>,
     }
 }
 impl<B: Body> Body for AdmittedBody<B> {
@@ -386,7 +567,7 @@ pin_project! {
         #[pin]
         inner: B,
         progress: Arc<UploadProgress>,
-        delivery: Arc<crate::delivery::DeliveryState>,
+        delivery: Arc<DeliveryState>,
     }
 }
 impl<B: Body<Data = Bytes>> Body for UploadBody<B> {
@@ -450,6 +631,8 @@ fn configure_pool(builder: &mut hyper_util::client::legacy::Builder, config: Pro
 #[derive(Clone, Debug)]
 struct LimitedConnector {
     inner: HttpConnector,
+    /// The one address every connection reaches, when the hop has one.
+    dial: Option<Uri>,
     capacity: crate::AdmissionLimiter,
     write_timeout: Duration,
     connect_timeout: Duration,
@@ -467,6 +650,7 @@ impl tower_service::Service<Uri> for LimitedConnector {
             return Box::pin(async move { Err(Box::new(error) as BoxError) });
         }
         let mut connector = self.inner.clone();
+        let uri = self.dial.clone().unwrap_or(uri);
         let write_timeout = self.write_timeout;
         let connect_timeout = self.connect_timeout;
         Box::pin(async move {
@@ -502,7 +686,7 @@ struct CancelUpstream {
 impl Drop for CancelUpstream {
     fn drop(&mut self) {
         if self.armed {
-            crate::delivery::DeliveryFailure::Upstream(self.capture.take()).cancel();
+            DeliveryFailure::Upstream(self.capture.take()).cancel();
         }
     }
 }
@@ -521,6 +705,9 @@ fn classify_client_error(error: ClientError) -> HttpProxyError {
 fn http_connector(config: ProxyResourceConfig) -> HttpConnector {
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
+    connector.set_keepalive(Some(crate::listener::KEEPALIVE_IDLE));
+    connector.set_keepalive_interval(Some(crate::listener::KEEPALIVE_INTERVAL));
+    connector.set_keepalive_retries(Some(crate::listener::KEEPALIVE_RETRIES));
     connector.set_connect_timeout(Some(config.setup_timeout()));
     connector
 }
@@ -538,16 +725,21 @@ pub fn prepare_reverse_proxy_request<B>(
     upstream_origin: &Uri,
 ) -> Result<Request<B>, ReverseProxyRequestError> {
     *request.uri_mut() = upstream_request_uri(upstream_origin, request.uri())?;
-    strip_hop_by_hop_headers(request.headers_mut());
+    strip_request_hop_by_hop_headers(request.headers_mut());
     Ok(request)
 }
 
 pub fn apply_forwarded_header_policy<B>(request: &mut Request<B>, peer_ip: IpAddr, proto: &str) {
-    let original_host = request.headers().get(HOST).cloned();
+    // An HTTP/2 client names its authority in the request target.
+    let original_host = request
+        .headers()
+        .get(HOST)
+        .cloned()
+        .or_else(|| uri_authority(request.uri()));
     let websocket = crate::websocket::is_websocket_upgrade(request);
     // Consume the client's hop-by-hop nominations before installing trusted
     // metadata. A later upstream rewrite must not let Connection remove it.
-    strip_hop_by_hop_headers(request.headers_mut());
+    strip_request_hop_by_hop_headers(request.headers_mut());
     if websocket {
         request
             .headers_mut()
@@ -570,21 +762,11 @@ pub fn apply_forwarded_header_policy<B>(request: &mut Request<B>, peer_ip: IpAdd
     if let Some(original_host) = original_host {
         request
             .headers_mut()
-            .insert(HeaderName::from_static("x-forwarded-host"), original_host);
+            .insert(X_FORWARDED_HOST, original_host);
     }
 }
 
-pub fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut forwarded = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if is_forwarded_header_name(name) {
-            forwarded.append(name.clone(), value.clone());
-        }
-    }
-    forwarded
-}
-
-pub fn strip_forwarded_headers(headers: &mut HeaderMap) {
+fn strip_forwarded_headers(headers: &mut HeaderMap) {
     let forwarded_names: Vec<HeaderName> = headers
         .keys()
         .filter(|name| is_forwarded_header_name(name))
@@ -616,6 +798,26 @@ pub fn upstream_request_uri(
         .or_else(|| Some(http::uri::PathAndQuery::from_static("/")));
 
     Uri::from_parts(parts).map_err(ReverseProxyRequestError::InvalidUri)
+}
+
+/// Removes hop-by-hop request headers. A request that asked for trailers keeps
+/// `TE: trailers`, the one TE value an HTTP/2 hop carries and gRPC servers
+/// require; an HTTP/1.1 hop removes it before sending.
+fn strip_request_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let trailers = header_contains_token(headers, TE, "trailers");
+    strip_hop_by_hop_headers(headers);
+    if trailers {
+        headers.insert(TE, HeaderValue::from_static("trailers"));
+    }
+}
+
+pub(crate) fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case(token))
 }
 
 pub fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
@@ -674,15 +876,6 @@ pin_project! {
     }
 }
 
-impl<B> TrackedBody<B> {
-    pub fn new(inner: B, permit: DrainPermit) -> Self {
-        Self {
-            inner,
-            permit: Some(Arc::new(permit)),
-        }
-    }
-}
-
 impl<B> Body for TrackedBody<B>
 where
     B: Body,
@@ -730,6 +923,46 @@ impl From<ClientError> for HttpProxyError {
         Self::Client(error)
     }
 }
+
+impl From<HttpProxyError> for AppHttpProxyError {
+    fn from(error: HttpProxyError) -> Self {
+        Self::Proxy(error)
+    }
+}
+
+impl From<ReverseProxyRequestError> for AppHttpProxyError {
+    fn from(error: ReverseProxyRequestError) -> Self {
+        Self::Proxy(error.into())
+    }
+}
+
+impl fmt::Display for AppHttpProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Proxy(error) => write!(f, "{error}"),
+            Self::GrpcRequiresH2c => {
+                f.write_str("gRPC requires an app port that declares the h2c protocol")
+            }
+        }
+    }
+}
+
+impl Error for AppHttpProxyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Proxy(error) => Some(error),
+            Self::GrpcRequiresH2c => None,
+        }
+    }
+}
+
+impl fmt::Display for InvalidAppProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "app protocol must be http1 or h2c, got {:?}", self.0)
+    }
+}
+
+impl Error for InvalidAppProtocol {}
 
 impl fmt::Display for HttpProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

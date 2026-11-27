@@ -1,0 +1,222 @@
+//! The accept loop and socket options shared by every proxy listener.
+use std::{future::Future, io, net::SocketAddr, time::Duration};
+
+use socket2::{SockRef, TcpKeepalive};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
+
+use crate::Shutdown;
+
+/// A peer that stops answering is detected after about 90 seconds.
+pub(crate) const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const KEEPALIVE_RETRIES: u32 = 3;
+/// Pause after an accept failure that needs capacity to return, such as an
+/// exhausted file-descriptor table.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// A source of accepted connections. Production listeners are `TcpListener`s.
+pub trait Accept {
+    fn accept(&mut self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+impl Accept for TcpListener {
+    async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+        TcpListener::accept(self).await
+    }
+}
+
+/// Accepts connections until shutdown and returns the tasks still running.
+///
+/// `connection` admits each socket and returns the task that serves it, or
+/// `None` to close it. A failed accept never ends the loop: an error that
+/// belongs to one connection is skipped, and any other error waits briefly for
+/// capacity. The listening socket closes before this returns, so the kernel
+/// refuses new connections while the caller drains.
+pub async fn serve_listener<L, F, Fut>(
+    mut listener: L,
+    shutdown: &Shutdown,
+    mut connection: F,
+) -> JoinSet<()>
+where
+    L: Accept,
+    F: FnMut(TcpStream, SocketAddr) -> Option<Fut>,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut connections = JoinSet::new();
+    loop {
+        while connections.try_join_next().is_some() {}
+        let accepted = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, peer)) => {
+                let _ = configure_socket(&stream);
+                if let Some(task) = connection(stream, peer) {
+                    connections.spawn(task);
+                }
+            }
+            Err(error) if belongs_to_one_connection(&error) => {}
+            Err(_) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+                }
+            }
+        }
+    }
+    drop(listener);
+    connections
+}
+
+/// Disables Nagle and enables TCP keepalive on an accepted or dialled socket.
+pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Linux reports a network error already pending on the new socket through
+/// `accept`. The connection is gone; the listener is healthy.
+fn belongs_to_one_connection(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    /// Fails `accept` with the queued errors, then accepts real connections.
+    struct FailingAccept {
+        errors: VecDeque<io::Error>,
+        inner: TcpListener,
+    }
+
+    impl Accept for FailingAccept {
+        async fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
+            match self.errors.pop_front() {
+                Some(error) => Err(error),
+                None => self.inner.accept().await,
+            }
+        }
+    }
+
+    async fn echo_one_byte(mut stream: TcpStream) {
+        let byte = stream.read_u8().await.expect("served connection reads");
+        stream
+            .write_u8(byte)
+            .await
+            .expect("served connection writes");
+    }
+
+    #[tokio::test]
+    async fn accept_errors_leave_the_listener_serving() {
+        let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = inner.local_addr().unwrap();
+        let listener = FailingAccept {
+            errors: [libc::EMFILE, libc::ECONNABORTED, libc::ENFILE, libc::ENOMEM]
+                .into_iter()
+                .map(io::Error::from_raw_os_error)
+                .collect(),
+            inner,
+        };
+        let shutdown = Shutdown::new();
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                serve_listener(listener, &shutdown, |stream, _| Some(echo_one_byte(stream))).await
+            }
+        });
+
+        for byte in [7_u8, 9] {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_u8(byte).await.unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), byte);
+        }
+
+        shutdown.shutdown();
+        let mut connections = server.await.unwrap();
+        while connections.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_listener_while_connections_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Shutdown::new();
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                serve_listener(listener, &shutdown, |stream, _| Some(echo_one_byte(stream))).await
+            }
+        });
+        let mut open = TcpStream::connect(addr).await.unwrap();
+        // The server accepted this connection once its echo arrives.
+        open.write_u8(1).await.unwrap();
+        assert_eq!(open.read_u8().await.unwrap(), 1);
+        let mut draining = TcpStream::connect(addr).await.unwrap();
+
+        shutdown.shutdown();
+        let mut connections = server.await.unwrap();
+
+        let refused = TcpStream::connect(addr).await.unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+        if let Some(task) = connections.join_next().await {
+            task.unwrap();
+        }
+        drop(connections);
+        let _ = draining.read_u8().await;
+    }
+
+    #[tokio::test]
+    async fn accepted_sockets_disable_nagle_and_enable_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Shutdown::new();
+        let (options, observed) = tokio::sync::oneshot::channel();
+        let mut options = Some(options);
+        let server = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                serve_listener(listener, &shutdown, move |stream, _| {
+                    let socket = SockRef::from(&stream);
+                    let observed = (
+                        stream.nodelay().unwrap(),
+                        socket.keepalive().unwrap(),
+                        socket.tcp_keepalive_time().unwrap(),
+                    );
+                    if let Some(options) = options.take() {
+                        let _ = options.send(observed);
+                    }
+                    None::<std::future::Ready<()>>
+                })
+                .await
+            }
+        });
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(observed.await.unwrap(), (true, true, KEEPALIVE_IDLE));
+        shutdown.shutdown();
+        server.await.unwrap();
+    }
+}

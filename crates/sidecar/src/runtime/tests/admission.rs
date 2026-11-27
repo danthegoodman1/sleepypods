@@ -44,10 +44,9 @@ impl Fixture {
                 let body = body.clone();
                 let sent = sent.clone();
                 let upgrades = app_upgrades.clone();
-                connections.spawn(proxy_core::serve_http_connection(
+                connections.spawn(serve_app_connection(
                     stream,
-                    Shutdown::new(),
-                    move |mut request| {
+                    move |mut request: Request<Incoming>| {
                         let held_uploads = held_uploads.clone();
                         let body = body.clone();
                         let sent = sent.clone();
@@ -81,11 +80,12 @@ impl Fixture {
                                 );
                             }
                             if path == "/ws" {
-                                let response = proxy_core::websocket_upgrade_response(
-                                    &request,
-                                    Full::new(Bytes::new()).boxed_unsync(),
-                                )
-                                .unwrap();
+                                let response =
+                                    tokio_tungstenite::tungstenite::handshake::server::create_response_with_body(
+                                        &request,
+                                        || Full::new(Bytes::new()).boxed_unsync(),
+                                    )
+                                    .unwrap();
                                 let upgrade = hyper::upgrade::on(&mut request);
                                 upgrades.lock().await.spawn(async move {
                                     let mut ws =
@@ -127,7 +127,12 @@ impl Fixture {
             app_port,
             InstanceId::new("admission").unwrap(),
             Generation::new(1),
-            IdleReportConfig::new(Duration::from_secs(3600), Duration::from_secs(1)).unwrap(),
+            IdleReportConfig::new(
+                Duration::from_secs(3600),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            )
+            .unwrap(),
             Duration::from_millis(100),
         )
         .unwrap()
@@ -190,9 +195,13 @@ fn limits(connections: usize, requests: usize, handshakes: usize) -> ProxyResour
         .unwrap()
 }
 async fn count(limiter: &proxy_core::AdmissionLimiter, expected: usize) {
-    tokio::time::timeout(TEST_TIMEOUT, limiter.wait_for_in_flight(expected))
-        .await
-        .unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while limiter.in_flight() != expected {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 async fn closed(stream: &mut TcpStream) {
     let result = tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut [0; 1]))
@@ -371,6 +380,7 @@ async fn websocket_transfers_socket_and_request_permits_past_http101() {
     );
     ws.close(None).await.unwrap();
     let _ = ws.next().await;
+    drop(ws);
     count(&fixture.admission.requests, 0).await;
     assert_eq!(fixture.request("/ok").await.status(), StatusCode::OK);
     fixture.stop().await;
@@ -487,7 +497,12 @@ async fn tcp_listener_limits_sessions_preserves_quiet_streams_and_bounds_pending
         app_port,
         InstanceId::new("tcp-admission").unwrap(),
         Generation::new(1),
-        IdleReportConfig::new(Duration::from_secs(3600), Duration::from_secs(1)).unwrap(),
+        IdleReportConfig::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
         Duration::from_millis(100),
     )
     .unwrap()
@@ -657,10 +672,16 @@ async fn early_response_upload_eos_flow_control_stall_retains_work_then_recovers
         app_port,
         InstanceId::new("upload-credit").unwrap(),
         Generation::new(1),
-        IdleReportConfig::new(Duration::from_secs(3600), Duration::from_secs(1)).unwrap(),
+        IdleReportConfig::new(
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        )
+        .unwrap(),
         Duration::from_millis(100),
     )
     .unwrap()
+    .with_app_protocol(proxy_core::AppProtocol::H2c)
     .with_resource_config(
         limits(8, 1, 8)
             .with_timeouts(
@@ -751,4 +772,27 @@ async fn early_response_upload_eos_flow_control_stall_retains_work_then_recovers
     runtime.await.unwrap().unwrap();
     app.abort();
     let _ = app.await;
+}
+
+/// Serves one app connection over HTTP/1.1 or HTTP/2, with upgrades.
+async fn serve_app_connection<F, Fut, B>(stream: TcpStream, handler: F)
+where
+    F: Fn(Request<Incoming>) -> Fut,
+    Fut: std::future::Future<Output = Result<Response<B>, Infallible>> + Send + 'static,
+    B: http_body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let admission = proxy_core::ProxyAdmission::new(ProxyResourceConfig::default());
+    let handshake = admission.handshakes.try_acquire().unwrap();
+    let io = admission.admit_io(stream).unwrap();
+    proxy_core::serve_http_connection_admitted(
+        io,
+        Shutdown::new(),
+        admission,
+        handshake,
+        None,
+        handler,
+    )
+    .await;
 }

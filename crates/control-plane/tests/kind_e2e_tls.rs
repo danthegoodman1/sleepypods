@@ -122,6 +122,7 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
     )
     .await?;
     assert_instance_response(&response, TERMINATION_TARGET, "http", &[TERMINATION_TARGET])?;
+    assert_app_saw_host(&response, TERMINATION_HOST)?;
     wait_for_instance_state(
         &mut operator,
         TERMINATION_INSTANCE_ID,
@@ -129,6 +130,21 @@ async fn tls_termination_through_deployed_platform() -> TestResult<()> {
         Duration::from_secs(30),
     )
     .await?;
+
+    // A browser negotiates HTTP/2 with frontline. The app serves HTTP/1.1
+    // only and receives the request as HTTP/1.1 with the client's host.
+    let response = tls_get_http2(
+        config.tls_termination_addr,
+        TERMINATION_HOST,
+        "/terminated-h2",
+        app.cert.der().clone(),
+    )
+    .await?;
+    assert_instance_response(&response, TERMINATION_TARGET, "http", &[TERMINATION_TARGET])?;
+    assert_app_saw_host(&response, TERMINATION_HOST)?;
+    if !response.body.contains("path=/terminated-h2\n") {
+        return Err(format!("HTTP/2 request path was not preserved: {:?}", response.body).into());
+    }
     assert_materialized_deployment_and_service(kube, &config, TERMINATION_TARGET, "http", None)
         .await?;
 
@@ -607,6 +623,60 @@ fn tls_get_blocking(
         status,
         body: body.to_owned(),
     })
+}
+
+/// Sends one request over HTTP/2 negotiated by ALPN, as a browser does.
+async fn tls_get_http2(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    certificate: CertificateDer<'static>,
+) -> TestResult<HttpResponse> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate)?;
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from(host.to_owned())?, stream)
+        .await?;
+    if stream.get_ref().1.alpn_protocol() != Some(&b"h2"[..]) {
+        return Err(format!(
+            "frontline negotiated {:?}, expected h2",
+            stream.get_ref().1.alpn_protocol()
+        )
+        .into());
+    }
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await?;
+    let connection = tokio::spawn(connection);
+    let request = http::Request::builder()
+        .uri(format!("https://{host}{path}"))
+        .body(Empty::<bytes::Bytes>::new())?;
+    let response = tokio::time::timeout(Duration::from_secs(30), sender.send_request(request))
+        .await
+        .map_err(|_| "HTTP/2 request through TLS termination timed out")??;
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await?.to_bytes();
+    connection.abort();
+
+    Ok(HttpResponse {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+/// The app reports the Host it received. It must be the client's.
+fn assert_app_saw_host(response: &HttpResponse, host: &str) -> TestResult<()> {
+    if !response.body.contains(&format!("host={host}\n")) {
+        return Err(format!("app did not see host {host:?}: {:?}", response.body).into());
+    }
+    Ok(())
 }
 
 fn assert_instance_response(

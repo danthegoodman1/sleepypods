@@ -26,6 +26,7 @@ pub struct ProxyResourceConfig {
     setup_timeout: Duration,
     upstream_header_idle_timeout: Duration,
     write_idle_timeout: Duration,
+    keepalive_idle_timeout: Duration,
 }
 
 impl Default for ProxyResourceConfig {
@@ -41,6 +42,7 @@ impl Default for ProxyResourceConfig {
             setup_timeout: Duration::from_secs(10),
             upstream_header_idle_timeout: Duration::from_secs(60),
             write_idle_timeout: Duration::from_secs(60),
+            keepalive_idle_timeout: Duration::from_secs(90),
         }
     }
 }
@@ -172,7 +174,14 @@ impl ProxyResourceConfig {
             "SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS",
             defaults.write_idle_timeout.as_millis() as u64,
         )?;
-        defaults
+        let keepalive = value(
+            "SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS",
+            defaults.keepalive_idle_timeout.as_millis() as u64,
+        )?;
+        // Set both ends of the keep-alive relation before validating either.
+        let mut config = defaults;
+        config.keepalive_idle_timeout = Duration::from_millis(keepalive);
+        config
             .with_upstream_pool(
                 upstream as usize,
                 idle as usize,
@@ -211,12 +220,21 @@ impl ProxyResourceConfig {
             self.upstream_header_idle_timeout,
             self.write_idle_timeout,
             self.pool_idle_timeout,
+            self.keepalive_idle_timeout,
         ]
         .iter()
         .any(|v| *v < Duration::from_millis(1) || *v > Duration::from_secs(3600))
         {
             return Err(InvalidProxyResourceConfig(
                 "proxy timeouts must be in 1ms..=1h".into(),
+            ));
+        }
+        // Both proxies read the same settings. A pooled upstream connection
+        // must retire before the server it reaches stops waiting for a request.
+        if self.pool_idle_timeout >= self.keepalive_idle_timeout {
+            return Err(InvalidProxyResourceConfig(
+                "upstream pool idle timeout must be shorter than the HTTP keep-alive idle timeout"
+                    .into(),
             ));
         }
         Ok(())
@@ -241,6 +259,9 @@ impl ProxyResourceConfig {
     }
     pub fn write_idle_timeout(self) -> Duration {
         self.write_idle_timeout
+    }
+    pub fn keepalive_idle_timeout(self) -> Duration {
+        self.keepalive_idle_timeout
     }
 }
 
@@ -426,6 +447,7 @@ mod tests {
             "SLEEPYPODS_PROXY_SETUP_TIMEOUT_MS",
             "SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS",
             "SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS",
+            "SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS",
         ] {
             for invalid in ["0", "-1", "invalid", "18446744073709551615"] {
                 assert!(
@@ -439,6 +461,24 @@ mod tests {
             ProxyResourceConfig::from_vars(|_| None).unwrap(),
             ProxyResourceConfig::default()
         );
+    }
+    #[test]
+    fn upstream_pool_idle_must_stay_below_the_keepalive_idle_timeout() {
+        let vars = |pool: &'static str, keepalive: &'static str| {
+            ProxyResourceConfig::from_vars(move |key| match key {
+                "SLEEPYPODS_PROXY_POOL_IDLE_TIMEOUT_MS" => Some(pool.into()),
+                "SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS" => Some(keepalive.into()),
+                _ => None,
+            })
+        };
+        assert!(vars("30000", "30000").is_err());
+        assert!(vars("90000", "60000").is_err());
+        let config = vars("120000", "180000").unwrap();
+        assert_eq!(config.pool_idle_timeout(), Duration::from_secs(120));
+        assert_eq!(config.keepalive_idle_timeout(), Duration::from_secs(180));
+        assert!(ProxyResourceConfig::default()
+            .with_upstream_pool(1024, 8, Duration::from_secs(90))
+            .is_err());
     }
     #[tokio::test(start_paused = true)]
     async fn successful_flush_does_not_reset_a_blocked_write_deadline() {

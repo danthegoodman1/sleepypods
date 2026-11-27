@@ -8,6 +8,12 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 // deadline alone does not cancel that attempt. These are per-stage bounds,
 // independent of callers' overall request and startup budgets.
 const CONNECT_STAGE_TIMEOUT: Duration = Duration::from_secs(2);
+// A peer that vanished without closing fails the channel after one interval
+// plus the acknowledgement timeout. Pings continue while the channel is idle:
+// a frontline holds a quiet stream and a sidecar waits minutes between calls.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 pub const CONTROL_PLANE_TLS_CA_PEM_ENV: &str = "SLEEPYPODS_CONTROL_PLANE_TLS_CA_PEM";
 pub const MAX_CONTROL_PLANE_CA_BYTES: usize = 64 * 1024;
 
@@ -17,7 +23,12 @@ pub fn native_endpoint(
     uri: String,
     ca_pem: Option<&str>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint = Endpoint::from_shared(uri)?.connect_timeout(CONNECT_STAGE_TIMEOUT);
+    let endpoint = Endpoint::from_shared(uri)?
+        .connect_timeout(CONNECT_STAGE_TIMEOUT)
+        .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(TCP_KEEPALIVE));
     match endpoint.uri().scheme_str() {
         Some("https") => {
             let mut tls = ClientTlsConfig::new()

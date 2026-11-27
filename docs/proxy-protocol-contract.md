@@ -6,45 +6,105 @@ upgrade. Normal upstream HTTP connections remain pooled, including the separate
 HTTP/2 prior-knowledge client used for h2c and gRPC. An idle HTTP keep-alive
 connection does not hold an active-work drain permit.
 
+## Protocol per hop
+
+The protocol a client speaks to frontline is independent of the protocol the
+app serves.
+
+| Hop | Protocol |
+| --- | --- |
+| Client to frontline | HTTP/1.1 or HTTP/2, chosen by the client. TLS-terminated listeners offer `h2` and `http/1.1`. |
+| Frontline to sidecar | The client's HTTP version. The sidecar serves both. |
+| Sidecar to app | The protocol declared for the app port: `http1` (the default) or `h2c`. |
+
+The sidecar reads the app protocol from `SLEEPYPODS_APP_PROTOCOL`, which the
+control plane renders from the workload class.
+
+- An `http1` port receives every request as HTTP/1.1. A request from an
+  HTTP/2 client carries the client's authority as `Host`.
+- An `h2c` port receives every request as prior-knowledge HTTP/2, including
+  requests from HTTP/1.1 clients. `:authority` is the client's authority.
+- gRPC needs HTTP/2 to the app. On an `http1` port the sidecar answers a
+  request with content type `application/grpc` (or a `+codec` form) itself:
+  HTTP 200 with `grpc-status: 12` (unimplemented) and a `grpc-message`.
+  gRPC-Web uses its own content type and travels over HTTP/1.1.
+- A request that asked for trailers keeps `TE: trailers` on every HTTP/2 hop,
+  which gRPC servers require. An HTTP/1.1 hop removes it.
+- WebSocket upgrades use HTTP/1.1 on every hop, on either app protocol. An
+  `h2c` app that accepts WebSockets also serves HTTP/1.1 upgrades on its port.
+
+Frontline replaces spoofable `Forwarded` and `X-Forwarded-*` fields using the
+peer address, the listener scheme and the client's authority: the `Host` field,
+or the request target for an HTTP/2 client. The sidecar preserves that trusted
+edge output and takes the client's authority from `Host`, then
+`X-Forwarded-Host`, then the request target.
+
 ## WebSocket handshakes
 
-Each proxy validates the client handshake and completes the upstream handshake
-before returning `101 Switching Protocols`. A persistently refused connection
-exhausts the shared setup deadline and returns 504; other connection failures
-return 502. Upstream handshake timeouts return 504. An upstream HTTP rejection retains its
-status, end-to-end response headers and complete body, up to 64 KiB. A larger or
-incomplete rejection body fails with 502 or 504 instead of returning a truncated
-representation. Upgrade response bodies are empty.
+Each proxy completes the upstream handshake before returning `101 Switching
+Protocols`. A persistently refused connection exhausts the shared setup
+deadline and returns 504; other connection failures return 502. Upstream
+handshake timeouts return 504. An upstream HTTP rejection retains its status,
+end-to-end response headers and complete body, up to 64 KiB. A larger or
+incomplete rejection body fails with 502 or 504 instead of returning a
+truncated representation. An upstream that switches to a protocol other than
+WebSocket returns 502. Upgrade response bodies are empty.
 
-Authorization, Cookie, Origin, the original Host, custom application headers,
-offered subprotocols and relevant response headers (including repeated Set-Cookie)
-are preserved. Standard hop-by-hop headers and headers named by Connection are
-removed. Each hop generates its own challenge and validates its own response;
-an upstream can select at most one subprotocol actually offered by the client.
-Frontline replaces spoofable Forwarded and X-Forwarded-* fields using the peer
-address, listener scheme and original Host. Sidecar preserves that trusted edge
-output.
+The handshake passes through unchanged in both directions. The upstream
+receives the client's `Sec-WebSocket-Key`, version, offered subprotocols and
+extensions with Authorization, Cookie, Origin, the original Host and custom
+application headers. The client receives the upstream's
+`Sec-WebSocket-Accept`, selected subprotocol, accepted extensions and other
+response headers, including repeated Set-Cookie. Standard hop-by-hop headers
+and headers named by Connection are removed, and each hop writes its own
+`Connection: upgrade` and `Upgrade: websocket`. The peers validate the
+negotiation; a proxy forwards it.
 
-The relay supports plain RFC 6455 frames. Client extension offers are omitted
-when dialing upstream, so clients offering compression can negotiate an
-uncompressed connection. An upstream claiming any extension is rejected before
-101. HTTP/2 extended CONNECT WebSockets and encrypted `wss` backend origins are
-not supported. HTTPS clients can use frontline TLS termination and the ordinary
-HTTP/1.1 WebSocket upgrade path.
+After the 101 each proxy relays the upgraded bytes and parses no frame.
+Extensions such as permessage-deflate therefore work end to end, a message
+has no proxy size limit, and a session holds two fixed 16 KiB relay buffers
+per hop whatever its peers send. Each direction is relayed independently, so
+a peer that stops reading stalls only its own direction. HTTP/2 extended
+CONNECT WebSockets and encrypted `wss` backend origins are not supported;
+frontline does not advertise the extended CONNECT setting, so HTTP/2 clients
+open WebSockets over HTTP/1.1. HTTPS clients can use frontline TLS termination
+and the ordinary HTTP/1.1 WebSocket upgrade path.
+
+## Listeners and sockets
+
+Every listener runs one accept loop. A failed `accept` never ends it: an error
+that belongs to one connection (aborted, reset, unreachable peer) is skipped,
+and any other error, such as an exhausted file-descriptor table, pauses the
+loop for 100 ms. When shutdown starts the listening socket closes first, so
+new connections are refused while admitted work drains.
+
+Every accepted and dialled socket has Nagle disabled and TCP keepalive enabled:
+probes start after 60 seconds of silence and repeat every 10 seconds, and
+three unanswered probes end the connection. A peer that vanishes without
+closing is found after about 90 seconds on any protocol.
 
 ## Setup and progress deadlines
 
 - The first incoming HTTP request must finish headers within 10 seconds,
   including a silent connection or incomplete HTTP/2 preface. HTTP/1.1 headers
-  have a 64 KiB buffer limit and a 10-second per-request read deadline.
+  have a 64 KiB buffer limit.
+- An HTTP/1.1 server connection waits up to 90 seconds for each later request
+  (`SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS`), measured until that request's
+  headers are complete. The upstream pool idle timeout must be shorter, so a
+  proxy retires a pooled connection before the next hop closes it; startup
+  rejects configuration where it is not.
 - Ordinary HTTP upstream connection establishment has a 10-second deadline.
   HTTP/1, HTTP/2, WebSocket, TCP and SNI share pre-dispatch connection recovery.
   Completed connect-stage errors containing `ConnectionRefused` or `TimedOut`
   may retry, at most once per 50 ms; other errors return immediately. The
   initial probing window lasts the smaller of one second and a quarter of
-  the available setup budget. During that window each TCP cap is bounded by
-  the remaining probing time; later attempts get the remaining overall
-  budget. This does not depend on which per-address error Hyper preserves.
+  the available setup budget. During that window TCP attempts are short
+  probes: the first is capped at 100 ms and each later cap doubles, bounded by
+  the remaining probing time. A backend whose address starts answering a
+  moment after it turns ready is therefore reached about one short probe
+  later. Attempts after the window get the remaining overall budget, so a
+  slow path can still complete. This does not depend on which per-address
+  error Hyper preserves.
   Attempts retain the same admission/pool permit and total deadline.
   Each old TCP attempt is dropped before its replacement starts. This can
   recover a transient stale Service flow while allowing a slower replacement;
@@ -56,24 +116,32 @@ HTTP/1.1 WebSocket upgrade path.
   platform blocking DNS work may still outlive caller cancellation until the
   OS resolver returns. Protocol handshakes, HTTP requests, bodies and
   established streams are never replayed by this connection policy.
-- HTTP/2 uses a 30-second keepalive interval and a 10-second acknowledgement
-  timeout to detect an unresponsive peer.
+- HTTP/2 server connections use a 30-second keepalive interval and a 10-second
+  acknowledgement timeout to detect an unresponsive peer. Frontline's HTTP/2
+  connections to a sidecar use the same interval, also while idle, with the
+  setup timeout as the acknowledgement timeout. The sidecar sends no HTTP/2
+  pings to the app: gRPC servers close a connection that pings too often, and
+  the app shares the pod.
 - WebSocket upstream connection and handshake, including a rejection body,
   has a 10-second deadline. Completing the downstream upgrade also has a
-  10-second deadline. Established frame writes have a 60-second deadline;
-  close writes, flushes and waiting for a close response use 10 seconds.
-- TCP's existing stream-idle deadline now covers reads, partial writes and
-  shutdown. Progress in either direction keeps the session alive. Two blocked
-  writers cannot bypass the deadline. The default is one hour.
+  10-second deadline. In an established session a pending write or shutdown
+  has the 60-second write deadline. A quiet session has no idle deadline; TCP
+  keepalive ends it when a peer is lost. After one peer closes its stream the
+  other has 10 seconds to finish before the session ends.
+- TCP's stream-idle deadline covers reads, partial writes and shutdown.
+  Progress in either direction keeps the session alive. Two blocked writers
+  cannot bypass the deadline. The default is one hour. A half-closed TCP
+  session stays open until that deadline.
 
-The WebSocket library API allows callers to configure handshake, write and close
-durations. The production listeners allow the validated environment overrides below. There is
+The production listeners allow the validated environment overrides below. There is
 no total lifetime deadline on an active HTTP request/body, gRPC stream, TCP
 session or WebSocket session. Setup deadlines do not turn a long stream into a
 short request. HTTP response headers must arrive within 60 seconds without actual
 upload-byte progress. Each nonempty buffer advancement resets that clock; an
 empty frame or a stalled upload does not. Long-poll endpoints must return headers
-within this budget, then may keep the body open indefinitely.
+within this budget, then may keep the body open indefinitely. A pooled
+connection whose request timed out waiting for headers serves no later
+request; streams already on it continue.
 
 The drain permit covers a WebSocket's upstream setup and entire upgraded
 session. Cancellation drops the permit and aborts an unfinished upstream HTTP
@@ -123,6 +191,17 @@ and starts a complete new idle interval. Missing, malformed or oversized hints
 use the ordinary configured retry policy. A deferral is not an acknowledgement
 of Pod membership or permission to sleep.
 
+The sidecar reports for as long as it runs. After any answer, including an
+accepted report, it reports again every retry backoff while the pod stays
+quiet, and any activity starts a complete new idle interval. An accepted report
+changes nothing in the sidecar: it keeps accepting connections until SIGTERM
+starts its drain, so an instance that a wake returns to Running during drain
+serves on the same pod and can sleep again later. One `ReportIdle` call has the
+setup timeout as its deadline, and the control-plane channel uses HTTP/2
+keepalive (30-second interval, 10-second acknowledgement timeout, also while
+idle) and TCP keepalive, so a control plane that stops answering costs one
+retry.
+
 ## Data-plane resource limits
 
 These environment variables apply independently to frontline and sidecar. All
@@ -139,7 +218,8 @@ termination and SNI passthrough listeners.
 | `SLEEPYPODS_PROXY_MAX_UPSTREAM_CONNECTIONS` | 1024 | Active plus idle pooled HTTP upstream sockets across origins |
 | `SLEEPYPODS_PROXY_MAX_IDLE_PER_HOST` | 8 | Idle HTTP sockets per origin in each protocol pool |
 | `SLEEPYPODS_PROXY_POOL_IDLE_TIMEOUT_MS` | 30000 | Idle pooled HTTP socket eviction |
-| `SLEEPYPODS_PROXY_SETUP_TIMEOUT_MS` | 10000 | Initial protocol setup, HTTP/1 headers, upstream connects and WS negotiation |
+| `SLEEPYPODS_PROXY_SETUP_TIMEOUT_MS` | 10000 | Initial protocol setup, the first request's headers, upstream connects and WS negotiation |
+| `SLEEPYPODS_PROXY_KEEPALIVE_IDLE_TIMEOUT_MS` | 90000 | Wait for the next request on an HTTP/1.1 server connection; must exceed the pool idle timeout |
 | `SLEEPYPODS_PROXY_UPSTREAM_HEADER_IDLE_TIMEOUT_MS` | 60000 | Response-header wait without upload-byte progress |
 | `SLEEPYPODS_PROXY_WRITE_IDLE_TIMEOUT_MS` | 60000 | Pending socket/stream delivery writes, including TCP/SNI |
 
@@ -166,6 +246,10 @@ upstream HTTP connection; other requests sharing that upstream h2 connection may
 also fail. The selected connection is poisoned so the pool does not reuse it.
 Application waits with no produced upload bytes are exempt after early response
 headers, and there is no universal active-body lifetime limit.
+
+The delivery deadline for an HTTP/1.1 body is its socket's write deadline: a
+stalled HTTP/1.1 peer stalls the socket. Only HTTP/2 bodies run the separate
+per-stream watchdog described above.
 
 TCP/SNI retain their separate one-hour stream-idle policy. The write override
 bounds pending writes and shutdown, not quiet but established sessions. Metrics
