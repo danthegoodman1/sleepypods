@@ -32,6 +32,7 @@ use pin_project_lite::pin_project;
 use crate::{
     delivery::{DeliveryFailure, DeliveryState, Watchdog},
     drain::{DrainError, DrainPermit, DrainTracker},
+    pod_route::{authority_without_userinfo, PodRoute, PodRoutes},
     AdmissionPermit, ProxyAdmission, ProxyResourceConfig, Shutdown,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -45,7 +46,9 @@ const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 
 /// Forwards requests to the origin each request names, in the HTTP version
-/// its client used. The upstream is a sidecar, which serves both versions.
+/// its client used. The upstream is a sidecar, which serves both versions. An
+/// origin that carries a [`PodRoute`] reaches the Pod first and its Service
+/// when the Pod address fails.
 #[derive(Clone, Debug)]
 pub struct HttpProxy {
     drain: DrainTracker,
@@ -126,6 +129,7 @@ impl HttpProxy {
                 Hop::Sidecar => None,
                 Hop::App(origin) => Some(origin),
             },
+            pod_routes: PodRoutes::default(),
             capacity: upstream_connections.clone(),
             write_timeout: config.write_idle_timeout(),
             connect_timeout: config.setup_timeout(),
@@ -361,8 +365,10 @@ fn client_authority<B>(request: &Request<B>) -> Option<HeaderValue> {
         .or_else(|| uri_authority(request.uri()))
 }
 
+/// The request target's `host[:port]`. Userinfo, such as the Pod route a
+/// frontline origin carries, is never an authority a peer addressed.
 fn uri_authority(uri: &Uri) -> Option<HeaderValue> {
-    HeaderValue::from_str(uri.authority()?.as_str()).ok()
+    HeaderValue::from_str(authority_without_userinfo(uri.authority()?)).ok()
 }
 
 /// `application/grpc` and its `+codec` forms. gRPC-Web uses its own type and
@@ -633,6 +639,8 @@ struct LimitedConnector {
     inner: HttpConnector,
     /// The one address every connection reaches, when the hop has one.
     dial: Option<Uri>,
+    /// Sidecar origins that carry a Pod route try the Pod first.
+    pod_routes: PodRoutes,
     capacity: crate::AdmissionLimiter,
     write_timeout: Duration,
     connect_timeout: Duration,
@@ -650,31 +658,44 @@ impl tower_service::Service<Uri> for LimitedConnector {
             return Box::pin(async move { Err(Box::new(error) as BoxError) });
         }
         let mut connector = self.inner.clone();
+        let pod_route = match self.dial {
+            Some(_) => None,
+            None => PodRoute::from_origin(&uri),
+        };
+        let pod_routes = self.pod_routes.clone();
         let uri = self.dial.clone().unwrap_or(uri);
         let write_timeout = self.write_timeout;
         let connect_timeout = self.connect_timeout;
         Box::pin(async move {
-            let stream = tokio::time::timeout(
-                connect_timeout,
-                crate::connect::retry_connect(connect_timeout, |tcp_timeout| {
-                    connector.set_connect_timeout(Some(tcp_timeout));
-                    connector.call(uri.clone())
-                }),
-            )
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "upstream HTTP connect timeout",
-                )
-            })??;
+            let started = tokio::time::Instant::now();
+            let pod = match &pod_route {
+                Some(route) => pod_routes.connect(route, connect_timeout).await,
+                None => None,
+            };
+            let stream = match pod {
+                Some(stream) => stream,
+                None => {
+                    let budget = connect_timeout.saturating_sub(started.elapsed());
+                    tokio::time::timeout(
+                        budget,
+                        crate::connect::retry_connect(budget, |tcp_timeout| {
+                            connector.set_connect_timeout(Some(tcp_timeout));
+                            connector.call(uri.clone())
+                        }),
+                    )
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "upstream HTTP connect timeout",
+                        )
+                    })??
+                    .into_inner()
+                }
+            };
             Ok(TokioIo::new(
-                crate::AdmittedIo::new(
-                    stream.into_inner(),
-                    permit.expect("admitted connection"),
-                    write_timeout,
-                )
-                .cancellable(),
+                crate::AdmittedIo::new(stream, permit.expect("admitted connection"), write_timeout)
+                    .cancellable(),
             ))
         })
     }

@@ -223,8 +223,12 @@ message ProxyRouteEntry {
   string instance_id = 2;
   InstanceState instance_state = 3;
   uint64 instance_generation = 4;
+  // The ready backend's Service address.
   optional string backend_uri = 5;
   optional uint64 backend_generation = 6;
+  // The ready backend's Pod address: the ready endpoint's IP on the sidecar's
+  // listen port. A proxy tries it before the Service address.
+  optional string pod_backend_uri = 7;
 }
 
 message ProxyCachePolicy {

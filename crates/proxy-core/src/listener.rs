@@ -103,7 +103,7 @@ pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
 /// reset. The socket therefore sends FIN first, so the client reads end of
 /// stream even if more input arrives later, and then discards the input
 /// already buffered, so the close sends nothing more. Neither step waits.
-fn close_refused(stream: TcpStream) {
+pub fn close_refused(stream: TcpStream) {
     let socket = SockRef::from(&stream);
     let _ = socket.shutdown(std::net::Shutdown::Write);
     let mut buffer = [0; 4096];

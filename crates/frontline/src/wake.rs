@@ -41,7 +41,10 @@ pub enum WakeInstanceResponse {
 pub struct ReadyBackend {
     pub instance_id: InstanceId,
     pub instance_generation: Generation,
+    /// The Service address.
     pub backend: BackendEndpoint,
+    /// The Pod address, which HTTP forwarding tries before the Service.
+    pub pod_backend: Option<BackendEndpoint>,
     pub backend_generation: Option<BackendGeneration>,
 }
 
@@ -93,6 +96,7 @@ pub fn route_disposition(entry: &RouteEntry) -> RouteDisposition {
                 instance_id: entry.instance_id.clone(),
                 instance_generation: entry.instance_generation,
                 backend: backend.clone(),
+                pod_backend: entry.pod_backend.clone(),
                 backend_generation: entry.backend_generation,
             }),
             None => pending(true),
@@ -120,6 +124,7 @@ mod tests {
             instance_state: state,
             instance_generation: Generation::new(7),
             backend: backend.then(|| BackendEndpoint::new("http://10.0.0.1:8080").unwrap()),
+            pod_backend: backend.then(|| BackendEndpoint::new("http://10.244.0.7:15000").unwrap()),
             backend_generation: backend.then(|| BackendGeneration::new(3)),
         }
     }
@@ -129,6 +134,10 @@ mod tests {
         match route_disposition(&entry(InstanceState::Running, true)) {
             RouteDisposition::Ready(ready) => {
                 assert_eq!(ready.backend.uri(), "http://10.0.0.1:8080");
+                assert_eq!(
+                    ready.pod_backend.as_ref().map(BackendEndpoint::uri),
+                    Some("http://10.244.0.7:15000")
+                );
                 assert_eq!(ready.instance_generation, Generation::new(7));
                 assert_eq!(ready.backend_generation, Some(BackendGeneration::new(3)));
             }
