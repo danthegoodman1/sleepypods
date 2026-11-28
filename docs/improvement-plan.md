@@ -149,7 +149,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 0A: Replace deprecated `fetch_update` calls | Commit `2c27de5`: three call sites use `try_update`; `cargo clippy --workspace --all-targets -- -D warnings` exits 0 on 1.100.0. |
 | Complete | Work | 0B: Pinned toolchain | Commit `2c27de5`: `rust-toolchain.toml` pins 1.100.0; both CI jobs run `rustup toolchain install`; the four image builds use `rust:1.100-bookworm`. |
-| In Progress | Gate | CI green on the pinned toolchain | Every `ci.yml` step passes locally at `720a51f`: fmt, clippy, 997 workspace tests, dependency boundaries, both checker scripts, the protocol fixture, both load-smoke checks and the real-Postgres target (46 passed, complete inventory). All fourteen kind gates and `smoke-images.sh` pass at `720a51f`. Missing: hosted CI run on the pull request. |
+| Complete | Gate | CI green on the pinned toolchain | Hosted CI run `46084579743` on PR #14 at `aaeacb9` passed: `rust` (6 m 57 s) and `kind-e2e` (15 m 6 s). Locally at `720a51f`, every `ci.yml` step, all fourteen kind gates and `smoke-images.sh` pass. |
 
 ## Phase 1: Contain Single-Request and Single-Fault Failures in the Proxies
 
